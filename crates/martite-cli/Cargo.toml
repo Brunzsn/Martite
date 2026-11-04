@@ -1,0 +1,26 @@
+[package]
+name = "martite-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line toolchain for the Martite language"
+publish = false
+
+[[bin]]
+name = "martite"
+path = "src/main.rs"
+
+[dependencies]
+martite.workspace = true
+martite-base.workspace = true
+martite-config.workspace = true
+martite-syntax.workspace = true
+martite-resolve.workspace = true
+martite-check.workspace = true
+martite-runtime.workspace = true
+martite-driver.workspace = true
+martite-lint.workspace = true
+martite-fmt.workspace = true
+
+[lints]
+workspace = true

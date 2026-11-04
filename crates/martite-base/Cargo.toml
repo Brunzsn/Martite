@@ -1,0 +1,12 @@
+[package]
+name = "martite-base"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Spans, source maps, diagnostics, and load limits for Martite"
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

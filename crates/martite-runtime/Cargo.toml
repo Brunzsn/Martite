@@ -1,0 +1,16 @@
+[package]
+name = "martite-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tree-walking interpreter and standard library for Martite"
+publish = false
+
+[dependencies]
+martite-base.workspace = true
+martite-syntax.workspace = true
+martite-check.workspace = true
+libm.workspace = true
+
+[lints]
+workspace = true

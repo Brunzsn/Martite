@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+martite = { path = "crates/martite", version = "0.1.0" }
+martite-base = { path = "crates/martite-base", version = "0.1.0" }
+martite-syntax = { path = "crates/martite-syntax", version = "0.1.0" }
+martite-config = { path = "crates/martite-config", version = "0.1.0" }
+martite-resolve = { path = "crates/martite-resolve", version = "0.1.0" }
+martite-check = { path = "crates/martite-check", version = "0.1.0" }
+martite-runtime = { path = "crates/martite-runtime", version = "0.1.0" }
+martite-driver = { path = "crates/martite-driver", version = "0.1.0" }
+martite-lint = { path = "crates/martite-lint", version = "0.1.0" }
+martite-fmt = { path = "crates/martite-fmt", version = "0.1.0" }
+
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.0"
+libm = "0.2.16"
+stacker = "0.1.25"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = "warn"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = true

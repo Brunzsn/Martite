@@ -1,0 +1,14 @@
+[package]
+name = "martite-fmt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Formatter for Martite"
+publish = false
+
+[dependencies]
+martite-base.workspace = true
+martite-syntax.workspace = true
+
+[lints]
+workspace = true
