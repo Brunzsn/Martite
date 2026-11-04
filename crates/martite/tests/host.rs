@@ -1,6 +1,4 @@
-use martite::{
-    Engine, HostSignature, HostType, Instance, Outcome,
-};
+use martite::{Engine, HostSignature, HostType, Instance, Outcome};
 use martite_base::MemoryProvider;
 use martite_runtime::Value;
 
@@ -84,27 +82,22 @@ fn plugin_init_hook_and_state() {
     let mut instance: Instance<'_> = plugin.instantiate().expect("init");
     match instance.call("saved", vec![doc]).expect("hook") {
         Outcome::Handled(value) => {
-            assert!(matches!(value, Value::Result(Ok(_))), "unexpected {value:?}");
+            assert!(
+                matches!(value, Value::Result(Ok(_))),
+                "unexpected {value:?}"
+            );
         }
         Outcome::NoHandler => panic!("handler missing"),
     }
     assert!(matches!(instance.state(), Some(Value::Struct(_))));
     let snapshot = instance.snapshot();
-    assert_ne!(snapshot.type_fingerprint, 0);
+    assert_ne!(snapshot.type_fingerprint, [0u8; 32]);
     assert!(!snapshot.bytes.is_empty());
 
     let mut restored = plugin.instantiate().expect("init");
     restored.restore(&snapshot).expect("restore");
-    let before = martite_runtime::show(
-        instance.state().unwrap(),
-        &plugin.program().types,
-        false,
-    );
-    let after = martite_runtime::show(
-        restored.state().unwrap(),
-        &plugin.program().types,
-        false,
-    );
+    let before = martite_runtime::show(instance.state().unwrap(), &plugin.program().types, false);
+    let after = martite_runtime::show(restored.state().unwrap(), &plugin.program().types, false);
     assert_eq!(before, after);
 }
 
@@ -191,11 +184,7 @@ fn test_doubles_serve_offline_tests() {
     let plugin = engine.load(MATH_MANIFEST, &provider).expect("load");
     let reports = plugin.run_tests();
     assert_eq!(reports.len(), 1);
-    assert!(
-        reports[0].passed(),
-        "test failed: {:?}",
-        reports[0].outcome
-    );
+    assert!(reports[0].passed(), "test failed: {:?}", reports[0].outcome);
 }
 
 #[test]
@@ -208,10 +197,9 @@ fn missing_host_implementation_is_a_load_error() {
         Ok(_) => panic!("expected a load error"),
         Err(error) => error,
     };
-    assert!(error
-        .iter()
-        .any(|d| d.code == martite_base::Code::E509
-            && d.message.contains("no Rust implementation")));
+    assert!(error.iter().any(
+        |d| d.code == martite_base::Code::E509 && d.message.contains("no Rust implementation")
+    ));
 }
 
 const SETTINGS_PLUGIN: &str = r#"
@@ -269,10 +257,10 @@ fn mismatched_host_signature_is_a_load_error() {
         Ok(_) => panic!("expected a load error"),
         Err(error) => error,
     };
-    assert!(error
-        .iter()
-        .any(|d| d.code == martite_base::Code::E509
-            && d.message.contains("mismatched Rust signature")));
+    assert!(
+        error.iter().any(|d| d.code == martite_base::Code::E509
+            && d.message.contains("mismatched Rust signature"))
+    );
 }
 
 #[test]

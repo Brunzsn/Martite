@@ -1,8 +1,8 @@
 //! Load pipeline: sources → parse → resolve → check.
 
-use martite_base::{Code, Diagnostic, LoadLimits, SourceMap, SourceProvider, Severity};
-use martite_check::{check, CheckedProgram};
-use martite_resolve::{resolve, InterfaceSource, ResolveOptions};
+use martite_base::{Code, Diagnostic, LoadLimits, Severity, SourceMap, SourceProvider};
+use martite_check::{CheckedProgram, check};
+use martite_resolve::{InterfaceSource, ResolveOptions, resolve};
 
 #[derive(Debug, Clone, Default)]
 pub struct LoadOptions {
@@ -58,10 +58,7 @@ pub fn load(provider: &dyn SourceProvider, options: &LoadOptions) -> LoadedProgr
     let mut diagnostics = resolved.diagnostics;
     let program = match resolved.program {
         Some(resolved) => {
-            if diagnostics
-                .iter()
-                .any(|d| d.severity == Severity::Error)
-            {
+            if diagnostics.iter().any(|d| d.severity == Severity::Error) {
                 None
             } else {
                 let checked = check(resolved);

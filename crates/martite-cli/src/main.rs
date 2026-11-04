@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use martite::{Engine, HostSignature, HostType, LANG_EDITION};
 use martite_base::{Code, Diagnostic, FileSystemProvider, LoadLimits, Severity, SourceMap};
 use martite_config::parse_manifest;
-use martite_driver::{load, LoadOptions};
+use martite_driver::{LoadOptions, load};
 use martite_resolve::InterfaceSource;
 use martite_runtime::{ExecLimits, Runtime, Trap, Value};
 
@@ -50,7 +50,10 @@ fn main() -> ExitCode {
     match command.as_str() {
         "run" => cmd_run(rest),
         "check" => cmd_check(rest, false),
-        "lint" => cmd_check(rest, true),
+        "lint" => {
+            eprintln!("martite lint: the linter is not available yet");
+            ExitCode::from(2)
+        }
         "test" => cmd_test(rest),
         "fmt" => {
             eprintln!("martite fmt: the formatter is not available yet");
@@ -88,65 +91,76 @@ struct Parsed {
 }
 
 fn parse_args(args: &[String], allow_trailing: bool) -> Result<Parsed, String> {
+    use lexopt::prelude::*;
+
     let mut out = Parsed::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--json" => out.json = true,
-            "--interface" => {
-                i += 1;
-                let path = args.get(i).ok_or("--interface requires a path")?;
+    let mut parser = lexopt::Parser::from_args(args.iter().cloned());
+    while let Some(arg) = parser.next().map_err(|error| error.to_string())? {
+        match arg {
+            Long("json") => out.json = true,
+            Long("interface") => {
+                let path = parser
+                    .value()
+                    .map_err(|error| error.to_string())?
+                    .string()
+                    .map_err(|error| error.to_string())?;
                 out.interfaces.push(PathBuf::from(path));
             }
-            "--fuel" => {
-                i += 1;
+            Long("fuel") => {
                 out.fuel = Some(
-                    args.get(i)
-                        .ok_or("--fuel requires a number")?
+                    parser
+                        .value()
+                        .map_err(|error| error.to_string())?
+                        .string()
+                        .map_err(|error| error.to_string())?
                         .parse()
                         .map_err(|_| "--fuel requires a number")?,
                 );
             }
-            "--memory" => {
-                i += 1;
+            Long("memory") => {
                 out.memory = Some(
-                    args.get(i)
-                        .ok_or("--memory requires a number")?
+                    parser
+                        .value()
+                        .map_err(|error| error.to_string())?
+                        .string()
+                        .map_err(|error| error.to_string())?
                         .parse()
                         .map_err(|_| "--memory requires a number")?,
                 );
             }
-            "--depth" => {
-                i += 1;
+            Long("depth") => {
                 out.depth = Some(
-                    args.get(i)
-                        .ok_or("--depth requires a number")?
+                    parser
+                        .value()
+                        .map_err(|error| error.to_string())?
+                        .string()
+                        .map_err(|error| error.to_string())?
                         .parse()
                         .map_err(|_| "--depth requires a number")?,
                 );
             }
-            "--fix" => {}
-            other if other.starts_with('-') => return Err(format!("unknown option `{other}`")),
-            other => {
-                if out.path.is_some() {
-                    if allow_trailing && !other.starts_with('-') {
-                        out.script_args.push(other.to_string());
-                    } else if allow_trailing {
-                        out.script_args.push(other.to_string());
-                    } else {
-                        return Err("expected a single path".into());
-                    }
-                    i += 1;
-                    while i < args.len() {
-                        out.script_args.push(args[i].clone());
-                        i += 1;
+            Long("fix") => {
+                return Err("--fix is not supported; the linter is not implemented".into());
+            }
+            Value(value) => {
+                let value = value.string().map_err(|error| error.to_string())?;
+                if out.path.is_none() {
+                    out.path = Some(value);
+                } else if !allow_trailing {
+                    return Err("expected a single path".into());
+                } else {
+                    out.script_args.push(value);
+                }
+                if allow_trailing && out.path.is_some() {
+                    for value in parser.raw_args().map_err(|error| error.to_string())? {
+                        out.script_args
+                            .push(value.string().map_err(|error| error.to_string())?);
                     }
                     break;
                 }
-                out.path = Some(other.to_string());
             }
+            _ => return Err(arg.unexpected().to_string()),
         }
-        i += 1;
     }
     Ok(out)
 }
@@ -164,7 +178,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     let path = PathBuf::from(&file);
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         eprintln!("error: invalid file path `{file}`");
         return ExitCode::from(2);
@@ -173,7 +190,8 @@ fn cmd_run(args: &[String]) -> ExitCode {
         eprintln!("error: file not found: {file}");
         return ExitCode::from(2);
     }
-    let provider = FileSystemProvider::new(parent);
+    // `martite run` is the standalone host: it is intentionally unrestricted.
+    let provider = FileSystemProvider::unrestricted(parent);
     let mut engine = Engine::new();
     register_std(&mut engine, parsed.script_args.clone());
     apply_limits(&mut engine, &parsed);
@@ -192,7 +210,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
             }
             match main.value {
                 Value::Result(Err(error)) => {
-                    eprintln!("{}", martite_runtime::show(&error, &plugin.program().types, true));
+                    eprintln!(
+                        "{}",
+                        martite_runtime::show(&error, &plugin.program().types, true)
+                    );
                     ExitCode::from(1)
                 }
                 _ => ExitCode::SUCCESS,
@@ -214,7 +235,10 @@ fn cmd_check(args: &[String], lint: bool) -> ExitCode {
         }
     };
     let Some(path) = parsed.path else {
-        eprintln!("error: {} requires a path", if lint { "lint" } else { "check" });
+        eprintln!(
+            "error: {} requires a path",
+            if lint { "lint" } else { "check" }
+        );
         return ExitCode::from(2);
     };
     let path = PathBuf::from(&path);
@@ -289,7 +313,10 @@ fn cmd_check(args: &[String], lint: bool) -> ExitCode {
         },
     );
     print_diagnostics(&loaded.diagnostics, &loaded.sources, parsed.json);
-    let has_errors = loaded.diagnostics.iter().any(|d| d.severity == Severity::Error);
+    let has_errors = loaded
+        .diagnostics
+        .iter()
+        .any(|d| d.severity == Severity::Error);
     if has_errors {
         ExitCode::from(1)
     } else if lint && loaded.diagnostics.is_empty() {
@@ -472,10 +499,7 @@ fn load_interfaces(paths: &[PathBuf], root: Option<&Path>) -> Vec<InterfaceSourc
             .trim_start_matches("./")
             .trim_end_matches(".mti")
             .replace('/', ".");
-        out.push(InterfaceSource {
-            path: module,
-            text,
-        });
+        out.push(InterfaceSource { path: module, text });
     }
     out
 }
@@ -496,7 +520,10 @@ fn register_std(engine: &mut Engine, args: Vec<String>) {
         "std.io.read_line",
         HostSignature::new(
             vec![],
-            HostType::Result(Box::new(HostType::Option(Box::new(HostType::Str))), Box::new(HostType::Str)),
+            HostType::Result(
+                Box::new(HostType::Option(Box::new(HostType::Str))),
+                Box::new(HostType::Str),
+            ),
         ),
         |_cx, _args| {
             let mut line = String::new();
@@ -548,10 +575,7 @@ fn register_std(engine: &mut Engine, args: Vec<String>) {
         HostSignature::new(vec![], HostType::List(Box::new(HostType::Str))),
         move |_cx, _args| {
             Ok(Value::list(
-                args.clone()
-                    .into_iter()
-                    .map(Value::str)
-                    .collect(),
+                args.clone().into_iter().map(Value::str).collect(),
             ))
         },
     );
@@ -580,5 +604,3 @@ fn apply_limits(engine: &mut Engine, parsed: &Parsed) {
     };
     engine.set_limits(limits, limits);
 }
-
-

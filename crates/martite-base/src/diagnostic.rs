@@ -331,7 +331,10 @@ impl Diagnostic {
     pub fn render_json(&self, sources: &SourceMap) -> String {
         let mut out = String::from("{");
         out.push_str(&format!("\"code\":{}", json_str(self.code.as_str())));
-        out.push_str(&format!(",\"severity\":{}", json_str(self.severity.as_str())));
+        out.push_str(&format!(
+            ",\"severity\":{}",
+            json_str(self.severity.as_str())
+        ));
         out.push_str(&format!(",\"message\":{}", json_str(&self.message)));
         if let Some(source) = self.source {
             if let Some(file) = sources.get(source) {
@@ -428,7 +431,7 @@ impl Emit {
     pub fn sorted(mut self) -> Vec<Diagnostic> {
         self.diagnostics.sort_by_key(|d| {
             (
-                d.source.map(|s| s.0).unwrap_or(0),
+                d.source.map(|s| s.0).unwrap_or(u32::MAX),
                 d.span.map(|s| s.start).unwrap_or(0),
                 d.code,
             )

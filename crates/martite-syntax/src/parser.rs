@@ -1,10 +1,10 @@
 use std::mem::discriminant;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use martite_base::{Code, Diagnostic, LoadLimits, Span};
+use martite_base::{Code, Diagnostic, LoadLimits, Span, normalize_source};
 
 use crate::ast::*;
-use crate::lexer::{lex, lex_fragment, Lexed};
+use crate::lexer::{Lexed, lex, lex_fragment};
 use crate::token::{IdentClass, StrPart, Token, TokenKind, TypeName};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,11 +21,13 @@ pub struct ParseOutput {
 }
 
 pub fn parse_source(source: &str, limits: LoadLimits) -> ParseOutput {
-    Parser::new(source, limits, false).parse_program()
+    let source = normalize_source(source);
+    Parser::new(&source, limits, false).parse_program()
 }
 
 pub fn parse_interface(source: &str, limits: LoadLimits) -> ParseOutput {
-    Parser::new(source, limits, true).parse_program()
+    let source = normalize_source(source);
+    Parser::new(&source, limits, true).parse_program()
 }
 
 type PResult<T> = Result<T, ()>;
@@ -40,6 +42,7 @@ struct Parser<'a> {
     allow_struct_lit: bool,
     interface: bool,
     depth: usize,
+    limit_hit: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -52,12 +55,7 @@ impl<'a> Parser<'a> {
         Self::with_lexed(source, lexed, limits, interface)
     }
 
-    fn with_lexed(
-        source: &'a str,
-        lexed: Lexed,
-        limits: LoadLimits,
-        interface: bool,
-    ) -> Self {
+    fn with_lexed(source: &'a str, lexed: Lexed, limits: LoadLimits, interface: bool) -> Self {
         Self {
             source,
             tokens: lexed.tokens,
@@ -68,6 +66,7 @@ impl<'a> Parser<'a> {
             allow_struct_lit: true,
             interface,
             depth: 0,
+            limit_hit: false,
         }
     }
 
@@ -76,7 +75,7 @@ impl<'a> Parser<'a> {
         let mut items = Vec::new();
         loop {
             self.skip_all_newlines();
-            if self.at(&TokenKind::Eof) {
+            if self.at(&TokenKind::Eof) || self.limit_hit {
                 break;
             }
             match self.parse_item() {
@@ -85,6 +84,9 @@ impl<'a> Parser<'a> {
                     self.statement_end();
                 }
                 Err(()) => self.recover_item(),
+            }
+            if self.limit_hit {
+                break;
             }
         }
         let end = self.span();
@@ -162,10 +164,9 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok((name, class, token.span))
             }
-            _ => Err(self.error_at_current(format!(
-                "expected an identifier, found {}",
-                token.kind
-            ))),
+            _ => {
+                Err(self.error_at_current(format!("expected an identifier, found {}", token.kind)))
+            }
         }
     }
 
@@ -188,11 +189,7 @@ impl<'a> Parser<'a> {
     fn expect_screaming(&mut self) -> PResult<(String, Span)> {
         let (name, class, span) = self.expect_ident()?;
         if class != IdentClass::Screaming {
-            self.error(
-                Code::E104,
-                span,
-                format!("`{name}` must be SCREAMING_CASE"),
-            );
+            self.error(Code::E104, span, format!("`{name}` must be SCREAMING_CASE"));
         }
         Ok((name, span))
     }
@@ -224,6 +221,7 @@ impl<'a> Parser<'a> {
                     self.limits.nesting_depth
                 ),
             );
+            self.limit_hit = true;
             return Err(());
         }
         self.depth += 1;
@@ -332,7 +330,11 @@ impl<'a> Parser<'a> {
         result
     }
 
-    fn with_struct_lit<T>(&mut self, allow: bool, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+    fn with_struct_lit<T>(
+        &mut self,
+        allow: bool,
+        f: impl FnOnce(&mut Self) -> PResult<T>,
+    ) -> PResult<T> {
         let saved = self.allow_struct_lit;
         self.allow_struct_lit = allow;
         let result = f(self);
@@ -419,7 +421,7 @@ impl<'a> Parser<'a> {
                                 Code::E003,
                                 token.span,
                                 "test names may not contain interpolation",
-                            ))
+                            ));
                         }
                     }
                 }
@@ -507,7 +509,10 @@ impl<'a> Parser<'a> {
         } else {
             Some(self.parse_block()?)
         };
-        let end = body.as_ref().map(|b| b.span).unwrap_or_else(|| self.span_before());
+        let end = body
+            .as_ref()
+            .map(|b| b.span)
+            .unwrap_or_else(|| self.span_before());
         let span = start.merge(end);
         Ok(FnDecl {
             id: self.id(),
@@ -756,9 +761,7 @@ impl<'a> Parser<'a> {
 
     fn parse_type(&mut self) -> PResult<TyExpr> {
         self.enter_depth()?;
-        let result = stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
-            self.parse_type_inner()
-        });
+        let result = stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || self.parse_type_inner());
         self.depth -= 1;
         result
     }
@@ -875,21 +878,28 @@ impl<'a> Parser<'a> {
                     kind: TyKind::Fn { params, ret },
                 })
             }
-            _ => Err(self.error_at_current(format!(
-                "expected a type, found {}",
-                token.kind
-            ))),
+            _ => Err(self.error_at_current(format!("expected a type, found {}", token.kind))),
         }
     }
 
     // ----- statements and blocks ----------------------------------------
 
     fn parse_block(&mut self) -> PResult<Block> {
+        self.enter_depth()?;
+        let result = stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || self.parse_block_inner());
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_block_inner(&mut self) -> PResult<Block> {
         let start = self.expect(&TokenKind::LBrace)?.span;
         let mut stmts = Vec::new();
         self.with_newlines(false, |p| {
             p.skip_all_newlines();
             while !p.at(&TokenKind::RBrace) && !p.at(&TokenKind::Eof) {
+                if p.limit_hit {
+                    return Err(());
+                }
                 let stmt = p.parse_stmt()?;
                 stmts.push(stmt);
                 p.statement_end();
@@ -908,7 +918,11 @@ impl<'a> Parser<'a> {
     fn parse_stmt(&mut self) -> PResult<Stmt> {
         let start = self.span();
         let is_let = self.eat(&TokenKind::Let);
-        let is_var = if is_let { false } else { self.eat(&TokenKind::Var) };
+        let is_var = if is_let {
+            false
+        } else {
+            self.eat(&TokenKind::Var)
+        };
         if is_let || is_var {
             let mutable = is_var;
             let pattern = self.parse_pattern()?;
@@ -1008,6 +1022,21 @@ impl<'a> Parser<'a> {
         })
     }
 
+    // Kept here so the depth guard is exercised without a 1 MiB fixture.
+    #[cfg(test)]
+    fn depth_test_program(levels: usize) -> String {
+        let mut source = String::from("fn main() {\n");
+        for _ in 0..levels {
+            source.push_str("while true {\n");
+        }
+        source.push_str("let x = 1\n");
+        for _ in 0..levels {
+            source.push_str("}\n");
+        }
+        source.push_str("}\n");
+        source
+    }
+
     fn assign_op(&mut self) -> Option<AssignOp> {
         Some(match self.peek_kind() {
             TokenKind::Eq => AssignOp::Assign,
@@ -1046,9 +1075,7 @@ impl<'a> Parser<'a> {
 
     fn parse_expr(&mut self) -> PResult<Expr> {
         self.enter_depth()?;
-        let result = stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
-            self.parse_expr_inner()
-        });
+        let result = stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || self.parse_expr_inner());
         self.depth -= 1;
         result
     }
@@ -1154,9 +1181,9 @@ impl<'a> Parser<'a> {
                 | TokenKind::Gt
                 | TokenKind::Ge
         ) {
-            return Err(self.error_at_current(
-                "comparison operators are non-associative; add parentheses",
-            ));
+            return Err(
+                self.error_at_current("comparison operators are non-associative; add parentheses")
+            );
         }
         let span = lhs.span.merge(rhs.span);
         Ok(Expr {
@@ -1181,9 +1208,9 @@ impl<'a> Parser<'a> {
         self.skip_continuation_newlines();
         let end = self.parse_add()?;
         if matches!(self.peek_kind(), TokenKind::DotDot | TokenKind::DotDotEq) {
-            return Err(self.error_at_current(
-                "range operators are non-associative; add parentheses",
-            ));
+            return Err(
+                self.error_at_current("range operators are non-associative; add parentheses")
+            );
         }
         let span = start.span.merge(end.span);
         Ok(Expr {
@@ -1328,7 +1355,7 @@ impl<'a> Parser<'a> {
                         _ => {
                             return Err(self.error_at_current(
                                 "expected a field name or tuple index after `.`",
-                            ))
+                            ));
                         }
                     };
                     let span = expr.span.merge(self.span_before());
@@ -1387,11 +1414,7 @@ impl<'a> Parser<'a> {
             TokenKind::Int(v) => {
                 self.advance();
                 let value = if v > i64::MAX as i128 {
-                    self.error(
-                        Code::E001,
-                        token.span,
-                        "integer literal is out of range",
-                    );
+                    self.error(Code::E001, token.span, "integer literal is out of range");
                     i64::MAX
                 } else {
                     v as i64
@@ -1494,13 +1517,12 @@ impl<'a> Parser<'a> {
             TokenKind::If => self.parse_if_expr(),
             TokenKind::Match => self.parse_match_expr(),
             TokenKind::Fn => self.parse_lambda(),
-            TokenKind::Underscore => Err(self.error_at_current(
-                "`_` is a wildcard and cannot be used as an expression",
-            )),
-            _ => Err(self.error_at_current(format!(
-                "expected an expression, found {}",
-                token.kind
-            ))),
+            TokenKind::Underscore => {
+                Err(self.error_at_current("`_` is a wildcard and cannot be used as an expression"))
+            }
+            _ => {
+                Err(self.error_at_current(format!("expected an expression, found {}", token.kind)))
+            }
         }
     }
 
@@ -1534,12 +1556,7 @@ impl<'a> Parser<'a> {
                 StrPart::Text(t) => parts.push(StrExprPart::Text(t.clone())),
                 StrPart::Expr(expr_span) => {
                     let lexed = lex_fragment(self.source, *expr_span, self.limits);
-                    let mut sub = Parser::with_lexed(
-                        self.source,
-                        lexed,
-                        self.limits,
-                        false,
-                    );
+                    let mut sub = Parser::with_lexed(self.source, lexed, self.limits, false);
                     let expr = sub.parse_expr().map_err(|_| {
                         self.error(
                             Code::E003,
@@ -1682,11 +1699,7 @@ impl<'a> Parser<'a> {
         Ok(Expr {
             id: self.id(),
             span: start.merge(self.span_before()),
-            kind: ExprKind::StructLit {
-                name,
-                fields,
-                base,
-            },
+            kind: ExprKind::StructLit { name, fields, base },
         })
     }
 
@@ -1761,9 +1774,7 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 if !p.at(&TokenKind::RBrace) {
-                    return Err(p.error_at_current(
-                        "expected a comma between match arms",
-                    ));
+                    return Err(p.error_at_current("expected a comma between match arms"));
                 }
             }
             Ok(())
@@ -1830,9 +1841,8 @@ impl<'a> Parser<'a> {
 
     fn parse_pattern(&mut self) -> PResult<Pattern> {
         self.enter_depth()?;
-        let result = stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
-            self.parse_pattern_inner()
-        });
+        let result =
+            stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || self.parse_pattern_inner());
         self.depth -= 1;
         result
     }
@@ -1927,7 +1937,7 @@ impl<'a> Parser<'a> {
                                 Code::E003,
                                 token.span,
                                 "string patterns may not contain interpolation",
-                            ))
+                            ));
                         }
                     }
                 }
@@ -2015,13 +2025,10 @@ impl<'a> Parser<'a> {
                     }
                 })
             }
-            TokenKind::Ident(_, IdentClass::Screaming) => Err(self.error_at_current(
-                "consts cannot be used as patterns",
-            )),
-            _ => Err(self.error_at_current(format!(
-                "expected a pattern, found {}",
-                token.kind
-            ))),
+            TokenKind::Ident(_, IdentClass::Screaming) => {
+                Err(self.error_at_current("consts cannot be used as patterns"))
+            }
+            _ => Err(self.error_at_current(format!("expected a pattern, found {}", token.kind))),
         }
     }
 
@@ -2143,4 +2150,34 @@ fn is_continuation_next(kind: &TokenKind) -> bool {
             | TokenKind::Or
             | TokenKind::QuestionQuestion
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn arbitrary_source_does_not_panic(source in ".*") {
+            let limits = LoadLimits {
+                file_size: 1024 * 1024,
+                nesting_depth: 32,
+                file_count: 256,
+            };
+            let _ = parse_source(&source, limits);
+        }
+    }
+
+    #[test]
+    fn nested_blocks_hit_e002_without_recursing_forever() {
+        let source = Parser::depth_test_program(64);
+        let limits = LoadLimits {
+            file_size: 1024 * 1024,
+            nesting_depth: 16,
+            file_count: 256,
+        };
+        let out = parse_source(&source, limits);
+        assert!(out.diagnostics.iter().any(|d| d.code == Code::E002));
+    }
 }

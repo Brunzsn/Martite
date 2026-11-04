@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 
 use martite_base::{SourceId, Span};
-use martite_resolve::{
-    BuiltinItem, DefId, DefInfo, ModuleId, ModuleTarget, ResolvedProgram,
-};
+use martite_resolve::{BuiltinItem, DefId, DefInfo, ModuleId, ModuleTarget, ResolvedProgram};
 use martite_syntax::{Block, FnDecl, NodeId};
 
 use crate::ty::{BindingId, Ty, TypeId, TypeTable};

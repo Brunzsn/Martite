@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use martite_resolve::{ModuleId, DefId};
+use martite_resolve::{DefId, ModuleId};
 use martite_syntax::Bound;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -68,18 +68,16 @@ impl Ty {
             Ty::List(t) => Ty::list(t.substitute(vars)),
             Ty::Map(k, v) => Ty::Map(Box::new(k.substitute(vars)), Box::new(v.substitute(vars))),
             Ty::Option(t) => Ty::option(t.substitute(vars)),
-            Ty::Result(t, e) => Ty::Result(
-                Box::new(t.substitute(vars)),
-                Box::new(e.substitute(vars)),
-            ),
+            Ty::Result(t, e) => {
+                Ty::Result(Box::new(t.substitute(vars)), Box::new(e.substitute(vars)))
+            }
             Ty::Fn(params, ret) => Ty::Fn(
                 params.iter().map(|t| t.substitute(vars)).collect(),
                 Box::new(ret.substitute(vars)),
             ),
-            Ty::Named(id, args) => Ty::Named(
-                *id,
-                args.iter().map(|t| t.substitute(vars)).collect(),
-            ),
+            Ty::Named(id, args) => {
+                Ty::Named(*id, args.iter().map(|t| t.substitute(vars)).collect())
+            }
             _ => self.clone(),
         }
     }
@@ -259,7 +257,6 @@ impl TypeTable {
             _ => None,
         }
     }
-
 }
 
 #[derive(Debug, Clone, Default)]
@@ -303,9 +300,7 @@ impl Infer {
             (Ty::List(a), Ty::List(b)) => self.unify(a, b),
             (Ty::Map(ak, av), Ty::Map(bk, bv)) => self.unify(ak, bk) && self.unify(av, bv),
             (Ty::Option(a), Ty::Option(b)) => self.unify(a, b),
-            (Ty::Result(at, ae), Ty::Result(bt, be)) => {
-                self.unify(at, bt) && self.unify(ae, be)
-            }
+            (Ty::Result(at, ae), Ty::Result(bt, be)) => self.unify(at, bt) && self.unify(ae, be),
             (Ty::Fn(ap, ar), Ty::Fn(bp, br)) => {
                 ap.len() == bp.len()
                     && ap.iter().zip(bp).all(|(x, y)| self.unify(x, y))
@@ -333,7 +328,9 @@ fn contains_var(ty: &Ty, var: u32) -> bool {
         Ty::Tuple(items) => items.iter().any(|t| contains_var(t, var)),
         Ty::List(t) | Ty::Option(t) => contains_var(t, var),
         Ty::Map(k, v) | Ty::Result(k, v) => contains_var(k, var) || contains_var(v, var),
-        Ty::Fn(params, ret) => params.iter().any(|t| contains_var(t, var)) || contains_var(ret, var),
+        Ty::Fn(params, ret) => {
+            params.iter().any(|t| contains_var(t, var)) || contains_var(ret, var)
+        }
         Ty::Named(_, args) => args.iter().any(|t| contains_var(t, var)),
         _ => false,
     }
@@ -378,7 +375,11 @@ pub struct TypeResolver<'a> {
 }
 
 impl TypeResolver<'_> {
-    pub fn resolve(&self, ty: &martite_syntax::TyExpr, symbols: &martite_resolve::Symbols) -> Result<Ty, String> {
+    pub fn resolve(
+        &self,
+        ty: &martite_syntax::TyExpr,
+        symbols: &martite_resolve::Symbols,
+    ) -> Result<Ty, String> {
         use martite_syntax::{PrimTy, TyKind};
         match &ty.kind {
             TyKind::Prim(p) => Ok(match p {
@@ -456,11 +457,7 @@ impl TypeResolver<'_> {
                             }
                         }
                         if let Some(def) = symbols.types.get(name) {
-                            let id = self
-                                .def_to_type
-                                .get(def)
-                                .copied()
-                                .ok_or("unknown type")?;
+                            let id = self.def_to_type.get(def).copied().ok_or("unknown type")?;
                             let expected = self.types.get(id).map(|d| d.params.len()).unwrap_or(0);
                             if resolved_args.len() != expected {
                                 return Err(format!(

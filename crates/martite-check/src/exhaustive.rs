@@ -1,6 +1,6 @@
 use martite_syntax::{MatchArm, PatKind, Pattern};
 
-use crate::ty::{instantiate_params, Ty, TypeId, TypeTable};
+use crate::ty::{Ty, TypeId, TypeTable, instantiate_params};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ctor {
@@ -131,7 +131,11 @@ fn pattern_rep(pat: &Pattern, ty: &Ty, types: &TypeTable, out: &mut Vec<P>) {
             }
             out.push(P::Wild);
         }
-        PatKind::Struct { name: _, fields, rest } => {
+        PatKind::Struct {
+            name: _,
+            fields,
+            rest,
+        } => {
             let Ty::Named(id, type_args) = ty else {
                 out.push(P::Wild);
                 return;
@@ -359,11 +363,7 @@ mod tests {
             &Ty::Bool,
             &table
         ));
-        assert!(is_exhaustive(
-            &[arm(PatKind::Wild)],
-            &Ty::Bool,
-            &table
-        ));
+        assert!(is_exhaustive(&[arm(PatKind::Wild)], &Ty::Bool, &table));
     }
 
     #[test]

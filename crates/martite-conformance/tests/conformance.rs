@@ -1,5 +1,5 @@
 use martite_base::Code;
-use martite_conformance::{assert_code, codes, run, trap, Case};
+use martite_conformance::{Case, assert_code, codes, run, trap};
 use martite_runtime::{ExecLimits, Runtime, Trap, Value};
 
 #[test]
@@ -26,10 +26,7 @@ fn load_limit_e002() {
 #[test]
 fn name_errors() {
     assert_code("fn main() { missing() }", Code::E101);
-    assert_code(
-        "fn main() {}\nfn main() {}\n",
-        Code::E102,
-    );
+    assert_code("fn main() {}\nfn main() {}\n", Code::E102);
     assert_code("fn main() { let x = 1\nlet x = 2 }", Code::E103);
     assert_code(
         "const A: int = B\nconst B: int = A\nfn main() {}",
@@ -43,10 +40,7 @@ fn type_errors() {
     assert_code(r#"fn main() { let x: int = "no" }"#, Code::E201);
     assert_code("fn main() { let x = [] }", Code::E202);
     assert_code(r#"fn main() { let x = 1 + "a" }"#, Code::E203);
-    assert_code(
-        "fn f(x: int) {}\nfn main() { f() }",
-        Code::E204,
-    );
+    assert_code("fn f(x: int) {}\nfn main() { f() }", Code::E204);
     assert_code("fn main() { let m = {1.0: 2} }", Code::E205);
     assert_code("fn main() { 1 }", Code::E206);
     assert_code(
@@ -54,10 +48,7 @@ fn type_errors() {
         Code::E207,
     );
     assert_code("fn main() { let x = 1\nx.nope() }", Code::E208);
-    assert_code(
-        "fn main() { let x: list[int, str] = [] }",
-        Code::E209,
-    );
+    assert_code("fn main() { let x: list[int, str] = [] }", Code::E209);
 }
 
 #[test]
@@ -66,10 +57,7 @@ fn pattern_errors() {
         "fn main() { match true { true => print(\"x\") } }",
         Code::E301,
     );
-    assert_code(
-        "fn main() { let Some(x) = Some(1) }",
-        Code::E302,
-    );
+    assert_code("fn main() { let Some(x) = Some(1) }", Code::E302);
     assert_code(
         "fn main() { match 1 { 1 | x => print(\"x\"), _ => print(\"y\") } }",
         Code::E303,
@@ -130,22 +118,17 @@ on saved(doc: Doc) -> Result[(), str]
     assert!(codes(base).contains(&Code::E506));
 
     let calls_handler = Case::single("on a() { b() }\non b() {}\n")
-        .interface(
-            "app.hooks",
-            "on a()\non b()\n",
-        )
+        .interface("app.hooks", "on a()\non b()\n")
         .grant("app.hooks");
     assert!(codes(calls_handler).contains(&Code::E505));
 
-    let base = Case::single("fn main() {}")
-        .interface("bad.iface", "on init() -> int\n");
+    let base = Case::single("fn main() {}").interface("bad.iface", "on init() -> int\n");
     assert!(codes(base).contains(&Code::E507));
 }
 
 #[test]
 fn show_format_golden() {
-    let logs = run(
-        r#"
+    let logs = run(r#"
         enum Color { Red, Green }
         struct Point { x: int, y: float }
         fn main() {
@@ -162,8 +145,7 @@ fn show_format_golden() {
             print("{Some(1)}")
             print("{0..3}")
         }
-        "#,
-    );
+        "#);
     assert_eq!(
         logs,
         vec![
@@ -182,8 +164,7 @@ fn show_format_golden() {
 
 #[test]
 fn std_math_surface_uses_euler() {
-    let logs = run(
-        r#"
+    let logs = run(r#"
         use std.math
         use std.math.EULER
         fn main() {
@@ -193,8 +174,7 @@ fn std_math_surface_uses_euler() {
             print("{math.min(3, 1)}")
             print("{math.clamp(5, 0, 3)}")
         }
-        "#,
-    );
+        "#);
     assert_eq!(
         logs,
         vec![
@@ -257,8 +237,7 @@ fn memory_limit_is_enforced() {
 
 #[test]
 fn result_and_options_work() {
-    let logs = run(
-        r#"
+    let logs = run(r#"
         fn main() {
             let x: int? = Some(2)
             print("{x ?? 0}")
@@ -269,8 +248,7 @@ fn result_and_options_work() {
             let e: Result[int, str] = Err("bad")
             print("{e.unwrap_or(9)}")
         }
-        "#,
-    );
+        "#);
     assert_eq!(logs, ["2", "7", "3", "9"]);
 }
 

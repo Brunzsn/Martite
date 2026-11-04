@@ -6,6 +6,6 @@ pub mod parser;
 pub mod token;
 
 pub use ast::*;
-pub use lexer::{lex, lex_fragment, Lexed};
-pub use parser::{parse_interface, parse_source, ParseOutput, Program};
+pub use lexer::{Lexed, lex, lex_fragment};
+pub use parser::{ParseOutput, Program, parse_interface, parse_source};
 pub use token::{Comment, IdentClass, StrLit, StrPart, Token, TokenKind, TypeName};

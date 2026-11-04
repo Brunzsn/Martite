@@ -19,7 +19,27 @@ pub fn lex(source: &str, limits: LoadLimits) -> Lexed {
 /// Lex a fragment (used for interpolation expressions). Token spans remain
 /// relative to the original file.
 pub fn lex_fragment(source: &str, span: Span, limits: LoadLimits) -> Lexed {
-    Lexer::new(source, span.start as usize, span.end as usize, limits).run()
+    let mut start = (span.start as usize).min(source.len());
+    let mut end = (span.end as usize).min(source.len());
+    while start > 0 && !source.is_char_boundary(start) {
+        start -= 1;
+    }
+    while end > 0 && !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    if start > end {
+        let mut d = Diagnostic::error(Code::E001, "invalid interpolation span");
+        d.span = Some(Span::new(start as u32, end as u32));
+        return Lexed {
+            tokens: vec![Token {
+                kind: TokenKind::Eof,
+                span: Span::empty(end as u32),
+            }],
+            comments: Vec::new(),
+            diagnostics: vec![d],
+        };
+    }
+    Lexer::new(source, start, end, limits).run()
 }
 
 struct Lexer<'a> {
@@ -107,7 +127,10 @@ impl<'a> Lexer<'a> {
 
     fn push(&mut self, kind: TokenKind, span: Span) {
         let significant = !matches!(kind, TokenKind::Newline);
-        self.out.tokens.push(Token { kind: kind.clone(), span });
+        self.out.tokens.push(Token {
+            kind: kind.clone(),
+            span,
+        });
         if significant {
             self.last_sig = Some(kind);
         }
@@ -184,7 +207,10 @@ impl<'a> Lexer<'a> {
         }
         if !text.is_ascii() {
             self.error(Code::E001, span, "identifiers must be ASCII");
-            self.push(TokenKind::Ident(text.to_string(), IdentClass::Invalid), span);
+            self.push(
+                TokenKind::Ident(text.to_string(), IdentClass::Invalid),
+                span,
+            );
             return;
         }
         let class = classify(text);
@@ -336,8 +362,15 @@ impl<'a> Lexer<'a> {
                 prev_digit = true;
                 self.bump();
             } else if ch == '_' {
-                if !prev_digit || !matches!(self.peek_n(1), Some(b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
-                {
+                let next_ok = match radix {
+                    2 => matches!(self.peek_n(1), Some(b'0'..=b'1')),
+                    16 => matches!(
+                        self.peek_n(1),
+                        Some(b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F')
+                    ),
+                    _ => matches!(self.peek_n(1), Some(b'0'..=b'9')),
+                };
+                if !prev_digit || !next_ok {
                     self.error(
                         Code::E001,
                         span,
@@ -486,8 +519,8 @@ impl<'a> Lexer<'a> {
                         continue;
                     }
                     let expr_start = self.pos;
-                    match match_brace(self.src, self.pos, self.end) {
-                        Some(close) => {
+                    match match_brace(self.src, self.pos, self.end, self.limits.nesting_depth) {
+                        Ok(close) => {
                             let expr_span = Span::new(expr_start as u32, close as u32);
                             if self.src[expr_start..close].trim().is_empty() {
                                 self.error(
@@ -503,7 +536,18 @@ impl<'a> Lexer<'a> {
                             }
                             self.pos = close + 1;
                         }
-                        None => {
+                        Err(BraceError::TooDeep) => {
+                            self.error(
+                                Code::E002,
+                                Span::new(brace_start as u32, self.pos as u32),
+                                format!(
+                                    "interpolation nesting exceeds the limit of {}",
+                                    self.limits.nesting_depth
+                                ),
+                            );
+                            break;
+                        }
+                        Err(BraceError::Unterminated) => {
                             self.error(
                                 Code::E001,
                                 Span::new(brace_start as u32, self.pos as u32),
@@ -583,10 +627,7 @@ impl<'a> Lexer<'a> {
             '=' => {
                 if self.peek() == Some('=') {
                     self.bump();
-                    self.push(
-                        TokenKind::EqEq,
-                        Span::new(start as u32, self.pos as u32),
-                    );
+                    self.push(TokenKind::EqEq, Span::new(start as u32, self.pos as u32));
                 } else if self.peek() == Some('>') {
                     self.bump();
                     self.push(
@@ -600,10 +641,7 @@ impl<'a> Lexer<'a> {
             '!' => {
                 if self.peek() == Some('=') {
                     self.bump();
-                    self.push(
-                        TokenKind::NotEq,
-                        Span::new(start as u32, self.pos as u32),
-                    );
+                    self.push(TokenKind::NotEq, Span::new(start as u32, self.pos as u32));
                 } else {
                     self.error(
                         Code::E001,
@@ -635,10 +673,7 @@ impl<'a> Lexer<'a> {
                             Span::new(start as u32, self.pos as u32),
                         );
                     } else {
-                        self.push(
-                            TokenKind::DotDot,
-                            Span::new(start as u32, self.pos as u32),
-                        );
+                        self.push(TokenKind::DotDot, Span::new(start as u32, self.pos as u32));
                     }
                 } else {
                     self.postfix_dot = self
@@ -748,27 +783,37 @@ fn is_screaming(text: &str) -> bool {
     chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BraceError {
+    Unterminated,
+    TooDeep,
+}
+
 /// Find the `}` matching an interpolation that started before `start`.
 /// Returns the byte index of the closing brace.
-fn match_brace(src: &str, start: usize, end: usize) -> Option<usize> {
+///
+/// `remaining` bounds nested string interpolations. Braces inside an ordinary
+/// expression are counted iteratively, so only a nested string literal
+/// consumes stack depth.
+fn match_brace(src: &str, start: usize, end: usize, remaining: usize) -> Result<usize, BraceError> {
     let bytes = src.as_bytes();
     let mut i = start;
-    let mut depth = 1usize;
+    let mut brace_depth = 1usize;
     while i < end {
         match bytes[i] {
             b'{' => {
-                depth += 1;
+                brace_depth += 1;
                 i += 1;
             }
             b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
+                brace_depth -= 1;
+                if brace_depth == 0 {
+                    return Ok(i);
                 }
                 i += 1;
             }
             b'"' => {
-                i = skip_string(src, i, end)?;
+                i = skip_string(src, i, end, remaining)?;
             }
             b'/' if bytes.get(i + 1) == Some(&b'/') => {
                 i += 2;
@@ -776,31 +821,54 @@ fn match_brace(src: &str, start: usize, end: usize) -> Option<usize> {
                     i += 1;
                 }
             }
-            b'\n' | b'\r' => return None,
+            b'\n' | b'\r' => return Err(BraceError::Unterminated),
             _ => {
                 i += src[i..end].chars().next().map(char::len_utf8).unwrap_or(1);
             }
         }
     }
-    None
+    Err(BraceError::Unterminated)
 }
 
-fn skip_string(src: &str, start: usize, end: usize) -> Option<usize> {
+fn skip_string(src: &str, start: usize, end: usize, remaining: usize) -> Result<usize, BraceError> {
     let bytes = src.as_bytes();
     let mut i = start + 1;
     while i < end {
         match bytes[i] {
-            b'\\' => i += 2,
-            b'"' => return Some(i + 1),
+            b'\\' => {
+                i += 1;
+                if i >= end {
+                    return Err(BraceError::Unterminated);
+                }
+                let escaped = src[i..end].chars().next().ok_or(BraceError::Unterminated)?;
+                i += escaped.len_utf8();
+                // `\u{...}` may contain braces; skip the whole escape so the
+                // scanner does not mistake it for an interpolation.
+                if escaped == 'u' && bytes.get(i) == Some(&b'{') {
+                    i += 1;
+                    while i < end && bytes[i] != b'}' {
+                        i += src[i..end].chars().next().map(char::len_utf8).unwrap_or(1);
+                    }
+                    if i < end {
+                        i += 1;
+                    }
+                }
+            }
+            b'"' => return Ok(i + 1),
             b'{' => {
-                let close = match_brace(src, i + 1, end)?;
+                if remaining == 0 {
+                    return Err(BraceError::TooDeep);
+                }
+                let close = match_brace(src, i + 1, end, remaining - 1)?;
                 i = close + 1;
             }
-            b'\n' | b'\r' => return None,
-            _ => i += src[i..end].chars().next().map(char::len_utf8).unwrap_or(1),
+            b'\n' | b'\r' => return Err(BraceError::Unterminated),
+            _ => {
+                i += src[i..end].chars().next().map(char::len_utf8).unwrap_or(1);
+            }
         }
     }
-    None
+    Err(BraceError::Unterminated)
 }
 
 #[cfg(test)]
@@ -873,5 +941,25 @@ mod tests {
     fn bad_escape() {
         let out = lex("\"\\q\"", LoadLimits::default());
         assert_eq!(out.diagnostics[0].code, Code::E001);
+    }
+
+    #[test]
+    fn escaped_non_ascii_inside_interpolation_does_not_panic() {
+        let out = lex(r#""{"\é"}""#, LoadLimits::default());
+        assert!(!out.tokens.is_empty());
+    }
+
+    #[test]
+    fn invalid_fragment_span_is_a_diagnostic() {
+        let out = lex_fragment("abc", Span::new(3, 1), LoadLimits::default());
+        assert_eq!(out.diagnostics[0].code, Code::E001);
+    }
+
+    #[test]
+    fn radix_aware_underscore_validation() {
+        let out = lex("1_a", LoadLimits::default());
+        assert!(out.diagnostics.iter().any(|d| d.code == Code::E001));
+        let out = lex("0b1_a", LoadLimits::default());
+        assert!(out.diagnostics.iter().any(|d| d.code == Code::E001));
     }
 }

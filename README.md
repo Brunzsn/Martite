@@ -31,6 +31,16 @@ cargo run -p martite-cli -- check --interface examples/plugin/app/editor.mti exa
 Exit codes follow the specification: `0` success, `1` diagnostics or `main` returned `Err`,
 `2` usage/load errors, and `101` for script panics.
 
+## Host policy
+
+`martite run` is the standalone host and is intentionally unrestricted: it has
+ambient filesystem access plus `std.io` and `std.env`. Limit flags still apply.
+
+Embeddings and plugin hosts use a sandboxed `FileSystemProvider` by default.
+An embedding that deliberately wants ambient access must opt in with
+`FileSystemProvider::unrestricted` (and should document that decision).
+`std.io`/`std.env` are not registered for embeddings automatically.
+
 ## Tests
 
 ```sh

@@ -1,7 +1,7 @@
 //! Shared harness for the Martite conformance suite.
 
 use martite_base::{Code, LoadLimits, MemoryProvider, Severity, SourceMap};
-use martite_driver::{load, LoadOptions, LoadedProgram};
+use martite_driver::{LoadOptions, LoadedProgram, load};
 use martite_resolve::InterfaceSource;
 use martite_runtime::{ExecLimits, Runtime, Trap, Value};
 
@@ -93,7 +93,11 @@ pub fn run(source: &str) -> Vec<String> {
 
 pub fn run_case(case: Case) -> Result<Vec<String>, Trap> {
     let loaded = case.load();
-    if loaded.diagnostics.iter().any(|d| d.severity == Severity::Error) {
+    if loaded
+        .diagnostics
+        .iter()
+        .any(|d| d.severity == Severity::Error)
+    {
         let sources: &SourceMap = &loaded.sources;
         panic!(
             "unexpected diagnostics:\n{}",

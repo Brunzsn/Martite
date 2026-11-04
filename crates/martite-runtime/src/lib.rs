@@ -10,6 +10,6 @@ pub use interp::{
 };
 pub use ops::{show, value_eq, value_ord};
 pub use value::{
-    key_from_value, key_to_value, Closure, ClosureTarget, EnumValue, HandleValue, KeyValue,
-    OrderedMap, StructValue, Value,
+    Closure, ClosureTarget, EnumValue, HandleValue, KeyValue, MAX_VALUE_DEPTH, OrderedMap,
+    StructValue, Value, key_from_value, key_to_value, value_depth_exceeds,
 };

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use indexmap::IndexMap;
 use martite_check::{BindingId, BuiltinFn, DefId, TypeId};
 use martite_syntax::{LambdaBody, LambdaParam};
 
@@ -66,17 +67,9 @@ pub enum ClosureTarget {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OrderedMap {
-    entries: Vec<(Key, Value)>,
-}
-
-impl Default for OrderedMap {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
+    entries: IndexMap<Key, Value>,
 }
 
 impl OrderedMap {
@@ -93,48 +86,41 @@ impl OrderedMap {
     }
 
     pub fn get(&self, key: &Key) -> Option<&Value> {
-        self.entries
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v)
+        self.entries.get(key)
     }
 
     pub fn get_mut(&mut self, key: &Key) -> Option<&mut Value> {
-        self.entries
-            .iter_mut()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v)
+        self.entries.get_mut(key)
     }
 
     /// Insert a key, keeping its position if it already exists.
     pub fn insert(&mut self, key: Key, value: Value) {
-        if let Some((_, existing)) = self.entries.iter_mut().find(|(k, _)| *k == key) {
-            *existing = value;
-        } else {
-            self.entries.push((key, value));
-        }
+        self.entries.insert(key, value);
     }
 
     /// Remove a key in O(n), preserving the order of the remaining keys.
     pub fn remove(&mut self, key: &Key) -> Option<Value> {
-        let index = self.entries.iter().position(|(k, _)| k == key)?;
-        Some(self.entries.remove(index).1)
+        self.entries.shift_remove(key)
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
     }
 
-    pub fn entries(&self) -> &[(Key, Value)] {
-        &self.entries
+    pub fn entries(&self) -> &indexmap::map::Slice<Key, Value> {
+        self.entries.as_slice()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&Key, &Value)> {
+        self.entries.iter()
     }
 
     pub fn keys(&self) -> Vec<Key> {
-        self.entries.iter().map(|(k, _)| k.clone()).collect()
+        self.entries.keys().cloned().collect()
     }
 
     pub fn values(&self) -> Vec<Value> {
-        self.entries.iter().map(|(_, v)| v.clone()).collect()
+        self.entries.values().cloned().collect()
     }
 
     pub fn eq_as_set(&self, other: &OrderedMap) -> bool {
@@ -144,11 +130,93 @@ impl OrderedMap {
         self.entries.iter().all(|(key, value)| {
             other
                 .entries
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v == value)
+                .get(key)
+                .map(|other_value| other_value == value)
                 .unwrap_or(false)
         })
+    }
+}
+
+/// Maximum nesting of runtime values. This is independent of syntactic
+/// nesting; it protects recursive traversals and drop glue from hostile values
+/// built at runtime.
+pub const MAX_VALUE_DEPTH: usize = 128;
+
+/// True when `value` contains a container nested deeper than `limit`.
+///
+/// This is deliberately iterative: it is used to reject values before
+/// recursive consumers (`Show`, equality, snapshots, drop glue) can see them.
+pub fn value_depth_exceeds(value: &Value, limit: usize) -> bool {
+    let mut stack = vec![(value, 1usize)];
+    while let Some((value, depth)) = stack.pop() {
+        if depth > limit {
+            return true;
+        }
+        match value {
+            Value::List(items) | Value::Tuple(items) => {
+                for item in items.iter() {
+                    stack.push((item, depth + 1));
+                }
+            }
+            Value::Map(map) => {
+                for (key, value) in map.entries() {
+                    if key_depth_exceeds(key, limit.saturating_sub(depth)) {
+                        return true;
+                    }
+                    stack.push((value, depth + 1));
+                }
+            }
+            Value::Struct(value) => {
+                for field in &value.fields {
+                    stack.push((field, depth + 1));
+                }
+            }
+            Value::Enum(value) => {
+                for field in &value.payload {
+                    stack.push((field, depth + 1));
+                }
+            }
+            Value::Option(Some(value)) | Value::Result(Ok(value)) | Value::Result(Err(value)) => {
+                stack.push((value, depth + 1));
+            }
+            Value::Fn(closure) => {
+                for value in closure.captures.values() {
+                    stack.push((value, depth + 1));
+                }
+            }
+            Value::Unit
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::Bool(_)
+            | Value::Str(_)
+            | Value::Range { .. }
+            | Value::Option(None)
+            | Value::Builtin(_)
+            | Value::BuiltinModuleFn { .. }
+            | Value::Handle(_) => {}
+        }
+    }
+    false
+}
+
+fn key_depth_exceeds(key: &KeyValue, remaining: usize) -> bool {
+    match key {
+        KeyValue::Tuple(items) => {
+            remaining == 0
+                || items
+                    .iter()
+                    .any(|item| key_depth_exceeds(item, remaining - 1))
+        }
+        KeyValue::Struct(_, fields) | KeyValue::Enum(_, _, fields) => {
+            remaining == 0
+                || fields
+                    .iter()
+                    .any(|field| key_depth_exceeds(field, remaining - 1))
+        }
+        KeyValue::Option(Some(value))
+        | KeyValue::Result(Ok(value))
+        | KeyValue::Result(Err(value)) => remaining == 0 || key_depth_exceeds(value, remaining - 1),
+        _ => false,
     }
 }
 
@@ -172,12 +240,9 @@ pub fn key_from_value(value: &Value) -> Result<KeyValue, String> {
         Value::Int(v) => KeyValue::Int(*v),
         Value::Bool(v) => KeyValue::Bool(*v),
         Value::Str(v) => KeyValue::Str(v.to_string()),
-        Value::Tuple(items) => KeyValue::Tuple(
-            items
-                .iter()
-                .map(key_from_value)
-                .collect::<Result<_, _>>()?,
-        ),
+        Value::Tuple(items) => {
+            KeyValue::Tuple(items.iter().map(key_from_value).collect::<Result<_, _>>()?)
+        }
         Value::Struct(value) => KeyValue::Struct(
             value.type_id,
             value
@@ -215,9 +280,7 @@ pub fn key_to_value(key: &KeyValue) -> Value {
         KeyValue::Int(v) => Value::Int(*v),
         KeyValue::Bool(v) => Value::Bool(*v),
         KeyValue::Str(v) => Value::Str(Rc::from(v.as_str())),
-        KeyValue::Tuple(items) => {
-            Value::Tuple(Rc::new(items.iter().map(key_to_value).collect()))
-        }
+        KeyValue::Tuple(items) => Value::Tuple(Rc::new(items.iter().map(key_to_value).collect())),
         KeyValue::Struct(id, fields) => Value::Struct(Rc::new(StructValue {
             type_id: *id,
             fields: fields.iter().map(key_to_value).collect(),
@@ -227,9 +290,7 @@ pub fn key_to_value(key: &KeyValue) -> Value {
             variant: *variant,
             payload: payload.iter().map(key_to_value).collect(),
         })),
-        KeyValue::Option(inner) => {
-            Value::Option(inner.as_ref().map(|v| Box::new(key_to_value(v))))
-        }
+        KeyValue::Option(inner) => Value::Option(inner.as_ref().map(|v| Box::new(key_to_value(v)))),
         KeyValue::Result(result) => Value::Result(match result {
             Ok(v) => Ok(Box::new(key_to_value(v))),
             Err(v) => Err(Box::new(key_to_value(v))),
@@ -384,5 +445,51 @@ fn key_value_size(key: &KeyValue) -> u64 {
             Ok(k) | Err(k) => 16 + key_value_size(k),
         },
         KeyValue::Handle(_, token) => 16 + token.len() as u64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordered_map_keeps_position_on_overwrite_and_reinsert() {
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Str("a".into()), Value::Int(1));
+        map.insert(KeyValue::Str("b".into()), Value::Int(2));
+        map.insert(KeyValue::Str("a".into()), Value::Int(3));
+        let entries: Vec<_> = map.entries().iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(
+            entries,
+            vec![KeyValue::Str("a".into()), KeyValue::Str("b".into())]
+        );
+        assert_eq!(map.get(&KeyValue::Str("a".into())), Some(&Value::Int(3)));
+        map.remove(&KeyValue::Str("a".into()));
+        map.insert(KeyValue::Str("a".into()), Value::Int(4));
+        let entries: Vec<_> = map.entries().iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(
+            entries,
+            vec![KeyValue::Str("b".into()), KeyValue::Str("a".into())]
+        );
+    }
+
+    #[test]
+    fn map_equality_ignores_order() {
+        let mut a = OrderedMap::new();
+        a.insert(KeyValue::Str("x".into()), Value::Int(1));
+        a.insert(KeyValue::Str("y".into()), Value::Int(2));
+        let mut b = OrderedMap::new();
+        b.insert(KeyValue::Str("y".into()), Value::Int(2));
+        b.insert(KeyValue::Str("x".into()), Value::Int(1));
+        assert!(a.eq_as_set(&b));
+    }
+
+    #[test]
+    fn value_depth_is_bounded() {
+        let mut value = Value::Unit;
+        for _ in 0..MAX_VALUE_DEPTH + 1 {
+            value = Value::list(vec![value]);
+        }
+        assert!(value_depth_exceeds(&value, MAX_VALUE_DEPTH));
     }
 }

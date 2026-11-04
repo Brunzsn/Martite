@@ -32,6 +32,7 @@ A feature only gets in if it passes five tests: a beginner can learn it in a few
 - **Encoding:** UTF-8. A leading BOM is ignored. `\r\n` is normalized to `\n` before lexing. Tabs are legal whitespace. A NUL byte is a lexical error.
 - **Modules:** a file is a module. The **project root** is the directory of the entry file (the manifest's `entry` for a plugin, the file given to `martite run` for a script). `use geometry.shapes` loads `<root>/geometry/shapes.mt`. `std.*` is built in. Host modules come from interface files (`app/editor.mti` is module `app.editor`). A module path that matches both a source file and an interface is E106.
 - **The interpreter never touches the filesystem.** It asks a `SourceProvider` for the text of a module path. The CLI supplies a filesystem provider, and an embedding supplies whatever it likes (an in-memory map, an archive).
+- **Provider policy in the reference implementation.** `martite run` uses an unrestricted filesystem provider. `martite check`, `martite test`, and embedded plugin hosts use a sandboxed provider rooted at the project directory by default; an embedding must explicitly opt in to unrestricted access. Sandboxing rejects absolute paths, drive prefixes, `.`/`..` components, empty components, and symlink escapes.
 - **Editions.** The manifest declares `lang = "1"`. Within an edition, the keyword set, prelude names, standard library surface, `Show` format, fuel table (section 8), and error codes never change incompatibly. New keywords or prelude names appear only in a new edition, so existing code cannot start hitting E103 shadowing errors. `martite run` on a script uses the edition in `martite.toml`, or the newest one if absent.
 - **Load limits** (host-configurable; defaults shown). They exist so that parsing and checking hostile input cannot exhaust the host's native stack or memory. Exceeding one is E002.
   - source file size: 1 MiB
@@ -164,7 +165,7 @@ fn replace(doc: Doc, sel: Selection, new_text: str) -> Result[(), str]
 on saved(doc: Doc, kind: SaveKind) -> Result[(), str]    // no body: a hook
 ```
 
-- A body-less `fn` is a **host function**. It is an ordinary typed function (it may be generic), runs synchronously, and may have effects on the host. It can fail only by returning `Result` or `Option`. A fault inside the Rust implementation itself (a bug) surfaces as the `HostFault` trap.
+- A body-less `fn` is a **host function**. It is an ordinary typed function (it may be generic), runs synchronously, and may have effects on the host. It can fail only by returning `Result` or `Option`. A fault inside the Rust implementation itself (a bug) surfaces as the `HostFault` trap. Host functions may not declare `mut` parameters (E509); the host boundary is copy-in only.
 - A body-less `on` is a **hook**, an event the host may deliver to a plugin. Hook names are unique across the host's interface, and `init` and `shutdown` may not be declared as hooks. Both are checked when the interface loads (E507).
 - `struct Name` with no braces is an **opaque handle** (and takes no type parameters). It is an identity token that the host resolves, not a shared mutable object, so copying one copies the token and value semantics still hold inside the plugin. A stale handle makes host functions return `Err` or `None`; it never crashes.
 - Interface files have no `impl` blocks. Host APIs are free functions (`editor.text(doc)`), never methods on host types.
@@ -195,7 +196,7 @@ deadline_ms = 20
 max_words = 5000
 ```
 
-- **Loading fails (E508)** if the manifest is malformed or has unknown keys, `lang` is unsupported, `api` has a different major version from the host's interface, `api`'s minor is greater than the host's, the entry file is missing, or a granted module does not exist. Adding hooks, functions, or types is a compatible change (minor bump). Removing or retyping one is not (major bump).
+- **Loading fails (E508)** if the manifest is malformed or has unknown keys, `lang` is unsupported, `api` has a different major version from the host's interface, `api`'s minor is greater than the host's, the entry file is missing, or a granted module does not exist. The entry must be a non-empty relative path inside the project root; absolute paths, drive prefixes, `:`, empty components, and `.`/`..` components are E508. Adding hooks, functions, or types is a compatible change (minor bump). Removing or retyping one is not (major bump).
 - **Interface version.** The host interface version is fixed at `1.0` for edition 1 and is not written in interface files. The manifest's `api` major must equal `1`, and its minor must not exceed `0`.
 - **Limits** are effective-value = `min(requested, host maximum)`, and an unrequested limit takes the host default.
 - **Settings** map TOML to `Json`: tables to `Obj`, arrays to `Arr`, strings, booleans, numbers (all to `Num(float)`). Datetimes are rejected. `Json` must be imported with `use std.json.Json` before it can appear in an `init` signature.
@@ -401,11 +402,11 @@ Every diagnostic carries a code, a primary span, a message, and an optional `hel
 | `Panic(msg, span, trace)` | any panic listed above, with a call trace |
 | `OutOfFuel` | the step budget ran out |
 | `OutOfMemory` | live value bytes exceeded the cap |
-| `DepthExceeded` | call depth or expression nesting exceeded the cap |
+| `DepthExceeded` | call depth, expression nesting, or runtime value nesting exceeded the cap |
 | `Deadline` | the wall-clock deadline passed (checked every N fuel ticks and at host calls) |
 | `HostFault(msg)` | a host function failed in a way its signature cannot express (a bug in the host) |
 
-- **Limits** are per hook call and set by the host as `Limits { fuel, memory, depth, deadline }`. The manifest may request limits, and the host clamps them. The engine may also enforce a compiled-in depth ceiling so that the interpreter's native stack cannot overflow.
+- **Limits** are per hook call and set by the host as `Limits { fuel, memory, depth, deadline }`. The manifest may request limits, and the host clamps them. The engine may also enforce a compiled-in depth ceiling so that the interpreter's native stack cannot overflow. The reference interpreter additionally caps runtime value nesting at 128; exceeding it is `DepthExceeded`. That value-nesting ceiling is compiled in and is not part of the host-configurable `Limits`.
 - **Fuel** is charged as follows, and the table is fixed within an edition:
 
   | Event | Cost |
@@ -464,7 +465,7 @@ Methods of generic types are typed like ordinary generic functions with the rece
 | `map[K,V]` | `len`, `get(k) -> V?`, `has(k)`, `keys() -> list[K]`, `values() -> list[V]`, `entries() -> list[(K,V)]`. `mut self`: `remove(k) -> V?`, `clear()`. Insert and overwrite with `m[k] = v` |
 | `str` | `len`, `chars() -> list[str]`, `split(sep) -> list[str]`, `trim`, `contains(s)`, `find(s) -> int?` (index of first match), `starts_with`, `ends_with`, `replace(from, to)`, `to_upper`, `to_lower`, `parse_int() -> int?`, `parse_float() -> float?` |
 | `int` | `abs()`, `pow(e: int)` (panics if `e < 0` or on overflow) |
-| `float` | `abs`, `floor`, `ceil`, `trunc`, `sqrt`, `pow(e: float)`, `round(digits: int)` (round half away from zero at that decimal place, `digits >= 0` else panic), `is_nan`, `is_finite` |
+| `float` | `abs`, `floor`, `ceil`, `trunc`, `sqrt`, `pow(e: float)`, `round(digits: int)` (round half away from zero at that decimal place, `digits >= 0` else panic; digits above 308 leave the value unchanged), `is_nan`, `is_finite` |
 | `range` | `len() -> int`, `contains(i: int) -> bool`, `to_list() -> list[int]` |
 | `Option[T]` | `is_some`, `is_none`, `map(f)`, `and_then(f)`, `unwrap_or(d)`, `ok_or(e) -> Result[T, E]`, `expect(msg)` |
 | `Result[T,E]` | `is_ok`, `is_err`, `map(f)`, `map_err(f)`, `and_then(f)`, `unwrap_or(d)`, `ok() -> T?`, `expect(msg)` |
@@ -472,7 +473,7 @@ Methods of generic types are typed like ordinary generic functions with the rece
 **Edge cases (normative):**
 
 - `split(sep)` splits on non-overlapping occurrences and keeps empty pieces, so `"".split(",")` is `[""]`, and `split("")` splits into characters. `replace` with an empty `from` panics. `trim` removes Unicode whitespace at both ends.
-- `parse_int` accepts `-?[0-9]+` only (no whitespace, no `+`, no underscores) and returns `None` on overflow. `parse_float` accepts decimal and exponent forms, and returns `None` for anything else, including `NaN` and `inf`.
+- `parse_int` accepts `-?[0-9]+` only (no whitespace, no `+`, no underscores) and returns `None` on overflow. `parse_float` accepts `-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?`, requiring digits on both sides of the decimal point; `.5`, `1.`, and `1.e2` return `None`. Anything else, including `NaN` and `inf`, also returns `None`.
 - `unwrap_or(d)` evaluates `d` eagerly. Use `??` for a lazy default.
 - `map`, `filter`, `enumerate`, `reversed`, `sorted`, `keys`, `values`, and `entries` are eager and return new lists.
 - Indexing `xs[i]` and `m[k]` panics if missing, and `.get` is the safe form. `martite lint` flags unguarded `expect`.
@@ -589,7 +590,7 @@ Notes for the parser:
 - A snake identifier in a pattern is always a binding and a Pascal one is always a variant or type.
 - Lists in braces require commas, a trailing comma is allowed, and a block-bodied match arm may omit its comma. A missing comma between expression arms is a parse error with a `help` line, since newlines are ignored inside list-style braces.
 - A string token contains its interpolations, which are parsed as nested expressions. Nesting counts toward the E002 depth limit.
-- `.mti` files are parsed in interface mode, where `fn` and `on` signatures have no body and a brace-less `struct Name` is an opaque handle. A newline ends each signature.
+- `.mti` files are parsed in interface mode, where `fn` and `on` signatures have no body and a brace-less `struct Name` is an opaque handle. A newline ends each signature. Host `fn` parameters may not be `mut`; such a declaration is E509 at load time.
 - A lone `-` before an int in a pattern is part of the literal. In expressions it is unary minus.
 
 ## 11. Embedding API
@@ -620,7 +621,7 @@ let snap = inst.snapshot();                    // state is a data type, so it se
 - **Interface and implementation are tied together.** Every host function declared in an `.mti` must have a Rust implementation with a matching type at load time, and a missing or mistyped one is a load error (E509), not a runtime surprise.
 - **Threads.** Values are `Rc`, so an instance is `!Send`. A host that runs plugins on several threads uses one instance per thread, or enables `Arc`-backed values behind a cargo feature.
 - **Host functions charge fuel.** Host code can call `cx.charge(n)` to account for expensive work, since the interpreter cannot see inside it. A Rust-side failure returns `HostFault`.
-- **Snapshots** are a canonical, self-describing encoding of the state value together with a **type fingerprint**: a hash over the names and shapes of every type reachable from the state type (field names and types, variant names and order, type parameters), ignoring doc comments and `pub`. Opaque handles are encoded as host-defined tokens tagged as valid for one host session only.
+- **Snapshots** are a versioned, bounded binary encoding of the state value together with a **type fingerprint**: a BLAKE3 hash over the names and shapes of every type reachable from the state type (field names and types, variant names and order, type parameters), ignoring doc comments and `pub`. The reference encoding stores numeric type IDs rather than a self-describing schema and validates every decoded type, variant, field count, and value against the checked program; a snapshot whose format version or fingerprint does not match is rejected. Opaque handles are encoded as host-defined tokens; the host is responsible for treating those tokens as valid only for one host session (the reference format does not add a separate session tag).
 - **Reload.** The host re-checks the new source and compares fingerprints. If they are equal it restores the snapshot without running `init`; otherwise it re-runs `init` (the host may instead choose to refuse the reload).
 - **Test doubles.** The embedding can ship a test harness that registers fake host functions and supplies handles, so `test` blocks in plugins run offline.
 

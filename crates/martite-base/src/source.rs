@@ -1,5 +1,9 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 
 /// Identifies one source file inside a [`SourceMap`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -41,6 +45,20 @@ impl Span {
     }
 }
 
+/// Normalize source text before it is stored or lexed.
+///
+/// A leading BOM is removed and CRLF is normalized to LF, as required by the
+/// language rules. Keeping this in one place means token spans always refer to
+/// the same bytes that a [`SourceMap`] serves to diagnostics.
+pub fn normalize_source(text: &str) -> String {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    if text.contains("\r\n") {
+        text.replace("\r\n", "\n")
+    } else {
+        text.to_string()
+    }
+}
+
 /// One loaded source file.
 #[derive(Debug, Clone)]
 pub struct SourceFile {
@@ -51,6 +69,7 @@ pub struct SourceFile {
 
 impl SourceFile {
     fn new(name: String, text: String) -> Self {
+        let text = normalize_source(&text);
         let mut line_starts = vec![0];
         for (i, b) in text.bytes().enumerate() {
             if b == b'\n' {
@@ -74,13 +93,16 @@ impl SourceFile {
 
     /// 1-based line and 1-based Unicode-scalar column.
     pub fn line_col(&self, offset: u32) -> (u32, u32) {
-        let offset = offset.min(self.text.len() as u32);
-        let line = match self.line_starts.binary_search(&offset) {
+        let mut offset = offset.min(self.text.len() as u32) as usize;
+        while offset > 0 && !self.text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        let line = match self.line_starts.binary_search(&(offset as u32)) {
             Ok(i) => i,
             Err(i) => i.saturating_sub(1),
         };
         let line_start = self.line_starts[line] as usize;
-        let col = self.text[line_start..offset as usize].chars().count() + 1;
+        let col = self.text[line_start..offset].chars().count() + 1;
         ((line + 1) as u32, col as u32)
     }
 
@@ -98,8 +120,14 @@ impl SourceFile {
     }
 
     pub fn slice(&self, span: Span) -> &str {
-        let start = span.start.min(self.text.len() as u32) as usize;
-        let end = span.end.min(self.text.len() as u32) as usize;
+        let mut start = span.start.min(self.text.len() as u32) as usize;
+        let mut end = span.end.min(self.text.len() as u32) as usize;
+        while start > 0 && !self.text.is_char_boundary(start) {
+            start -= 1;
+        }
+        while end > 0 && !self.text.is_char_boundary(end) {
+            end -= 1;
+        }
         if start <= end {
             &self.text[start..end]
         } else {
@@ -129,6 +157,8 @@ impl SourceMap {
         self.files.get(id.0 as usize)
     }
 
+    /// Panics if `id` was not produced by this map. Prefer [`SourceMap::get`]
+    /// when the ID came from an untrusted or external source.
     pub fn file(&self, id: SourceId) -> &SourceFile {
         &self.files[id.0 as usize]
     }
@@ -149,7 +179,9 @@ impl SourceMap {
     }
 
     pub fn line_col(&self, id: SourceId, offset: u32) -> (u32, u32) {
-        self.file(id).line_col(offset)
+        self.get(id)
+            .map(|file| file.line_col(offset))
+            .unwrap_or((1, 1))
     }
 }
 
@@ -158,35 +190,127 @@ impl SourceMap {
 pub trait SourceProvider {
     /// Read a path relative to the project root. Paths use `/` separators.
     fn read(&self, path: &str) -> Result<String, String>;
+
+    /// Read a path while refusing to load more than `max_bytes`.
+    ///
+    /// The default implementation exists for simple providers, but filesystem
+    /// providers should override it so an oversized file is rejected before it
+    /// is read into memory.
+    fn read_limited(&self, path: &str, max_bytes: usize) -> Result<String, String> {
+        let text = self.read(path)?;
+        if text.len() > max_bytes {
+            Err(format!("file `{path}` exceeds the {max_bytes} byte limit"))
+        } else {
+            Ok(text)
+        }
+    }
+}
+
+/// How a [`FileSystemProvider`] is allowed to resolve paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FsMode {
+    /// Relative paths only, rooted at the configured directory.
+    Sandboxed,
+    /// Paths are resolved with the host process's filesystem authority.
+    Unrestricted,
 }
 
 /// Reads modules from a directory on disk.
+///
+/// The default constructor creates a sandboxed provider: module paths are
+/// opened relative to `root`, `..`/absolute paths are rejected, and symlink
+/// escapes are refused by the capability-based filesystem API.
+///
+/// Use [`FileSystemProvider::unrestricted`] for the standalone CLI host, or
+/// when an embedding deliberately wants to grant ambient filesystem access.
 #[derive(Debug, Clone)]
 pub struct FileSystemProvider {
     root: PathBuf,
+    mode: FsMode,
 }
 
 impl FileSystemProvider {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            mode: FsMode::Sandboxed,
+        }
+    }
+
+    /// Create a provider that resolves paths using ambient filesystem
+    /// authority. This is intentionally explicit.
+    pub fn unrestricted(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            mode: FsMode::Unrestricted,
+        }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    pub fn is_sandboxed(&self) -> bool {
+        self.mode == FsMode::Sandboxed
+    }
+}
+
+fn is_safe_relative_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    if normalized.is_empty() {
+        return false;
+    }
+    normalized.split('/').all(|part| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && !part.contains(':')
+            && !part.contains('\0')
+    })
+}
+
+fn read_bounded(mut file: impl Read, max_bytes: usize) -> Result<String, String> {
+    let mut text = String::new();
+    let limit = (max_bytes as u64).saturating_add(1);
+    file.by_ref()
+        .take(limit)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("cannot read source: {e}"))?;
+    if text.len() > max_bytes {
+        return Err(format!("source file exceeds the {max_bytes} byte limit"));
+    }
+    Ok(text)
 }
 
 impl SourceProvider for FileSystemProvider {
     fn read(&self, path: &str) -> Result<String, String> {
-        let relative = path.replace('\\', "/");
-        if relative
-            .split('/')
-            .any(|part| part == ".." || part.is_empty())
-        {
-            return Err(format!("invalid module path `{path}`"));
+        self.read_limited(path, usize::MAX)
+    }
+
+    fn read_limited(&self, path: &str, max_bytes: usize) -> Result<String, String> {
+        match self.mode {
+            FsMode::Sandboxed => {
+                if !is_safe_relative_path(path) {
+                    return Err(format!("invalid module path `{path}`"));
+                }
+                let relative = path.replace('\\', "/");
+                let dir = Dir::open_ambient_dir(&self.root, ambient_authority())
+                    .map_err(|e| format!("cannot open {}: {e}", self.root.display()))?;
+                let file = dir.open(&relative).map_err(|e| {
+                    format!("cannot read {}: {e}", self.root.join(&relative).display())
+                })?;
+                read_bounded(file, max_bytes)
+            }
+            FsMode::Unrestricted => {
+                let relative = path.replace('\\', "/");
+                let full = self
+                    .root
+                    .join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+                let file = std::fs::File::open(&full)
+                    .map_err(|e| format!("cannot read {}: {e}", full.display()))?;
+                read_bounded(file, max_bytes)
+            }
         }
-        let full = self.root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
-        std::fs::read_to_string(&full).map_err(|e| format!("cannot read {}: {e}", full.display()))
     }
 }
 
@@ -218,6 +342,15 @@ impl SourceProvider for MemoryProvider {
             .cloned()
             .ok_or_else(|| format!("file not found: {path}"))
     }
+
+    fn read_limited(&self, path: &str, max_bytes: usize) -> Result<String, String> {
+        let text = self.read(path)?;
+        if text.len() > max_bytes {
+            Err(format!("file `{path}` exceeds the {max_bytes} byte limit"))
+        } else {
+            Ok(text)
+        }
+    }
 }
 
 /// Load limits that keep hostile input from exhausting the host.
@@ -241,6 +374,7 @@ impl Default for LoadLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn line_and_scalar_column_are_one_based() {
@@ -251,10 +385,46 @@ mod tests {
     }
 
     #[test]
+    fn non_boundary_offsets_are_clamped() {
+        let file = SourceFile::new("x.mt".into(), "aé\n".into());
+        assert_eq!(file.line_col(2), (1, 2));
+        assert_eq!(file.slice(Span::new(0, 2)), "a");
+    }
+
+    #[test]
+    fn bom_and_crlf_are_normalized() {
+        let file = SourceFile::new("x.mt".into(), "\u{feff}a\r\nb".into());
+        assert_eq!(file.text(), "a\nb");
+        assert_eq!(file.line_col(2), (2, 1));
+    }
+
+    #[test]
+    fn bounded_read_stops_at_limit() {
+        let err = read_bounded(Cursor::new(b"abcdef".to_vec()), 3).unwrap_err();
+        assert!(err.contains("exceeds"));
+    }
+
+    #[test]
+    fn relative_paths_are_checked() {
+        assert!(is_safe_relative_path("a/b.mt"));
+        assert!(!is_safe_relative_path("../a.mt"));
+        assert!(!is_safe_relative_path("C:/a.mt"));
+        assert!(!is_safe_relative_path("/a.mt"));
+        assert!(!is_safe_relative_path("a//b.mt"));
+    }
+
+    #[test]
+    fn sandboxed_provider_rejects_escape_attempts() {
+        let provider = FileSystemProvider::new(".");
+        assert!(provider.read_limited("../outside.mt", 1024).is_err());
+        assert!(provider.read_limited("C:/outside.mt", 1024).is_err());
+        assert!(provider.is_sandboxed());
+        let provider = FileSystemProvider::unrestricted(".");
+        assert!(!provider.is_sandboxed());
+    }
+
+    #[test]
     fn span_merge() {
-        assert_eq!(
-            Span::new(2, 4).merge(Span::new(7, 9)),
-            Span::new(2, 9)
-        );
+        assert_eq!(Span::new(2, 4).merge(Span::new(7, 9)), Span::new(2, 9));
     }
 }

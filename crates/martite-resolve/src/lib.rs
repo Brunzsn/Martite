@@ -293,7 +293,18 @@ impl<'a> Loader<'a> {
         if let Some(cached) = self.file_cache.get(relative) {
             return cached.clone();
         }
-        let text = self.provider.read(relative).ok();
+        let text = match self
+            .provider
+            .read_limited(relative, self.options.limits.file_size)
+        {
+            Ok(text) => Some(text),
+            Err(error) => {
+                if error.contains("exceeds") {
+                    self.diag(Code::E002, None, None, error);
+                }
+                None
+            }
+        };
         self.file_cache.insert(relative.to_string(), text.clone());
         text
     }
@@ -780,9 +791,7 @@ impl<'a> Loader<'a> {
                     Item::Struct(s) => s.fields.iter().map(|f| f.name.clone()).collect(),
                     _ => HashSet::new(),
                 };
-                let methods = methods_by_type
-                    .entry(imp.type_name.clone())
-                    .or_default();
+                let methods = methods_by_type.entry(imp.type_name.clone()).or_default();
                 for method in &imp.methods {
                     self.check_params(module_id, &method.params);
                     self.check_type_params(module_id, &method.generics);
@@ -802,10 +811,7 @@ impl<'a> Loader<'a> {
                             module_id,
                             method.span,
                             Code::E102,
-                            format!(
-                                "duplicate method `{}` on `{}`",
-                                method.name, imp.type_name
-                            ),
+                            format!("duplicate method `{}` on `{}`", method.name, imp.type_name),
                         );
                     }
                     let def = self.add_def(
@@ -842,11 +848,13 @@ impl<'a> Loader<'a> {
             };
             let full = use_decl.path.join(".");
             let target = if Self::is_builtin_module(&full) {
-                Some(UseResolved::Module(ModuleTarget::Builtin(match full.as_str() {
-                    "std.math" => "std.math",
-                    "std.json" => "std.json",
-                    _ => unreachable!(),
-                })))
+                Some(UseResolved::Module(ModuleTarget::Builtin(
+                    match full.as_str() {
+                        "std.math" => "std.math",
+                        "std.json" => "std.json",
+                        _ => unreachable!(),
+                    },
+                )))
             } else if self.module_exists(&full) {
                 let is_iface = self.interfaces.contains_key(&full);
                 let mid = self.ensure_module(&full, is_iface);
@@ -925,7 +933,10 @@ impl<'a> Loader<'a> {
                             module_id,
                             use_decl.span,
                             Code::E106,
-                            format!("module `{}` has no item `{item_name}`", self.modules[target_module.0 as usize].path),
+                            format!(
+                                "module `{}` has no item `{item_name}`",
+                                self.modules[target_module.0 as usize].path
+                            ),
                         );
                         continue;
                     };
@@ -1061,10 +1072,7 @@ impl<'a> Loader<'a> {
                 if use_decl.path.len() - k != 1 {
                     return None;
                 }
-                return Some(UseResolved::BuiltinItem(
-                    prefix,
-                    use_decl.path[k].clone(),
-                ));
+                return Some(UseResolved::BuiltinItem(prefix, use_decl.path[k].clone()));
             }
             if self.module_exists(&prefix) {
                 let is_iface = self.interfaces.contains_key(&prefix);
@@ -1301,10 +1309,7 @@ fn is_pascal_case(name: &str) -> bool {
 
 fn is_screaming_case(name: &str) -> bool {
     name.len() >= 2
-        && name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_uppercase())
+        && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
         && name
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
@@ -1314,8 +1319,9 @@ fn builtin_item_kind(module: &str, name: &str) -> Option<DefKind> {
     match module {
         "std.math" => match name {
             "PI" | "EULER" => Some(DefKind::Const),
-            "min" | "max" | "clamp" | "sin" | "cos" | "tan" | "atan2" | "exp" | "ln"
-            | "log10" => Some(DefKind::Fn),
+            "min" | "max" | "clamp" | "sin" | "cos" | "tan" | "atan2" | "exp" | "ln" | "log10" => {
+                Some(DefKind::Fn)
+            }
             _ => None,
         },
         "std.json" => match name {

@@ -21,6 +21,7 @@ martite-runtime.workspace = true
 martite-driver.workspace = true
 martite-lint.workspace = true
 martite-fmt.workspace = true
+lexopt.workspace = true
 
 [lints]
 workspace = true

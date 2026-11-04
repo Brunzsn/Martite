@@ -37,6 +37,8 @@ impl<'p, 'h> Runtime<'p, 'h> {
         if let Some((place, _)) = receiver_value.take() {
             self.write_place(place, value)?;
         }
+        self.check_value_depth(&result, expr.span)?;
+        self.check_value_memory(&result)?;
         Ok(result)
     }
 
@@ -95,6 +97,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 .unwrap_or(Value::Option(None))),
             "contains" => {
                 let needle = args.into_iter().next().unwrap_or(Value::Unit);
+                self.charge(items.len() as u64)?;
                 Ok(Value::Bool(items.iter().any(|v| value_eq(v, &needle))))
             }
             "map" => {
@@ -187,12 +190,14 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let n = out.len() as u64;
                 self.charge(n * (n + 1).ilog2().max(1) as u64)?;
                 out.sort_by(value_ord);
+                self.ensure_deadline()?;
                 Ok(Value::list(out))
             }
             "sorted_by" => {
                 let closure = closure_arg(&args, 0);
                 let snapshot = items.clone();
-                self.charge(snapshot.len() as u64)?;
+                let n = snapshot.len() as u64;
+                self.charge(n.saturating_mul((n + 1).ilog2().max(1) as u64))?;
                 let mut keyed = Vec::with_capacity(snapshot.len());
                 for item in snapshot.iter() {
                     let key = self
@@ -201,6 +206,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     keyed.push((key, item.clone()));
                 }
                 keyed.sort_by(|a, b| value_ord(&a.0, &b.0));
+                self.ensure_deadline()?;
                 Ok(Value::list(keyed.into_iter().map(|(_, v)| v).collect()))
             }
             "join" => {
@@ -222,6 +228,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             "push" => {
                 let value = args.into_iter().next().unwrap_or(Value::Unit);
+                self.charge(1)?;
                 Rc::make_mut(items).push(value);
                 Ok(Value::Unit)
             }
@@ -233,6 +240,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let n = items.len() as u64;
                 self.charge(n * (n + 1).ilog2().max(1) as u64)?;
                 Rc::make_mut(items).sort_by(value_ord);
+                self.ensure_deadline()?;
                 Ok(Value::Unit)
             }
             "insert" => {
@@ -256,11 +264,13 @@ impl<'p, 'h> Runtime<'p, 'h> {
             "extend" => {
                 let other = args.into_iter().next().unwrap_or(Value::Unit);
                 if let Value::List(other) = other {
+                    self.charge(other.len() as u64)?;
                     Rc::make_mut(items).extend(other.iter().cloned());
                 }
                 Ok(Value::Unit)
             }
             "clear" => {
+                self.charge(items.len() as u64)?;
                 Rc::make_mut(items).clear();
                 Ok(Value::Unit)
             }
@@ -296,16 +306,25 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     .map_err(|msg| EvalError::Trap(self.panic(msg, span)))?;
                 Ok(Value::Bool(map.get(&key).is_some()))
             }
-            "keys" => Ok(Value::list(
-                map.keys().iter().map(key_to_value).collect(),
-            )),
-            "values" => Ok(Value::list(map.values())),
-            "entries" => Ok(Value::list(
-                map.entries()
-                    .iter()
-                    .map(|(k, v)| Value::tuple(vec![key_to_value(k), v.clone()]))
-                    .collect(),
-            )),
+            "keys" => {
+                self.charge(map.len() as u64)?;
+                Ok(Value::list(
+                    map.keys().iter().map(key_to_value).collect(),
+                ))
+            }
+            "values" => {
+                self.charge(map.len() as u64)?;
+                Ok(Value::list(map.values()))
+            }
+            "entries" => {
+                self.charge(map.len() as u64)?;
+                Ok(Value::list(
+                    map.entries()
+                        .iter()
+                        .map(|(k, v)| Value::tuple(vec![key_to_value(k), v.clone()]))
+                        .collect(),
+                ))
+            }
             "remove" => {
                 let key = args.first().cloned().unwrap_or(Value::Unit);
                 let key = key_from_value(&key)
@@ -316,6 +335,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     .unwrap_or(Value::Option(None)))
             }
             "clear" => {
+                self.charge(map.len() as u64)?;
                 Rc::make_mut(map).clear();
                 Ok(Value::Unit)
             }
@@ -334,12 +354,18 @@ impl<'p, 'h> Runtime<'p, 'h> {
             return self.trap(self.internal_panic("receiver is not a str"));
         };
         match name {
-            "len" => Ok(Value::Int(text.chars().count() as i64)),
-            "chars" => Ok(Value::list(
-                text.chars()
-                    .map(|c| Value::str(c.to_string()))
-                    .collect(),
-            )),
+            "len" => {
+                self.charge((text.len() as u64).div_ceil(8))?;
+                Ok(Value::Int(text.chars().count() as i64))
+            }
+            "chars" => {
+                self.charge((text.len() as u64).div_ceil(8))?;
+                Ok(Value::list(
+                    text.chars()
+                        .map(|c| Value::str(c.to_string()))
+                        .collect(),
+                ))
+            }
             "split" => {
                 let sep = args
                     .first()
@@ -353,12 +379,17 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 self.charge((text.len() as u64).div_ceil(8))?;
                 Ok(Value::list(parts))
             }
-            "trim" => Ok(Value::str(text.trim().to_string())),
+            "trim" => {
+                let out = text.trim().to_string();
+                self.charge((out.len() as u64).div_ceil(8))?;
+                Ok(Value::str(out))
+            }
             "contains" => {
                 let needle = args
                     .first()
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
                     .unwrap_or_default();
+                self.charge((text.len() as u64).div_ceil(8))?;
                 Ok(Value::Bool(text.contains(&needle)))
             }
             "find" => {
@@ -366,6 +397,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     .first()
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
                     .unwrap_or_default();
+                self.charge((text.len() as u64).div_ceil(8))?;
                 Ok(text
                     .find(&needle)
                     .map(|byte| Value::Int(text[..byte].chars().count() as i64))
@@ -377,6 +409,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     .first()
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
                     .unwrap_or_default();
+                self.charge((text.len() as u64).div_ceil(8))?;
                 Ok(Value::Bool(text.starts_with(&needle)))
             }
             "ends_with" => {
@@ -384,6 +417,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     .first()
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
                     .unwrap_or_default();
+                self.charge((text.len() as u64).div_ceil(8))?;
                 Ok(Value::Bool(text.ends_with(&needle)))
             }
             "replace" => {
@@ -402,16 +436,30 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 self.charge((out.len() as u64).div_ceil(8))?;
                 Ok(Value::str(out))
             }
-            "to_upper" => Ok(Value::str(text.to_uppercase())),
-            "to_lower" => Ok(Value::str(text.to_lowercase())),
-            "parse_int" => Ok(match parse_int(&text) {
-                Some(v) => Value::Option(Some(Box::new(Value::Int(v)))),
-                None => Value::Option(None),
-            }),
-            "parse_float" => Ok(match parse_float(&text) {
-                Some(v) => Value::Option(Some(Box::new(Value::Float(v)))),
-                None => Value::Option(None),
-            }),
+            "to_upper" => {
+                let out = text.to_uppercase();
+                self.charge((out.len() as u64).div_ceil(8))?;
+                Ok(Value::str(out))
+            }
+            "to_lower" => {
+                let out = text.to_lowercase();
+                self.charge((out.len() as u64).div_ceil(8))?;
+                Ok(Value::str(out))
+            }
+            "parse_int" => {
+                self.charge((text.len() as u64).div_ceil(8))?;
+                Ok(match parse_int(&text) {
+                    Some(v) => Value::Option(Some(Box::new(Value::Int(v)))),
+                    None => Value::Option(None),
+                })
+            }
+            "parse_float" => {
+                self.charge((text.len() as u64).div_ceil(8))?;
+                Ok(match parse_float(&text) {
+                    Some(v) => Value::Option(Some(Box::new(Value::Float(v)))),
+                    None => Value::Option(None),
+                })
+            }
             _ => self.trap(self.internal_panic(format!("unknown str method `{name}`"))),
         }
     }
@@ -436,10 +484,24 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 if exponent < 0 {
                     return self.trap(self.panic("negative exponent", span));
                 }
-                value
-                    .checked_pow(exponent as u32)
-                    .map(Value::Int)
-                    .ok_or_else(|| EvalError::Trap(self.panic("integer overflow", span)))
+                if exponent == 0 {
+                    return Ok(Value::Int(1));
+                }
+                match *value {
+                    0 => Ok(Value::Int(0)),
+                    1 => Ok(Value::Int(1)),
+                    -1 if exponent % 2 == 0 => Ok(Value::Int(1)),
+                    -1 => Ok(Value::Int(-1)),
+                    _ => {
+                        let exponent = u32::try_from(exponent).map_err(|_| {
+                            EvalError::Trap(self.panic("integer overflow", span))
+                        })?;
+                        value
+                            .checked_pow(exponent)
+                            .map(Value::Int)
+                            .ok_or_else(|| EvalError::Trap(self.panic("integer overflow", span)))
+                    }
+                }
             }
             _ => self.trap(self.internal_panic(format!("unknown int method `{name}`"))),
         }
@@ -475,6 +537,11 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let digits = int_arg(&args, 0).unwrap_or(0);
                 if digits < 0 {
                     return self.trap(self.panic("round digits must be non-negative", span));
+                }
+                // More digits than an f64 can represent cannot change the
+                // value, and `10f64.powi` would overflow to infinity.
+                if digits > 308 {
+                    return Ok(Value::Float(*value));
                 }
                 let factor = 10f64.powi(digits as i32);
                 Ok(Value::Float(libm::round(*value * factor) / factor))
@@ -512,14 +579,16 @@ impl<'p, 'h> Runtime<'p, 'h> {
             "to_list" => {
                 self.charge(len.max(0) as u64)?;
                 let mut out = Vec::new();
-                let last = if *inclusive { *end } else { end.saturating_sub(1) };
-                let mut i = *start;
-                while i <= last {
-                    out.push(Value::Int(i));
-                    if i == i64::MAX {
-                        break;
+                let last = if *inclusive { Some(*end) } else { end.checked_sub(1) };
+                if let Some(last) = last {
+                    let mut i = *start;
+                    while i <= last {
+                        out.push(Value::Int(i));
+                        if i == i64::MAX {
+                            break;
+                        }
+                        i += 1;
                     }
-                    i += 1;
                 }
                 Ok(Value::list(out))
             }
@@ -713,32 +782,33 @@ fn parse_float(text: &str) -> Option<f64> {
     if bytes[0] == b'-' {
         i = 1;
     }
-    let mut digits = 0;
+    let int_start = i;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
-        digits += 1;
         i += 1;
+    }
+    if i == int_start {
+        return None;
     }
     if i < bytes.len() && bytes[i] == b'.' {
         i += 1;
+        let frac_start = i;
         while i < bytes.len() && bytes[i].is_ascii_digit() {
-            digits += 1;
             i += 1;
         }
-    }
-    if digits == 0 {
-        return None;
+        if i == frac_start {
+            return None;
+        }
     }
     if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
         i += 1;
         if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
             i += 1;
         }
-        let mut exp_digits = 0;
+        let exp_start = i;
         while i < bytes.len() && bytes[i].is_ascii_digit() {
-            exp_digits += 1;
             i += 1;
         }
-        if exp_digits == 0 {
+        if i == exp_start {
             return None;
         }
     }

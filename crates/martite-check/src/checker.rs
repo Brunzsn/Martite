@@ -1,9 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use martite_base::{Code, Diagnostic, Severity, Span};
-use martite_resolve::{
-    BuiltinItem, DefId, DefKind, ModuleId, ModuleTarget, ResolvedProgram,
-};
+use martite_resolve::{BuiltinItem, DefId, DefKind, ModuleId, ModuleTarget, ResolvedProgram};
 use martite_syntax::*;
 
 use crate::exhaustive::is_exhaustive;
@@ -144,7 +142,9 @@ impl Checker {
             id: TypeId(0),
             name: "Json".into(),
             module: None,
-            kind: TypeDefKind::Enum { variants: Vec::new() },
+            kind: TypeDefKind::Enum {
+                variants: Vec::new(),
+            },
             params: Vec::new(),
             is_interface: false,
             is_builtin: true,
@@ -216,9 +216,7 @@ impl Checker {
                     id: TypeId(0),
                     name: name.clone(),
                     module: Some(module_id),
-                    kind: TypeDefKind::Struct {
-                        fields: Vec::new(),
-                    },
+                    kind: TypeDefKind::Struct { fields: Vec::new() },
                     params,
                     is_interface,
                     is_builtin: false,
@@ -229,7 +227,8 @@ impl Checker {
         }
 
         // Fill fields and variants now that every type name is mapped.
-        let entries: Vec<(DefId, TypeId)> = self.def_to_type.iter().map(|(a, b)| (*a, *b)).collect();
+        let entries: Vec<(DefId, TypeId)> =
+            self.def_to_type.iter().map(|(a, b)| (*a, *b)).collect();
         for (def, type_id) in entries {
             let info = self.resolved.def(def).clone();
             let module_id = info.module;
@@ -237,7 +236,11 @@ impl Checker {
             let Some(item) = items.get(info.item_index) else {
                 continue;
             };
-            let params = self.types.get(type_id).map(|d| d.params.clone()).unwrap_or_default();
+            let params = self
+                .types
+                .get(type_id)
+                .map(|d| d.params.clone())
+                .unwrap_or_default();
             match item {
                 Item::Struct(s) => {
                     if s.opaque {
@@ -399,14 +402,8 @@ impl Checker {
                                     Ty::Error
                                 }
                             };
-                            let binding = self.alloc_binding(
-                                name,
-                                ty.clone(),
-                                *mutable,
-                                param.id,
-                                false,
-                                0,
-                            );
+                            let binding =
+                                self.alloc_binding(name, ty.clone(), *mutable, param.id, false, 0);
                             params.push(ParamSig {
                                 node: param.id,
                                 binding,
@@ -515,7 +512,9 @@ impl Checker {
                 })
                 .collect()
         } else {
-            (0..impl_params.len()).map(|i| Ty::Param(i as u32)).collect()
+            (0..impl_params.len())
+                .map(|i| Ty::Param(i as u32))
+                .collect()
         };
         let self_ty = Ty::Named(type_id, self_args);
         for method in &imp.methods {
@@ -601,8 +600,7 @@ impl Checker {
                     is_pub: method.is_pub,
                 },
             );
-            self.methods
-                .insert((type_id, method.name.clone()), def);
+            self.methods.insert((type_id, method.name.clone()), def);
         }
     }
 
@@ -664,12 +662,7 @@ impl Checker {
             for param in &init.params {
                 match &param.kind {
                     ParamKind::SelfParam { .. } => {
-                        self.err_at(
-                            root,
-                            param.span,
-                            Code::E504,
-                            "`init` may not take `self`",
-                        );
+                        self.err_at(root, param.span, Code::E504, "`init` may not take `self`");
                     }
                     ParamKind::Normal { name, mutable, ty } => {
                         let ty = match self.resolve_ty_in(root, ty, &[]) {
@@ -710,12 +703,10 @@ impl Checker {
                 );
             }
             let ret = match &init.ret {
-                Some(t) => self
-                    .resolve_ty_in(root, t, &[])
-                    .unwrap_or_else(|msg| {
-                        self.report_type_error(root, t.span, msg);
-                        Ty::Error
-                    }),
+                Some(t) => self.resolve_ty_in(root, t, &[]).unwrap_or_else(|msg| {
+                    self.report_type_error(root, t.span, msg);
+                    Ty::Error
+                }),
                 None => Ty::Unit,
             };
             if !self.is_data_type(&ret) {
@@ -771,14 +762,8 @@ impl Checker {
                             );
                             Ty::Error
                         });
-                        let binding = self.alloc_binding(
-                            "self",
-                            ty.clone(),
-                            *mutable,
-                            param.id,
-                            true,
-                            0,
-                        );
+                        let binding =
+                            self.alloc_binding("self", ty.clone(), *mutable, param.id, true, 0);
                         params.push(ParamSig {
                             node: param.id,
                             binding,
@@ -840,7 +825,10 @@ impl Checker {
                             root,
                             handler.span,
                             Code::E502,
-                            format!("`{}` does not name a hook in a granted interface", handler.name),
+                            format!(
+                                "`{}` does not name a hook in a granted interface",
+                                handler.name
+                            ),
                         );
                         HookSig {
                             name: handler.name.clone(),
@@ -965,13 +953,12 @@ impl Checker {
         prelude_names().contains(&name)
     }
 
-    fn bind_existing(
-        &mut self,
-        name: &str,
-        id: BindingId,
-        span: Span,
-    ) {
-        let module = self.ctx.as_ref().map(|c| c.module).unwrap_or(self.resolved.entry);
+    fn bind_existing(&mut self, name: &str, id: BindingId, span: Span) {
+        let module = self
+            .ctx
+            .as_ref()
+            .map(|c| c.module)
+            .unwrap_or(self.resolved.entry);
         if name != "self" && name != "_" && self.scope_contains_visible(name) {
             // Duplicate pattern names and shadowing are reported by their
             // dedicated rules; avoid double-reporting here.
@@ -1026,11 +1013,7 @@ impl Checker {
         }
 
         for (def, module_id, c) in defs {
-            let ty = self
-                .const_types
-                .get(&def)
-                .cloned()
-                .unwrap_or(Ty::Error);
+            let ty = self.const_types.get(&def).cloned().unwrap_or(Ty::Error);
             let saved_ctx = self.ctx.take();
             let saved_scopes = std::mem::take(&mut self.scopes);
             self.ctx = Some(FnCtx {
@@ -1109,7 +1092,7 @@ impl Checker {
                     match part {
                         StrExprPart::Text(t) => text.push_str(t),
                         StrExprPart::Expr(_) => {
-                            return Err("interpolation is not a constant expression".into())
+                            return Err("interpolation is not a constant expression".into());
                         }
                     }
                 }
@@ -1192,17 +1175,13 @@ impl Checker {
                     Some(Resolution::Variant(id, index)) => {
                         Ok(ConstValue::Enum(*id, *index, values))
                     }
-                    Some(Resolution::PreludeVariant(v)) => {
-                        Ok(ConstValue::Prelude(*v, values))
-                    }
+                    Some(Resolution::PreludeVariant(v)) => Ok(ConstValue::Prelude(*v, values)),
                     _ => Err("function calls are not constant expressions".into()),
                 }
             }
             ExprKind::Var(_) => match self.resolutions.get(&expr.id) {
                 Some(Resolution::Const(def)) => self.eval_const(*def, visiting),
-                Some(Resolution::PreludeVariant(v)) => {
-                    Ok(ConstValue::Prelude(*v, Vec::new()))
-                }
+                Some(Resolution::PreludeVariant(v)) => Ok(ConstValue::Prelude(*v, Vec::new())),
                 _ => Err("name is not a constant".into()),
             },
             _ => Err("not a constant expression".into()),
@@ -1312,7 +1291,11 @@ impl Checker {
     }
 
     fn is_top_level_visible(&self, name: &str) -> bool {
-        let module = self.ctx.as_ref().map(|c| c.module).unwrap_or(self.resolved.entry);
+        let module = self
+            .ctx
+            .as_ref()
+            .map(|c| c.module)
+            .unwrap_or(self.resolved.entry);
         self.resolved.module(module).symbols.contains(name)
             || prelude_names().contains(&name)
             || self

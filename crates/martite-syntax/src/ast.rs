@@ -169,7 +169,9 @@ pub struct Param {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParamKind {
-    SelfParam { mutable: bool },
+    SelfParam {
+        mutable: bool,
+    },
     Normal {
         name: String,
         mutable: bool,
@@ -204,7 +206,10 @@ pub struct TyExpr {
 pub enum TyKind {
     Prim(PrimTy),
     Unit,
-    Named { name: String, args: Vec<TyExpr> },
+    Named {
+        name: String,
+        args: Vec<TyExpr>,
+    },
     Optional(Box<TyExpr>),
     Tuple(Vec<TyExpr>),
     Fn {

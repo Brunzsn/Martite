@@ -1,5 +1,5 @@
 use martite_base::{LoadLimits, MemoryProvider};
-use martite_driver::{load, LoadOptions};
+use martite_driver::{LoadOptions, load};
 use martite_runtime::{ExecLimits, Runtime};
 
 fn run_source(source: &str) -> Vec<String> {
@@ -223,6 +223,24 @@ fn std_json_round_trip() {
             "#
         ),
         [r#"{"a":[1.0,2.0],"b":true}"#]
+    );
+}
+
+#[test]
+fn std_json_duplicate_keys_keep_first_position_and_last_value() {
+    assert_eq!(
+        run_source(
+            r#"
+            use std.json
+            fn main() {
+                match json.parse("\{\"a\": 1, \"b\": 2, \"a\": 3\}") {
+                    Ok(value) => print(json.stringify(value)),
+                    Err(e) => print("error: {e}")
+                }
+            }
+            "#
+        ),
+        [r#"{"a":3.0,"b":2.0}"#]
     );
 }
 

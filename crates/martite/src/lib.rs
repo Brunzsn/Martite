@@ -7,15 +7,15 @@ use martite_base::{
     Code, Diagnostic, FileSystemProvider, LoadLimits, MemoryProvider, SourceMap, SourceProvider,
 };
 use martite_check::{CheckedProgram, FnSig, Ty, TypeDefKind, TypeId};
-use martite_config::{parse_manifest, Manifest};
-use martite_driver::{load, LoadOptions};
+use martite_config::{Manifest, parse_manifest};
+use martite_driver::{LoadOptions, load};
 use martite_resolve::{DefId, InterfaceSource};
 use martite_runtime::{
-    ExecLimits, HostContext, HostDispatcher, HostFault, Runtime, Trap, Value,
+    ExecLimits, HostContext, HostDispatcher, HostFault, MAX_VALUE_DEPTH, Runtime, Trap, Value,
 };
 
 pub use martite_base::{SourceId, Span};
-pub use martite_runtime::{show, ExecLimits as Limits, Value as HostValue};
+pub use martite_runtime::{ExecLimits as Limits, Value as HostValue, show};
 
 /// The language edition implemented by this crate.
 pub const LANG_EDITION: &str = "1";
@@ -84,7 +84,7 @@ fn host_type_matches(host: &HostType, ty: &Ty, program: &CheckedProgram) -> bool
         }
         (HostType::Handle(name), Ty::Named(id, _)) => program
             .type_def(*id)
-            .map(|d| &d.name == name)
+            .map(|d| &d.name == name && d.is_interface && matches!(&d.kind, TypeDefKind::Opaque))
             .unwrap_or(false),
         _ => false,
     }
@@ -202,7 +202,7 @@ impl Engine {
     ) -> Result<Reload, Vec<Diagnostic>> {
         let plugin = self.load(manifest_text, provider)?;
         let fingerprint = plugin.type_fingerprint();
-        let keep_snapshot = fingerprint != 0
+        let keep_snapshot = fingerprint != [0u8; 32]
             && fingerprint == previous.type_fingerprint()
             && fingerprint == snapshot.type_fingerprint;
         Ok(Reload {
@@ -229,8 +229,16 @@ impl Engine {
     ) -> Result<Plugin, Vec<Diagnostic>> {
         // Check the manifest's API version against the host's interface version.
         let (host_major, host_minor) = HOST_API_VERSION;
-        let (want_major, want_minor) = parse_api(&manifest.api);
         let mut diagnostics = Vec::new();
+        let (want_major, want_minor) = match parse_api(&manifest.api) {
+            Ok(version) => version,
+            Err(()) => {
+                return Err(vec![Diagnostic::error(
+                    Code::E508,
+                    format!("malformed plugin API version `{}`", manifest.api),
+                )]);
+            }
+        };
         if want_major != host_major {
             diagnostics.push(Diagnostic::error(
                 Code::E508,
@@ -241,9 +249,7 @@ impl Engine {
         } else if want_minor > host_minor {
             diagnostics.push(Diagnostic::error(
                 Code::E508,
-                format!(
-                    "plugin requires newer API minor {want_minor}, host provides {host_minor}"
-                ),
+                format!("plugin requires newer API minor {want_minor}, host provides {host_minor}"),
             ));
         }
         if !diagnostics.is_empty() {
@@ -263,9 +269,9 @@ impl Engine {
         if loaded.has_errors() {
             return Err(loaded.diagnostics);
         }
-        let program = loaded.program.ok_or_else(|| {
-            vec![Diagnostic::error(Code::E508, "program failed to load")]
-        })?;
+        let program = loaded
+            .program
+            .ok_or_else(|| vec![Diagnostic::error(Code::E508, "program failed to load")])?;
         let mut host_by_def = HashMap::new();
         let mut missing = Vec::new();
         for module in &program.resolved.modules {
@@ -283,10 +289,20 @@ impl Engine {
                         continue;
                     };
                     if let (Some(want), Some(sig)) = (&registered.signature, program.fn_sig(def)) {
+                        if sig.params.iter().any(|param| param.mutable) {
+                            diagnostics.push(Diagnostic::error(
+                                Code::E509,
+                                format!(
+                                    "host function `{qualified}` may not take `mut` parameters"
+                                ),
+                            ));
+                        }
                         if !want.matches(sig, &program) {
                             diagnostics.push(Diagnostic::error(
                                 Code::E509,
-                                format!("host function `{qualified}` has a mismatched Rust signature"),
+                                format!(
+                                    "host function `{qualified}` has a mismatched Rust signature"
+                                ),
                             ));
                         }
                     }
@@ -334,11 +350,7 @@ impl Engine {
             &LoadOptions {
                 entry: entry.into(),
                 interfaces: self.interfaces.clone(),
-                grants: self
-                    .interfaces
-                    .iter()
-                    .map(|i| i.path.clone())
-                    .collect(),
+                grants: self.interfaces.iter().map(|i| i.path.clone()).collect(),
                 limits: self.load_limits,
                 edition: LANG_EDITION.into(),
             },
@@ -346,10 +358,11 @@ impl Engine {
         if loaded.has_errors() {
             return Err(loaded.diagnostics);
         }
-        let program = loaded.program.ok_or_else(|| {
-            vec![Diagnostic::error(Code::E508, "program failed to load")]
-        })?;
+        let program = loaded
+            .program
+            .ok_or_else(|| vec![Diagnostic::error(Code::E508, "program failed to load")])?;
         let mut host_by_def = HashMap::new();
+        let mut diagnostics = Vec::new();
         for module in &program.resolved.modules {
             if !module.is_interface {
                 continue;
@@ -359,18 +372,41 @@ impl Engine {
                     let qualified = format!("{}.{}", module.path, f.name);
                     if let Some(def) = program.resolved.node_to_def.get(&f.id).copied() {
                         if let Some(registered) = self.host_fns.get(&qualified) {
+                            if let (Some(want), Some(sig)) =
+                                (&registered.signature, program.fn_sig(def))
+                            {
+                                if sig.params.iter().any(|param| param.mutable) {
+                                    diagnostics.push(Diagnostic::error(
+                                        Code::E509,
+                                        format!(
+                                            "host function `{qualified}` may not take `mut` parameters"
+                                        ),
+                                    ));
+                                }
+                                if !want.matches(sig, &program) {
+                                    diagnostics.push(Diagnostic::error(
+                                        Code::E509,
+                                        format!(
+                                            "host function `{qualified}` has a mismatched Rust signature"
+                                        ),
+                                    ));
+                                }
+                            }
                             host_by_def.insert(def, registered.clone());
                         }
                     }
                 }
             }
         }
+        if !diagnostics.is_empty() {
+            return Err(diagnostics);
+        }
         Ok(Plugin {
             program,
             sources: loaded.sources,
             host_by_def,
             settings: toml::Value::Table(Default::default()),
-            limits: self.default_limits,
+            limits: clamp_limits(self.default_limits, self.max_limits),
             manifest: Manifest {
                 name: "script".into(),
                 version: "0.0.0".into(),
@@ -400,11 +436,14 @@ fn clamp_limits(requested: ExecLimits, max: ExecLimits) -> ExecLimits {
     }
 }
 
-fn parse_api(api: &str) -> (u32, u32) {
+fn parse_api(api: &str) -> Result<(u32, u32), ()> {
     let mut parts = api.split('.');
-    let major = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    (major, minor)
+    let major = parts.next().ok_or(())?.parse().map_err(|_| ())?;
+    let minor = parts.next().ok_or(())?.parse().map_err(|_| ())?;
+    if parts.next().is_some() {
+        return Err(());
+    }
+    Ok((major, minor))
 }
 
 pub struct Plugin {
@@ -479,12 +518,12 @@ impl Plugin {
 
     /// Fingerprint of the state type, used to decide whether a snapshot can
     /// survive a reload.
-    pub fn type_fingerprint(&self) -> u64 {
+    pub fn type_fingerprint(&self) -> [u8; 32] {
         self.program
             .state_type
             .as_ref()
             .map(|ty| fingerprint_type(ty, &self.program))
-            .unwrap_or(0)
+            .unwrap_or([0u8; 32])
     }
 
     /// Run `fn main` in a script, using the registered host functions.
@@ -520,8 +559,7 @@ impl Plugin {
             let mut dispatcher = Dispatch {
                 fns: &self.host_by_def,
             };
-            let mut runtime =
-                Runtime::with_host(&self.program, self.limits, &mut dispatcher);
+            let mut runtime = Runtime::with_host(&self.program, self.limits, &mut dispatcher);
             let outcome = runtime.invoke(*def, Vec::new()).map(|result| result.value);
             reports.push(TestReport {
                 name,
@@ -590,9 +628,7 @@ impl<'p> Instance<'p> {
         let mut runtime =
             Runtime::with_host(&self.plugin.program, self.plugin.limits, &mut dispatcher);
         let value = runtime.invoke_handler(hook, &mut self.state, args)?;
-        Ok(value
-            .map(Outcome::Handled)
-            .unwrap_or(Outcome::NoHandler))
+        Ok(value.map(Outcome::Handled).unwrap_or(Outcome::NoHandler))
     }
 
     pub fn shutdown(&mut self) -> Result<(), Trap> {
@@ -617,6 +653,7 @@ impl<'p> Instance<'p> {
             .map(|state| encode_value(state, &self.plugin.program))
             .unwrap_or_default();
         Snapshot {
+            format_version: SNAPSHOT_FORMAT_VERSION,
             type_fingerprint,
             bytes,
         }
@@ -624,6 +661,9 @@ impl<'p> Instance<'p> {
 
     /// Restore a snapshot if its type fingerprint matches this plugin.
     pub fn restore(&mut self, snapshot: &Snapshot) -> Result<(), String> {
+        if snapshot.format_version != SNAPSHOT_FORMAT_VERSION {
+            return Err("unsupported snapshot format version".into());
+        }
         if snapshot.type_fingerprint != self.plugin.type_fingerprint() {
             return Err("snapshot type fingerprint mismatch".into());
         }
@@ -632,18 +672,22 @@ impl<'p> Instance<'p> {
             return Ok(());
         }
         let mut pos = 0;
-        let value = decode_value(&snapshot.bytes, &mut pos, &self.plugin.program)?;
+        let value = decode_value(&snapshot.bytes, &mut pos, &self.plugin.program, 0)?;
         if pos != snapshot.bytes.len() {
             return Err("trailing bytes in snapshot".into());
         }
+        validate_snapshot_value(&value, &self.plugin.program, 0)?;
         self.state = Some(value);
         Ok(())
     }
 }
 
+const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
-    pub type_fingerprint: u64,
+    pub format_version: u32,
+    pub type_fingerprint: [u8; 32],
     pub bytes: Vec<u8>,
 }
 
@@ -668,12 +712,7 @@ impl HostDispatcher for Dispatch<'_> {
 }
 
 fn toml_to_json(value: &toml::Value, json_type: TypeId, program: &CheckedProgram) -> Value {
-    let variant = |name: &str| {
-        program
-            .types
-            .variant_index(json_type, name)
-            .unwrap_or(0)
-    };
+    let variant = |name: &str| program.types.variant_index(json_type, name).unwrap_or(0);
     let make = |variant: usize, payload: Vec<Value>| {
         Value::Enum(Rc::new(martite_runtime::EnumValue {
             type_id: json_type,
@@ -713,110 +752,131 @@ fn toml_to_json(value: &toml::Value, json_type: TypeId, program: &CheckedProgram
 // Snapshots
 // ----------------------------------------------------------------------
 
-fn fingerprint_type(ty: &Ty, program: &CheckedProgram) -> u64 {
-    let mut hash = Fnv::new();
+fn fingerprint_type(ty: &Ty, program: &CheckedProgram) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"martite-state-v1");
     fingerprint_into(&mut hash, ty, program, &mut Vec::new());
-    hash.finish()
+    *hash.finalize().as_bytes()
 }
 
-fn fingerprint_into(hash: &mut Fnv, ty: &Ty, program: &CheckedProgram, stack: &mut Vec<TypeId>) {
+fn hash_bytes(hash: &mut blake3::Hasher, bytes: &[u8]) {
+    hash.update(&(bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
+}
+
+fn fingerprint_into(
+    hash: &mut blake3::Hasher,
+    ty: &Ty,
+    program: &CheckedProgram,
+    stack: &mut Vec<TypeId>,
+) {
     match ty {
-        Ty::Int => hash.write(b"int"),
-        Ty::Float => hash.write(b"float"),
-        Ty::Bool => hash.write(b"bool"),
-        Ty::Str => hash.write(b"str"),
-        Ty::Unit => hash.write(b"unit"),
-        Ty::Range => hash.write(b"range"),
-        Ty::Never => hash.write(b"never"),
-        Ty::Error => hash.write(b"error"),
+        Ty::Int => {
+            hash.update(b"int");
+        }
+        Ty::Float => {
+            hash.update(b"float");
+        }
+        Ty::Bool => {
+            hash.update(b"bool");
+        }
+        Ty::Str => {
+            hash.update(b"str");
+        }
+        Ty::Unit => {
+            hash.update(b"unit");
+        }
+        Ty::Range => {
+            hash.update(b"range");
+        }
+        Ty::Never => {
+            hash.update(b"never");
+        }
+        Ty::Error => {
+            hash.update(b"error");
+        }
         Ty::Tuple(items) => {
-            hash.write(b"tuple");
+            hash.update(b"tuple");
+            hash.update(&(items.len() as u64).to_le_bytes());
             for item in items {
                 fingerprint_into(hash, item, program, stack);
             }
-            hash.write(b"end");
         }
         Ty::List(t) => {
-            hash.write(b"list");
+            hash.update(b"list");
             fingerprint_into(hash, t, program, stack);
         }
         Ty::Map(k, v) | Ty::Result(k, v) => {
-            hash.write(if matches!(ty, Ty::Map(_, _)) { b"map" } else { b"result" });
+            hash.update(if matches!(ty, Ty::Map(_, _)) {
+                b"map"
+            } else {
+                b"result"
+            });
             fingerprint_into(hash, k, program, stack);
             fingerprint_into(hash, v, program, stack);
         }
         Ty::Option(t) => {
-            hash.write(b"option");
+            hash.update(b"option");
             fingerprint_into(hash, t, program, stack);
         }
         Ty::Fn(params, ret) => {
-            hash.write(b"fn");
+            hash.update(b"fn");
+            hash.update(&(params.len() as u64).to_le_bytes());
             for p in params {
                 fingerprint_into(hash, p, program, stack);
             }
             fingerprint_into(hash, ret, program, stack);
         }
         Ty::Named(id, args) => {
-            hash.write(b"named");
+            hash.update(b"named");
             if stack.contains(id) {
-                hash.write(b"recursive");
+                hash.update(b"recursive");
                 return;
             }
             stack.push(*id);
             if let Some(def) = program.type_def(*id) {
-                hash.write(def.name.as_bytes());
+                hash_bytes(hash, def.name.as_bytes());
                 match &def.kind {
-                    TypeDefKind::Opaque => hash.write(b"opaque"),
+                    TypeDefKind::Opaque => {
+                        hash.update(b"opaque");
+                    }
                     TypeDefKind::Struct { fields } => {
-                        hash.write(b"struct");
+                        hash.update(b"struct");
+                        hash.update(&(fields.len() as u64).to_le_bytes());
                         for field in fields {
-                            hash.write(field.name.as_bytes());
+                            hash_bytes(hash, field.name.as_bytes());
                             fingerprint_into(hash, &field.ty, program, stack);
                         }
                     }
                     TypeDefKind::Enum { variants } => {
-                        hash.write(b"enum");
+                        hash.update(b"enum");
+                        hash.update(&(variants.len() as u64).to_le_bytes());
                         for variant in variants {
-                            hash.write(variant.name.as_bytes());
+                            hash_bytes(hash, variant.name.as_bytes());
+                            hash.update(&(variant.payload.len() as u64).to_le_bytes());
                             for payload in &variant.payload {
                                 fingerprint_into(hash, payload, program, stack);
                             }
                         }
                     }
                 }
+            } else {
+                hash.update(b"unknown");
             }
             stack.pop();
+            hash.update(&(args.len() as u64).to_le_bytes());
             for arg in args {
                 fingerprint_into(hash, arg, program, stack);
             }
         }
         Ty::Param(i) => {
-            hash.write(b"param");
-            hash.write(&i.to_le_bytes());
+            hash.update(b"param");
+            hash.update(&i.to_le_bytes());
         }
         Ty::Var(i) => {
-            hash.write(b"var");
-            hash.write(&i.to_le_bytes());
+            hash.update(b"var");
+            hash.update(&i.to_le_bytes());
         }
-    }
-}
-
-struct Fnv(u64);
-
-impl Fnv {
-    fn new() -> Self {
-        Self(0xcbf29ce484222325)
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.0 ^= *byte as u64;
-            self.0 = self.0.wrapping_mul(0x100000001b3);
-        }
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
     }
 }
 
@@ -1004,7 +1064,15 @@ fn encode_scalar_key(out: &mut Vec<u8>, value: &Value) {
     }
 }
 
-fn decode_value(bytes: &[u8], pos: &mut usize, program: &CheckedProgram) -> Result<Value, String> {
+fn decode_value(
+    bytes: &[u8],
+    pos: &mut usize,
+    program: &CheckedProgram,
+    depth: usize,
+) -> Result<Value, String> {
+    if depth > MAX_VALUE_DEPTH {
+        return Err("snapshot value nesting is too deep".into());
+    }
     let tag = read_u8(bytes, pos)?;
     Ok(match tag {
         0 => Value::Unit,
@@ -1013,27 +1081,27 @@ fn decode_value(bytes: &[u8], pos: &mut usize, program: &CheckedProgram) -> Resu
         3 => Value::Bool(read_u8(bytes, pos)? != 0),
         4 => Value::str(read_string(bytes, pos)?),
         5 => {
-            let len = read_len(bytes, pos)?;
-            let mut items = Vec::with_capacity(len);
+            let len = read_collection_len(bytes, pos, 1)?;
+            let mut items = Vec::new();
             for _ in 0..len {
-                items.push(decode_value(bytes, pos, program)?);
+                items.push(decode_value(bytes, pos, program, depth + 1)?);
             }
             Value::list(items)
         }
         6 => {
-            let len = read_len(bytes, pos)?;
-            let mut items = Vec::with_capacity(len);
+            let len = read_collection_len(bytes, pos, 1)?;
+            let mut items = Vec::new();
             for _ in 0..len {
-                items.push(decode_value(bytes, pos, program)?);
+                items.push(decode_value(bytes, pos, program, depth + 1)?);
             }
             Value::tuple(items)
         }
         7 => {
-            let len = read_len(bytes, pos)?;
+            let len = read_collection_len(bytes, pos, 2)?;
             let mut map = martite_runtime::OrderedMap::new();
             for _ in 0..len {
-                let key = decode_key(bytes, pos)?;
-                let value = decode_value(bytes, pos, program)?;
+                let key = decode_key(bytes, pos, depth + 1)?;
+                let value = decode_value(bytes, pos, program, depth + 1)?;
                 map.insert(key, value);
             }
             Value::map(map)
@@ -1044,21 +1112,21 @@ fn decode_value(bytes: &[u8], pos: &mut usize, program: &CheckedProgram) -> Resu
             inclusive: read_u8(bytes, pos)? != 0,
         },
         9 => {
-            let type_id = TypeId(read_len(bytes, pos)? as u32);
-            let len = read_len(bytes, pos)?;
-            let mut fields = Vec::with_capacity(len);
+            let type_id = TypeId(read_u32(bytes, pos)?);
+            let len = read_collection_len(bytes, pos, 1)?;
+            let mut fields = Vec::new();
             for _ in 0..len {
-                fields.push(decode_value(bytes, pos, program)?);
+                fields.push(decode_value(bytes, pos, program, depth + 1)?);
             }
             Value::Struct(Rc::new(martite_runtime::StructValue { type_id, fields }))
         }
         10 => {
-            let type_id = TypeId(read_len(bytes, pos)? as u32);
+            let type_id = TypeId(read_u32(bytes, pos)?);
             let variant = read_len(bytes, pos)?;
-            let len = read_len(bytes, pos)?;
-            let mut payload = Vec::with_capacity(len);
+            let len = read_collection_len(bytes, pos, 1)?;
+            let mut payload = Vec::new();
             for _ in 0..len {
-                payload.push(decode_value(bytes, pos, program)?);
+                payload.push(decode_value(bytes, pos, program, depth + 1)?);
             }
             Value::Enum(Rc::new(martite_runtime::EnumValue {
                 type_id,
@@ -1068,14 +1136,19 @@ fn decode_value(bytes: &[u8], pos: &mut usize, program: &CheckedProgram) -> Resu
         }
         11 => match read_u8(bytes, pos)? {
             0 => Value::Option(None),
-            _ => Value::Option(Some(Box::new(decode_value(bytes, pos, program)?))),
+            _ => Value::Option(Some(Box::new(decode_value(
+                bytes,
+                pos,
+                program,
+                depth + 1,
+            )?))),
         },
         12 => match read_u8(bytes, pos)? {
-            0 => Value::Result(Ok(Box::new(decode_value(bytes, pos, program)?))),
-            _ => Value::Result(Err(Box::new(decode_value(bytes, pos, program)?))),
+            0 => Value::Result(Ok(Box::new(decode_value(bytes, pos, program, depth + 1)?))),
+            _ => Value::Result(Err(Box::new(decode_value(bytes, pos, program, depth + 1)?))),
         },
         13 => {
-            let type_id = TypeId(read_len(bytes, pos)? as u32);
+            let type_id = TypeId(read_u32(bytes, pos)?);
             let token = read_string(bytes, pos)?;
             Value::Handle(Rc::new(martite_runtime::HandleValue { type_id, token }))
         }
@@ -1083,37 +1156,44 @@ fn decode_value(bytes: &[u8], pos: &mut usize, program: &CheckedProgram) -> Resu
     })
 }
 
-fn decode_key(bytes: &[u8], pos: &mut usize) -> Result<martite_runtime::KeyValue, String> {
+fn decode_key(
+    bytes: &[u8],
+    pos: &mut usize,
+    depth: usize,
+) -> Result<martite_runtime::KeyValue, String> {
     use martite_runtime::KeyValue;
+    if depth > MAX_VALUE_DEPTH {
+        return Err("snapshot key nesting is too deep".into());
+    }
     let tag = read_u8(bytes, pos)?;
     Ok(match tag {
         0 => KeyValue::Int(read_i64(bytes, pos)?),
         1 => KeyValue::Bool(read_u8(bytes, pos)? != 0),
         2 => KeyValue::Str(read_string(bytes, pos)?),
         3 => {
-            let len = read_len(bytes, pos)?;
-            let mut items = Vec::with_capacity(len);
+            let len = read_collection_len(bytes, pos, 1)?;
+            let mut items = Vec::new();
             for _ in 0..len {
-                items.push(decode_key(bytes, pos)?);
+                items.push(decode_key(bytes, pos, depth + 1)?);
             }
             KeyValue::Tuple(items)
         }
         4 => {
-            let type_id = TypeId(read_len(bytes, pos)? as u32);
-            let len = read_len(bytes, pos)?;
-            let mut fields = Vec::with_capacity(len);
+            let type_id = TypeId(read_u32(bytes, pos)?);
+            let len = read_collection_len(bytes, pos, 1)?;
+            let mut fields = Vec::new();
             for _ in 0..len {
-                fields.push(decode_key(bytes, pos)?);
+                fields.push(decode_key(bytes, pos, depth + 1)?);
             }
             KeyValue::Struct(type_id, fields)
         }
         5 => {
-            let type_id = TypeId(read_len(bytes, pos)? as u32);
+            let type_id = TypeId(read_u32(bytes, pos)?);
             let variant = read_len(bytes, pos)?;
-            let len = read_len(bytes, pos)?;
-            let mut payload = Vec::with_capacity(len);
+            let len = read_collection_len(bytes, pos, 1)?;
+            let mut payload = Vec::new();
             for _ in 0..len {
-                payload.push(decode_key(bytes, pos)?);
+                payload.push(decode_key(bytes, pos, depth + 1)?);
             }
             KeyValue::Enum(type_id, variant, payload)
         }
@@ -1121,18 +1201,18 @@ fn decode_key(bytes: &[u8], pos: &mut usize) -> Result<martite_runtime::KeyValue
             if read_u8(bytes, pos)? == 0 {
                 KeyValue::Option(None)
             } else {
-                KeyValue::Option(Some(Box::new(decode_key(bytes, pos)?)))
+                KeyValue::Option(Some(Box::new(decode_key(bytes, pos, depth + 1)?)))
             }
         }
         7 => {
             if read_u8(bytes, pos)? == 0 {
-                KeyValue::Result(Ok(Box::new(decode_key(bytes, pos)?)))
+                KeyValue::Result(Ok(Box::new(decode_key(bytes, pos, depth + 1)?)))
             } else {
-                KeyValue::Result(Err(Box::new(decode_key(bytes, pos)?)))
+                KeyValue::Result(Err(Box::new(decode_key(bytes, pos, depth + 1)?)))
             }
         }
         8 => {
-            let type_id = TypeId(read_len(bytes, pos)? as u32);
+            let type_id = TypeId(read_u32(bytes, pos)?);
             let token = read_string(bytes, pos)?;
             KeyValue::Handle(type_id, token)
         }
@@ -1147,9 +1227,12 @@ fn read_u8(bytes: &[u8], pos: &mut usize) -> Result<u8, String> {
 }
 
 fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64, String> {
-    let slice = bytes.get(*pos..*pos + 8).ok_or("truncated snapshot")?;
+    let rest = bytes.get(*pos..).ok_or("truncated snapshot")?;
+    let slice = rest.get(..8).ok_or("truncated snapshot")?;
     *pos += 8;
-    Ok(u64::from_le_bytes(slice.try_into().unwrap()))
+    Ok(u64::from_le_bytes(
+        slice.try_into().map_err(|_| "truncated snapshot")?,
+    ))
 }
 
 fn read_i64(bytes: &[u8], pos: &mut usize) -> Result<i64, String> {
@@ -1157,19 +1240,195 @@ fn read_i64(bytes: &[u8], pos: &mut usize) -> Result<i64, String> {
 }
 
 fn read_len(bytes: &[u8], pos: &mut usize) -> Result<usize, String> {
-    Ok(read_u64(bytes, pos)? as usize)
+    usize::try_from(read_u64(bytes, pos)?).map_err(|_| "snapshot length is too large".into())
+}
+
+fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, String> {
+    u32::try_from(read_len(bytes, pos)?).map_err(|_| "snapshot type id is too large".into())
+}
+
+fn read_collection_len(
+    bytes: &[u8],
+    pos: &mut usize,
+    min_item_bytes: usize,
+) -> Result<usize, String> {
+    let len = read_len(bytes, pos)?;
+    let remaining = bytes.len().saturating_sub(*pos);
+    if len > remaining / min_item_bytes.max(1) {
+        return Err("snapshot container length exceeds remaining bytes".into());
+    }
+    Ok(len)
 }
 
 fn read_string(bytes: &[u8], pos: &mut usize) -> Result<String, String> {
     let len = read_len(bytes, pos)?;
-    let slice = bytes.get(*pos..*pos + len).ok_or("truncated snapshot string")?;
+    let remaining = bytes.len().saturating_sub(*pos);
+    if len > remaining {
+        return Err("truncated snapshot string".into());
+    }
+    let slice = &bytes[*pos..*pos + len];
     *pos += len;
     String::from_utf8(slice.to_vec()).map_err(|_| "invalid UTF-8 in snapshot".into())
 }
 
-/// Convenience for tests and examples: a provider rooted at a directory.
+fn validate_snapshot_value(
+    value: &Value,
+    program: &CheckedProgram,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > MAX_VALUE_DEPTH {
+        return Err("snapshot value nesting is too deep".into());
+    }
+    match value {
+        Value::Unit
+        | Value::Int(_)
+        | Value::Float(_)
+        | Value::Bool(_)
+        | Value::Str(_)
+        | Value::Range { .. }
+        | Value::Option(None) => Ok(()),
+        Value::List(items) | Value::Tuple(items) => {
+            for item in items.iter() {
+                validate_snapshot_value(item, program, depth + 1)?;
+            }
+            Ok(())
+        }
+        Value::Map(map) => {
+            for (key, value) in map.entries() {
+                validate_snapshot_key(key, program, depth + 1)?;
+                validate_snapshot_value(value, program, depth + 1)?;
+            }
+            Ok(())
+        }
+        Value::Struct(value) => {
+            let Some(def) = program.types.get(value.type_id) else {
+                return Err("snapshot references an unknown struct type".into());
+            };
+            let TypeDefKind::Struct { fields } = &def.kind else {
+                return Err("snapshot struct type is not a struct".into());
+            };
+            if fields.len() != value.fields.len() {
+                return Err("snapshot struct field count does not match its type".into());
+            }
+            for field in &value.fields {
+                validate_snapshot_value(field, program, depth + 1)?;
+            }
+            Ok(())
+        }
+        Value::Enum(value) => {
+            let Some(def) = program.types.get(value.type_id) else {
+                return Err("snapshot references an unknown enum type".into());
+            };
+            let TypeDefKind::Enum { variants } = &def.kind else {
+                return Err("snapshot enum type is not an enum".into());
+            };
+            let Some(variant) = variants.get(value.variant) else {
+                return Err("snapshot enum variant is out of range".into());
+            };
+            if variant.payload.len() != value.payload.len() {
+                return Err("snapshot enum payload count does not match its variant".into());
+            }
+            for field in &value.payload {
+                validate_snapshot_value(field, program, depth + 1)?;
+            }
+            Ok(())
+        }
+        Value::Option(Some(value)) => validate_snapshot_value(value, program, depth + 1),
+        Value::Result(Ok(value)) | Value::Result(Err(value)) => {
+            validate_snapshot_value(value, program, depth + 1)
+        }
+        Value::Handle(value) => {
+            let Some(def) = program.types.get(value.type_id) else {
+                return Err("snapshot references an unknown handle type".into());
+            };
+            if matches!(&def.kind, TypeDefKind::Opaque) {
+                Ok(())
+            } else {
+                Err("snapshot handle type is not opaque".into())
+            }
+        }
+        Value::Fn(_) | Value::Builtin(_) | Value::BuiltinModuleFn { .. } => {
+            Err("snapshot contains a function value".into())
+        }
+    }
+}
+
+fn validate_snapshot_key(
+    key: &martite_runtime::KeyValue,
+    program: &CheckedProgram,
+    depth: usize,
+) -> Result<(), String> {
+    use martite_runtime::KeyValue;
+    if depth > MAX_VALUE_DEPTH {
+        return Err("snapshot key nesting is too deep".into());
+    }
+    match key {
+        KeyValue::Int(_) | KeyValue::Bool(_) | KeyValue::Str(_) => Ok(()),
+        KeyValue::Tuple(items) => {
+            for item in items.iter() {
+                validate_snapshot_key(item, program, depth + 1)?;
+            }
+            Ok(())
+        }
+        KeyValue::Struct(type_id, fields) => {
+            let Some(def) = program.types.get(*type_id) else {
+                return Err("snapshot key references an unknown struct type".into());
+            };
+            let TypeDefKind::Struct { fields: def_fields } = &def.kind else {
+                return Err("snapshot key struct type is not a struct".into());
+            };
+            if def_fields.len() != fields.len() {
+                return Err("snapshot key field count does not match its type".into());
+            }
+            for field in fields {
+                validate_snapshot_key(field, program, depth + 1)?;
+            }
+            Ok(())
+        }
+        KeyValue::Enum(type_id, variant, fields) => {
+            let Some(def) = program.types.get(*type_id) else {
+                return Err("snapshot key references an unknown enum type".into());
+            };
+            let TypeDefKind::Enum { variants } = &def.kind else {
+                return Err("snapshot key enum type is not an enum".into());
+            };
+            let Some(variant) = variants.get(*variant) else {
+                return Err("snapshot key enum variant is out of range".into());
+            };
+            if variant.payload.len() != fields.len() {
+                return Err("snapshot key payload count does not match its variant".into());
+            }
+            for field in fields {
+                validate_snapshot_key(field, program, depth + 1)?;
+            }
+            Ok(())
+        }
+        KeyValue::Option(Some(value))
+        | KeyValue::Result(Ok(value))
+        | KeyValue::Result(Err(value)) => validate_snapshot_key(value, program, depth + 1),
+        KeyValue::Option(None) => Ok(()),
+        KeyValue::Handle(type_id, _) => {
+            let Some(def) = program.types.get(*type_id) else {
+                return Err("snapshot key references an unknown handle type".into());
+            };
+            if matches!(&def.kind, TypeDefKind::Opaque) {
+                Ok(())
+            } else {
+                Err("snapshot key handle type is not opaque".into())
+            }
+        }
+    }
+}
+
+/// Convenience for tests and examples: a sandboxed provider rooted at a directory.
 pub fn fs_provider(root: impl Into<std::path::PathBuf>) -> FileSystemProvider {
     FileSystemProvider::new(root)
+}
+
+/// Convenience for the standalone CLI host or an embedding that explicitly
+/// wants ambient filesystem authority.
+pub fn fs_provider_unrestricted(root: impl Into<std::path::PathBuf>) -> FileSystemProvider {
+    FileSystemProvider::unrestricted(root)
 }
 
 /// Convenience for in-memory embeddings.
@@ -1179,4 +1438,37 @@ pub fn memory_provider(files: &[(&str, &str)]) -> MemoryProvider {
         provider.insert(*path, *text);
     }
     provider
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_length_overflow_is_rejected() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        let mut pos = 0;
+        let _ = read_len(&bytes, &mut pos);
+        let mut pos = 0;
+        assert!(read_collection_len(&bytes, &mut pos, 1).is_err());
+    }
+
+    #[test]
+    fn snapshot_string_length_is_bounded_by_remaining_bytes() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&100u64.to_le_bytes());
+        bytes.extend_from_slice(b"short");
+        let mut pos = 0;
+        assert!(read_string(&bytes, &mut pos).is_err());
+    }
+
+    #[test]
+    fn api_versions_are_strict() {
+        assert_eq!(parse_api("1.0"), Ok((1, 0)));
+        assert!(parse_api("1").is_err());
+        assert!(parse_api("1.0.0").is_err());
+        assert!(parse_api("1.x").is_err());
+        assert!(parse_api("1.0junk").is_err());
+    }
 }

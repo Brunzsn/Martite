@@ -7,6 +7,7 @@ description = "Spans, source maps, diagnostics, and load limits for Martite"
 publish = false
 
 [dependencies]
+cap-std.workspace = true
 
 [lints]
 workspace = true

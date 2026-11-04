@@ -68,12 +68,7 @@ fn run_executes_a_script_and_passes_arguments() {
         "main.mt",
         "use std.env\nfn main() { print(\"hello {env.args()}\") }\n",
     );
-    let output = martite(&[
-        s("run"),
-        script.as_os_str(),
-        s("alpha"),
-        s("beta"),
-    ]);
+    let output = martite(&[s("run"), script.as_os_str(), s("alpha"), s("beta")]);
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(
         stdout(&output).contains("hello [\"alpha\", \"beta\"]"),
@@ -99,13 +94,14 @@ fn run_reports_a_panic_with_location_and_exit_101() {
 #[test]
 fn check_reports_e201_and_json_on_stdout() {
     let dir = TempDir::new("check");
-    let script = dir.file(
-        "main.mt",
-        "fn main() {\n    let x: int = \"no\"\n}\n",
-    );
+    let script = dir.file("main.mt", "fn main() {\n    let x: int = \"no\"\n}\n");
     let output = martite(&[s("check"), script.as_os_str()]);
     assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("E201"), "stderr: {}", stderr(&output));
+    assert!(
+        stderr(&output).contains("E201"),
+        "stderr: {}",
+        stderr(&output)
+    );
 
     let json = martite(&[s("check"), s("--json"), script.as_os_str()]);
     assert_eq!(json.status.code(), Some(1));
@@ -139,8 +135,16 @@ fn test_runs_passing_and_failing_blocks() {
     );
     let output = martite(&[s("test"), failing.as_os_str()]);
     assert_eq!(output.status.code(), Some(1));
-    assert!(stdout(&output).contains("FAILED"), "stdout: {}", stdout(&output));
-    assert!(stdout(&output).contains("boom"), "stdout: {}", stdout(&output));
+    assert!(
+        stdout(&output).contains("FAILED"),
+        "stdout: {}",
+        stdout(&output)
+    );
+    assert!(
+        stdout(&output).contains("boom"),
+        "stdout: {}",
+        stdout(&output)
+    );
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 
-use martite_check::TypeTable;
 use martite_check::TypeDefKind;
+use martite_check::TypeTable;
 
 use crate::value::{Value, key_from_value};
 
@@ -38,7 +38,10 @@ pub fn value_eq(a: &Value, b: &Value) -> bool {
         (Struct(a), Struct(b)) => {
             a.type_id == b.type_id
                 && a.fields.len() == b.fields.len()
-                && a.fields.iter().zip(b.fields.iter()).all(|(x, y)| value_eq(x, y))
+                && a.fields
+                    .iter()
+                    .zip(b.fields.iter())
+                    .all(|(x, y)| value_eq(x, y))
         }
         (Enum(a), Enum(b)) => {
             a.type_id == b.type_id
@@ -95,12 +98,11 @@ pub fn value_ord(a: &Value, b: &Value) -> Ordering {
             (Ok(_), Err(_)) => Ordering::Less,
             (Err(_), Ok(_)) => Ordering::Greater,
         },
-        (Struct(a), Struct(b)) => {
-            a.type_id
-                .0
-                .cmp(&b.type_id.0)
-                .then_with(|| sequence_cmp(&a.fields, &b.fields))
-        }
+        (Struct(a), Struct(b)) => a
+            .type_id
+            .0
+            .cmp(&b.type_id.0)
+            .then_with(|| sequence_cmp(&a.fields, &b.fields)),
         (Enum(a), Enum(b)) => a
             .type_id
             .0
@@ -255,7 +257,8 @@ fn write_show(out: &mut String, value: &Value, types: &TypeTable, top: bool) {
             let name = def.map(|d| d.name.as_str()).unwrap_or("<struct>");
             let _ = write!(out, "{name} {{ ");
             if let Some(TypeDefKind::Struct { fields }) = def.map(|d| &d.kind) {
-                for (i, (field, field_value)) in fields.iter().zip(value.fields.iter()).enumerate() {
+                for (i, (field, field_value)) in fields.iter().zip(value.fields.iter()).enumerate()
+                {
                     if i > 0 {
                         out.push_str(", ");
                     }

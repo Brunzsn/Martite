@@ -69,12 +69,13 @@ impl std::fmt::Display for ManifestError {
 impl std::error::Error for ManifestError {}
 
 pub fn parse_manifest(text: &str) -> Result<Manifest, ManifestError> {
-    let file: ManifestFile = toml::from_str(text)
-        .map_err(|e| ManifestError { message: format!("malformed plugin.toml: {e}") })?;
+    let file: ManifestFile = toml::from_str(text).map_err(|e| ManifestError {
+        message: format!("malformed plugin.toml: {e}"),
+    })?;
     let plugin = file.plugin;
-    let name = plugin
-        .name
-        .ok_or_else(|| ManifestError { message: "plugin.name is required".into() })?;
+    let name = plugin.name.ok_or_else(|| ManifestError {
+        message: "plugin.name is required".into(),
+    })?;
     if name.is_empty()
         || !name
             .chars()
@@ -84,36 +85,73 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, ManifestError> {
             message: "plugin.name must match [a-z0-9-]+".into(),
         });
     }
-    let version = plugin
-        .version
-        .ok_or_else(|| ManifestError { message: "plugin.version is required".into() })?;
-    let lang = plugin
-        .lang
-        .ok_or_else(|| ManifestError { message: "plugin.lang is required".into() })?;
+    let version = plugin.version.ok_or_else(|| ManifestError {
+        message: "plugin.version is required".into(),
+    })?;
+    let lang = plugin.lang.ok_or_else(|| ManifestError {
+        message: "plugin.lang is required".into(),
+    })?;
     if lang != "1" {
         return Err(ManifestError {
             message: format!("unsupported language edition `{lang}`"),
         });
     }
-    let api = plugin
-        .api
-        .ok_or_else(|| ManifestError { message: "plugin.api is required".into() })?;
-    let entry = plugin
-        .entry
-        .ok_or_else(|| ManifestError { message: "plugin.entry is required".into() })?;
+    let api = plugin.api.ok_or_else(|| ManifestError {
+        message: "plugin.api is required".into(),
+    })?;
+    let entry = plugin.entry.ok_or_else(|| ManifestError {
+        message: "plugin.entry is required".into(),
+    })?;
+    if entry.is_empty()
+        || entry.starts_with('/')
+        || entry.starts_with('\\')
+        || entry
+            .split(['/', '\\'])
+            .any(|part| part.is_empty() || part == ".." || part == ".")
+        || entry.contains(':')
+    {
+        return Err(ManifestError {
+            message: "plugin.entry must be a relative path inside the project".into(),
+        });
+    }
+    let settings = file
+        .settings
+        .unwrap_or_else(|| toml::Value::Table(Default::default()));
+    if !matches!(settings, toml::Value::Table(_)) {
+        return Err(ManifestError {
+            message: "settings must be a table".into(),
+        });
+    }
+    if contains_datetime(&settings) {
+        return Err(ManifestError {
+            message: "settings may not contain TOML datetimes".into(),
+        });
+    }
+    let mut grants = file.permissions.grant;
+    grants.sort();
+    grants.dedup();
     Ok(Manifest {
         name,
         version,
         lang,
         api,
         entry,
-        grants: file.permissions.grant,
+        grants,
         fuel: file.limits.fuel,
         memory: file.limits.memory,
         depth: file.limits.depth,
         deadline_ms: file.limits.deadline_ms,
-        settings: file.settings.unwrap_or(toml::Value::Table(Default::default())),
+        settings,
     })
+}
+
+fn contains_datetime(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Datetime(_) => true,
+        toml::Value::Array(items) => items.iter().any(contains_datetime),
+        toml::Value::Table(table) => table.values().any(contains_datetime),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -157,8 +195,9 @@ pub struct ToolConfig {
 }
 
 pub fn parse_tool_config(text: &str) -> Result<ToolConfig, ManifestError> {
-    let file: ToolFile = toml::from_str(text)
-        .map_err(|e| ManifestError { message: format!("malformed martite.toml: {e}") })?;
+    let file: ToolFile = toml::from_str(text).map_err(|e| ManifestError {
+        message: format!("malformed martite.toml: {e}"),
+    })?;
     Ok(ToolConfig {
         lang: file.tool.lang,
         lint_severity: file.lint.severity,
