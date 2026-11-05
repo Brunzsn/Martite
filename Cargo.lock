@@ -364,6 +364,7 @@ dependencies = [
  "martite-resolve",
  "martite-runtime",
  "martite-syntax",
+ "serde_json",
 ]
 
 [[package]]
@@ -378,12 +379,17 @@ dependencies = [
 name = "martite-conformance"
 version = "0.1.0"
 dependencies = [
+ "martite",
  "martite-base",
  "martite-check",
+ "martite-config",
  "martite-driver",
+ "martite-fmt",
+ "martite-lint",
  "martite-resolve",
  "martite-runtime",
  "martite-syntax",
+ "toml",
 ]
 
 [[package]]

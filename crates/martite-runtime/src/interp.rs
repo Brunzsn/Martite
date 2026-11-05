@@ -566,15 +566,29 @@ impl<'p, 'h> Runtime<'p, 'h> {
             StmtKind::Expr { expr, assign } => {
                 if let Some((op, rhs)) = assign {
                     let place = self.eval_place(expr)?;
-                    let lhs = self.read_place(&place)?;
+                    let lhs = if matches!(op, AssignOp::Assign) {
+                        None
+                    } else {
+                        Some(self.read_place(&place)?)
+                    };
                     let rhs = self.eval_expr(rhs)?;
                     let value = match op {
                         AssignOp::Assign => rhs,
-                        AssignOp::Add => self.binary_values(BinaryOp::Add, lhs, rhs, stmt.span)?,
-                        AssignOp::Sub => self.binary_values(BinaryOp::Sub, lhs, rhs, stmt.span)?,
-                        AssignOp::Mul => self.binary_values(BinaryOp::Mul, lhs, rhs, stmt.span)?,
-                        AssignOp::Div => self.binary_values(BinaryOp::Div, lhs, rhs, stmt.span)?,
-                        AssignOp::Rem => self.binary_values(BinaryOp::Rem, lhs, rhs, stmt.span)?,
+                        AssignOp::Add => {
+                            self.binary_values(BinaryOp::Add, lhs.unwrap(), rhs, stmt.span)?
+                        }
+                        AssignOp::Sub => {
+                            self.binary_values(BinaryOp::Sub, lhs.unwrap(), rhs, stmt.span)?
+                        }
+                        AssignOp::Mul => {
+                            self.binary_values(BinaryOp::Mul, lhs.unwrap(), rhs, stmt.span)?
+                        }
+                        AssignOp::Div => {
+                            self.binary_values(BinaryOp::Div, lhs.unwrap(), rhs, stmt.span)?
+                        }
+                        AssignOp::Rem => {
+                            self.binary_values(BinaryOp::Rem, lhs.unwrap(), rhs, stmt.span)?
+                        }
                     };
                     self.write_place(place, value)?;
                     self.check_memory()?;

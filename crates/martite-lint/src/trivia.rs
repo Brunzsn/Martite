@@ -13,6 +13,25 @@ pub fn whitespace_only(text: &str, start: u32, end: u32) -> bool {
     text[start..end].chars().all(char::is_whitespace)
 }
 
+/// The start of an item including a preceding `pub` keyword. AST spans start
+/// at `fn`, `struct`, `enum`, or `const`, so docs and suppressions written
+/// directly above a public item would otherwise appear detached.
+pub fn item_start(text: &str, start: u32) -> u32 {
+    let start = start.min(text.len() as u32) as usize;
+    let before = &text[..start];
+    let trimmed = before.trim_end();
+    if let Some(prefix) = trimmed.strip_suffix("pub") {
+        let boundary = prefix
+            .chars()
+            .next_back()
+            .map_or(true, |ch| ch.is_whitespace() || ch == '{' || ch == '}');
+        if boundary {
+            return prefix.len() as u32;
+        }
+    }
+    start as u32
+}
+
 /// Comments directly before `start`, with only whitespace between them and the
 /// element. Blank lines do not detach a comment. Returned in source order.
 pub fn preceding_comments<'a>(program: &'a Program, text: &str, start: u32) -> Vec<&'a Comment> {

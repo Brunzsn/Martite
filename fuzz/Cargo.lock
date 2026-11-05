@@ -246,12 +246,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "martite-driver"
+version = "0.1.0"
+dependencies = [
+ "martite-base",
+ "martite-check",
+ "martite-resolve",
+ "martite-syntax",
+]
+
+[[package]]
 name = "martite-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
  "libfuzzer-sys",
  "martite-base",
+ "martite-driver",
  "martite-runtime",
  "martite-syntax",
 ]

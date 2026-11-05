@@ -2382,7 +2382,7 @@ impl<'a> Formatter<'a> {
             }
             StmtKind::While { cond, body } => {
                 let mut docs = vec![Doc::text("while "), self.expr(cond), Doc::text(" ")];
-                docs.push(self.block(body));
+                docs.push(self.block_expanded(body));
                 Doc::concat(docs)
             }
             StmtKind::For {
@@ -2393,7 +2393,7 @@ impl<'a> Formatter<'a> {
                 let mut docs = vec![Doc::text("for "), self.pattern(pattern), Doc::text(" in ")];
                 docs.push(self.expr(iter));
                 docs.push(Doc::text(" "));
-                docs.push(self.block(body));
+                docs.push(self.block_expanded(body));
                 Doc::concat(docs)
             }
             StmtKind::Return(value) => {

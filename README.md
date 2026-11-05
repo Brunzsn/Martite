@@ -98,8 +98,25 @@ An embedding that deliberately wants ambient access must opt in with
 cargo test --workspace
 ```
 
-The conformance crate covers representative failures for E001–E508, the normative `Show`
-format, runtime panics, fuel/memory limits, plugin state, snapshots, and host grants.
-The lint crate covers syntax and checked-tier rules, suppression and config precedence,
-project-level fixes, and the `martite lint` CLI. The formatter crate covers section 14
-golden fixtures, idempotence, AST equality, comment placement, and the `martite fmt` CLI.
+`martite-conformance` is the cross-cutting section 13 suite:
+
+- one failing and one passing fixture for every E-code, including E508/E509;
+- one failing and one passing fixture for every lint rule, tier metadata,
+  syntax-only behavior, documented exemptions, primary spans, and suppression;
+- golden preset/group/severity/threshold/option/override and glob tests;
+- golden `Show`, fuel, memory, depth, deadline, panic, and trap tests;
+- grammar fixtures for the section 10 parser notes;
+- plugin state, snapshots, handles, grants, settings, and test doubles;
+- formatter idempotence, AST equality, comment survival, and suppression
+  invariance.
+
+The checker fuzz target lives in the separate `fuzz/` workspace:
+
+```sh
+cd fuzz
+cargo fuzz run checker -- -runs=10000
+```
+
+The deterministic corpus is replayed by the normal workspace test suite, so CI
+does not need `cargo-fuzz` to catch the checked-in regressions. See
+`fuzz/README.md` for the other targets.

@@ -1204,7 +1204,9 @@ impl<'a> Loader<'a> {
             }
             let mut state: HashMap<String, u8> = HashMap::new();
             let mut stack = Vec::new();
-            for name in consts.keys().cloned().collect::<Vec<_>>() {
+            let mut names: Vec<String> = consts.keys().cloned().collect();
+            names.sort();
+            for name in names {
                 self.visit_const(&name, &consts, &mut state, &mut stack, ModuleId(i as u32));
             }
         }

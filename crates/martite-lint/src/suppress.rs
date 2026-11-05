@@ -330,40 +330,57 @@ fn collect_elements(program: &Program, text: &str) -> Vec<Element> {
 
 fn collect_item(item: &Item, text: &str, out: &mut Vec<Element>) {
     match item {
-        Item::Use(_) | Item::Const(_) => push(out, item.span(), item.span()),
+        Item::Use(_) | Item::Const(_) => {
+            let start = trivia::item_start(text, item.span().start);
+            push(
+                out,
+                Span::new(start, item.span().end),
+                Span::new(start, item.span().end),
+            );
+        }
         Item::Struct(decl) => {
-            push(out, decl.span, brace_head(text, decl.span));
+            let start = trivia::item_start(text, decl.span.start);
+            let span = Span::new(start, decl.span.end);
+            push(out, span, brace_head(text, span));
             for field in &decl.fields {
                 push(out, field.span, field.span);
             }
         }
         Item::Enum(decl) => {
-            push(out, decl.span, brace_head(text, decl.span));
+            let start = trivia::item_start(text, decl.span.start);
+            let span = Span::new(start, decl.span.end);
+            push(out, span, brace_head(text, span));
             for variant in &decl.variants {
                 push(out, variant.span, variant.span);
             }
         }
         Item::Impl(decl) => {
-            push(out, decl.span, brace_head(text, decl.span));
+            let start = trivia::item_start(text, decl.span.start);
+            let span = Span::new(start, decl.span.end);
+            push(out, span, brace_head(text, span));
             for method in &decl.methods {
+                let method_start = trivia::item_start(text, method.span.start);
+                let method_span = Span::new(method_start, method.span.end);
                 let head = method
                     .body
                     .as_ref()
-                    .map(|body| block_head(method.span, body))
-                    .unwrap_or(method.span);
-                push(out, method.span, head);
+                    .map(|body| block_head(method_span, body))
+                    .unwrap_or(method_span);
+                push(out, method_span, head);
                 if let Some(body) = &method.body {
                     collect_block(body, text, out);
                 }
             }
         }
         Item::Fn(decl) => {
+            let start = trivia::item_start(text, decl.span.start);
+            let span = Span::new(start, decl.span.end);
             let head = decl
                 .body
                 .as_ref()
-                .map(|body| block_head(decl.span, body))
-                .unwrap_or(decl.span);
-            push(out, decl.span, head);
+                .map(|body| block_head(span, body))
+                .unwrap_or(span);
+            push(out, span, head);
             if let Some(body) = &decl.body {
                 collect_block(body, text, out);
             }

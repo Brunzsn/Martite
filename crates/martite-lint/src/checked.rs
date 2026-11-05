@@ -1391,6 +1391,13 @@ impl<'a> Checked<'a> {
         if self.analysis.function_value_uses.contains(&sig.def) {
             return None;
         }
+        let mut declaration = declaration;
+        let bytes = self.module.text.as_bytes();
+        while (declaration.end as usize) < bytes.len()
+            && matches!(bytes[declaration.end as usize], b' ' | b'\t')
+        {
+            declaration.end += 1;
+        }
         let mut edits = vec![FixEdit::new(declaration, "")];
         if !param.is_self {
             let index = sig
@@ -1823,7 +1830,13 @@ fn find_mut_keyword(text: &str, span: Span) -> Option<Span> {
     let end = span.end.min(text.len() as u32) as usize;
     let offset = text[start..end].find("mut")?;
     let at = start + offset;
-    Some(Span::new(at as u32, (at + 3) as u32))
+    let mut after = at + 3;
+    // Remove the separator too, so the fix does not leave `fn f( x)` or
+    // `f( x)` behind.
+    while after < text.len() && matches!(text.as_bytes()[after], b' ' | b'\t') {
+        after += 1;
+    }
+    Some(Span::new(at as u32, after as u32))
 }
 
 fn line_removal_span(text: &str, span: Span) -> Span {

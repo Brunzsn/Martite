@@ -13,6 +13,7 @@ arbitrary = { version = "1", features = ["derive"] }
 martite-base = { path = "../crates/martite-base" }
 martite-syntax = { path = "../crates/martite-syntax" }
 martite-runtime = { path = "../crates/martite-runtime" }
+martite-driver = { path = "../crates/martite-driver" }
 
 [[bin]]
 name = "lexer"
@@ -29,6 +30,12 @@ doc = false
 [[bin]]
 name = "json"
 path = "fuzz_targets/json.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "checker"
+path = "fuzz_targets/checker.rs"
 test = false
 doc = false
 

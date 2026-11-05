@@ -1,6 +1,8 @@
+fn produce()->int{1}
+fn extremely_long_function_name_with_many_words(first_argument:int,second_argument:int,third_argument:int)->int{first_argument+second_argument+third_argument}
 fn main(){
-let short_value=1
-let long_value=first_long_expression_name+second_long_expression_name+third_long_expression_name+fourth_long_expression_name
-let list_value=[first_long_expression_name,second_long_expression_name,third_long_expression_name,fourth_long_expression_name]
-let call_value=some_function(first_long_expression_name,second_long_expression_name,third_long_expression_name)
+var total=0
+total=total+1
+let value=produce()
+let long_variable_name=extremely_long_function_name_with_many_words(produce(),produce(),produce())
 }

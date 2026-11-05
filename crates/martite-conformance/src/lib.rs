@@ -1,16 +1,24 @@
 //! Shared harness for the Martite conformance suite.
 
-use martite_base::{Code, LoadLimits, MemoryProvider, Severity, SourceMap};
-use martite_driver::{LoadOptions, LoadedProgram, load};
-use martite_resolve::InterfaceSource;
-use martite_runtime::{ExecLimits, Runtime, Trap, Value};
+use std::collections::HashSet;
 
+use martite_base::{
+    Code, Diagnostic, LoadLimits, MemoryProvider, Severity, SourceId, SourceMap, Span,
+};
+use martite_config::ToolConfig;
+use martite_driver::{LoadOptions, LoadedProgram, load};
+use martite_lint::{LintInputs, ManifestInput, SettingsResolver, lint};
+use martite_resolve::InterfaceSource;
+use martite_runtime::{ExecLimits, MainResult, Runtime, Trap, Value};
+
+#[derive(Debug, Clone)]
 pub struct Case {
     pub files: Vec<(String, String)>,
     pub entry: String,
     pub interfaces: Vec<InterfaceSource>,
     pub grants: Vec<String>,
     pub limits: LoadLimits,
+    pub edition: String,
 }
 
 impl Case {
@@ -21,6 +29,7 @@ impl Case {
             interfaces: Vec::new(),
             grants: Vec::new(),
             limits: LoadLimits::default(),
+            edition: "1".into(),
         }
     }
 
@@ -47,6 +56,16 @@ impl Case {
         self
     }
 
+    pub fn limits(mut self, limits: LoadLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    pub fn edition(mut self, edition: impl Into<String>) -> Self {
+        self.edition = edition.into();
+        self
+    }
+
     pub fn load(&self) -> LoadedProgram {
         let mut provider = MemoryProvider::new();
         for (path, text) in &self.files {
@@ -59,7 +78,7 @@ impl Case {
                 interfaces: self.interfaces.clone(),
                 grants: self.grants.clone(),
                 limits: self.limits,
-                edition: "1".into(),
+                edition: self.edition.clone(),
             },
         )
     }
@@ -87,11 +106,208 @@ pub fn assert_code(source: &str, expected: Code) {
     );
 }
 
+/// Assert that a case has no compile diagnostics.
+pub fn assert_clean(case: &Case) {
+    let loaded = case.load();
+    assert!(
+        loaded.diagnostics.is_empty(),
+        "expected a clean load, got:\n{}",
+        loaded
+            .diagnostics
+            .iter()
+            .map(|d| d.render(&loaded.sources))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Assert one diagnostic with an optional primary-span source slice, message
+/// substring, and help substring.
+pub fn assert_diagnostic(
+    case: &Case,
+    code: Code,
+    span_text: Option<&str>,
+    message_contains: Option<&str>,
+    help_contains: Option<&str>,
+) {
+    let loaded = case.load();
+    let matching: Vec<&Diagnostic> = loaded
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == code)
+        .collect();
+    assert!(
+        !matching.is_empty(),
+        "expected {code}, got {:?}: {}",
+        loaded
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .collect::<Vec<_>>(),
+        loaded
+            .diagnostics
+            .iter()
+            .map(|d| d.render(&loaded.sources))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let mut failures = Vec::new();
+    for diagnostic in &matching {
+        if let Some(expected) = span_text {
+            let actual = diagnostic
+                .source
+                .and_then(|source| loaded.sources.get(source))
+                .zip(diagnostic.span)
+                .map(|(file, span)| file.slice(span))
+                .unwrap_or("");
+            if actual != expected {
+                failures.push(format!(
+                    "span mismatch: expected {expected:?}, got {actual:?} ({})",
+                    diagnostic.render(&loaded.sources)
+                ));
+                continue;
+            }
+        }
+        if let Some(expected) = message_contains {
+            if !diagnostic.message.contains(expected) {
+                failures.push(format!(
+                    "message mismatch: expected substring {expected:?}, got {:?}",
+                    diagnostic.message
+                ));
+                continue;
+            }
+        }
+        if let Some(expected) = help_contains {
+            match &diagnostic.help {
+                Some(help) if help.contains(expected) => {}
+                other => failures.push(format!(
+                    "help mismatch: expected {expected:?}, got {other:?}"
+                )),
+            }
+        }
+        if failures.is_empty() {
+            return;
+        }
+    }
+    panic!("{code} assertions failed:\n{}", failures.join("\n"));
+}
+
+pub struct LintRun {
+    pub sources: SourceMap,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+impl LintRun {
+    pub fn codes(&self) -> Vec<Code> {
+        self.diagnostics.iter().map(|d| d.code).collect()
+    }
+
+    pub fn find(&self, code: Code) -> Option<&Diagnostic> {
+        self.diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == code)
+    }
+
+    pub fn span_text(&self, diagnostic: &Diagnostic) -> &str {
+        diagnostic
+            .source
+            .and_then(|source| self.sources.get(source))
+            .zip(diagnostic.span)
+            .map(|(file, span)| file.slice(span))
+            .unwrap_or("")
+    }
+
+    pub fn assert_has(&self, code: Code, span_text: Option<&str>, message_contains: Option<&str>) {
+        let Some(diagnostic) = self.find(code) else {
+            panic!(
+                "expected {code}, got {:?}:\n{}",
+                self.codes(),
+                self.diagnostics
+                    .iter()
+                    .map(|d| d.render(&self.sources))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        };
+        if let Some(expected) = span_text {
+            let actual = self.span_text(diagnostic);
+            assert_eq!(actual, expected, "primary span for {code}");
+        }
+        if let Some(expected) = message_contains {
+            assert!(
+                diagnostic.message.contains(expected),
+                "message for {code}: {:?} does not contain {expected:?}",
+                diagnostic.message
+            );
+        }
+    }
+
+    pub fn assert_not(&self, code: Code) {
+        assert!(
+            self.find(code).is_none(),
+            "unexpected {code}:\n{}",
+            self.diagnostics
+                .iter()
+                .map(|d| d.render(&self.sources))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+}
+
+/// Load a case and lint it. The case must type-check.
+pub fn lint_case(
+    case: &Case,
+    config: &ToolConfig,
+    selected: Option<HashSet<Code>>,
+    manifest_text: Option<&str>,
+) -> LintRun {
+    let loaded = case.load();
+    let errors: Vec<&Diagnostic> = loaded
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == Severity::Error)
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "lint fixture must type-check:\n{}",
+        errors
+            .iter()
+            .map(|d| d.render(&loaded.sources))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let program = loaded.program.as_ref().expect("checked program");
+    let resolver = SettingsResolver::new(config, selected).expect("valid settings");
+    let mut sources = loaded.sources.clone();
+    let manifest_source = manifest_text.map(|text| sources.add("plugin.toml", text));
+    let inputs = match (manifest_source, manifest_text) {
+        (Some(source), Some(text)) => LintInputs {
+            manifest: Some(ManifestInput {
+                source,
+                text,
+                grants: &case.grants,
+            }),
+        },
+        _ => LintInputs::default(),
+    };
+    let output = lint(program, &sources, &resolver, "", &inputs);
+    LintRun {
+        sources,
+        diagnostics: output.diagnostics,
+    }
+}
+
 pub fn run(source: &str) -> Vec<String> {
     run_case(Case::single(source)).expect("program should run")
 }
 
 pub fn run_case(case: Case) -> Result<Vec<String>, Trap> {
+    run_case_with_limits(&case, ExecLimits::default()).map(|main| main.log)
+}
+
+pub fn run_case_with_limits(case: &Case, limits: ExecLimits) -> Result<MainResult, Trap> {
     let loaded = case.load();
     if loaded
         .diagnostics
@@ -110,7 +326,7 @@ pub fn run_case(case: Case) -> Result<Vec<String>, Trap> {
         );
     }
     let program = loaded.program.expect("program");
-    let mut runtime = Runtime::new(&program, ExecLimits::default());
+    let mut runtime = Runtime::new(&program, limits);
     let main = runtime.run_main()?;
     if let Value::Result(Err(error)) = &main.value {
         return Err(Trap::Panic {
@@ -120,9 +336,94 @@ pub fn run_case(case: Case) -> Result<Vec<String>, Trap> {
             trace: Vec::new(),
         });
     }
-    Ok(main.log)
+    Ok(main)
 }
 
 pub fn trap(source: &str) -> Trap {
     run_case(Case::single(source)).expect_err("program should trap")
+}
+
+fn checked_program(case: &Case) -> martite_check::CheckedProgram {
+    let loaded = case.load();
+    assert!(
+        !loaded
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Severity::Error),
+        "program must load cleanly:\n{}",
+        loaded
+            .diagnostics
+            .iter()
+            .map(|d| d.render(&loaded.sources))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    loaded.program.expect("program")
+}
+
+fn run_with_fuel(
+    program: &martite_check::CheckedProgram,
+    fuel: u64,
+    memory: u64,
+) -> Result<(), Trap> {
+    let mut runtime = Runtime::new(
+        program,
+        ExecLimits {
+            fuel,
+            memory,
+            depth: 200,
+            deadline: None,
+        },
+    );
+    runtime.run_main().map(|_| ())
+}
+
+/// Smallest fuel budget that lets the program finish. The interpreter traps
+/// when a charge drives the remaining budget to zero, so this is one more
+/// than the total specified cost.
+pub fn min_fuel(case: &Case) -> u64 {
+    let program = checked_program(case);
+    let mut low = 1u64;
+    let mut high = 1_000_000u64;
+    assert!(
+        run_with_fuel(&program, high, 8 << 20).is_ok(),
+        "fixture needs more than the probe cap"
+    );
+    while low < high {
+        let mid = low + (high - low) / 2;
+        match run_with_fuel(&program, mid, 8 << 20) {
+            Ok(()) => high = mid,
+            Err(Trap::OutOfFuel) => low = mid + 1,
+            Err(trap) => panic!("unexpected trap while probing fuel: {trap:?}"),
+        }
+    }
+    low
+}
+
+/// Smallest memory budget that lets the program finish, i.e. its high-water
+/// mark under the specified accounting.
+pub fn min_memory(case: &Case) -> u64 {
+    let program = checked_program(case);
+    let mut low = 0u64;
+    let mut high = 8 << 20;
+    assert!(
+        run_with_fuel(&program, 1_000_000, high).is_ok(),
+        "fixture needs more than the probe cap"
+    );
+    while low < high {
+        let mid = low + (high - low) / 2;
+        match run_with_fuel(&program, 1_000_000, mid) {
+            Ok(()) => high = mid,
+            Err(Trap::OutOfMemory) => low = mid + 1,
+            Err(trap) => panic!("unexpected trap while probing memory: {trap:?}"),
+        }
+    }
+    low
+}
+
+pub fn source_slice(sources: &SourceMap, source: SourceId, span: Span) -> &str {
+    sources
+        .get(source)
+        .map(|file| file.slice(span))
+        .unwrap_or("")
 }

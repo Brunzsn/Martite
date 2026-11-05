@@ -124,9 +124,10 @@ impl<'a> SyntaxCtx<'a> {
                 });
             }
             Item::Const(constant) => {
+                let start = trivia::item_start(self.text, constant.span.start);
                 docs.push(DocElement {
-                    start: constant.span.start,
-                    span: constant.span,
+                    start,
+                    span: Span::new(start, constant.span.end),
                     kind: "constant",
                     name: constant.name.clone(),
                     is_pub: constant.is_pub,
@@ -137,9 +138,10 @@ impl<'a> SyntaxCtx<'a> {
             Item::Struct(decl) => self.walk_struct(decl, docs),
             Item::Enum(decl) => self.walk_enum(decl, docs),
             Item::Impl(decl) => {
+                let start = trivia::item_start(self.text, decl.span.start);
                 docs.push(DocElement {
-                    start: decl.span.start,
-                    span: decl.span,
+                    start,
+                    span: Span::new(start, decl.span.end),
                     kind: "impl",
                     name: decl.type_name.clone(),
                     is_pub: false,
@@ -188,9 +190,10 @@ impl<'a> SyntaxCtx<'a> {
         is_test: bool,
         docs: &mut Vec<DocElement>,
     ) {
+        let start = trivia::item_start(self.text, span.start);
         docs.push(DocElement {
-            start: span.start,
-            span,
+            start,
+            span: Span::new(start, span.end),
             kind,
             name: name.to_string(),
             is_pub,
@@ -274,9 +277,10 @@ impl<'a> SyntaxCtx<'a> {
     }
 
     fn walk_struct(&mut self, decl: &StructDecl, docs: &mut Vec<DocElement>) {
+        let start = trivia::item_start(self.text, decl.span.start);
         docs.push(DocElement {
-            start: decl.span.start,
-            span: decl.span,
+            start,
+            span: Span::new(start, decl.span.end),
             kind: "struct",
             name: decl.name.clone(),
             is_pub: decl.is_pub,
@@ -295,9 +299,10 @@ impl<'a> SyntaxCtx<'a> {
     }
 
     fn walk_enum(&mut self, decl: &EnumDecl, docs: &mut Vec<DocElement>) {
+        let start = trivia::item_start(self.text, decl.span.start);
         docs.push(DocElement {
-            start: decl.span.start,
-            span: decl.span,
+            start,
+            span: Span::new(start, decl.span.end),
             kind: "enum",
             name: decl.name.clone(),
             is_pub: decl.is_pub,
