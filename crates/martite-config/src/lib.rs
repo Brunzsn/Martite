@@ -174,10 +174,35 @@ pub struct ToolSection {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct LintSection {
+    pub preset: Option<String>,
+    #[serde(default)]
+    pub groups: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub severity: std::collections::HashMap<String, String>,
+    #[serde(default, alias = "threshold")]
+    pub thresholds: std::collections::HashMap<String, i64>,
     #[serde(default)]
-    pub threshold: std::collections::HashMap<String, i64>,
+    pub options: std::collections::HashMap<String, toml::Value>,
+    #[serde(default, rename = "override")]
+    pub overrides: Vec<LintOverride>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct LintOverride {
+    #[serde(default)]
+    pub paths: Vec<String>,
+    pub preset: Option<String>,
+    #[serde(default)]
+    pub groups: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub severity: std::collections::HashMap<String, String>,
+    #[serde(default, alias = "threshold")]
+    pub thresholds: std::collections::HashMap<String, i64>,
+    #[serde(default)]
+    pub options: std::collections::HashMap<String, toml::Value>,
+    #[serde(default)]
+    pub off: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -189,8 +214,12 @@ pub struct FormatSection {
 #[derive(Debug, Clone, Default)]
 pub struct ToolConfig {
     pub lang: Option<String>,
+    pub lint_preset: Option<String>,
+    pub lint_groups: std::collections::HashMap<String, String>,
     pub lint_severity: std::collections::HashMap<String, String>,
-    pub lint_threshold: std::collections::HashMap<String, i64>,
+    pub lint_thresholds: std::collections::HashMap<String, i64>,
+    pub lint_options: std::collections::HashMap<String, toml::Value>,
+    pub lint_overrides: Vec<LintOverride>,
     pub max_width: Option<usize>,
 }
 
@@ -200,8 +229,12 @@ pub fn parse_tool_config(text: &str) -> Result<ToolConfig, ManifestError> {
     })?;
     Ok(ToolConfig {
         lang: file.tool.lang,
+        lint_preset: file.lint.preset,
+        lint_groups: file.lint.groups,
         lint_severity: file.lint.severity,
-        lint_threshold: file.lint.threshold,
+        lint_thresholds: file.lint.thresholds,
+        lint_options: file.lint.options,
+        lint_overrides: file.lint.overrides,
         max_width: file.format.max_width,
     })
 }

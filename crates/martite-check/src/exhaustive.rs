@@ -45,6 +45,37 @@ pub fn is_exhaustive(arms: &[MatchArm], ty: &Ty, types: &TypeTable) -> bool {
     !useful(&matrix, &[P::Wild], &[ty.clone()], types)
 }
 
+/// Per-arm usefulness. An arm is useful when at least one of its alternatives
+/// is not covered by the earlier unguarded arms. Guarded arms never add
+/// coverage, so a guarded arm covered by an earlier unguarded arm is reported
+/// as redundant, while an uncovered guarded arm is useful.
+pub fn useful_arms(arms: &[MatchArm], ty: &Ty, types: &TypeTable) -> Vec<bool> {
+    if matches!(ty, Ty::Never | Ty::Error) {
+        return vec![false; arms.len()];
+    }
+    let mut matrix: Vec<Vec<P>> = Vec::new();
+    let mut out = Vec::with_capacity(arms.len());
+    for arm in arms {
+        let mut alternatives = Vec::new();
+        expand_or(&arm.pattern, &mut alternatives);
+        let mut rows = Vec::new();
+        let mut useful_any = false;
+        for pat in alternatives {
+            let mut row = Vec::new();
+            pattern_rep(&pat, ty, types, &mut row);
+            if useful(&matrix, &row, &[ty.clone()], types) {
+                useful_any = true;
+            }
+            rows.push(row);
+        }
+        if arm.guard.is_none() {
+            matrix.extend(rows);
+        }
+        out.push(useful_any);
+    }
+    out
+}
+
 fn expand_or<'a>(pat: &'a Pattern, out: &mut Vec<Pattern>) {
     match &pat.kind {
         PatKind::Or(alts) => {

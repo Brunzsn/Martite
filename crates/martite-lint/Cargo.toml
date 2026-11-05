@@ -11,6 +11,9 @@ martite-base.workspace = true
 martite-syntax.workspace = true
 martite-check.workspace = true
 martite-driver.workspace = true
+martite-config.workspace = true
+martite-resolve.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true

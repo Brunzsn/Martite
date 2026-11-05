@@ -410,8 +410,11 @@ version = "0.1.0"
 dependencies = [
  "martite-base",
  "martite-check",
+ "martite-config",
  "martite-driver",
+ "martite-resolve",
  "martite-syntax",
+ "toml",
 ]
 
 [[package]]

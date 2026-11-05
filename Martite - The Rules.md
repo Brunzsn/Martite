@@ -1,6 +1,6 @@
 # Martite: The Rules
 
-*Status: spec-freeze candidate, language edition 1. Sections 0 to 10 and 13 are normative. Section 11 (embedding API) is an illustrative sketch. Section 12 fixes lint IDs and meanings, but not severities.*
+*Status: spec-freeze candidate, language edition 1. Sections 0 to 10, 13, and 14 are normative. Section 11 (embedding API) is an illustrative sketch. Section 12 is normative for lint IDs, triggers, exemptions, tiers, primary spans, suppression, config resolution, and fix semantics; its severities, thresholds, and presets are recommended defaults that tools may tune.*
 
 A design for a small, statically typed, interpreted language with a linter-friendly core. **Martite's primary job is to be embedded in an application as its plugin language:** the host app exposes an API, and plugins are Martite programs that run sandboxed against it. It remains a complete general-purpose language, though. The core language and standard library have no ambient I/O, and the standalone CLI is simply one more host that happens to grant file and console access. The reference implementation (interpreter, linter, and an embedding crate) is planned in Rust; this document covers design only.
 
@@ -24,11 +24,12 @@ A feature only gets in if it passes five tests: a beginner can learn it in a few
 | Fuel is charged in proportion to work done, not just per node | A single built-in call such as `sorted` can't burn unbounded time for one unit of fuel |
 | `std.io` and `std.env` leave the core and become standalone-host modules | The core is pure and deterministic |
 | Language edition (`lang`) and interface version (`api`) are both declared in the manifest | Prelude and std growth can never silently break an existing plugin |
+| `martite fmt` has one canonical style (section 14), and `// allow` covers the next syntactic element rather than the next line | Formatting can never reorder, wrap, or reflow code in a way that changes what the linter reports |
 | `Eq`, `Ord`, and `Show` are structural, and the `Show` text format is specified | Interpolation, `print`, and sorting behave identically in every implementation |
 
 ## 0. Files, modules, editions, and load limits
 
-- **File types:** `.mt` source, `.mti` host interface, `plugin.toml` plugin manifest, `martite.toml` tool configuration (lint thresholds, severities, formatter options).
+- **File types:** `.mt` source, `.mti` host interface, `plugin.toml` plugin manifest, `martite.toml` tool configuration (lint presets, groups, severities, thresholds, options, formatter options).
 - **Encoding:** UTF-8. A leading BOM is ignored. `\r\n` is normalized to `\n` before lexing. Tabs are legal whitespace. A NUL byte is a lexical error.
 - **Modules:** a file is a module. The **project root** is the directory of the entry file (the manifest's `entry` for a plugin, the file given to `martite run` for a script). `use geometry.shapes` loads `<root>/geometry/shapes.mt`. `std.*` is built in. Host modules come from interface files (`app/editor.mti` is module `app.editor`). A module path that matches both a source file and an interface is E106.
 - **The interpreter never touches the filesystem.** It asks a `SourceProvider` for the text of a module path. The CLI supplies a filesystem provider, and an embedding supplies whatever it likes (an in-memory map, an archive).
@@ -55,10 +56,10 @@ A feature only gets in if it passes five tests: a beginner can learn it in a few
   - After a `.` in postfix position the lexer reads a plain decimal integer, never a float, so `t.0.1` means `(t.0).1`.
   - Strings: `"…"` with escapes `\n \r \t \0 \\ \" \{ \} \u{HEX}`. No raw newlines. Any other escape is E001.
 - **Interpolation:** `"{expr}"` where `expr` is any expression, converted with the `Show` format of section 9.2 (a `str` is inserted raw). The lexer tracks brace depth, so string literals and map literals may appear inside an interpolation. An empty `{}` is E001. An unescaped lone `}` is also E001, so write `\}` for a literal brace. Format specifications are not supported; use `x.round(2)`.
-- **Comments:** `//` and `///`. A `///` directly before an item is its doc comment, and anywhere else it is an ordinary comment. Comments are kept as trivia on tokens so the linter and formatter can see them.
-- **Suppression:** `// allow(L001)` or `// allow(L001, L002)` on the line above a diagnostic suppresses those lint IDs for diagnostics whose primary span starts on the next line. Compile errors (`E…`) cannot be suppressed.
+- **Comments:** `//` and `///`. A `///` directly before a *doc-able element* is its doc comment, and anywhere else it is an ordinary comment. Doc-able elements are top-level items, `impl` methods, struct fields, and enum variants; blank lines between the comment and the element do not detach it. Comments are kept as trivia on tokens so the linter and formatter can see them.
+- **Suppression:** `// allow(L001)` or `// allow(L001, L002)` suppresses those lint IDs for diagnostics whose primary span starts within the head of the next syntactic element: a statement, a struct field, an enum variant, an `impl` method, a match arm, or an item. The head is the whole element for simple statements, fields, variants, `const`, and `use`, and everything through the opening `{` for other items, `impl` methods, `if`, `while`, `for`, `match`, and block lambdas (section 12.3). Compile errors (`E…`) cannot be suppressed.
 - **Newlines** end statements. A newline is ignored when:
-  - the previous token is a binary operator, an assignment operator, `,`, `:`, `=>`, `->`, or an opening bracket;
+  - the previous token is a binary operator (including `|` in or-patterns), an assignment operator, `,`, `:`, `=>`, `->`, or an opening bracket;
   - the next token is `.` (method chains), `else`, `and`, `or`, or `??`, none of which can start a statement;
   - the innermost enclosing bracket is `()`, `[]`, or a **list-style brace** (struct, enum, impl, and match bodies, struct literals, map literals).
 
@@ -391,7 +392,7 @@ Every diagnostic carries a code, a primary span, a message, and an optional `hel
 - **Floats** follow IEEE 754 and never panic: `1.0 / 0.0` is `inf`. Conversions: `float(n)` rounds to the nearest float, and `int(f)` truncates toward zero and **panics** if `f` is NaN or out of range.
 - **Maps** iterate in **insertion order**, so output is deterministic. Overwriting a key keeps its position, and removing then re-inserting moves it to the end. `remove` is O(n) so that order is preserved.
 - **Slicing** `xs[a..b]` and `s[a..b]` panics unless `0 <= a <= b <= len` (for `..=`, `b` is inclusive).
-- **Panics** are uncatchable inside the language. They are index out of bounds, invalid slice, divide by zero, overflow, invalid `int(f)`, `expect` on `None`/`Err`, failed `assert`, and explicit `panic(msg)`. A script prints `panic: <msg> at <file>:<line>:<col>` to stderr and exits with status 101 (an `Err` from `main` exits with 1). A plugin hook **traps** (below). There are no exceptions; recoverable errors are `Result` values.
+- **Panics** are uncatchable inside the language. They are index out of bounds, invalid slice, divide by zero, overflow, invalid `int(f)`, `round` with a negative digit count, `replace` with an empty `from`, `expect` on `None`/`Err`, failed `assert`, and explicit `panic(msg)`. A script prints `panic: <msg> at <file>:<line>:<col>` to stderr and exits with status 101 (an `Err` from `main` exits with 1). A plugin hook **traps** (below). There are no exceptions; recoverable errors are `Result` values.
 - **`for`** iterates `list[T]` (yields `T`), `map[K,V]` (yields `(K,V)`), `str` (yields 1-char `str`), and `range` (yields `int`).
 - **`while true`** is the only infinite loop, and there is no `loop`.
 
@@ -476,7 +477,7 @@ Methods of generic types are typed like ordinary generic functions with the rece
 - `parse_int` accepts `-?[0-9]+` only (no whitespace, no `+`, no underscores) and returns `None` on overflow. `parse_float` accepts `-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?`, requiring digits on both sides of the decimal point; `.5`, `1.`, and `1.e2` return `None`. Anything else, including `NaN` and `inf`, also returns `None`.
 - `unwrap_or(d)` evaluates `d` eagerly. Use `??` for a lazy default.
 - `map`, `filter`, `enumerate`, `reversed`, `sorted`, `keys`, `values`, and `entries` are eager and return new lists.
-- Indexing `xs[i]` and `m[k]` panics if missing, and `.get` is the safe form. `martite lint` flags unguarded `expect`.
+- Indexing `xs[i]` and `m[k]` panics if missing, and `.get` is the safe form. `martite lint` flags unguarded `expect` in plugin code.
 - Strings are concatenated with `+`, and building a large string with repeated `+=` is quadratic (it is also fuel-charged), so prefer `list.join`.
 
 ### 9.4 Core modules (pure, always available, no grant)
@@ -627,52 +628,392 @@ let snap = inst.snapshot();                    // state is a data type, so it se
 
 ## 12. Linter design
 
-The linter is a set of rules over one immutable analysis result.
+The linter is a set of rules over one immutable analysis result. Rule IDs and meanings are fixed for the edition. Severities, thresholds, groups, and presets are defaults that tools may tune.
+
+### 12.1 Terms, analyses, and pipeline
+
+**Terms.** These definitions are normative for the rules in 12.5 and 12.6.
+
+- **Place.** A local, a parameter, or `self`, followed by any chain of `.field`, `.0`, and `[index]` projections. A `mut` parameter is a place; an immutable binding and `self` in a non-`mut self` method are places that cannot be written.
+- **Side-effect-free place.** A place whose index expressions are themselves side-effect-free expressions. Evaluating it does not call a function or mutate anything, though an index can still panic.
+- **Side-effect-free expression.** A literal, a side-effect-free place, a tuple/list/map literal whose elements are side-effect-free, a unary minus applied to a numeric literal, or a field/tuple projection of one. Calls, conversions other than `float(int)`, interpolation, `if`, `match`, blocks, and lambdas are not side-effect-free.
+- **Stable expression.** An expression whose repeated evaluation yields the same value with no side effects and no panic: a side-effect-free expression, or a chain of builtin methods that are not `mut self`, take no function argument, and are not listed in section 9.3 as panicking (`len`, `get`, `first`, `last`, `is_some`, `is_ok`, `find`, `contains`, and the like). `expect`, integer `abs`, integer `pow`, `round`, `replace`, indexing, and slicing are not stable. L008 uses this definition so that a guard such as `words.first().is_some()` can match a later `words.first().expect(…)`.
+- **Mutation.** A write to a place rooted at a binding: `=`, `op=`, a field/index/tuple store, passing the place as a `mut` argument, or calling a `mut self` method on the binding or a projection of it. Copy-out through a helper counts. Closures capture by value, so a write inside a closure is not a mutation of the enclosing binding (and is E404).
+- **Reachability.** The roots of a program are its `pub` items in every loaded module, its `on` handlers, `main`, and its `test` blocks. A function, method, or lambda is reachable when it is a root, is called, is used as a value, or is passed to a call whose callee may invoke it, transitively. Methods resolve statically and host functions are leaves. A lambda body is reachable when its lambda expression is evaluated in reachable code. This call graph over-approximates on purpose: any function used as a value is treated as callable, and any lambda is treated as callable once created.
+- **Panic-capable operation.** An operation the specification says can panic: index out of bounds, invalid slice, division or remainder by zero, integer overflow (including unary `-`, `abs`, `MIN / -1`, and integer `pow`), invalid `int(f)`, `round` with a negative digit count, `replace` with an empty `from`, `expect` on `None`/`Err`, a failed `assert`, and explicit `panic`.
+- **Loop exit.** For a `while` loop, a `break` whose nearest enclosing loop is that loop, or a `return` or `?` belonging to the function that encloses the loop. A `break` in a nested loop does not exit the outer loop, and a `return`, `?`, or `break` inside a lambda or nested function does not exit it. A `panic` is not an exit. Exits are judged on the control-flow graph, ignoring condition values.
+- **Guarded `expect` (L008).** An `.expect(…)` is guarded when it sits in the then-branch of an `if` whose condition tests `e.is_some()` or `e.is_ok()`, or in the right operand of an `and` whose left operand is such a test, where `e` is a stable expression and no mutation of a root of `e` occurs between the test and the call.
+- **Doc-able element.** A top-level item, an `impl` method, a struct field, or an enum variant.
+
+**Analyses.** The linter builds one immutable analysis result containing, in addition to spans, comment trivia, and parenthesis flags: binding, definition, and import tables and mutation facts (resolved); expression, pattern, state-type, and host-type tables (typed); per-arm usefulness results (patterns); the call graph and reachability, loop exits, and possible `Err` return paths (flow); parsed `plugin.toml` and `.mti` inputs and grants (manifest); and the emitted diagnostics (post).
 
 **Contracts the Rust core should guarantee:**
 
-- Every AST node has a `NodeId` and a `Span`, and tokens carry comment trivia.
-- Resolver and checker output live in side tables keyed by `NodeId`: binding for each identifier, type for each expression, use and assignment counts per binding.
+- Every AST node has a `NodeId` and a `Span`; tokens carry comment trivia; and every expression records whether it was parenthesized in source.
+- Resolver and checker output live in side tables keyed by `NodeId`: binding for each identifier, type for each expression, use and assignment counts per binding, and the call, mutation, and return facts needed by the flow tier.
 - A rule is `fn check(&Ctx, &mut Emit)`, and rules never mutate the tree. A fix is a list of `Edit { span, replacement }`, which `--fix` can apply safely because spans are exact.
-- Rules are tiered by the analysis they need (syntax only, then resolved, then typed), so the first rules can be written before the checker exists.
-- Output is deterministic and sorted by span.
-- The linter also reads `.mti` files and `plugin.toml` as inputs, so host-aware rules work offline, without the host.
+- Rules are tiered by the analysis they need, so the first rules can be written before the checker exists.
+- Output is deterministic and sorted by file path, then span, then rule ID, then message.
+- The linter also reads `.mti` files and `plugin.toml` as inputs, so host-aware rules work offline, without the host. It produces diagnostics only for `.mt` files and, for L020, `plugin.toml`; `.mti` files are never lint targets.
 
-**Starter rules (default severity):**
+**Pipeline.** The linter runs only on programs that pass every E-check, so it never duplicates a compile error. In a full run, if any E diagnostic exists in a program, `martite lint` prints those and runs no rules for that program. `--syntax-only` is the exception, meant for editors: it runs only the syntax tier on any file that parses, even while the rest of the project is broken, and it loads no interfaces or manifest. With several paths, each program is loaded separately, files reached by more than one entry are linted once, and a broken program does not block linting the others.
 
-| ID | Rule | Needs |
-| --- | --- | --- |
-| L001 | Unused binding, parameter, private item, or import (`_` prefix opts out) | resolved |
-| L002 | `var` never reassigned: use `let` (fix) | resolved |
-| L003 | Unreachable or redundant match arm | patterns |
-| L004 | Unreachable statement after `return`, `break`, `continue`, `panic`, or a `while true` with no `break` | syntax |
-| L005 | Constant condition (`if true`), except `while true` | syntax |
-| L006 | Self-comparison or self-assignment (`x == x`, `x = x`) | resolved |
-| L007 | `==`/`!=` on floats | typed |
-| L008 | `expect` outside tests (in a handler it traps the whole hook; prefer returning `Err`) | typed |
-| L009 | `let _ =` discarding a `Result` | typed |
-| L010 | Integer division or remainder by literal zero | syntax |
-| L011 | `x == true`, `if c { true } else { false }`, `not (a == b)` (fix) | syntax |
-| L012 | `x = x + n` to `x += n` (fix) | resolved |
-| L013 | `return` as the final statement, or `else` after a returning `if` (fix) | syntax |
-| L014 | `match` on a `bool` to `if` | typed |
-| L015 | `mut` parameter or `mut self` never mutated | resolved |
-| L016 | Empty block | syntax |
-| L017 | Function length, parameter count, nesting depth, or branch count over threshold | syntax |
-| L018 | `pub` item without `///` doc | syntax + trivia |
-| L019 | `while true` inside a handler with no reachable `break` or `return` (it can only end in `OutOfFuel`) | syntax |
-| L020 | Manifest grants a module that no file of the plugin `use`s (least privilege) | resolved + manifest |
-| L021 | An opaque host handle stored in the plugin state type (it is stale after a restart or restore) | typed |
+**Tiers.** A rule declares exactly one tier: the richest analysis it uses. Every guarantee of that tier and of its listed dependencies is available; a rule never requires an analysis outside it.
 
-Thresholds and severities live in `martite.toml`. Because the compiler already rejects shadowing, casing errors, type errors, and non-exhaustive matches, the lint set is almost entirely about simplification and suspicious code.
+| Tier | Guarantees |
+| --- | --- |
+| syntax | tokens, AST, spans, comments/trivia, parentheses, literal values |
+| resolved | + bindings, definitions, imports, method resolution, local mutation facts |
+| typed | + expression, pattern, and type tables; state type; entry kind; host types |
+| patterns | + per-arm usefulness for `match` (also typed) |
+| flow | + call graph and reachability, loop exits, possible `Err` paths (also typed) |
+| manifest | + parsed `plugin.toml` and `.mti` inputs, grants (also resolved) |
+| post | + all diagnostics emitted by enabled non-post rules (full runs only) |
+
+The `Tier` column in 12.5 and 12.6 assigns every rule. Under `--syntax-only`, only rules in the syntax tier run.
+
+**Stability.** Rule IDs are append-only and never reused. A retired rule leaves a tombstone, and changing what a rule means requires a new ID. Adding a rule is not an edition change. Rules that apply only to plugins (L008, L019, L020, L021, L026, L027, L031) are skipped for scripts and libraries.
+
+### 12.2 Severity, groups, and config
+
+Severities are `error`, `warn`, `info`, and `off`. `martite lint` exits 1 if any `error` diagnostic is reported, or any `warn` when `--deny-warnings` is given. `info` is shown but never affects the exit code.
+
+Resolution is a total order:
+
+1. The preset gives every rule a base severity.
+2. `[lint.groups]` overrides each rule in the named group.
+3. `[lint.severity]` overrides each named rule.
+4. Matching `[[lint.override]]` entries apply in array order; within one entry its `preset`, then `groups`, then `severity`, then `off`.
+5. `--rule` restricts which rules run and does not change severities.
+
+An override may set `preset`, `groups`, `severity`, `thresholds`, `options`, and `off`; an override's `preset` replaces the base preset for matching paths before its other fields apply, and `off` is shorthand for severity `off`. Listing the same rule in both `off` and `severity` in one override is a usage error. An override's `paths` are globs relative to the directory containing `martite.toml`: `*` matches within one path segment, `**` matches any number of segments, and `?` matches one scalar value. Matching is case-sensitive; later matching entries win.
+
+Groups: `correct` (probably a bug), `simplify` (equivalent, simpler code), `style`, `plugin` (host and sandbox concerns), `perf`, `docs`.
+
+Presets:
+
+- `minimal`: every rule `off`, then every rule in `correct` at `warn`, then L010 and L019 at `error`.
+- `recommended`: the default column in 12.5 and 12.6. This is the default preset.
+- `strict`: every rule enabled; rules whose default is `warn`, `info`, or `off` become `warn`, while rules whose default is `error` stay `error`.
+
+```toml
+# martite.toml
+[lint]
+preset = "recommended"
+
+[lint.groups]
+simplify = "info"
+
+[lint.severity]
+L018 = "warn"
+L026 = "off"
+
+[lint.thresholds]
+max_fn_lines = 60          # L017
+max_params   = 5           # L017, not counting self
+max_nesting  = 4           # L017
+max_branches = 12          # L017
+
+[lint.options]
+float_eq_zero_ok = true    # L007
+
+[[lint.override]]          # per-path adjustments
+paths = ["tests/**"]
+off   = ["L008", "L018"]
+```
+
+Unknown keys, unknown rule or group IDs, unknown severity or preset names, and bad values in `martite.toml` are a usage error (exit 2). Thresholds are `max_fn_lines >= 1`, `max_params >= 0`, `max_nesting >= 0`, and `max_branches >= 1`. Tombstoned rule IDs are accepted and ignored, and `--list-rules` marks them as retired; any other unknown rule ID is a usage error.
+
+### 12.3 Suppression
+
+`// allow(L001, L002)` suppresses those IDs for diagnostics whose primary span starts within the head of the next syntactic element (section 1). The element is a statement, a struct field, an enum variant, an `impl` method, a match arm, or an item. Its head is the whole element for simple statements, fields, variants, `const`, and `use`, and everything through the opening `{` for other items, `impl` methods, `if`, `while`, `for`, `match`, and block lambdas. So a suppression above an `fn` covers its signature but not its body, a suppression above an `impl` method covers its signature but not its body, and a suppression above a multi-line call covers every line of the call. Scoping to the element rather than the next line is what keeps suppressions valid when `martite fmt` reflows code.
+
+Blank lines between a suppression and its element do not detach it. Several `// allow` comments directly above one element combine. Only diagnostics in `.mt` files are suppressible; L020 in `plugin.toml` and any `.mti` diagnostic are not. E-codes cannot be suppressed, and neither L022 nor L032 is suppressed by another comment.
+
+A suppression that names an unknown ID, names an E-code, or suppresses nothing is reported by L022. L022 considers only the rules enabled for the run: a suppression naming a known rule that is `off` or excluded by `--rule` does not suppress nothing. L022 itself runs only when L022 is enabled.
+
+#### 12.3.1 Primary spans
+
+Each diagnostic's primary span is the anchor below. When a rule has several possible spans, this is the one used for suppression.
+
+| Rule | Primary span |
+| --- | --- |
+| L001 | The unused binding or parameter name; for an import or alias, its local name; for a private item, its declared name. |
+| L002 | The `var` keyword. |
+| L003 | The redundant arm's pattern. |
+| L004 | The first unreachable statement. |
+| L005 | The condition expression; for a constant operator, the operator that makes it constant. |
+| L006 | The operator. |
+| L007 | The comparison operator. |
+| L008 | The `.expect` callee. |
+| L009 | The `let` pattern. |
+| L010 | The zero divisor. |
+| L011 | The expression being simplified. |
+| L012 | The assignment operator. |
+| L013 | The `return` keyword; for the else form, the `if` keyword. |
+| L014 | The match scrutinee. |
+| L015 | The `mut` keyword. |
+| L016 | The block's opening brace. |
+| L017 | The item's name; for a lambda, the `fn` keyword. |
+| L018 | The item's declared name. |
+| L019 | The `while` keyword. |
+| L020 | The unused grant string in `plugin.toml`. |
+| L021 | The offending type occurrence in user code; if the handle is reachable only through a host type, the user-code type site naming that host type. |
+| L022 | The suppression comment. |
+| L023 | The `unwrap_or` call. |
+| L024 | The outermost mixed operator. |
+| L025 | The assignment operator. |
+| L026 | The offending operation. |
+| L027 | The earliest mutation of state that can reach an `Err` exit. |
+| L028 | The identifier read. |
+| L029 | The lambda expression. |
+| L030 | The test name. |
+| L031 | The `print` callee. |
+| L032 | The `///` comment. |
+
+### 12.4 Fixes
+
+A fix is a list of edits with an `applicability`: `machine` (always behavior-preserving, applied by `--fix`) or `maybe` (needs a human check, applied only by `--fix --suggested`). `--fix --suggested` applies both. Suppressed diagnostics produce no fixes.
+
+- Fixes are applied project-atomically: collect fixes for enabled, unsuppressed diagnostics, apply them to an in-memory overlay for the whole program, re-parse and re-check, and write files only after a pass that introduces no E-code.
+- Overlapping edits are resolved by keeping the one with the earlier start (ties go to the lower rule ID), and the linter re-runs, up to 5 passes. An insertion at the same offset as another edit conflicts with it and is resolved by the lower rule ID.
+- If a pass introduces any E-code, the linter discards that pass's fixes for every file, reports the introduced E diagnostics, and stops. A partially applied project is never written.
+- L015 follows the same rule: its declaration edit and all call-site edits in other files succeed or fail together.
+- Deleting a `use` statement removes its line and any trailing same-line comment, but not leading own-line comments. Those become L022's responsibility on a later pass.
+- `--fix` does not format. Run `martite fmt` afterwards. No lint rule talks about whitespace, so the two tools never conflict.
+- `--fix` and `--syntax-only` are mutually exclusive (usage error). `--fix --json` reports the diagnostics that remain after fixing. The exit code is computed from those remaining diagnostics.
+
+### 12.5 Rules
+
+Defaults are for the `recommended` preset. "Fix" is M (machine), S (maybe), or none.
+
+| ID | Fires when | Notes and exemptions | Tier | Fix | Group / default |
+| --- | --- | --- | --- | --- | --- |
+| L001 | A binding, parameter, import, alias, or private item is never used. A binding that is only ever assigned and never read counts as unused. | `_` prefix opts out. A private item is unused when unreachable from every root. Roots are `pub` items in every loaded module, `on` handlers, `main`, and `test` blocks, so mutually recursive dead code is found. Uses inside `test` blocks count. `self` is never flagged. | flow | M for imports (delete line), S for bindings (add `_`) | style / warn |
+| L002 | A `var` is never mutated: never written, never passed `mut`, and never receives a `mut self` call on itself or a projection. | `mutation` is defined in 12.1. | resolved | M (`var` to `let`) | simplify / warn |
+| L003 | A match arm is redundant or unreachable (Maranget usefulness), including a guarded arm already covered by an earlier unguarded one and any arm after a catch-all. | A guarded arm that is not covered is never flagged. | patterns | S (delete arm) | correct / warn |
+| L004 | A statement follows `return`, `break`, `continue`, `panic(…)`, or a `while true` with no `break`. | Prelude names cannot be shadowed, so matching `panic` by name is sound. A statement-level expression of type Never counts too. | typed | S (delete) | correct / warn |
+| L005 | A condition is a literal `true` or `false`, or `not`, `and`, or `or` applied to literals, in `if`, `while`, or a boolean operator. | `while true` is exempt. A SCREAMING const (`if DEBUG`) is exempt, since it is a deliberate switch. | syntax | S (keep the live branch) | correct / warn |
+| L006 | A self-comparison or self-assignment on a side-effect-free place or expression: `x == x`, `x != x`, `x = x`, `a.f = a.f`. | Calls are never side-effect-free for this rule. Help for `x != x` on floats suggests `is_nan()`. | resolved | none | correct / warn |
+| L007 | `==` or `!=` where an operand is a `float`. | Comparing against the literal `0.0` is allowed while `float_eq_zero_ok = true`. Floats nested in tuples or structs are not inspected. | typed | none | correct / warn |
+| L008 | `.expect(…)` outside `test` blocks that is not guarded. | Plugin code only. Guarded is defined in 12.1; it uses stable expressions, so `words.first().is_some()` guards a later `words.first().expect(…)`. In plugin code the help says a trap aborts the current hook and suggests returning `Err`. | typed | none | plugin / warn |
+| L009 | `let _ = e` where `e` is a `Result`. | Exempt in `test` blocks. Help suggests `?`, an explicit `match`, or `if r.is_err()`. Note that `.ok()` still discards the error. | typed | none | correct / warn |
+| L010 | Integer `/` or `%` by a literal zero (`0`, `0x0`, `0b0`, `-0`). | Float division by `0.0` is legal and is not flagged. In a full run the well-typedness of the program makes the integer case unambiguous. | typed | none | correct / error |
+| L011 | `x == true`, `x != false`, `x == false`, `x != true`, `if c { true } else { false }` and its inverse, `not (a == b)`, `not (a != b)`. | `not (a < b)` is deliberately not simplified, because it is not equivalent for NaN. | syntax | M | simplify / info |
+| L012 | `x = x + n` (also `-`, `*`, `/`, `%`) where `x` is a side-effect-free place. | `+=` evaluates place operands once, so `a[f()] = a[f()] + 1` is not flagged. `x = n + x` is not flagged. Not flagged when `n` contains a `mut` argument or `mut self` call rooted at `x`. | resolved | M | simplify / info |
+| L013 | `return e` or bare `return` as the last statement of a fn, lambda, or handler body. An `else` branch that follows an `if` whose branch ends in `return`, when the `if` is a statement. | A `return` inside a loop or `match` arm is never flagged. | syntax | M for final `return`, S for `else` | simplify / info |
+| L014 | A `match` on a `bool` with arms `true` and `false`, or `true` and `_`. | | typed | S | simplify / info |
+| L015 | A `mut` parameter or `mut self` that is never mutated in the body. | `mutation` is defined in 12.1. A fix is offered only for private functions and methods, where every call site is in the project: it edits the declaration and all call sites. Handlers and `pub` items get no fix. | resolved | S | correct / warn |
+| L016 | An empty block `{}`. | Exempt if it contains a comment. Struct, enum, and map braces are not blocks. A `=> ()` match arm is the preferred way to say "nothing". | syntax | none | style / info |
+| L017 | A function, method, handler, or lambda exceeds a threshold: lines (blank and comment-only lines excluded), parameters (excluding `self`), nesting depth of blocks, `if`, loops, and `match`, or branch count (1 + each `if`, loop, extra match arm, `and`, `or`, `??`). | One diagnostic per exceeded metric. Lambdas count toward the enclosing item's totals and add one nesting level. `test` blocks are exempt from the line limit. | syntax | none | style / info |
+| L018 | A `pub` fn, method, struct, enum, or const has no `///` doc. | Variants, fields, `main`, and `.mti` items are exempt from the requirement, but variants and fields are doc-able (12.1). | syntax | none | docs / off |
+| L019 | A `while true` in a handler, or in a function reachable from one, with no exit. | An exit is defined in 12.1. Such a loop can only end in `OutOfFuel`. A `panic` does not count. | flow | none | plugin / error |
+| L020 | The manifest grants a module that no file of the plugin `use`s (least privilege). | A grant for module `m` is used by `use m` and by `use m.X` for an item declared in `m`; a submodule import does not use the parent's grant. Uses inside `test` blocks count. Span points into `plugin.toml`. Fix removes the grant entry. | manifest | S | plugin / warn |
+| L021 | An opaque host handle appears anywhere in the state type, directly or through a container, tuple, generic, or user or host struct or enum. | A plugin with no `init` has no state type, so the rule does not fire. The span is the offending type occurrence in user code; if the handle is reachable only through a host type, the span is the user-code site naming that host type. Help suggests storing an id and re-resolving it. The handle is stale after a restart or restore. | typed | none | plugin / warn |
+
+### 12.6 Additional rules (L022 to L032)
+
+| ID | Fires when | Notes and exemptions | Tier | Fix | Group / default |
+| --- | --- | --- | --- | --- | --- |
+| L022 | A suppression names an unknown ID, names an E-code, or suppresses nothing. | Runs last in full runs and never under `--syntax-only`. Considers only enabled rules; a known rule that is `off` or excluded by `--rule` does not suppress nothing. A retired ID counts as unknown in a suppression. L022 is not suppressible. | post | M (remove ID or comment) | correct / warn |
+| L023 | `Option.unwrap_or(d)` where `d` is a call, a string or collection literal, interpolation, or anything that allocates or can trap. | `unwrap_or` evaluates `d` eagerly, while `??` is lazy. Scalar literals, plain names, and field/tuple projections are exempt. Everything else is treated as possibly allocating or trapping. The fix changes when `d` is evaluated, so it is `maybe`. `Result.unwrap_or` is exempt because `??` is `Option`-only. | typed | S (to `??`) | perf / info |
+| L024 | `and` and `or` mixed in one expression without parentheses (`a and b or c`). | Parentheses are recorded in the syntax tier. Precedence is well defined, but the mix is easy to misread. The formatter never adds parentheses, so this fix does. | syntax | M | style / info |
+| L025 | `s += …`, `s = s + …`, or `s = … + s` on a `str` inside a loop body. | Repeated concatenation is quadratic and fuel-charged. Help suggests collecting into a `list[str]` and calling `join`. | typed | none | perf / info |
+| L026 | A panic-capable operation in a handler or in a function reachable from one: `xs[i]` and `m[k]`, slicing, `/` or `%` by a non-constant, integer overflow (`+`, `-`, `*`, unary `-`, `abs`, `MIN / -1`), `int(f)`, integer `pow`, `insert`, `remove_at`, `round` with a possibly negative digit count, `replace` with a possibly empty `from`, `panic`. | Opt-in. A trap here aborts the whole hook. `assert` is exempt as a deliberate check; `expect` is covered by L008. The list follows section 8 and the panic notes in section 9.3. | flow | none | plugin / off |
+| L027 | A `mut self` handler (or a helper taking the state `mut`) mutates `self` and later returns `Err`, via `return Err(…)` or `?`, on some path. | Analyzed on the control-flow graph, with summaries for helpers that take the state `mut`; condition values are ignored. `Err` is a normal return and commits state (section 5). Help says to validate before mutating. Only for `Result` return types. | flow | none | plugin / warn |
+| L028 | A `_`-prefixed binding is read. | The prefix says "unused", so a read is misleading. Fix renames the binding and its uses. | resolved | S | style / info |
+| L029 | `fn(x) => f(x)` where `f` is a free function and the arguments pass through unchanged. | Methods and variant constructors are not values, so wrapping them is required and exempt. | resolved | S (replace with `f`) | simplify / info |
+| L030 | A `test` block contains no `assert` call and calls no function that does. | Asserts are counted lexically in the test and transitively in free functions it calls. Handler calls count only when the test asserts afterward. | flow | none | correct / warn |
+| L031 | `print` in plugin code outside `test` blocks. | The host's log sink may be a no-op, so this is usually a leftover debug call. Needs the entry kind, so it does not run under `--syntax-only`. | typed | none | plugin / info |
+| L032 | A `///` comment that does not directly precede a doc-able element. | Doc-able elements are defined in 12.1. Section 1 makes other `///` comments ordinary. L032 is not suppressible. Fix rewrites it as `//`. | syntax | M | docs / warn |
+
+### 12.7 Examples for the subtle rules
+
+L027: the state is committed even though the handler fails.
+
+```martite
+on added(mut self, item: str) -> Result[(), str] {
+    self.count += 1                          // L027: this mutation is committed
+    if item == "" { return Err("empty") }    // Err commits the new count
+    Ok(())
+}
+```
+
+The fix is to validate first and mutate last:
+
+```martite
+on added(mut self, item: str) -> Result[(), str] {
+    if item == "" { return Err("empty") }
+    self.count += 1
+    Ok(())
+}
+```
+
+L008 and a guard (not flagged):
+
+```martite
+if words.first().is_some() { let w = words.first().expect("checked") }
+```
+
+L019 (the only exit is `OutOfFuel`):
+
+```martite
+on tick(mut self) {
+    while true { self.n += 1 }               // L019, error by default
+}
+```
+
+### 12.8 Output and CLI
+
+Human output shows the severity and code in the header, a source excerpt with the primary span underlined, then `help`:
+
+```
+warn[L002]: variable `total` is never mutated
+  --> main.mt:12:5
+   |
+12 |     var total = 0
+   |     ^^^ use `let`
+   = help: replace `var` with `let` (machine fix)
+```
+
+JSON diagnostics keep the section 13 shape and gain `group`. `fix`, when present, is a list of edits; each edit carries `applicability` (`machine` or `maybe`), and every edit of one diagnostic has the same applicability. A lint diagnostic in `plugin.toml` (L020) uses that file in `file`, with byte offsets into it. No lint rule reports a diagnostic in an `.mti` file.
+
+`martite lint [paths]` lints `.mt` files. With no paths it uses the project rooted at the nearest ancestor of the working directory containing `martite.toml` or `plugin.toml`, and the manifest entry when present; if there is no manifest entry, every `.mt` file under that root is linted as its own entry. If neither file exists, the working directory is the root and a path is required. With paths, each path is loaded as `martite check` loads it; the loaded files are linted once per project root, and duplicate files are linted once. `.mti` files are read as inputs through the interfaces supplied by the embedding or `--interface`; they are not lint targets.
+
+Flags: `martite lint [paths]`, `--fix`, `--fix --suggested`, `--json`, `--deny-warnings`, `--syntax-only`, `--rule L001,L002`, `--interface <file>` (repeatable), `--list-rules`, and `--explain L019`.
+
+- `--syntax-only` runs only syntax-tier rules on the named files; it loads no interfaces, manifest, or other modules.
+- `--rule L001,L002` selects the exact set of rules to run; L022 runs only when it is selected, and its suppressed-nothing check considers only the selected rules. An unknown ID or a retired ID in `--rule` is a usage error.
+- `--list-rules` prints one line per ID with its group, default severity, and whether it is retired; with `--json` it prints an array of `{id, group, default_severity, retired}`.
+- `--explain L019` prints that rule's rationale and examples from the built-in registry; it does not load a project.
+- `--fix` and `--syntax-only` are mutually exclusive. `--fix` does not format.
+
+Diagnostics are sorted by the displayed file path (lexicographic by Unicode scalar value), then start byte, then rule ID, then message. Exit codes are 0, 1, and 2 as in section 13; `--syntax-only` reports parse errors as E-codes and exits 1 if any are present.
+
+Presets, groups, severities, thresholds, and options live in `martite.toml`. Because the compiler already rejects shadowing, casing errors, type errors, and non-exhaustive matches, the lint set is almost entirely about simplification and suspicious code.
 
 ## 13. Tooling and conformance
 
-- **Commands:** `martite run <file>` (script), `martite check <path>` (parse and type-check; with a plugin directory it also reads `plugin.toml` and the interfaces given by `--interface`), `martite lint [--fix] [--json]`, `martite test`, and `martite fmt`. The formatter's canonical style (4 spaces, 100 columns, trailing commas in multi-line lists) is configured in `martite.toml` and is not otherwise part of this document.
+- **Commands:** `martite run <file>` (script), `martite check <path>` (parse and type-check; with a plugin directory it also reads `plugin.toml` and the interfaces given by `--interface`), `martite lint` (flags in section 12.8), `martite test`, and `martite fmt` (flags in section 14.8). Tool settings (formatter options, lint severities, groups, thresholds, options, and per-path overrides) live in `martite.toml`.
 - **Test discovery:** `martite test <path>` loads the entry module and every module reachable through `use`, then runs every `test` block in that program. There is no name filter. It supplies no host test double, so a test that calls a host function traps. The command exits 1 if any test fails.
-- **Exit codes:** 0 success, 1 diagnostics found, a test failed, or `main` returned `Err`, 2 usage or load error, 101 panic or any other trap in a script.
-- **JSON diagnostics** (`--json`) are one object per diagnostic: `code`, `severity`, `message`, `file`, `span` (`start` and `end` byte offsets and 1-based `line`/`column`, where a column counts Unicode scalar values), optional `help`, and optional `fix` (a list of `{span, replacement}` edits).
-- **Conformance suite.** The reference implementation is considered complete only when it ships, and passes: at least one failing and one passing fixture for every E-code and every lint rule; golden tests for the `Show` format (section 9.2); golden tests for the fuel and memory tables (section 8); grammar fixtures for every parser note in section 10; and a fuzz run over the lexer, parser, and checker confirming that no input panics the host or exceeds the load limits.
+- **Exit codes:** 0 success, 1 diagnostics found (an `error`, or a `warn` under `--deny-warnings`), a test failed, `martite fmt --check` found a difference, or `main` returned `Err`, 2 usage or load error, 101 panic or any other trap in a script.
+- **JSON diagnostics** (`--json`) are one object per diagnostic: `code`, `severity`, `message`, `file`, `span` (`start` and `end` byte offsets and 1-based `line`/`column`, where a column counts Unicode scalar values), optional `help`, and optional `fix` (a list of `{span, replacement, applicability}` edits). Lint diagnostics also carry `group`.
+- **Conformance suite.** The reference implementation is considered complete only when it ships, and passes: at least one failing and one passing fixture for every E-code and every lint rule; one fixture at each rule's declared tier and a `--syntax-only` fixture showing higher-tier rules do not run; golden fixtures for preset, group, and override precedence; golden tests for the `Show` format (section 9.2); golden tests for the fuel and memory tables (section 8); grammar fixtures for every parser note in section 10; and a fuzz run over the lexer, parser, and checker confirming that no input panics the host or exceeds the load limits.
+- **Formatter and linter conformance.** The suite also includes: golden before/after fixtures for every row of sections 14.3 to 14.6; an idempotence check (`fmt(fmt(x)) == fmt(x)`) and an AST-equality check over the whole fixture corpus; a test that comments survive from every position the grammar allows; one fixture per documented exemption in sections 12.5 and 12.6; one fixture per primary-span and suppression case in section 12.3, including L022 under `--rule`; a project-atomic multi-file fix test for L015 and a fix-discard test where a fix would introduce an E-code; for every rule with a fix, a test that applying it removes the diagnostic, introduces no E-code, and leaves results unchanged under a deterministic test run; a golden JSON test covering `group` and per-edit `applicability`; a test that `--fix` followed by `fmt` is stable; and a test that formatting never changes which diagnostics are suppressed.
+
+## 14. Formatter (`martite fmt`)
+
+### 14.1 Guarantees
+
+- **One canonical style.** Output depends only on the token stream, the comments, and three config values (`max_width`, `indent`, `end_of_line`). There are no per-construct knobs.
+- **Idempotent.** `fmt(fmt(x)) == fmt(x)`.
+- **Meaning-preserving.** The formatted file parses to the same AST as the input, apart from the explicit normalizations below (trailing commas, import order, numeric literal case, comment spacing). The formatter never adds or removes parentheses, never rewrites string contents or interpolations, and never converts between `fn(x) => e` and `fn(x) { e }`. `martite fmt --verify` re-parses the output and compares ASTs, and a mismatch is a formatter bug that refuses to write the file.
+- **Total on valid input.** Any file that parses (no E001 to E003) can be formatted, even if it has type errors. A file with a syntax error is reported and left untouched.
+- **Comments are never lost, merged into a line, or moved across a statement boundary.**
+
+### 14.2 Where a line may break
+
+Newlines are significant (section 1), so the formatter may only break where a newline is ignored:
+
+- after a binary operator (including `|` in or-patterns), an assignment operator, `,`, `:`, `=>`, `->`, or an opening bracket;
+- before `.`, `else`, `and`, `or`, or `??`;
+- anywhere inside `()`, `[]`, or a list-style brace.
+
+It never breaks between `return` and its value, before `?`, after unary `-` or `not`, or inside `..` and `..=`.
+
+### 14.3 Layout rules
+
+Width is measured in Unicode scalar values, with a default `max_width` of 100. Indentation is spaces only, 4 per level by default. The printer is a standard group-based fit-or-break pretty printer: a group is printed flat if it fits in the remaining width, otherwise it breaks, and breaking an outer group never breaks an inner one that still fits. A token that cannot break (a long string, say) may exceed the width.
+
+| Construct | Rule |
+| --- | --- |
+| Comma lists (arguments, parameters, tuples, list and map literals, struct literal fields, type parameters and arguments, struct and enum bodies) | Flat if it fits. Otherwise one element per line, indented once, trailing comma added, closing bracket on its own line. Flat lists never have a trailing comma, except the 1-tuple `(e,)` and `(T,)`, which always keep theirs. |
+| Spacing | One space around binary operators, `=`, `=>`, `->`, and after `,` and `:`. No space before `:` or `,`, inside `()` or `[]`, around `.`, or after unary `-`. `not` is followed by one space. Ranges are tight: `0..n`, `a..=b`. |
+| Braces | Struct literals, struct and enum bodies, and struct patterns have inner spaces: `P { x: 1 }`. Map literals do not: `{"a": 1}`. Empty is `{}` everywhere, and an empty struct literal is `P {}`. |
+| Blocks | A block is one line if it is empty, or has exactly one statement that is an expression, assignment, `return`, `break`, or `continue`, contains no nested block, `match`, or comment, and the whole line fits. Otherwise it is expanded, one statement per line. `let`, `var`, `while`, and `for` always force expansion. |
+| `if` / `else` | `} else {` and `} else if c {` on one line. A one-line `if` may have an `else` only if both branches are one-line blocks and the whole expression fits. |
+| `match` | Always expanded, one arm per line. Expression arms end with a comma. Block arms end with `}` and no comma. Guards read `pat if cond =>`. An arm that does not fit breaks after `=>` and indents. An or-pattern that does not fit breaks after a trailing `\|`. |
+| Binary chains | If a chain does not fit, every operator at that precedence level breaks, with the continuation indented once. `and`, `or`, and `??` go at the start of the continuation line. All other operators stay at the end of the line. |
+| Method chains | The head is the root, any `.field` links before the first call, and the first call (so `editor.text(doc)` and `self.items.last()` stay together). If the whole chain does not fit, every remaining link goes on its own line with a leading `.`, indented once. |
+| Last-lambda hug | If the final argument is a lambda and all earlier arguments fit on the opening line, the call is printed `f(a, fn(x) {` … `})` instead of breaking every argument. Only one lambda may hug. |
+| Assignment and `let` | If the right side does not fit, break after `=` and indent once, unless the right side is a bracketed or block construct that can open on the same line. |
+| Signatures | Parameters wrap as a comma list. The return type stays on the closing line: `) -> Result[(), str] {`. If it still does not fit, break after `->`. |
+| `use` | Never wraps. |
+| Lambdas | `fn(x) => e` keeps one space around `=>`. If `e` does not fit, break after `=>`. |
+
+Nothing is column-aligned (no aligned `=>`, `:`, or trailing comments). One space precedes a trailing `//` comment.
+
+### 14.4 Blank lines
+
+- Runs of blank lines collapse to one. Leading and trailing blank lines in a block or file are removed, and a file ends with exactly one `\n`.
+- Top level: exactly one blank line between items, except that adjacent one-line `const` declarations and adjacent `use` lines keep whatever the author wrote (zero or one).
+- Inside `impl`: one blank line between methods, except that adjacent one-line methods keep the author's choice.
+- Inside blocks, the author's single blank lines between statements are kept. The formatter never inserts one.
+- A `///` or `// allow(...)` comment is glued to what follows it. Blank lines between them are deleted, so doc attachment and suppression cannot be broken by formatting.
+
+### 14.5 Imports
+
+Within each run of consecutive `use` lines (no blank line or non-`use` line between), lines are sorted by path, compared segment by segment by Unicode scalar value, with shorter prefixes first (`app.editor` before `app.editor.Doc`). Aliases do not affect order. Comments directly above a `use` line travel with it. Sorting is safe because items are order-independent. The formatter does not reorder across blank lines, so authors group imports by hand.
+
+### 14.6 Literals and comments
+
+- Strings and interpolations are emitted verbatim.
+- Hex digits are uppercase (`0xFF`), prefixes `0x` and `0b` are lowercase, exponent markers are lowercase (`1e9`), and underscores are kept as written.
+- `//` and `///` are followed by one space unless the comment is empty or the next character is `/`. `//foo` becomes `// foo`.
+- A suppression is normalized to `// allow(L001, L002)`: lowercase `allow`, one space after each comma.
+- An own-line comment is indented like the item or statement that follows it, or like the block's statements if it is the last thing in a block. A trailing comment stays on its line. A list or argument group containing a comment is always broken, because a `//` comment cannot sit inside a flat group.
+
+### 14.7 Interface files
+
+`.mti` files are parsed in interface mode and formatted by the same rules. One signature per line, parameters wrap like any `fn`, and a brace-less `struct Name` stays brace-less. Blank-line rules match 14.4. `plugin.toml` and `martite.toml` are not touched by `martite fmt`.
+
+### 14.8 CLI and config
+
+`martite fmt [--check] [--verify] [--stdin] [paths]` formats files in place by default. `--check` prints a unified diff and writes nothing. `--stdin` reads source on stdin and writes the result to stdout. With no paths it walks the project root for `.mt` and `.mti` files. Exit codes follow section 13: 0 if everything is already formatted (or was formatted), 1 if `--check` found a difference or a file had a syntax error, 2 for usage, config, or I/O errors.
+
+```toml
+# martite.toml
+[fmt]
+max_width   = 100      # 40 to 200
+indent      = 4        # 2 or 4
+end_of_line = "lf"     # "lf" or "crlf"
+```
+
+### 14.9 Worked example
+
+Before:
+
+```martite
+use app.status
+use app.editor
+
+on saved(mut self, doc: Doc, kind: SaveKind) -> Result[(), str] {
+  if kind == SaveKind.Auto {
+        return Ok(()) }
+    let words = editor.text(doc).split(" ").filter(fn(w) => w != "").map(fn(w) => w.trim()).filter(fn(w) => w.len() > 0).len()
+    self.saves += 1
+    status.show("{words} words after {self.saves} saves")
+}
+```
+
+After:
+
+```martite
+use app.editor
+use app.status
+
+on saved(mut self, doc: Doc, kind: SaveKind) -> Result[(), str] {
+    if kind == SaveKind.Auto { return Ok(()) }
+    let words = editor.text(doc)
+        .split(" ")
+        .filter(fn(w) => w != "")
+        .map(fn(w) => w.trim())
+        .filter(fn(w) => w.len() > 0)
+        .len()
+    self.saves += 1
+    status.show("{words} words after {self.saves} saves")
+}
+```
 
 ## Decisions worth challenging
 
@@ -690,3 +1031,10 @@ Thresholds and severities live in `martite.toml`. Because the compiler already r
 12. **Strings index by Unicode scalar value.** It matches what beginners expect from "the 3rd character", but `len` and slicing are O(n) on non-ASCII text.
 13. **Only free functions are first-class.** Methods and variant constructors need a lambda wrapper, which keeps method resolution static and the checker simple.
 14. **Aliases rename only the local binding.** `use a.b as c` has no effect on the declared name, so diagnostics, `Show` output, and snapshots show the original name. The cost is that a reader must map the alias back to see what is imported. The benefit is that name clashes between host modules never block a plugin, and a long module name can be shortened. There are still no glob imports and no re-exports.
+15. **One formatter style with three knobs** (`max_width`, `indent`, `end_of_line`). This removes style arguments, at the cost that nobody can adopt a house style.
+16. **Single-statement blocks collapse to one line** when they fit. This matches the examples in this document, but adding a second statement changes the first one's layout, so diffs are a little noisier.
+17. **Import sorting belongs to the formatter**, not a lint, because it is always safe when items are order-independent. The cost is that `martite fmt` can reorder lines even when it changes nothing else.
+18. **`// allow` covers the next element's head, not the next line.** This keeps suppressions valid across reformatting, but it is wider than a single line (a suppression above a multi-line call covers all of it) and narrower than a whole body (above an `if` it does not cover the branches).
+19. **`info` diagnostics never fail the build.** That keeps style rules from blocking CI, but they may be ignored forever. Teams that care can raise a group to `warn`.
+20. **L026 (panic-capable operations in handlers) is off by default.** In a plugin language every panic is a trap, so it arguably belongs on, but indexing and division are too common for a default-on rule to be useful.
+21. **L027 exists because `Err` commits state** (decision 11). If the language ever rolls state back on `Err`, L027 becomes a tombstone.

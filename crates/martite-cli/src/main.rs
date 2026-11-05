@@ -1,12 +1,18 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use martite::{Engine, HostSignature, HostType, LANG_EDITION};
-use martite_base::{Code, Diagnostic, FileSystemProvider, LoadLimits, Severity, SourceMap};
-use martite_config::parse_manifest;
+use martite_base::{
+    Applicability, Code, Diagnostic, FileSystemProvider, LoadLimits, Severity, SourceMap,
+    SourceProvider, normalize_source,
+};
+use martite_config::{Manifest, ToolConfig, parse_manifest, parse_tool_config};
 use martite_driver::{LoadOptions, load};
+use martite_lint::{LintInputs, ManifestInput, SettingsResolver, normalize_path, sort_diagnostics};
 use martite_resolve::InterfaceSource;
 use martite_runtime::{ExecLimits, Runtime, Trap, Value};
+use martite_syntax::parse_source;
 
 const USAGE: &str = "\
 Martite language toolchain
@@ -29,6 +35,15 @@ Options:
     --fuel <n>            Fuel for `run` and `test`
     --memory <n>          Memory limit in bytes for `run` and `test`
     --depth <n>           Call-depth limit for `run` and `test`
+
+Lint options:
+    --fix                 Apply machine-applicable fixes
+    --fix --suggested     Also apply fixes that need review
+    --deny-warnings       Exit 1 when warnings are reported
+    --syntax-only         Run only syntax-tier rules
+    --rule L001,L002      Run only the selected rules
+    --list-rules          List every rule
+    --explain L019        Explain one rule
 ";
 
 const STD_IO: &str = r#"fn read_line() -> Result[str?, str]
@@ -50,10 +65,7 @@ fn main() -> ExitCode {
     match command.as_str() {
         "run" => cmd_run(rest),
         "check" => cmd_check(rest, false),
-        "lint" => {
-            eprintln!("martite lint: the linter is not available yet");
-            ExitCode::from(2)
-        }
+        "lint" => cmd_lint(rest),
         "test" => cmd_test(rest),
         "fmt" => {
             eprintln!("martite fmt: the formatter is not available yet");
@@ -140,7 +152,7 @@ fn parse_args(args: &[String], allow_trailing: bool) -> Result<Parsed, String> {
                 );
             }
             Long("fix") => {
-                return Err("--fix is not supported; the linter is not implemented".into());
+                return Err("--fix is only supported by `martite lint`".into());
             }
             Value(value) => {
                 let value = value.string().map_err(|error| error.to_string())?;
@@ -163,6 +175,839 @@ fn parse_args(args: &[String], allow_trailing: bool) -> Result<Parsed, String> {
         }
     }
     Ok(out)
+}
+
+#[derive(Default)]
+struct LintArgs {
+    json: bool,
+    interfaces: Vec<PathBuf>,
+    paths: Vec<String>,
+    fix: bool,
+    suggested: bool,
+    deny_warnings: bool,
+    syntax_only: bool,
+    rules: Option<HashSet<Code>>,
+    list_rules: bool,
+    explain: Option<String>,
+}
+
+fn parse_lint_args(args: &[String]) -> Result<LintArgs, String> {
+    use lexopt::prelude::*;
+
+    let mut out = LintArgs::default();
+    let mut parser = lexopt::Parser::from_args(args.iter().cloned());
+    while let Some(arg) = parser.next().map_err(|error| error.to_string())? {
+        match arg {
+            Long("json") => out.json = true,
+            Long("interface") => {
+                let path = parser
+                    .value()
+                    .map_err(|error| error.to_string())?
+                    .string()
+                    .map_err(|error| error.to_string())?;
+                out.interfaces.push(PathBuf::from(path));
+            }
+            Long("fix") => out.fix = true,
+            Long("suggested") => out.suggested = true,
+            Long("deny-warnings") => out.deny_warnings = true,
+            Long("syntax-only") => out.syntax_only = true,
+            Long("list-rules") => out.list_rules = true,
+            Long("rule") => {
+                let value = parser
+                    .value()
+                    .map_err(|error| error.to_string())?
+                    .string()
+                    .map_err(|error| error.to_string())?;
+                out.rules = Some(martite_lint::parse_selection(&value)?);
+            }
+            Long("explain") => {
+                out.explain = Some(
+                    parser
+                        .value()
+                        .map_err(|error| error.to_string())?
+                        .string()
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            Value(value) => out
+                .paths
+                .push(value.string().map_err(|error| error.to_string())?),
+            _ => return Err(arg.unexpected().to_string()),
+        }
+    }
+    if out.fix && out.syntax_only {
+        return Err("--fix and --syntax-only are mutually exclusive".into());
+    }
+    if out.suggested && !out.fix {
+        return Err("--suggested requires --fix".into());
+    }
+    Ok(out)
+}
+
+struct RenderedDiagnostic {
+    file: String,
+    start: u32,
+    code: Code,
+    message: String,
+    severity: Severity,
+    human: String,
+    json: String,
+}
+
+fn render_diagnostic(diagnostic: &Diagnostic, sources: &SourceMap) -> RenderedDiagnostic {
+    let file = diagnostic
+        .source
+        .and_then(|source| sources.get(source))
+        .map(|file| file.name().to_string())
+        .unwrap_or_default();
+    let human = if diagnostic.code.is_lint() {
+        diagnostic.render_lint(sources)
+    } else {
+        diagnostic.render(sources)
+    };
+    RenderedDiagnostic {
+        file,
+        start: diagnostic.span.map(|span| span.start).unwrap_or(0),
+        code: diagnostic.code,
+        message: diagnostic.message.clone(),
+        severity: diagnostic.severity,
+        human,
+        json: diagnostic.render_json(sources),
+    }
+}
+
+fn render_all(diagnostics: &[Diagnostic], sources: &SourceMap, out: &mut Vec<RenderedDiagnostic>) {
+    for diagnostic in diagnostics {
+        out.push(render_diagnostic(diagnostic, sources));
+    }
+}
+
+fn print_rendered(diagnostics: &mut Vec<RenderedDiagnostic>, json: bool) {
+    diagnostics.sort_by(|left, right| {
+        left.file
+            .cmp(&right.file)
+            .then_with(|| left.start.cmp(&right.start))
+            .then_with(|| left.code.cmp(&right.code))
+            .then_with(|| left.message.cmp(&right.message))
+    });
+    let mut seen = HashSet::new();
+    for diagnostic in diagnostics.iter() {
+        let key = format!(
+            "{}\0{}\0{}\0{}",
+            diagnostic.file, diagnostic.start, diagnostic.code, diagnostic.message
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        if json {
+            println!("{}", diagnostic.json);
+        } else {
+            eprintln!("{}", diagnostic.human);
+        }
+    }
+}
+
+fn lint_fails(diagnostics: &[RenderedDiagnostic], deny_warnings: bool) -> bool {
+    diagnostics.iter().any(|diagnostic| {
+        diagnostic.severity == Severity::Error
+            || (deny_warnings && diagnostic.severity == Severity::Warning)
+    })
+}
+
+fn find_nearest(start: &Path, name: &str) -> Option<PathBuf> {
+    let start = if start.is_file() {
+        start.parent()?
+    } else {
+        start
+    };
+    for dir in start.ancestors() {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn find_project_root(start: &Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        if dir.join("plugin.toml").is_file() || dir.join("martite.toml").is_file() {
+            return Some(dir.to_path_buf());
+        }
+    }
+    None
+}
+
+fn load_tool_config(start: &Path) -> Result<Option<(ToolConfig, PathBuf)>, String> {
+    let Some(path) = find_nearest(start, "martite.toml") else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let config = parse_tool_config(&text).map_err(|error| error.message)?;
+    let dir = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    Ok(Some((config, dir)))
+}
+
+fn resolver_for(
+    start: &Path,
+    selected: Option<HashSet<Code>>,
+) -> Result<(SettingsResolver, PathBuf), String> {
+    let loaded = load_tool_config(start)?;
+    let (config, dir) = match loaded {
+        Some((config, dir)) => (config, dir),
+        None => (
+            ToolConfig::default(),
+            if start.is_file() {
+                start.parent().unwrap_or(Path::new(".")).to_path_buf()
+            } else {
+                start.to_path_buf()
+            },
+        ),
+    };
+    let resolver = SettingsResolver::new(&config, selected).map_err(|error| error.to_string())?;
+    Ok((resolver, dir))
+}
+
+fn relative_to(base: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(base).unwrap_or(path);
+    normalize_path(&relative.to_string_lossy())
+}
+
+fn scan_martite_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    scan_martite_files_into(root, &mut out);
+    out.sort();
+    out
+}
+
+fn scan_martite_files_into(root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            scan_martite_files_into(&path, out);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("mt") {
+            out.push(path);
+        }
+    }
+}
+
+struct ProjectSpec {
+    root: PathBuf,
+    entry: String,
+    edition: String,
+    interfaces: Vec<InterfaceSource>,
+    grants: Vec<String>,
+    manifest: Option<Manifest>,
+    manifest_text: Option<String>,
+}
+
+fn interface_paths(interfaces: &[InterfaceSource]) -> Vec<String> {
+    interfaces
+        .iter()
+        .map(|interface| interface.path.clone())
+        .collect()
+}
+
+fn script_interfaces(cli: &[PathBuf], root: &Path) -> Vec<InterfaceSource> {
+    let mut interfaces = load_interfaces(cli, Some(root));
+    if !interfaces
+        .iter()
+        .any(|interface| interface.path == "std.io")
+    {
+        interfaces.push(std_interface("std.io", STD_IO));
+    }
+    if !interfaces
+        .iter()
+        .any(|interface| interface.path == "std.env")
+    {
+        interfaces.push(std_interface("std.env", STD_ENV));
+    }
+    interfaces
+}
+
+fn script_spec(root: PathBuf, entry: String, cli: &[PathBuf]) -> ProjectSpec {
+    let interfaces = script_interfaces(cli, &root);
+    let grants = interface_paths(&interfaces);
+    ProjectSpec {
+        root,
+        entry,
+        edition: LANG_EDITION.to_string(),
+        interfaces,
+        grants,
+        manifest: None,
+        manifest_text: None,
+    }
+}
+
+fn collect_projects(
+    args: &LintArgs,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<Vec<ProjectSpec>, String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut specs = Vec::new();
+
+    if args.paths.is_empty() {
+        let Some(root) = find_project_root(&cwd) else {
+            return Err(
+                "lint requires a path when no `martite.toml` or `plugin.toml` is present".into(),
+            );
+        };
+        if root.join("plugin.toml").is_file() {
+            match plugin_spec(&root, args, diagnostics) {
+                Some(spec) => specs.push(spec),
+                None => {}
+            }
+        } else {
+            for file in scan_martite_files(&root) {
+                let entry = relative_to(&root, &file);
+                specs.push(script_spec(root.clone(), entry, &args.interfaces));
+            }
+        }
+    } else {
+        for raw in &args.paths {
+            let path = PathBuf::from(raw);
+            if path.is_file() {
+                if path.extension().and_then(|ext| ext.to_str()) == Some("mti") {
+                    continue;
+                }
+                let root = path
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."))
+                    .to_path_buf();
+                let entry = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| format!("invalid path `{raw}`"))?
+                    .to_string();
+                specs.push(script_spec(root, entry, &args.interfaces));
+            } else if path.is_dir() {
+                if path.join("plugin.toml").is_file() {
+                    if let Some(spec) = plugin_spec(&path, args, diagnostics) {
+                        specs.push(spec);
+                    }
+                } else {
+                    for file in scan_martite_files(&path) {
+                        let entry = relative_to(&path, &file);
+                        specs.push(script_spec(path.clone(), entry, &args.interfaces));
+                    }
+                }
+            } else {
+                return Err(format!("path not found: {}", path.display()));
+            }
+        }
+    }
+
+    // Files reached through more than one entry are linted once.
+    let mut seen = HashSet::new();
+    specs.retain(|spec| {
+        let full = spec.root.join(&spec.entry);
+        let key = std::fs::canonicalize(&full).unwrap_or(full);
+        seen.insert(key)
+    });
+    Ok(specs)
+}
+
+fn plugin_spec(
+    root: &Path,
+    args: &LintArgs,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<ProjectSpec> {
+    let manifest_path = root.join("plugin.toml");
+    let text = match std::fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(error) => {
+            diagnostics.push(Diagnostic::error(
+                Code::E508,
+                format!("cannot read {}: {error}", manifest_path.display()),
+            ));
+            return None;
+        }
+    };
+    let manifest = match parse_manifest(&text) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            diagnostics.push(Diagnostic::error(Code::E508, error.message));
+            return None;
+        }
+    };
+    let interfaces = load_interfaces(&args.interfaces, Some(root));
+    Some(ProjectSpec {
+        root: root.to_path_buf(),
+        entry: manifest.entry.clone(),
+        edition: manifest.lang.clone(),
+        grants: manifest.grants.clone(),
+        interfaces,
+        manifest: Some(manifest),
+        manifest_text: Some(text),
+    })
+}
+
+struct OverlayProvider<'a> {
+    base: &'a dyn SourceProvider,
+    overlay: &'a HashMap<String, String>,
+}
+
+impl SourceProvider for OverlayProvider<'_> {
+    fn read(&self, path: &str) -> Result<String, String> {
+        if let Some(text) = self.overlay.get(path) {
+            Ok(text.clone())
+        } else {
+            self.base.read(path)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PendingEdit {
+    path: String,
+    span: martite_base::Span,
+    replacement: String,
+    code: Code,
+}
+
+struct FixOutcome {
+    rendered: Vec<RenderedDiagnostic>,
+    failed: bool,
+}
+
+fn fix_project(
+    spec: &ProjectSpec,
+    resolver: &SettingsResolver,
+    config_dir: &Path,
+    suggested: bool,
+) -> FixOutcome {
+    let base = FileSystemProvider::new(spec.root.clone());
+    let mut overlay: HashMap<String, String> = HashMap::new();
+    let mut last = Vec::new();
+
+    for pass in 0..=5 {
+        let manifest_text = spec.manifest_text.as_ref().map(|original| {
+            overlay
+                .get("plugin.toml")
+                .cloned()
+                .unwrap_or_else(|| original.clone())
+        });
+        let (entry, edition, grants, manifest) = if let Some(text) = &manifest_text {
+            match parse_manifest(text) {
+                Ok(manifest) => (
+                    manifest.entry.clone(),
+                    manifest.lang.clone(),
+                    manifest.grants.clone(),
+                    Some(manifest),
+                ),
+                Err(error) => {
+                    let diagnostic = Diagnostic::error(Code::E508, error.message);
+                    last = vec![render_diagnostic(&diagnostic, &SourceMap::new())];
+                    return FixOutcome {
+                        rendered: last,
+                        failed: true,
+                    };
+                }
+            }
+        } else {
+            (
+                spec.entry.clone(),
+                spec.edition.clone(),
+                spec.grants.clone(),
+                None,
+            )
+        };
+
+        let provider = OverlayProvider {
+            base: &base,
+            overlay: &overlay,
+        };
+        let mut loaded = load(
+            &provider,
+            &LoadOptions {
+                entry,
+                interfaces: spec.interfaces.clone(),
+                grants,
+                limits: LoadLimits::default(),
+                edition,
+            },
+        );
+        last.clear();
+        render_all(&loaded.diagnostics, &loaded.sources, &mut last);
+        if loaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == Severity::Error)
+        {
+            return FixOutcome {
+                rendered: last,
+                failed: true,
+            };
+        }
+        let Some(program) = loaded.program.as_ref() else {
+            return FixOutcome {
+                rendered: last,
+                failed: false,
+            };
+        };
+        let manifest_source = manifest_text
+            .as_ref()
+            .map(|text| loaded.sources.add("plugin.toml", text.clone()));
+        let inputs = match (&manifest, manifest_source, manifest_text.as_deref()) {
+            (Some(manifest), Some(source), Some(text)) => LintInputs {
+                manifest: Some(ManifestInput {
+                    source,
+                    text,
+                    grants: &manifest.grants,
+                }),
+            },
+            _ => LintInputs::default(),
+        };
+        let prefix = relative_to(config_dir, &spec.root);
+        let output = martite_lint::lint(program, &loaded.sources, &resolver, &prefix, &inputs);
+        render_all(&output.diagnostics, &loaded.sources, &mut last);
+
+        if pass == 5 {
+            break;
+        }
+        let edits = collect_edits(&output.diagnostics, &loaded.sources, suggested);
+        if edits.is_empty() {
+            break;
+        }
+        if !apply_edits(&edits, &loaded.sources, &mut overlay) {
+            break;
+        }
+    }
+
+    let mut failed = false;
+    for (path, text) in &overlay {
+        let full = spec.root.join(path);
+        if let Some(parent) = full.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                eprintln!("error: cannot create {}: {error}", parent.display());
+                failed = true;
+                continue;
+            }
+        }
+        if let Err(error) = std::fs::write(&full, text) {
+            eprintln!("error: cannot write {}: {error}", full.display());
+            failed = true;
+        }
+    }
+    FixOutcome {
+        rendered: last,
+        failed,
+    }
+}
+
+fn collect_edits(
+    diagnostics: &[Diagnostic],
+    sources: &SourceMap,
+    suggested: bool,
+) -> Vec<PendingEdit> {
+    let mut edits = Vec::new();
+    for diagnostic in diagnostics {
+        let Some(fix) = &diagnostic.fix else {
+            continue;
+        };
+        if fix.applicability == Applicability::Maybe && !suggested {
+            continue;
+        }
+        for edit in &fix.edits {
+            let source = edit.source.or(diagnostic.source);
+            let Some(source) = source else {
+                continue;
+            };
+            let Some(file) = sources.get(source) else {
+                continue;
+            };
+            edits.push(PendingEdit {
+                path: file.name().to_string(),
+                span: edit.span,
+                replacement: edit.replacement.clone(),
+                code: diagnostic.code,
+            });
+        }
+    }
+    edits.sort_by_key(|edit| (edit.span.start, edit.code, edit.span.end));
+    let mut accepted: Vec<PendingEdit> = Vec::new();
+    for edit in edits {
+        if accepted.iter().any(|previous| interferes(previous, &edit)) {
+            continue;
+        }
+        accepted.push(edit);
+    }
+    accepted
+}
+
+fn interferes(left: &PendingEdit, right: &PendingEdit) -> bool {
+    if left.path != right.path {
+        return false;
+    }
+    let left_empty = left.span.start == left.span.end;
+    let right_empty = right.span.start == right.span.end;
+    if left_empty && right_empty {
+        return left.span.start == right.span.start;
+    }
+    if left_empty {
+        return left.span.start >= right.span.start && left.span.start <= right.span.end;
+    }
+    if right_empty {
+        return right.span.start >= left.span.start && right.span.start <= left.span.end;
+    }
+    left.span.start < right.span.end && right.span.start < left.span.end
+}
+
+fn apply_edits(
+    edits: &[PendingEdit],
+    sources: &SourceMap,
+    overlay: &mut HashMap<String, String>,
+) -> bool {
+    let mut by_path: HashMap<String, Vec<&PendingEdit>> = HashMap::new();
+    for edit in edits {
+        by_path.entry(edit.path.clone()).or_default().push(edit);
+    }
+    let mut changed = false;
+    for (path, mut edits) in by_path {
+        let Some(file) = sources.files().find(|(_, file)| file.name() == path) else {
+            continue;
+        };
+        let mut text = file.1.text().to_string();
+        edits.sort_by(|left, right| {
+            right
+                .span
+                .start
+                .cmp(&left.span.start)
+                .then_with(|| right.span.end.cmp(&left.span.end))
+        });
+        let mut applied = false;
+        for edit in edits {
+            let start = edit.span.start as usize;
+            let end = edit.span.end as usize;
+            if start > text.len() || end > text.len() || start > end {
+                continue;
+            }
+            text.replace_range(start..end, &edit.replacement);
+            applied = true;
+        }
+        if applied {
+            changed = true;
+            overlay.insert(path, text);
+        }
+    }
+    changed
+}
+
+fn cmd_lint(args: &[String]) -> ExitCode {
+    let parsed = match parse_lint_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("error: {message}\n");
+            return ExitCode::from(2);
+        }
+    };
+
+    if parsed.list_rules {
+        if parsed.json {
+            println!("{}", martite_lint::list_rules_json());
+        } else {
+            print!("{}", martite_lint::list_rules_text());
+        }
+        return ExitCode::SUCCESS;
+    }
+    if let Some(id) = &parsed.explain {
+        let Some(code) = Code::from_str(id) else {
+            eprintln!("error: unknown rule `{id}`");
+            return ExitCode::from(2);
+        };
+        if !code.is_lint() || martite_lint::is_retired(code) || !martite_lint::is_known(code) {
+            eprintln!("error: unknown lint rule `{id}`");
+            return ExitCode::from(2);
+        }
+        match martite_lint::explain_text(code) {
+            Some(text) => {
+                println!("{text}");
+                return ExitCode::SUCCESS;
+            }
+            None => {
+                eprintln!("error: unknown lint rule `{id}`");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    if parsed.syntax_only {
+        return lint_syntax_only_mode(&parsed);
+    }
+
+    let mut project_diagnostics = Vec::new();
+    let specs = match collect_projects(&parsed, &mut project_diagnostics) {
+        Ok(specs) => specs,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut rendered = Vec::new();
+    let empty_sources = SourceMap::new();
+    render_all(&project_diagnostics, &empty_sources, &mut rendered);
+    let mut had_load_error = !project_diagnostics.is_empty();
+
+    for spec in specs {
+        let (resolver, config_dir) = match resolver_for(&spec.root, parsed.rules.clone()) {
+            Ok(value) => value,
+            Err(message) => {
+                eprintln!("error: {message}");
+                return ExitCode::from(2);
+            }
+        };
+        if parsed.fix {
+            let outcome = fix_project(&spec, &resolver, &config_dir, parsed.suggested);
+            rendered.extend(outcome.rendered);
+            if outcome.failed {
+                had_load_error = true;
+            }
+            continue;
+        }
+        let provider = FileSystemProvider::new(spec.root.clone());
+        let mut loaded = load(
+            &provider,
+            &LoadOptions {
+                entry: spec.entry.clone(),
+                interfaces: spec.interfaces,
+                grants: spec.grants,
+                limits: LoadLimits::default(),
+                edition: spec.edition,
+            },
+        );
+        render_all(&loaded.diagnostics, &loaded.sources, &mut rendered);
+        if loaded
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == Severity::Error)
+        {
+            had_load_error = true;
+            continue;
+        }
+        let Some(program) = loaded.program.as_ref() else {
+            continue;
+        };
+        let manifest_source = spec
+            .manifest_text
+            .as_ref()
+            .map(|text| loaded.sources.add("plugin.toml", text.clone()));
+        let inputs = match (&spec.manifest, manifest_source, &spec.manifest_text) {
+            (Some(manifest), Some(source), Some(text)) => LintInputs {
+                manifest: Some(ManifestInput {
+                    source,
+                    text,
+                    grants: &manifest.grants,
+                }),
+            },
+            _ => LintInputs::default(),
+        };
+        let prefix = relative_to(&config_dir, &spec.root);
+        let output = martite_lint::lint(program, &loaded.sources, &resolver, &prefix, &inputs);
+        render_all(&output.diagnostics, &loaded.sources, &mut rendered);
+    }
+    print_rendered(&mut rendered, parsed.json);
+    if had_load_error || lint_fails(&rendered, parsed.deny_warnings) {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn lint_syntax_only_mode(args: &LintArgs) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut files = Vec::new();
+    if args.paths.is_empty() {
+        let Some(root) = find_project_root(&cwd) else {
+            eprintln!("error: --syntax-only requires a path when no project file is present");
+            return ExitCode::from(2);
+        };
+        files.extend(scan_martite_files(&root));
+    } else {
+        for raw in &args.paths {
+            let path = PathBuf::from(raw);
+            if path.is_file() {
+                if path.extension().and_then(|ext| ext.to_str()) != Some("mti") {
+                    files.push(path);
+                }
+            } else if path.is_dir() {
+                files.extend(scan_martite_files(&path));
+            } else {
+                eprintln!("error: path not found: {}", path.display());
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    files.retain(|path| {
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        seen.insert(key)
+    });
+
+    let mut sources = SourceMap::new();
+    let mut diagnostics = Vec::new();
+    let mut had_parse_error = false;
+    for path in files {
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => normalize_source(&text),
+            Err(error) => {
+                eprintln!("error: cannot read {}: {error}", path.display());
+                return ExitCode::from(2);
+            }
+        };
+        let display = path
+            .strip_prefix(&cwd)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let source = sources.add(display, text.clone());
+        let parsed = parse_source(&text, LoadLimits::default());
+        if !parsed.diagnostics.is_empty() {
+            had_parse_error = true;
+            let mut parse_diagnostics = parsed.diagnostics;
+            for diagnostic in &mut parse_diagnostics {
+                diagnostic.source = Some(source);
+            }
+            diagnostics.extend(parse_diagnostics);
+            continue;
+        }
+        let (resolver, config_dir) = match resolver_for(&path, args.rules.clone()) {
+            Ok(value) => value,
+            Err(message) => {
+                eprintln!("error: {message}");
+                return ExitCode::from(2);
+            }
+        };
+        let relative = relative_to(&config_dir, &path);
+        let settings = resolver.resolve(&relative);
+        diagnostics.extend(martite_lint::lint_syntax_only(
+            source,
+            &text,
+            &parsed.program,
+            &settings,
+        ));
+    }
+    sort_diagnostics(&mut diagnostics, &sources);
+    let mut rendered = Vec::new();
+    render_all(&diagnostics, &sources, &mut rendered);
+    print_rendered(&mut rendered, args.json);
+    if had_parse_error || lint_fails(&rendered, args.deny_warnings) {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 fn cmd_run(args: &[String]) -> ExitCode {

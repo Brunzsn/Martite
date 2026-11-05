@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::mem::discriminant;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -12,6 +13,11 @@ pub struct Program {
     pub items: Vec<Item>,
     pub is_interface: bool,
     pub span: Span,
+    /// Comments in source order. Tokens themselves do not carry trivia in this
+    /// implementation, so the lint and format tools read them from here.
+    pub comments: Vec<crate::token::Comment>,
+    /// Expressions that were written inside parentheses in the source.
+    pub parenthesized: HashSet<NodeId>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +49,8 @@ struct Parser<'a> {
     interface: bool,
     depth: usize,
     limit_hit: bool,
+    comments: Vec<crate::token::Comment>,
+    parenthesized: HashSet<NodeId>,
 }
 
 impl<'a> Parser<'a> {
@@ -67,6 +75,8 @@ impl<'a> Parser<'a> {
             interface,
             depth: 0,
             limit_hit: false,
+            comments: lexed.comments,
+            parenthesized: HashSet::new(),
         }
     }
 
@@ -95,6 +105,8 @@ impl<'a> Parser<'a> {
                 items,
                 is_interface: self.interface,
                 span: start.merge(end),
+                comments: self.comments,
+                parenthesized: self.parenthesized,
             },
             diagnostics: self.diagnostics,
         }
@@ -1609,6 +1621,7 @@ impl<'a> Parser<'a> {
                 })
             } else {
                 p.expect(&TokenKind::RParen)?;
+                p.parenthesized.insert(first.id);
                 Ok(first)
             }
         })

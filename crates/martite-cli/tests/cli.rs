@@ -180,3 +180,63 @@ grant = ["app.editor"]
     ]);
     assert!(output.status.success(), "stderr: {}", stderr(&output));
 }
+
+#[test]
+fn lint_lists_and_explains_rules() {
+    let output = martite(&[s("lint"), s("--list-rules")]);
+    assert!(output.status.success());
+    assert!(stdout(&output).contains("L001"));
+
+    let json = martite(&[s("lint"), s("--list-rules"), s("--json")]);
+    assert!(json.status.success());
+    assert!(stdout(&json).contains("\"id\":\"L001\""));
+
+    let explain = martite(&[s("lint"), s("--explain"), s("L019")]);
+    assert!(explain.status.success());
+    assert!(stdout(&explain).contains("L019"));
+}
+
+#[test]
+fn lint_syntax_only_reports_constant_conditions() {
+    let dir = TempDir::new("lint-syntax");
+    let script = dir.file("main.mt", "fn main() {\n    if true {}\n}\n");
+    let output = martite(&[
+        s("lint"),
+        s("--syntax-only"),
+        s("--deny-warnings"),
+        script.as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("L005"),
+        "stderr: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn lint_fix_applies_machine_fixes() {
+    let dir = TempDir::new("lint-fix");
+    let script = dir.file(
+        "main.mt",
+        "fn main() {\n    var value = 1\n    print(value)\n}\n",
+    );
+    let output = martite(&[s("lint"), s("--fix"), script.as_os_str()]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = std::fs::read_to_string(&script).expect("read fixed file");
+    assert!(text.contains("let value"), "fixed source: {text}");
+    assert!(!text.contains("var value"), "fixed source: {text}");
+}
+
+#[test]
+fn lint_deny_warnings_changes_the_exit_code() {
+    let dir = TempDir::new("lint-deny");
+    let script = dir.file(
+        "main.mt",
+        "fn main() {\n    if true {\n        print(\"x\")\n    }\n}\n",
+    );
+    let plain = martite(&[s("lint"), script.as_os_str()]);
+    assert!(plain.status.success(), "stderr: {}", stderr(&plain));
+    let denied = martite(&[s("lint"), s("--deny-warnings"), script.as_os_str()]);
+    assert_eq!(denied.status.code(), Some(1));
+}
