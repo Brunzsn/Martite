@@ -16,7 +16,7 @@ The workspace is split along the compiler pipeline:
 - `martite` — embedding and plugin host API
 - `martite-cli` — `martite` binary and standalone `std.io`/`std.env` host
 - `martite-lint` — rule registry, configuration, suppression, and fixes
-- `martite-fmt` — reserved for the post-M7 formatter milestone
+- `martite-fmt` — canonical formatter, comments, and layout
 - `martite-conformance` — cross-cutting conformance fixtures
 
 ## Commands
@@ -33,7 +33,26 @@ cargo run -p martite-cli -- lint --rule L005,L011 --deny-warnings examples/hello
 cargo run -p martite-cli -- lint --fix --suggested examples/hello.mt
 cargo run -p martite-cli -- lint --list-rules
 cargo run -p martite-cli -- lint --explain L019
+cargo run -p martite-cli -- fmt examples
+cargo run -p martite-cli -- fmt --check examples
+cargo run -p martite-cli -- fmt --verify examples/hello.mt
+cargo run -p martite-cli -- fmt --stdin < examples/hello.mt
 ```
+
+Formatter settings live in `martite.toml`:
+
+```toml
+[fmt]
+max_width = 100   # 40 to 200
+indent = 4        # 2 or 4
+end_of_line = "lf" # "lf" or "crlf"
+```
+
+`[format]` is accepted as a deprecated alias for `[fmt]`. `martite fmt` formats
+`.mt` and `.mti` files in place; `--check` prints a unified diff, `--verify`
+re-parses the output and compares ASTs before writing, and `--stdin` reads one
+source file from stdin. Files with syntax errors (E001–E003) are reported and
+left untouched.
 
 Lint settings live in `martite.toml`:
 
@@ -82,4 +101,5 @@ cargo test --workspace
 The conformance crate covers representative failures for E001–E508, the normative `Show`
 format, runtime panics, fuel/memory limits, plugin state, snapshots, and host grants.
 The lint crate covers syntax and checked-tier rules, suppression and config precedence,
-project-level fixes, and the `martite lint` CLI.
+project-level fixes, and the `martite lint` CLI. The formatter crate covers section 14
+golden fixtures, idempotence, AST equality, comment placement, and the `martite fmt` CLI.

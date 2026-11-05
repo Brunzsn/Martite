@@ -1,3 +1,5 @@
 struct Doc
+
 fn text(doc: Doc) -> str
+
 on saved(doc: Doc) -> Result[(), str]

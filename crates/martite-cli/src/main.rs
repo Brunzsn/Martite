@@ -12,7 +12,7 @@ use martite_driver::{LoadOptions, load};
 use martite_lint::{LintInputs, ManifestInput, SettingsResolver, normalize_path, sort_diagnostics};
 use martite_resolve::InterfaceSource;
 use martite_runtime::{ExecLimits, Runtime, Trap, Value};
-use martite_syntax::parse_source;
+use martite_syntax::{parse_interface, parse_source};
 
 const USAGE: &str = "\
 Martite language toolchain
@@ -25,7 +25,7 @@ Commands:
     check [options] <path> Parse and type-check
     lint [options] <path> Lint a project
     test [options] <path> Run test blocks
-    fmt [options] <path>  Format sources
+    fmt [options] [paths] Format sources
     help                  Show this help
     version               Show the toolchain version
 
@@ -35,6 +35,11 @@ Options:
     --fuel <n>            Fuel for `run` and `test`
     --memory <n>          Memory limit in bytes for `run` and `test`
     --depth <n>           Call-depth limit for `run` and `test`
+
+Fmt options:
+    --check               Print a unified diff; do not write
+    --verify              Re-parse output and compare ASTs
+    --stdin               Read source from stdin and write to stdout
 
 Lint options:
     --fix                 Apply machine-applicable fixes
@@ -67,10 +72,7 @@ fn main() -> ExitCode {
         "check" => cmd_check(rest, false),
         "lint" => cmd_lint(rest),
         "test" => cmd_test(rest),
-        "fmt" => {
-            eprintln!("martite fmt: the formatter is not available yet");
-            ExitCode::from(2)
-        }
+        "fmt" => cmd_fmt(rest),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -400,6 +402,295 @@ fn scan_martite_files_into(root: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+#[derive(Default)]
+struct FmtArgs {
+    check: bool,
+    verify: bool,
+    stdin: bool,
+    paths: Vec<String>,
+}
+
+fn parse_fmt_args(args: &[String]) -> Result<FmtArgs, String> {
+    use lexopt::prelude::*;
+
+    let mut out = FmtArgs::default();
+    let mut parser = lexopt::Parser::from_args(args.iter().cloned());
+    while let Some(arg) = parser.next().map_err(|error| error.to_string())? {
+        match arg {
+            Long("check") => out.check = true,
+            Long("verify") => out.verify = true,
+            Long("stdin") => out.stdin = true,
+            Value(value) => out
+                .paths
+                .push(value.string().map_err(|error| error.to_string())?),
+            _ => return Err(arg.unexpected().to_string()),
+        }
+    }
+    if out.stdin && !out.paths.is_empty() {
+        return Err("--stdin cannot be combined with paths".into());
+    }
+    Ok(out)
+}
+
+fn cmd_fmt(args: &[String]) -> ExitCode {
+    let parsed = match parse_fmt_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("error: {message}\n");
+            return ExitCode::from(2);
+        }
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    if parsed.stdin {
+        let mut source = String::new();
+        if let Err(error) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut source) {
+            eprintln!("error: cannot read stdin: {error}");
+            return ExitCode::from(2);
+        }
+        let config = match fmt_config_for(&cwd) {
+            Ok(config) => config,
+            Err(message) => {
+                eprintln!("error: {message}");
+                return ExitCode::from(2);
+            }
+        };
+        return format_stdin(&source, &config, &parsed, "<stdin>");
+    }
+
+    let files = match collect_fmt_files(&parsed, &cwd) {
+        Ok(files) => files,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut failed = false;
+    for file in files {
+        match format_file(&file, &parsed) {
+            Ok(status) => {
+                if status != ExitCode::SUCCESS {
+                    failed = true;
+                }
+            }
+            Err(message) => {
+                eprintln!("error: {message}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn fmt_config_for(start: &Path) -> Result<martite_config::FmtConfig, String> {
+    match load_tool_config(start)? {
+        Some((config, _)) => Ok(config.fmt),
+        None => Ok(martite_config::FmtConfig::default()),
+    }
+}
+
+fn collect_fmt_files(args: &FmtArgs, cwd: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    if args.paths.is_empty() {
+        let Some(root) = find_project_root(cwd) else {
+            return Err(
+                "fmt requires a path when no `martite.toml` or `plugin.toml` is present".into(),
+            );
+        };
+        scan_format_files(&root, &mut files);
+    } else {
+        for raw in &args.paths {
+            let path = PathBuf::from(raw);
+            if path.is_file() {
+                let extension = path.extension().and_then(|ext| ext.to_str());
+                if extension != Some("mt") && extension != Some("mti") {
+                    return Err(format!("not a Martite source file: {}", path.display()));
+                }
+                files.push(path);
+            } else if path.is_dir() {
+                scan_format_files(&path, &mut files);
+            } else {
+                return Err(format!("path not found: {}", path.display()));
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    files.retain(|path| {
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        seen.insert(key)
+    });
+    files.sort();
+    Ok(files)
+}
+
+fn scan_format_files(root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            scan_format_files(&path, out);
+        } else if matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("mt") | Some("mti")
+        ) {
+            out.push(path);
+        }
+    }
+}
+
+fn format_stdin(
+    source: &str,
+    config: &martite_config::FmtConfig,
+    args: &FmtArgs,
+    name: &str,
+) -> ExitCode {
+    let output = martite_fmt::format_source(source, config);
+    if output.text.is_none() {
+        print_fmt_diagnostics(&output.diagnostics, name, source);
+        return ExitCode::from(1);
+    }
+    let formatted = output.text.unwrap();
+    if args.verify {
+        if let Err(message) = verify_format(source, &formatted, false) {
+            eprintln!("error: formatter bug in {name}: {message}");
+            return ExitCode::from(2);
+        }
+    }
+    if args.check {
+        if source != formatted {
+            print!("{}", unified_diff(name, source, &formatted));
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+    print!("{formatted}");
+    ExitCode::SUCCESS
+}
+
+fn format_file(path: &Path, args: &FmtArgs) -> Result<ExitCode, String> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let interface = path.extension().and_then(|ext| ext.to_str()) == Some("mti");
+    let config = fmt_config_for(path)?;
+    let output = if interface {
+        martite_fmt::format_interface(&source, &config)
+    } else {
+        martite_fmt::format_source(&source, &config)
+    };
+    let name = path
+        .strip_prefix(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    if output.text.is_none() {
+        print_fmt_diagnostics(&output.diagnostics, &name, &source);
+        return Ok(ExitCode::from(1));
+    }
+    let formatted = output.text.unwrap();
+    if args.verify {
+        verify_format(&source, &formatted, interface)
+            .map_err(|message| format!("formatter bug in {name}: {message}"))?;
+    }
+    if args.check {
+        if source != formatted {
+            print!("{}", unified_diff(&name, &source, &formatted));
+            return Ok(ExitCode::from(1));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    if source != formatted {
+        std::fs::write(path, formatted)
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn verify_format(before: &str, after: &str, interface: bool) -> Result<(), String> {
+    let left = if interface {
+        parse_interface(before, LoadLimits::default())
+    } else {
+        parse_source(before, LoadLimits::default())
+    };
+    let right = if interface {
+        parse_interface(after, LoadLimits::default())
+    } else {
+        parse_source(after, LoadLimits::default())
+    };
+    if right.diagnostics.iter().any(|diagnostic| {
+        matches!(diagnostic.code, Code::E001 | Code::E002 | Code::E003)
+            && diagnostic.severity == Severity::Error
+    }) {
+        return Err("formatted output does not parse".into());
+    }
+    if !martite_fmt::structurally_equal(&left.program, &right.program) {
+        return Err("formatted output has a different AST".into());
+    }
+    Ok(())
+}
+
+fn print_fmt_diagnostics(diagnostics: &[martite_base::Diagnostic], name: &str, source: &str) {
+    let mut sources = SourceMap::new();
+    let source_id = sources.add(name.to_string(), source.to_string());
+    for diagnostic in diagnostics {
+        if !matches!(diagnostic.code, Code::E001 | Code::E002 | Code::E003) {
+            continue;
+        }
+        let mut diagnostic = diagnostic.clone();
+        diagnostic.source = Some(source_id);
+        eprintln!("{}", diagnostic.render(&sources));
+    }
+}
+
+/// A compact whole-file unified diff. Formatter output is already canonical,
+/// so a single hunk is both valid and easier to read than a minimal edit
+/// script with many tiny hunks.
+fn unified_diff(name: &str, before: &str, after: &str) -> String {
+    let before_lines: Vec<&str> = before
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    let after_lines: Vec<&str> = after
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    let before_count = if before.ends_with('\n') || before.ends_with("\r\n") {
+        before_lines.len() - 1
+    } else {
+        before_lines.len()
+    };
+    let after_count = if after.ends_with('\n') || after.ends_with("\r\n") {
+        after_lines.len() - 1
+    } else {
+        after_lines.len()
+    };
+    let name = name.replace('\\', "/");
+    let mut out = String::new();
+    out.push_str(&format!("--- a/{name}\n"));
+    out.push_str(&format!("+++ b/{name}\n"));
+    out.push_str(&format!("@@ -1,{before_count} +1,{after_count} @@\n"));
+    for line in before_lines.iter().take(before_count) {
+        out.push('-');
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in after_lines.iter().take(after_count) {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 struct ProjectSpec {

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::mem::discriminant;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -18,6 +18,11 @@ pub struct Program {
     pub comments: Vec<crate::token::Comment>,
     /// Expressions that were written inside parentheses in the source.
     pub parenthesized: HashSet<NodeId>,
+    /// Exact source parentheses around expressions, types, and patterns.
+    /// Nested pairs are recorded innermost first.
+    pub expression_parens: HashMap<NodeId, Vec<ParenPair>>,
+    pub type_parens: HashMap<NodeId, Vec<ParenPair>>,
+    pub pattern_parens: HashMap<NodeId, Vec<ParenPair>>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +56,9 @@ struct Parser<'a> {
     limit_hit: bool,
     comments: Vec<crate::token::Comment>,
     parenthesized: HashSet<NodeId>,
+    expression_parens: HashMap<NodeId, Vec<ParenPair>>,
+    type_parens: HashMap<NodeId, Vec<ParenPair>>,
+    pattern_parens: HashMap<NodeId, Vec<ParenPair>>,
 }
 
 impl<'a> Parser<'a> {
@@ -77,6 +85,9 @@ impl<'a> Parser<'a> {
             limit_hit: false,
             comments: lexed.comments,
             parenthesized: HashSet::new(),
+            expression_parens: HashMap::new(),
+            type_parens: HashMap::new(),
+            pattern_parens: HashMap::new(),
         }
     }
 
@@ -107,6 +118,9 @@ impl<'a> Parser<'a> {
                 span: start.merge(end),
                 comments: self.comments,
                 parenthesized: self.parenthesized,
+                expression_parens: self.expression_parens,
+                type_parens: self.type_parens,
+                pattern_parens: self.pattern_parens,
             },
             diagnostics: self.diagnostics,
         }
@@ -583,6 +597,7 @@ impl<'a> Parser<'a> {
 
     fn parse_optional_ret(&mut self) -> PResult<Option<TyExpr>> {
         if self.eat(&TokenKind::Arrow) {
+            self.skip_continuation_newlines();
             Ok(Some(self.parse_type()?))
         } else {
             Ok(None)
@@ -684,6 +699,7 @@ impl<'a> Parser<'a> {
         let start = self.expect(&TokenKind::Const)?.span;
         let (name, _) = self.expect_screaming()?;
         self.expect(&TokenKind::Colon)?;
+        self.skip_continuation_newlines();
         let ty = self.parse_type()?;
         self.expect(&TokenKind::Eq)?;
         let value = self.parse_expr()?;
@@ -860,7 +876,11 @@ impl<'a> Parser<'a> {
                             kind: TyKind::Tuple(items),
                         })
                     } else {
-                        p.expect(&TokenKind::RParen)?;
+                        let close = p.expect(&TokenKind::RParen)?.span;
+                        p.type_parens
+                            .entry(first.id)
+                            .or_default()
+                            .push(ParenPair { open: start, close });
                         Ok(first)
                     }
                 })
@@ -880,6 +900,7 @@ impl<'a> Parser<'a> {
                 })?;
                 self.expect(&TokenKind::RParen)?;
                 let ret = if self.eat(&TokenKind::Arrow) {
+                    self.skip_continuation_newlines();
                     Some(Box::new(self.parse_type()?))
                 } else {
                     None
@@ -939,6 +960,7 @@ impl<'a> Parser<'a> {
             let mutable = is_var;
             let pattern = self.parse_pattern()?;
             let ty = if self.eat(&TokenKind::Colon) {
+                self.skip_continuation_newlines();
                 Some(self.parse_type()?)
             } else {
                 None
@@ -1095,6 +1117,7 @@ impl<'a> Parser<'a> {
     fn parse_expr_inner(&mut self) -> PResult<Expr> {
         self.skip_continuation_newlines();
         let lhs = self.parse_or()?;
+        self.skip_continuation_newlines();
         if self.at(&TokenKind::QuestionQuestion) {
             self.advance();
             self.skip_continuation_newlines();
@@ -1115,7 +1138,11 @@ impl<'a> Parser<'a> {
 
     fn parse_or(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_and()?;
-        while self.at(&TokenKind::Or) {
+        loop {
+            self.skip_continuation_newlines();
+            if !self.at(&TokenKind::Or) {
+                break;
+            }
             self.advance();
             self.skip_continuation_newlines();
             let rhs = self.parse_and()?;
@@ -1135,7 +1162,11 @@ impl<'a> Parser<'a> {
 
     fn parse_and(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_not()?;
-        while self.at(&TokenKind::And) {
+        loop {
+            self.skip_continuation_newlines();
+            if !self.at(&TokenKind::And) {
+                break;
+            }
             self.advance();
             self.skip_continuation_newlines();
             let rhs = self.parse_not()?;
@@ -1318,9 +1349,7 @@ impl<'a> Parser<'a> {
     fn parse_postfix(&mut self) -> PResult<Expr> {
         let mut expr = self.parse_primary()?;
         loop {
-            if self.ignore_newlines {
-                self.skip_all_newlines();
-            }
+            self.skip_continuation_newlines();
             match self.peek_kind() {
                 TokenKind::LParen => {
                     let args = self.parse_args()?;
@@ -1620,8 +1649,12 @@ impl<'a> Parser<'a> {
                     kind: ExprKind::Tuple(items),
                 })
             } else {
-                p.expect(&TokenKind::RParen)?;
+                let close = p.expect(&TokenKind::RParen)?.span;
                 p.parenthesized.insert(first.id);
+                p.expression_parens
+                    .entry(first.id)
+                    .or_default()
+                    .push(ParenPair { open: start, close });
                 Ok(first)
             }
         })
@@ -1775,6 +1808,7 @@ impl<'a> Parser<'a> {
                 } else {
                     MatchBody::Expr(p.with_struct_lit(true, |p| p.parse_expr())?)
                 };
+                let block_body = matches!(body, MatchBody::Block(_));
                 let span = arm_start.merge(p.span_before());
                 arms.push(MatchArm {
                     id: p.id(),
@@ -1786,9 +1820,10 @@ impl<'a> Parser<'a> {
                 if p.eat(&TokenKind::Comma) {
                     continue;
                 }
-                if !p.at(&TokenKind::RBrace) {
-                    return Err(p.error_at_current("expected a comma between match arms"));
+                if block_body || p.at(&TokenKind::RBrace) {
+                    continue;
                 }
+                return Err(p.error_at_current("expected a comma between match arms"));
             }
             Ok(())
         })?;
@@ -1830,6 +1865,7 @@ impl<'a> Parser<'a> {
         })?;
         self.expect(&TokenKind::RParen)?;
         let ret = if self.eat(&TokenKind::Arrow) {
+            self.skip_continuation_newlines();
             Some(self.parse_type()?)
         } else {
             None
@@ -1867,6 +1903,7 @@ impl<'a> Parser<'a> {
         }
         let mut alternatives = vec![first];
         while self.eat(&TokenKind::Pipe) {
+            self.skip_continuation_newlines();
             alternatives.push(self.parse_pat()?);
         }
         let span = alternatives
@@ -2033,7 +2070,11 @@ impl<'a> Parser<'a> {
                             kind: PatKind::Tuple(items),
                         })
                     } else {
-                        p.expect(&TokenKind::RParen)?;
+                        let close = p.expect(&TokenKind::RParen)?.span;
+                        p.pattern_parens
+                            .entry(first.id)
+                            .or_default()
+                            .push(ParenPair { open: start, close });
                         Ok(first)
                     }
                 })

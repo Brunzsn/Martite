@@ -1,10 +1,6 @@
-fn add(a: int, b: int) -> int {
-    a + b
-}
+fn add(a: int, b: int) -> int { a + b }
 
-test "adds numbers" {
-    assert(add(2, 3) == 5, "2 + 3 should be 5")
-}
+test "adds numbers" { assert(add(2, 3) == 5, "2 + 3 should be 5") }
 
 test "lists sort" {
     var xs = [3, 1, 2]
@@ -12,6 +8,4 @@ test "lists sort" {
     assert(xs == [1, 2, 3], "list was not sorted")
 }
 
-fn main() {
-    print("{add(20, 22)}")
-}
+fn main() { print("{add(20, 22)}") }

@@ -3,6 +3,14 @@ use martite_base::Span;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u32);
 
+/// One pair of source parentheses around a node. Nested pairs are recorded
+/// innermost first, so the formatter can reproduce redundant `((x))` too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParenPair {
+    pub open: Span,
+    pub close: Span,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
     Use(UseDecl),

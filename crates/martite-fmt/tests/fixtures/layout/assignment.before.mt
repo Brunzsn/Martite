@@ -1,0 +1,6 @@
+fn main(){
+let short_value=1
+let long_value=first_long_expression_name+second_long_expression_name+third_long_expression_name+fourth_long_expression_name
+let list_value=[first_long_expression_name,second_long_expression_name,third_long_expression_name,fourth_long_expression_name]
+let call_value=some_function(first_long_expression_name,second_long_expression_name,third_long_expression_name)
+}

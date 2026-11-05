@@ -161,8 +161,11 @@ pub struct ToolFile {
     pub tool: ToolSection,
     #[serde(default)]
     pub lint: LintSection,
-    #[serde(default)]
-    pub format: FormatSection,
+    /// `[fmt]` is the canonical section name. `[format]` is accepted as a
+    /// deprecated compatibility alias so existing configuration files keep
+    /// working; both names in one file are rejected as a duplicate field.
+    #[serde(default, alias = "format")]
+    pub fmt: FmtSection,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -207,8 +210,42 @@ pub struct LintOverride {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct FormatSection {
+pub struct FmtSection {
     pub max_width: Option<usize>,
+    pub indent: Option<usize>,
+    pub end_of_line: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndOfLine {
+    Lf,
+    Crlf,
+}
+
+impl EndOfLine {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EndOfLine::Lf => "lf",
+            EndOfLine::Crlf => "crlf",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FmtConfig {
+    pub max_width: usize,
+    pub indent: usize,
+    pub end_of_line: EndOfLine,
+}
+
+impl Default for FmtConfig {
+    fn default() -> Self {
+        Self {
+            max_width: 100,
+            indent: 4,
+            end_of_line: EndOfLine::Lf,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -220,13 +257,14 @@ pub struct ToolConfig {
     pub lint_thresholds: std::collections::HashMap<String, i64>,
     pub lint_options: std::collections::HashMap<String, toml::Value>,
     pub lint_overrides: Vec<LintOverride>,
-    pub max_width: Option<usize>,
+    pub fmt: FmtConfig,
 }
 
 pub fn parse_tool_config(text: &str) -> Result<ToolConfig, ManifestError> {
     let file: ToolFile = toml::from_str(text).map_err(|e| ManifestError {
         message: format!("malformed martite.toml: {e}"),
     })?;
+    let fmt = parse_fmt_config(file.fmt)?;
     Ok(ToolConfig {
         lang: file.tool.lang,
         lint_preset: file.lint.preset,
@@ -235,7 +273,37 @@ pub fn parse_tool_config(text: &str) -> Result<ToolConfig, ManifestError> {
         lint_thresholds: file.lint.thresholds,
         lint_options: file.lint.options,
         lint_overrides: file.lint.overrides,
-        max_width: file.format.max_width,
+        fmt,
+    })
+}
+
+fn parse_fmt_config(section: FmtSection) -> Result<FmtConfig, ManifestError> {
+    let defaults = FmtConfig::default();
+    let max_width = section.max_width.unwrap_or(defaults.max_width);
+    if !(40..=200).contains(&max_width) {
+        return Err(ManifestError {
+            message: format!("fmt.max_width must be between 40 and 200, found {max_width}"),
+        });
+    }
+    let indent = section.indent.unwrap_or(defaults.indent);
+    if indent != 2 && indent != 4 {
+        return Err(ManifestError {
+            message: format!("fmt.indent must be 2 or 4, found {indent}"),
+        });
+    }
+    let end_of_line = match section.end_of_line.as_deref().unwrap_or("lf") {
+        "lf" => EndOfLine::Lf,
+        "crlf" => EndOfLine::Crlf,
+        other => {
+            return Err(ManifestError {
+                message: format!("fmt.end_of_line must be \"lf\" or \"crlf\", found `{other}`"),
+            });
+        }
+    };
+    Ok(FmtConfig {
+        max_width,
+        indent,
+        end_of_line,
     })
 }
 
@@ -284,5 +352,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message.contains("unknown field"));
+    }
+
+    #[test]
+    fn fmt_defaults_and_values() {
+        let config = parse_tool_config("").unwrap();
+        assert_eq!(config.fmt, FmtConfig::default());
+
+        let config = parse_tool_config(
+            r#"
+            [fmt]
+            max_width = 80
+            indent = 2
+            end_of_line = "crlf"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.fmt.max_width, 80);
+        assert_eq!(config.fmt.indent, 2);
+        assert_eq!(config.fmt.end_of_line, EndOfLine::Crlf);
+    }
+
+    #[test]
+    fn format_section_is_a_compatibility_alias() {
+        let config = parse_tool_config("[format]\nmax_width = 60\n").unwrap();
+        assert_eq!(config.fmt.max_width, 60);
+        assert_eq!(config.fmt.indent, 4);
+    }
+
+    #[test]
+    fn fmt_values_are_validated() {
+        for text in [
+            "[fmt]\nmax_width = 39\n",
+            "[fmt]\nmax_width = 201\n",
+            "[fmt]\nindent = 3\n",
+            "[fmt]\nend_of_line = \"native\"\n",
+        ] {
+            assert!(parse_tool_config(text).is_err(), "{text}");
+        }
     }
 }

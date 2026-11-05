@@ -49,6 +49,32 @@ fn martite(args: &[&std::ffi::OsStr]) -> Output {
         .expect("run martite")
 }
 
+fn martite_stdin(args: &[&std::ffi::OsStr], input: &str) -> Output {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_martite"))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn martite");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait for martite")
+}
+
+fn martite_in(dir: &Path, args: &[&std::ffi::OsStr]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_martite"))
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("run martite")
+}
+
 fn s(value: &str) -> &std::ffi::OsStr {
     std::ffi::OsStr::new(value)
 }
@@ -239,4 +265,113 @@ fn lint_deny_warnings_changes_the_exit_code() {
     assert!(plain.status.success(), "stderr: {}", stderr(&plain));
     let denied = martite(&[s("lint"), s("--deny-warnings"), script.as_os_str()]);
     assert_eq!(denied.status.code(), Some(1));
+}
+
+#[test]
+fn fmt_formats_in_place_and_check_reports_differences() {
+    let dir = TempDir::new("fmt");
+    let script = dir.file("main.mt", "fn main(){let x=[1,2,3]\nprint(\"{x}\")}");
+    let checked = martite(&[s("fmt"), s("--check"), script.as_os_str()]);
+    assert_eq!(checked.status.code(), Some(1));
+    assert!(stdout(&checked).contains("--- a/"));
+    assert!(stdout(&checked).contains("+++ b/"));
+    assert_eq!(
+        std::fs::read_to_string(&script).unwrap(),
+        "fn main(){let x=[1,2,3]\nprint(\"{x}\")}"
+    );
+
+    let formatted = martite(&[s("fmt"), s("--verify"), script.as_os_str()]);
+    assert!(formatted.status.success(), "stderr: {}", stderr(&formatted));
+    let text = std::fs::read_to_string(&script).unwrap();
+    assert!(text.contains("    let x = [1, 2, 3]"));
+
+    let clean = martite(&[s("fmt"), s("--check"), script.as_os_str()]);
+    assert!(clean.status.success(), "stderr: {}", stderr(&clean));
+}
+
+#[test]
+fn fmt_stdin_writes_to_stdout() {
+    let output = martite_stdin(&[s("fmt"), s("--stdin")], "fn main(){print(1)}");
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output), "fn main() { print(1) }\n");
+
+    let checked = martite_stdin(
+        &[s("fmt"), s("--stdin"), s("--check")],
+        "fn main(){print(1)}",
+    );
+    assert_eq!(checked.status.code(), Some(1));
+    assert!(stdout(&checked).contains("-fn main(){print(1)}"));
+}
+
+#[test]
+fn fmt_leaves_syntax_errors_untouched() {
+    let dir = TempDir::new("fmt-bad");
+    let source = "fn main( {\n";
+    let script = dir.file("main.mt", source);
+    let output = martite(&[s("fmt"), script.as_os_str()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("E003"),
+        "stderr: {}",
+        stderr(&output)
+    );
+    assert_eq!(std::fs::read_to_string(&script).unwrap(), source);
+}
+
+#[test]
+fn fmt_does_not_change_suppression() {
+    let dir = TempDir::new("fmt-suppress");
+    let script = dir.file(
+        "main.mt",
+        "fn main() {\n    // allow(L005)\n    if true { print(\"x\") }\n}\n",
+    );
+    let before = martite(&[s("lint"), script.as_os_str()]);
+    assert!(
+        !stderr(&before).contains("L005"),
+        "stderr: {}",
+        stderr(&before)
+    );
+    let formatted = martite(&[s("fmt"), script.as_os_str()]);
+    assert!(formatted.status.success(), "stderr: {}", stderr(&formatted));
+    let after = martite(&[s("lint"), script.as_os_str()]);
+    assert!(
+        !stderr(&after).contains("L005"),
+        "stderr: {}",
+        stderr(&after)
+    );
+    let text = std::fs::read_to_string(&script).unwrap();
+    assert!(text.contains("// allow(L005)\n    if true"), "{text}");
+}
+
+#[test]
+fn fmt_is_stable_after_lint_fix() {
+    let dir = TempDir::new("fmt-after-fix");
+    let script = dir.file("main.mt", "fn main(){var value = 1\nprint(value)}\n");
+    let fix = martite(&[s("lint"), s("--fix"), script.as_os_str()]);
+    assert!(fix.status.success(), "stderr: {}", stderr(&fix));
+    let formatted = martite(&[s("fmt"), script.as_os_str()]);
+    assert!(formatted.status.success(), "stderr: {}", stderr(&formatted));
+    let checked = martite(&[s("fmt"), s("--check"), script.as_os_str()]);
+    assert!(checked.status.success(), "stderr: {}", stderr(&checked));
+}
+
+#[test]
+fn fmt_uses_martite_toml_settings_and_walks_projects() {
+    let dir = TempDir::new("fmt-config");
+    dir.file(
+        "martite.toml",
+        "[fmt]\nmax_width = 40\nindent = 2\nend_of_line = \"crlf\"\n",
+    );
+    let script = dir.file("main.mt", "fn main(){let x=[1,2,3]}\n");
+    let interface = dir.file("api.mti", "struct Doc\nfn text(d: Doc)->str\n");
+    let output = martite_in(dir.path(), &[s("fmt")]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = std::fs::read_to_string(&script).unwrap();
+    assert!(text.contains("\r\n"), "expected CRLF: {text:?}");
+    assert!(
+        text.contains("  let x"),
+        "expected 2-space indent: {text:?}"
+    );
+    let mti = std::fs::read_to_string(&interface).unwrap();
+    assert_eq!(mti, "struct Doc\r\n\r\nfn text(d: Doc) -> str\r\n");
 }

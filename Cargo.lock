@@ -401,6 +401,7 @@ name = "martite-fmt"
 version = "0.1.0"
 dependencies = [
  "martite-base",
+ "martite-config",
  "martite-syntax",
 ]
 
