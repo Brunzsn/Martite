@@ -7,7 +7,9 @@ mod verify;
 
 use martite_base::{Code, Diagnostic, LoadLimits, normalize_source};
 use martite_config::FmtConfig;
-use martite_syntax::{Program, lex, parse_interface, parse_source};
+use martite_syntax::{
+    Program, lex, parse_interface_normalized_with_tokens, parse_source_normalized_with_tokens,
+};
 
 pub use verify::{comment_multiset, structurally_equal};
 
@@ -40,10 +42,10 @@ pub fn format_interface(source: &str, config: &FmtConfig) -> FormatOutput {
 
 fn format_mode(source: &str, config: &FmtConfig, interface: bool) -> FormatOutput {
     let source = normalize_source(source);
-    let parsed = if interface {
-        parse_interface(&source, LoadLimits::default())
+    let (parsed, tokens) = if interface {
+        parse_interface_normalized_with_tokens(source.as_ref(), LoadLimits::default())
     } else {
-        parse_source(&source, LoadLimits::default())
+        parse_source_normalized_with_tokens(source.as_ref(), LoadLimits::default())
     };
     let has_syntax_error = parsed.diagnostics.iter().any(|diagnostic| {
         matches!(diagnostic.code, Code::E001 | Code::E002 | Code::E003)
@@ -61,7 +63,7 @@ fn format_mode(source: &str, config: &FmtConfig, interface: bool) -> FormatOutpu
                 .collect(),
         };
     }
-    let text = format_program(&source, &parsed.program, config);
+    let text = format::format_program(source.as_ref(), &parsed.program, tokens, config);
     FormatOutput {
         text: Some(text),
         diagnostics: Vec::new(),

@@ -4,13 +4,89 @@
 //! `Group`, whether its contents fit on the current line. Widths are measured
 //! in Unicode scalar values, as required by section 14 of the language rules.
 
-use std::collections::VecDeque;
+use std::borrow::Cow;
+
+/// One piece of text with its cached scalar width.
+#[derive(Debug, Clone)]
+pub struct Text {
+    text: Cow<'static, str>,
+    width: usize,
+}
+
+impl Text {
+    fn new(text: impl Into<Cow<'static, str>>) -> Self {
+        let text = text.into();
+        let width = text.chars().count();
+        Self { text, width }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    fn width(&self) -> usize {
+        self.width
+    }
+}
+
+impl From<&'static str> for Text {
+    fn from(text: &'static str) -> Self {
+        Self::new(text)
+    }
+}
+
+impl From<String> for Text {
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+
+/// Cached layout information for a document subtree.
+#[derive(Debug, Clone, Copy)]
+pub struct Layout {
+    flat_width: Option<usize>,
+    forced_break: bool,
+}
+
+impl Layout {
+    const NIL: Self = Self {
+        flat_width: Some(0),
+        forced_break: false,
+    };
+
+    const fn width(width: usize) -> Self {
+        Self {
+            flat_width: Some(width),
+            forced_break: false,
+        }
+    }
+
+    const fn forced() -> Self {
+        Self {
+            flat_width: None,
+            forced_break: true,
+        }
+    }
+
+    fn join(self, other: Self) -> Self {
+        Self {
+            flat_width: match (self.flat_width, other.flat_width) {
+                (Some(left), Some(right)) => Some(left + right),
+                _ => None,
+            },
+            forced_break: self.forced_break || other.forced_break,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum Doc {
     Nil,
-    Text(String),
-    Concat(Vec<Doc>),
+    Text(Text),
+    Concat {
+        docs: Vec<Doc>,
+        layout: Layout,
+    },
     /// A space when flat, a newline when broken.
     Line,
     /// Nothing when flat, a newline when broken.
@@ -19,7 +95,10 @@ pub enum Doc {
     HardLine,
     /// Exactly one empty line between the surrounding content.
     BlankLine,
-    Group(Box<Doc>),
+    Group {
+        doc: Box<Doc>,
+        layout: Layout,
+    },
     /// Render the contents with one additional indentation level.
     Indent(Box<Doc>),
     /// Render the contents in flat mode regardless of the surrounding group.
@@ -28,6 +107,7 @@ pub enum Doc {
     Choice {
         flat: Box<Doc>,
         broken: Box<Doc>,
+        layout: Layout,
     },
     /// Emit `broken` when the surrounding group is broken, `flat` otherwise.
     IfBreak {
@@ -41,24 +121,33 @@ pub enum Doc {
 }
 
 impl Doc {
-    pub fn text(text: impl Into<String>) -> Self {
+    pub fn text(text: impl Into<Text>) -> Self {
         Doc::Text(text.into())
     }
 
+    pub fn group(doc: Doc) -> Self {
+        let layout = doc.layout();
+        Doc::Group {
+            doc: Box::new(doc),
+            layout,
+        }
+    }
+
+    pub fn choice(flat: Doc, broken: Doc) -> Self {
+        let layout = flat.layout();
+        Doc::Choice {
+            flat: Box::new(flat),
+            broken: Box::new(broken),
+            layout,
+        }
+    }
+
     pub fn concat(docs: impl IntoIterator<Item = Doc>) -> Self {
-        let mut out = Vec::new();
+        let mut out = Doc::Nil;
         for doc in docs {
-            match doc {
-                Doc::Nil => {}
-                Doc::Concat(inner) => out.extend(inner),
-                other => out.push(other),
-            }
+            out = out.append(doc);
         }
-        match out.len() {
-            0 => Doc::Nil,
-            1 => out.pop().unwrap(),
-            _ => Doc::Concat(out),
-        }
+        out
     }
 
     pub fn indent(self) -> Self {
@@ -66,37 +155,58 @@ impl Doc {
     }
 
     pub fn append(self, other: Doc) -> Self {
-        Doc::concat([self, other])
+        if matches!(other, Doc::Nil) {
+            return self;
+        }
+        let other_layout = other.layout();
+        match self {
+            Doc::Nil => other,
+            Doc::Concat {
+                mut docs,
+                mut layout,
+            } => {
+                match other {
+                    Doc::Concat {
+                        docs: mut inner, ..
+                    } => docs.append(&mut inner),
+                    other => docs.push(other),
+                }
+                layout = layout.join(other_layout);
+                Doc::Concat { docs, layout }
+            }
+            other_self => {
+                let layout = other_self.layout().join(other_layout);
+                Doc::Concat {
+                    docs: vec![other_self, other],
+                    layout,
+                }
+            }
+        }
     }
 
-    pub fn has_forced_break(&self) -> bool {
+    fn layout(&self) -> Layout {
         match self {
-            Doc::HardLine | Doc::BlankLine | Doc::BreakParent => true,
-            Doc::Nil | Doc::Text(_) | Doc::Line | Doc::SoftLine | Doc::LineSuffix(_) => false,
-            Doc::Concat(docs) => docs.iter().any(Doc::has_forced_break),
-            Doc::Group(doc) | Doc::Indent(doc) | Doc::Flat(doc) => doc.has_forced_break(),
-            Doc::Choice { flat, .. } => flat.has_forced_break(),
-            Doc::IfBreak { broken, flat } => broken.has_forced_break() && flat.has_forced_break(),
+            Doc::Nil => Layout::NIL,
+            Doc::Text(text) => Layout::width(text.width()),
+            Doc::Concat { layout, .. } | Doc::Group { layout, .. } | Doc::Choice { layout, .. } => {
+                *layout
+            }
+            Doc::Line => Layout::width(1),
+            Doc::SoftLine => Layout::NIL,
+            Doc::HardLine | Doc::BlankLine | Doc::BreakParent => Layout::forced(),
+            Doc::Indent(doc) | Doc::Flat(doc) => doc.layout(),
+            Doc::IfBreak { broken, flat } => Layout {
+                flat_width: flat.layout().flat_width,
+                forced_break: broken.layout().forced_break && flat.layout().forced_break,
+            },
+            Doc::LineSuffix(text) => Layout::width(text.chars().count() + 1),
         }
     }
 
     /// Width of the document when rendered flat, or `None` when it contains a
     /// construct that cannot be flattened.
     pub fn flat_width(&self) -> Option<usize> {
-        Some(match self {
-            Doc::Nil => 0,
-            Doc::Text(text) => text.chars().count(),
-            Doc::Concat(docs) => docs
-                .iter()
-                .try_fold(0usize, |total, doc| Some(total + doc.flat_width()?))?,
-            Doc::Line => 1,
-            Doc::SoftLine => 0,
-            Doc::HardLine | Doc::BlankLine | Doc::BreakParent => return None,
-            Doc::Group(doc) | Doc::Indent(doc) | Doc::Flat(doc) => doc.flat_width()?,
-            Doc::Choice { flat, .. } => flat.flat_width()?,
-            Doc::IfBreak { flat, .. } => flat.flat_width()?,
-            Doc::LineSuffix(text) => text.chars().count() + 1,
-        })
+        self.layout().flat_width
     }
 }
 
@@ -106,6 +216,7 @@ enum Mode {
     Break,
 }
 
+#[derive(Debug, Clone, Copy)]
 struct Command<'a> {
     indent: usize,
     mode: Mode,
@@ -121,6 +232,7 @@ pub struct Renderer {
     line_start: bool,
     pending_indent: usize,
     line_suffixes: Vec<String>,
+    line_suffix_width: usize,
     saw_content: bool,
 }
 
@@ -135,21 +247,23 @@ impl Renderer {
             line_start: true,
             pending_indent: 0,
             line_suffixes: Vec::new(),
+            line_suffix_width: 0,
             saw_content: false,
         }
     }
 
-    pub fn render(mut self, doc: &Doc) -> String {
-        let mut stack: Vec<Command<'_>> = vec![Command {
+    pub fn render<'a>(mut self, doc: &'a Doc) -> String {
+        let mut stack: Vec<Command<'a>> = vec![Command {
             indent: 0,
             mode: Mode::Break,
             doc,
         }];
+        let mut scratch = Vec::new();
         while let Some(command) = stack.pop() {
             match command.doc {
                 Doc::Nil => {}
-                Doc::Text(text) => self.write_text(text, command.indent),
-                Doc::Concat(docs) => {
+                Doc::Text(text) => self.write_text(text.as_str(), text.width(), command.indent),
+                Doc::Concat { docs, .. } => {
                     for doc in docs.iter().rev() {
                         stack.push(Command {
                             indent: command.indent,
@@ -160,7 +274,7 @@ impl Renderer {
                 }
                 Doc::Line => {
                     if command.mode == Mode::Flat {
-                        self.write_text(" ", command.indent);
+                        self.write_text(" ", 1, command.indent);
                     } else {
                         self.newline(command.indent);
                     }
@@ -172,15 +286,13 @@ impl Renderer {
                 }
                 Doc::HardLine => self.newline(command.indent),
                 Doc::BlankLine => self.blank_line(command.indent),
-                Doc::Group(doc) => {
+                Doc::Group { doc, layout } => {
                     let next = Command {
                         indent: command.indent,
                         mode: Mode::Flat,
                         doc,
                     };
-                    let fits = !doc.has_forced_break()
-                        && self.fits(next, &stack)
-                        && !doc.has_forced_break();
+                    let fits = !layout.forced_break && self.fits(next, &stack, &mut scratch);
                     stack.push(Command {
                         indent: command.indent,
                         mode: if fits { Mode::Flat } else { Mode::Break },
@@ -197,13 +309,17 @@ impl Renderer {
                     mode: Mode::Flat,
                     doc,
                 }),
-                Doc::Choice { flat, broken } => {
+                Doc::Choice {
+                    flat,
+                    broken,
+                    layout,
+                } => {
                     let next = Command {
                         indent: command.indent,
                         mode: Mode::Flat,
                         doc: flat,
                     };
-                    let fits = !flat.has_forced_break() && self.fits(next, &stack);
+                    let fits = !layout.forced_break && self.fits(next, &stack, &mut scratch);
                     stack.push(Command {
                         indent: command.indent,
                         mode: if fits { Mode::Flat } else { Mode::Break },
@@ -219,14 +335,22 @@ impl Renderer {
                         flat
                     },
                 }),
-                Doc::LineSuffix(text) => self.line_suffixes.push(text.clone()),
+                Doc::LineSuffix(text) => {
+                    self.line_suffix_width += text.chars().count() + 1;
+                    self.line_suffixes.push(text.clone());
+                }
                 Doc::BreakParent => {}
             }
         }
         self.finish()
     }
 
-    fn fits(&self, next: Command<'_>, rest: &[Command<'_>]) -> bool {
+    fn fits<'a>(
+        &self,
+        next: Command<'a>,
+        rest: &[Command<'a>],
+        scratch: &mut Vec<Command<'a>>,
+    ) -> bool {
         let mut remaining = self.width.saturating_sub(
             self.column
                 + if self.line_start {
@@ -235,43 +359,50 @@ impl Renderer {
                     0
                 },
         );
-        let mut pending: Vec<Command<'_>> = Vec::new();
-        pending.push(next);
-        for command in rest.iter().rev() {
-            pending.push(Command {
-                indent: command.indent,
-                mode: command.mode,
-                doc: command.doc,
-            });
+        if self.line_suffix_width > remaining {
+            return false;
         }
-        if !self.line_suffixes.is_empty() {
-            let suffix: usize = self
-                .line_suffixes
-                .iter()
-                .map(|text| text.chars().count() + 1)
-                .sum();
-            if suffix > remaining {
-                return false;
+        remaining -= self.line_suffix_width;
+
+        scratch.clear();
+        scratch.push(next);
+        let mut rest_index = rest.len();
+        loop {
+            let command = match scratch.pop() {
+                Some(command) => command,
+                None => {
+                    if rest_index == 0 {
+                        return true;
+                    }
+                    rest_index -= 1;
+                    rest[rest_index]
+                }
+            };
+
+            // A flat subtree has an exact cached width, so a whole command can
+            // be measured without expanding it.
+            if command.mode == Mode::Flat
+                && let Some(width) = command.doc.flat_width()
+            {
+                if width > remaining {
+                    return false;
+                }
+                remaining -= width;
+                continue;
             }
-            remaining -= suffix;
-        }
-        let mut queue: VecDeque<Command<'_>> = VecDeque::new();
-        for command in pending {
-            queue.push_back(command);
-        }
-        while let Some(command) = queue.pop_front() {
+
             match command.doc {
                 Doc::Nil | Doc::BreakParent => {}
                 Doc::Text(text) => {
-                    let width = text.chars().count();
+                    let width = text.width();
                     if width > remaining {
                         return false;
                     }
                     remaining -= width;
                 }
-                Doc::Concat(docs) => {
+                Doc::Concat { docs, .. } => {
                     for doc in docs.iter().rev() {
-                        queue.push_front(Command {
+                        scratch.push(Command {
                             indent: command.indent,
                             mode: command.mode,
                             doc,
@@ -293,27 +424,27 @@ impl Renderer {
                     }
                 }
                 Doc::HardLine | Doc::BlankLine => return true,
-                Doc::Group(doc) => queue.push_front(Command {
+                Doc::Group { doc, .. } => scratch.push(Command {
                     indent: command.indent,
                     mode: command.mode,
                     doc,
                 }),
-                Doc::Indent(doc) => queue.push_front(Command {
+                Doc::Indent(doc) => scratch.push(Command {
                     indent: command.indent + self.indent_width,
                     mode: command.mode,
                     doc,
                 }),
-                Doc::Flat(doc) => queue.push_front(Command {
+                Doc::Flat(doc) => scratch.push(Command {
                     indent: command.indent,
                     mode: Mode::Flat,
                     doc,
                 }),
-                Doc::Choice { flat, .. } => queue.push_front(Command {
+                Doc::Choice { flat, .. } => scratch.push(Command {
                     indent: command.indent,
                     mode: Mode::Flat,
                     doc: flat,
                 }),
-                Doc::IfBreak { flat, .. } => queue.push_front(Command {
+                Doc::IfBreak { flat, .. } => scratch.push(Command {
                     indent: command.indent,
                     mode: command.mode,
                     doc: flat,
@@ -327,10 +458,9 @@ impl Renderer {
                 }
             }
         }
-        true
     }
 
-    fn write_text(&mut self, text: &str, indent: usize) {
+    fn write_text(&mut self, text: &str, width: usize, indent: usize) {
         if text.is_empty() {
             return;
         }
@@ -343,7 +473,7 @@ impl Renderer {
             self.line_start = false;
         }
         self.out.push_str(text);
-        self.column += text.chars().count();
+        self.column += width;
         self.saw_content = true;
     }
 
@@ -352,6 +482,7 @@ impl Renderer {
             return;
         }
         let suffixes = std::mem::take(&mut self.line_suffixes);
+        self.line_suffix_width = 0;
         for suffix in suffixes {
             if !self.line_start && self.column > 0 {
                 self.out.push(' ');
@@ -379,11 +510,12 @@ impl Renderer {
         if !self.line_start {
             return;
         }
-        if self.out.is_empty() || self.out.ends_with(self.eol) {
+        let ends_with_eol = self.out.ends_with(self.eol);
+        if self.out.is_empty() || ends_with_eol {
             // `newline` either emitted one newline or was a no-op at line
             // start. In both cases exactly one extra newline makes one blank
             // line, but never stack more than one.
-            if !self.out.ends_with(&format!("{}{}", self.eol, self.eol)) {
+            if !ends_with_eol || !self.out[..self.out.len() - self.eol.len()].ends_with(self.eol) {
                 self.out.push_str(self.eol);
             }
         }
@@ -412,7 +544,7 @@ mod tests {
 
     #[test]
     fn groups_break_only_when_needed() {
-        let doc = Doc::Group(Box::new(Doc::concat([
+        let doc = Doc::group(Doc::concat([
             Doc::text("call("),
             Doc::concat([
                 Doc::SoftLine,
@@ -423,7 +555,7 @@ mod tests {
             .indent(),
             Doc::SoftLine,
             Doc::text(")"),
-        ])));
+        ]));
         assert_eq!(render(&doc, 80), "call(first, second)\n");
         assert_eq!(render(&doc, 10), "call(\n    first,\n    second\n)\n");
     }
@@ -436,11 +568,11 @@ mod tests {
 
     #[test]
     fn nested_group_stays_flat_inside_broken_parent() {
-        let entry = Doc::Group(Box::new(Doc::concat([
+        let entry = Doc::group(Doc::concat([
             Doc::text("a:"),
             Doc::concat([Doc::Line, Doc::text("1")]).indent(),
-        ])));
-        let outer = Doc::Group(Box::new(Doc::concat([
+        ]));
+        let outer = Doc::group(Doc::concat([
             Doc::text("{"),
             Doc::concat([
                 Doc::SoftLine,
@@ -454,7 +586,34 @@ mod tests {
             .indent(),
             Doc::SoftLine,
             Doc::text("}"),
-        ])));
+        ]));
         assert_eq!(render(&outer, 100), "{\n    a: 1, // c\n    b: 2\n}\n");
+    }
+
+    #[test]
+    fn cached_layout_matches_flat_rendering() {
+        let doc = Doc::concat([
+            Doc::text("ab"),
+            Doc::Line,
+            Doc::text("c"),
+            Doc::SoftLine,
+            Doc::text("d"),
+        ]);
+        assert_eq!(doc.flat_width(), Some(5));
+        assert!(!doc.layout().forced_break);
+
+        let doc = doc.append(Doc::HardLine);
+        assert_eq!(doc.flat_width(), None);
+        assert!(doc.layout().forced_break);
+    }
+
+    #[test]
+    fn static_text_borrows_its_source() {
+        let doc = Doc::text("static");
+        let Doc::Text(text) = doc else {
+            panic!("expected text");
+        };
+        assert!(matches!(text.text, Cow::Borrowed(_)));
+        assert_eq!(text.width(), 6);
     }
 }
