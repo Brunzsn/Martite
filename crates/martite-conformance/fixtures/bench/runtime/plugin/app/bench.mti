@@ -1,0 +1,2 @@
+on saved(item: str) -> Result[(), str]
+on tick()

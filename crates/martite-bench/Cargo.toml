@@ -1,0 +1,59 @@
+[package]
+name = "martite-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Criterion benchmarks for the Martite compiler, runtime, and CLI"
+publish = false
+autobenches = false
+
+[dependencies]
+martite.workspace = true
+martite-base.workspace = true
+martite-syntax.workspace = true
+martite-config.workspace = true
+martite-resolve.workspace = true
+martite-check.workspace = true
+martite-runtime.workspace = true
+martite-driver.workspace = true
+martite-lint.workspace = true
+martite-fmt.workspace = true
+
+[dev-dependencies]
+criterion = "0.8.2"
+stats_alloc = "0.1.10"
+
+[[bench]]
+name = "lexer"
+harness = false
+
+[[bench]]
+name = "parser"
+harness = false
+
+[[bench]]
+name = "load_check"
+harness = false
+
+[[bench]]
+name = "lint"
+harness = false
+
+[[bench]]
+name = "runtime"
+harness = false
+
+[[bench]]
+name = "formatter"
+harness = false
+
+[[bench]]
+name = "cli"
+harness = false
+
+[[bench]]
+name = "allocations"
+harness = false
+
+[lints]
+workspace = true

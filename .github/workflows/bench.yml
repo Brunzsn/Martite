@@ -1,0 +1,41 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    name: bench (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: python3
+          - os: windows-latest
+            python: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench
+      - name: Build CLI for startup benches
+        run: cargo build --release -p martite-cli
+      - name: Compile benchmarks
+        run: cargo bench -p martite-bench --no-run
+      - name: Clear stale Criterion results
+        run: ${{ matrix.python }} -c "import shutil; shutil.rmtree('target/criterion', ignore_errors=True)"
+      - name: Run benchmarks
+        run: cargo bench -p martite-bench
+      - name: Write benchmark summary
+        if: always()
+        run: ${{ matrix.python }} .github/scripts/bench_summary.py
+      - name: Upload Criterion results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-${{ matrix.os }}
+          path: target/criterion
+          if-no-files-found: ignore

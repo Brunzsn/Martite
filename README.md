@@ -18,6 +18,7 @@ The workspace is split along the compiler pipeline:
 - `martite-lint` — rule registry, configuration, suppression, and fixes
 - `martite-fmt` — canonical formatter, comments, and layout
 - `martite-conformance` — cross-cutting conformance fixtures
+- `martite-bench` — Criterion benchmarks for the compiler, runtime, tools, and CLI
 
 ## Commands
 
@@ -37,7 +38,13 @@ cargo run -p martite-cli -- fmt examples
 cargo run -p martite-cli -- fmt --check examples
 cargo run -p martite-cli -- fmt --verify examples/hello.mt
 cargo run -p martite-cli -- fmt --stdin < examples/hello.mt
+cargo bench -p martite-bench
 ```
+
+Benchmarks use the deterministic corpus in
+`crates/martite-conformance/fixtures/bench`. See
+[`crates/martite-bench/README.md`](crates/martite-bench/README.md) for the
+groups, baselines, and allocation reporting.
 
 Formatter settings live in `martite.toml`:
 
@@ -108,7 +115,28 @@ cargo test --workspace
 - grammar fixtures for the section 10 parser notes;
 - plugin state, snapshots, handles, grants, settings, and test doubles;
 - formatter idempotence, AST equality, comment survival, and suppression
-  invariance.
+  invariance;
+- parse, check, run, plugin, and formatter coverage for the shared benchmark
+  corpus.
+
+## Benchmarks
+
+The benchmark suite is a separate, unpublished workspace member. Benchmark-only
+dependencies live there, never in production crates.
+
+```sh
+cargo build --release -p martite-cli   # first time only, for the CLI group
+cargo bench -p martite-bench
+cargo bench -p martite-bench --no-run
+cargo bench -p martite-bench -- --save-baseline main
+cargo bench -p martite-bench -- --baseline main
+```
+
+`cargo bench` prints a Criterion report for each compiler/runtime/tool group and
+a separate allocation table. Results are informational: the suite asserts
+correctness of its fixtures, not performance thresholds. A manual GitHub Actions
+run writes the same overview to the job summary. See
+[`crates/martite-bench/README.md`](crates/martite-bench/README.md).
 
 The checker fuzz target lives in the separate `fuzz/` workspace:
 

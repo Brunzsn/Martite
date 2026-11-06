@@ -1,0 +1,7 @@
+struct Doc
+
+fn text(doc: Doc) -> str
+fn maybe() -> str?
+
+on saved(doc: Doc) -> Result[(), str]
+on tick()

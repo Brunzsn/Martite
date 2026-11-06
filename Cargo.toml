@@ -32,7 +32,7 @@ proptest = "1.12"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
-rust_2018_idioms = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
 
 [profile.dev]
 debug = "line-tables-only"

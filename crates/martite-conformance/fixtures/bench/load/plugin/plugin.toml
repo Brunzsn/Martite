@@ -1,0 +1,9 @@
+[plugin]
+name = "bench-load-plugin"
+version = "0.1.0"
+lang = "1"
+api = "1.0"
+entry = "main.mt"
+
+[permissions]
+grant = ["app.editor"]
