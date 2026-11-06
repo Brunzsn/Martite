@@ -3,7 +3,7 @@ use std::path::Path;
 use martite_base::LoadLimits;
 use martite_config::FmtConfig;
 use martite_fmt::{format_interface, format_source, structurally_equal};
-use martite_syntax::{parse_interface, parse_source};
+use martite_syntax::{ParseOptions, parse_interface_with, parse_source_with};
 
 fn format_ok(source: &str, interface: bool) -> String {
     let config = FmtConfig::default();
@@ -22,14 +22,14 @@ fn format_ok(source: &str, interface: bool) -> String {
 
 fn assert_equivalent(before: &str, after: &str, interface: bool) {
     let left = if interface {
-        parse_interface(before, LoadLimits::default()).program
+        parse_interface_with(before, LoadLimits::default(), ParseOptions::TOOLING).program
     } else {
-        parse_source(before, LoadLimits::default()).program
+        parse_source_with(before, LoadLimits::default(), ParseOptions::TOOLING).program
     };
     let right = if interface {
-        parse_interface(after, LoadLimits::default()).program
+        parse_interface_with(after, LoadLimits::default(), ParseOptions::TOOLING).program
     } else {
-        parse_source(after, LoadLimits::default()).program
+        parse_source_with(after, LoadLimits::default(), ParseOptions::TOOLING).program
     };
     assert!(
         structurally_equal(&left, &right),
@@ -313,7 +313,8 @@ fn golden_fixtures() {
         let source = std::fs::read_to_string(&before).expect("read fixture");
         let expected = martite_base::normalize_source(
             &std::fs::read_to_string(&after).expect("read expected fixture"),
-        );
+        )
+        .into_owned();
         let actual = format_ok(&source, interface);
         assert_eq!(actual, expected, "fixture {}", before.display());
         assert_eq!(format_ok(&actual, interface), actual);

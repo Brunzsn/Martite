@@ -5,8 +5,8 @@ use martite_config::{EndOfLine, FmtConfig};
 use martite_syntax::{
     Arg, AssignOp, BinaryOp, Block, Comment, ConstDecl, EnumDecl, Expr, ExprKind, Field, FieldInit,
     FieldName, FieldPat, FnDecl, GenericParam, ImplDecl, Item, LambdaBody, LambdaParam, MatchArm,
-    MatchBody, OnDecl, Param, ParamKind, PatKind, Pattern, Program, Stmt, StmtKind, StructDecl,
-    TestDecl, Token, TokenKind, TyExpr, TyKind, UnaryOp, UseDecl, Variant,
+    MatchBody, OnDecl, Param, ParamKind, ParenthesisTables, PatKind, Pattern, Program, Stmt,
+    StmtKind, StructDecl, TestDecl, Token, TokenKind, TyExpr, TyKind, UnaryOp, UseDecl, Variant,
 };
 
 use crate::doc::{Doc, Renderer};
@@ -15,10 +15,11 @@ use crate::normalize;
 pub(crate) fn format_program(
     source: &str,
     program: &Program,
+    parentheses: &ParenthesisTables,
     tokens: Vec<Token>,
     config: &FmtConfig,
 ) -> String {
-    let mut formatter = Formatter::new(source, program, tokens, config);
+    let mut formatter = Formatter::new(source, program, parentheses, tokens, config);
     let doc = formatter.program_doc();
     let eol = match config.end_of_line {
         EndOfLine::Lf => "\n",
@@ -86,6 +87,7 @@ fn op_class(op: BinaryOp) -> OpClass {
 struct Formatter<'a> {
     source: &'a str,
     program: &'a Program,
+    parentheses: &'a ParenthesisTables,
     tokens: Vec<Token>,
     config: &'a FmtConfig,
     used: Vec<bool>,
@@ -96,12 +98,14 @@ impl<'a> Formatter<'a> {
     fn new(
         source: &'a str,
         program: &'a Program,
+        parentheses: &'a ParenthesisTables,
         tokens: Vec<Token>,
         config: &'a FmtConfig,
     ) -> Self {
         Self {
             source,
             program,
+            parentheses,
             tokens,
             config,
             used: vec![false; program.comments.len()],
@@ -306,7 +310,7 @@ impl<'a> Formatter<'a> {
         (Doc::concat(docs), any)
     }
 
-    fn token(&mut self, text: &str, span: Option<Span>) -> Doc {
+    fn token(&mut self, text: &'static str, span: Option<Span>) -> Doc {
         let mut doc = Doc::text(text);
         if let Some(span) = span {
             let (suffix, _) = self.take_trailing(span.end);
@@ -315,7 +319,7 @@ impl<'a> Formatter<'a> {
         doc
     }
 
-    fn open_with_leading(&mut self, text: &str, open: Span, next: u32) -> Doc {
+    fn open_with_leading(&mut self, text: &'static str, open: Span, next: u32) -> Doc {
         let (suffix, had_trailing) = self.take_trailing(open.end);
         let has_leading = self.has_pending_before(next);
         let leading = self.leading_before(next);
@@ -418,33 +422,36 @@ impl<'a> Formatter<'a> {
         }
 
         let mut docs = Vec::new();
-        let mut previous: Option<usize> = None;
-        for (index, unit) in units.iter().enumerate() {
-            if let Some(previous_index) = previous {
-                let previous_unit = &units[previous_index];
-                let keep_blank = previous_unit.kind == UnitKind::ConstOneLine
-                    && unit.kind == UnitKind::ConstOneLine
-                    && self.has_blank_line(previous_unit.end, unit.start);
-                let previous_use = previous_unit.kind == UnitKind::Use;
-                let current_use = unit.kind == UnitKind::Use;
+        let mut previous: Option<(UnitKind, u32, usize)> = None;
+        for unit in units {
+            let current_kind = unit.kind;
+            let current_start = unit.start;
+            let current_end = unit.end;
+            let current_run = unit.run;
+            if let Some((previous_kind, previous_end, previous_run)) = previous {
+                let keep_blank = previous_kind == UnitKind::ConstOneLine
+                    && current_kind == UnitKind::ConstOneLine
+                    && self.has_blank_line(previous_end, current_start);
+                let previous_use = previous_kind == UnitKind::Use;
+                let current_use = current_kind == UnitKind::Use;
                 if previous_use && current_use {
-                    if previous_unit.run != unit.run {
+                    if previous_run != current_run {
                         docs.push(Doc::BlankLine);
                     } else {
                         docs.push(Doc::HardLine);
                     }
                 } else if keep_blank {
                     docs.push(Doc::BlankLine);
-                } else if previous_unit.kind == UnitKind::ConstOneLine
-                    && unit.kind == UnitKind::ConstOneLine
+                } else if previous_kind == UnitKind::ConstOneLine
+                    && current_kind == UnitKind::ConstOneLine
                 {
                     docs.push(Doc::HardLine);
                 } else {
                     docs.push(Doc::BlankLine);
                 }
             }
-            docs.push(unit.doc.clone());
-            previous = Some(index);
+            docs.push(unit.doc);
+            previous = Some((current_kind, current_end, current_run));
         }
 
         if self.has_pending_before(u32::MAX) {
@@ -695,10 +702,10 @@ impl<'a> Formatter<'a> {
         let mut docs = vec![Doc::text(if decl.is_pub { "pub const " } else { "const " })];
         docs.push(Doc::text(decl.name.clone()));
         let colon = self.find_before(decl.ty.span.start, ":");
-        docs.push(Doc::Group(Box::new(Doc::concat([
+        docs.push(Doc::group(Doc::concat([
             self.token(":", colon),
             Doc::concat([Doc::Line, self.ty(&decl.ty)]).indent(),
-        ]))));
+        ])));
         let eq = self.token_between(decl.ty.span.end, decl.value.span.start, "=");
         docs.push(Doc::text(" "));
         docs.push(self.token("=", eq));
@@ -714,10 +721,10 @@ impl<'a> Formatter<'a> {
         );
         Doc::concat([
             Doc::text(field.name.clone()),
-            Doc::Group(Box::new(Doc::concat([
+            Doc::group(Doc::concat([
                 self.token(":", colon),
                 Doc::concat([Doc::Line, self.ty(&field.ty)]).indent(),
-            ]))),
+            ])),
         ])
     }
 
@@ -803,10 +810,10 @@ impl<'a> Formatter<'a> {
                 }
                 bounds.push(Doc::text(bound.as_str()));
             }
-            docs.push(Doc::Group(Box::new(Doc::concat([
+            docs.push(Doc::group(Doc::concat([
                 self.token(":", colon),
                 Doc::concat([Doc::Line, Doc::concat(bounds)]).indent(),
-            ]))));
+            ])));
         }
         Doc::concat(docs)
     }
@@ -862,10 +869,10 @@ impl<'a> Formatter<'a> {
                     self.token_between(param.span.start + text.len() as u32, ty.span.start, ":");
                 Doc::concat([
                     Doc::text(text),
-                    Doc::Group(Box::new(Doc::concat([
+                    Doc::group(Doc::concat([
                         self.token(":", colon),
                         Doc::concat([Doc::Line, self.ty(ty)]).indent(),
-                    ]))),
+                    ])),
                 ])
             }
         }
@@ -883,11 +890,11 @@ impl<'a> Formatter<'a> {
             (Doc::Nil, false)
         };
         let ret_doc = self.ty(ret);
-        Doc::Group(Box::new(Doc::concat([
+        Doc::group(Doc::concat([
             Doc::text("->"),
             suffix,
             Doc::concat([Doc::Line, ret_doc]).indent(),
-        ])))
+        ]))
     }
 
     fn type_args(&mut self, args: &[TyExpr]) -> Doc {
@@ -912,8 +919,8 @@ impl<'a> Formatter<'a> {
     #[allow(clippy::too_many_arguments)]
     fn comma_list<T>(
         &mut self,
-        open_text: &str,
-        close_text: &str,
+        open_text: &'static str,
+        close_text: &'static str,
         open_span: Option<Span>,
         close_span: Option<Span>,
         items: &[(Span, T)],
@@ -976,28 +983,23 @@ impl<'a> Formatter<'a> {
         } else {
             Doc::Line
         };
-        Doc::Group(Box::new(Doc::concat([
+        Doc::group(Doc::concat([
             open,
             Doc::concat([inner_line, Doc::concat(content)]).indent(),
             close_line,
             self.token(close_text, close_span),
-        ])))
+        ]))
     }
 
     fn ty(&mut self, ty: &TyExpr) -> Doc {
-        let pairs = self
-            .program
-            .type_parens
-            .get(&ty.id)
-            .cloned()
-            .unwrap_or_default();
+        let pairs = self.parentheses.type_parens(ty.id);
         let start = pairs
             .last()
             .map(|pair| pair.open.start)
             .unwrap_or(ty.span.start);
         let lead = self.leading_before(start);
         let mut index = pairs.len();
-        let core = self.wrap_type_parens(&pairs, &mut index, ty);
+        let core = self.wrap_type_parens(pairs, &mut index, ty);
         lead.append(core)
     }
 
@@ -1100,19 +1102,14 @@ impl<'a> Formatter<'a> {
     // ----- patterns -------------------------------------------------------
 
     fn pattern(&mut self, pattern: &Pattern) -> Doc {
-        let pairs = self
-            .program
-            .pattern_parens
-            .get(&pattern.id)
-            .cloned()
-            .unwrap_or_default();
+        let pairs = self.parentheses.pattern_parens(pattern.id);
         let start = pairs
             .last()
             .map(|pair| pair.open.start)
             .unwrap_or(pattern.span.start);
         let lead = self.leading_before(start);
         let mut index = pairs.len();
-        let core = self.wrap_pattern_parens(&pairs, &mut index, pattern);
+        let core = self.wrap_pattern_parens(pairs, &mut index, pattern);
         lead.append(core)
     }
 
@@ -1247,10 +1244,7 @@ impl<'a> Formatter<'a> {
                     }
                     docs.push(self.pattern(alternative));
                 }
-                Doc::Group(Box::new(Doc::concat([
-                    docs.remove(0),
-                    Doc::concat(docs).indent(),
-                ])))
+                Doc::group(Doc::concat([docs.remove(0), Doc::concat(docs).indent()]))
             }
         }
     }
@@ -1268,10 +1262,10 @@ impl<'a> Formatter<'a> {
                 field.pattern.span.start,
                 ":",
             );
-            docs.push(Doc::Group(Box::new(Doc::concat([
+            docs.push(Doc::group(Doc::concat([
                 self.token(":", colon),
                 Doc::concat([Doc::Line, self.pattern(&field.pattern)]).indent(),
-            ]))));
+            ])));
         }
         Doc::concat(docs)
     }
@@ -1279,19 +1273,14 @@ impl<'a> Formatter<'a> {
     // ----- expressions ---------------------------------------------------
 
     fn expr(&mut self, expr: &Expr) -> Doc {
-        let pairs = self
-            .program
-            .expression_parens
-            .get(&expr.id)
-            .cloned()
-            .unwrap_or_default();
+        let pairs = self.parentheses.expression_parens(expr.id);
         let start = pairs
             .last()
             .map(|pair| pair.open.start)
             .unwrap_or(expr.span.start);
         let lead = self.leading_before(start);
         let mut index = pairs.len();
-        let core = self.wrap_expr_parens(&pairs, &mut index, expr);
+        let core = self.wrap_expr_parens(pairs, &mut index, expr);
         lead.append(core)
     }
 
@@ -1464,11 +1453,11 @@ impl<'a> Formatter<'a> {
 
     fn map_entry(&mut self, key: &Expr, value: &Expr) -> Doc {
         let colon = self.token_between(key.span.end, value.span.start, ":");
-        Doc::Group(Box::new(Doc::concat([
+        Doc::group(Doc::concat([
             self.expr(key),
             self.token(":", colon),
             Doc::concat([Doc::Line, self.expr(value)]).indent(),
-        ])))
+        ]))
     }
 
     fn struct_literal(
@@ -1535,7 +1524,7 @@ impl<'a> Formatter<'a> {
                 docs.push(Doc::concat([Doc::Line, self.expr(value)]).indent());
             }
         }
-        Doc::Group(Box::new(Doc::concat(docs)))
+        Doc::group(Doc::concat(docs))
     }
 
     fn binary_doc(&mut self, expr: &Expr, op: BinaryOp, lhs: &Expr, rhs: &Expr) -> Doc {
@@ -1585,7 +1574,7 @@ impl<'a> Formatter<'a> {
                 }
             }
         }
-        Doc::Group(Box::new(Doc::concat([first, Doc::concat(tail).indent()])))
+        Doc::group(Doc::concat([first, Doc::concat(tail).indent()]))
     }
 
     fn flatten_binary<'b>(
@@ -1606,12 +1595,7 @@ impl<'a> Formatter<'a> {
         ops: &mut Vec<BinaryOp>,
         root: bool,
     ) {
-        let parenthesized = !root
-            && self
-                .program
-                .expression_parens
-                .get(&expr.id)
-                .is_some_and(|pairs| !pairs.is_empty());
+        let parenthesized = !root && !self.parentheses.expression_parens(expr.id).is_empty();
         let ExprKind::Binary { op, lhs, rhs } = &expr.kind else {
             operands.push(expr);
             return;
@@ -1669,11 +1653,7 @@ impl<'a> Formatter<'a> {
             tail.push(segment);
         }
         let (suffix, _) = self.take_trailing(previous_end);
-        Doc::Group(Box::new(Doc::concat([
-            head,
-            Doc::concat(tail).indent(),
-            suffix,
-        ])))
+        Doc::group(Doc::concat([head, Doc::concat(tail).indent(), suffix]))
     }
 
     fn sequential_postfix(&mut self, root: &Expr, links: &[Link<'_>]) -> Doc {
@@ -1772,7 +1752,7 @@ impl<'a> Formatter<'a> {
                         docs.push(self.token("]", Some(close)));
                     }
                 }
-                (Doc::Group(Box::new(Doc::concat(docs))), span.end)
+                (Doc::group(Doc::concat(docs)), span.end)
             }
             Link::Try(span) => {
                 let question = self.token_between(previous_end, span.end, "?");
@@ -1836,10 +1816,7 @@ impl<'a> Formatter<'a> {
             })
             .and_then(|width| Some(width + header_width?));
         match width {
-            Some(width) if width <= self.config.max_width => Doc::Choice {
-                flat: Box::new(normal),
-                broken: Box::new(hug),
-            },
+            Some(width) if width <= self.config.max_width => Doc::choice(normal, hug),
             _ => normal,
         }
     }
@@ -1957,9 +1934,9 @@ impl<'a> Formatter<'a> {
                 );
                 docs.push(Doc::text(" "));
                 docs.push(self.token("=>", arrow));
-                docs.push(Doc::Group(Box::new(
+                docs.push(Doc::group(
                     Doc::concat([Doc::Line, self.expr(expr)]).indent(),
-                )));
+                ));
             }
         }
         Doc::concat(docs)
@@ -1969,10 +1946,10 @@ impl<'a> Formatter<'a> {
         let mut docs = vec![self.pattern(&param.pattern)];
         if let Some(ty) = &param.ty {
             let colon = self.token_between(param.pattern.span.end, ty.span.start, ":");
-            docs.push(Doc::Group(Box::new(Doc::concat([
+            docs.push(Doc::group(Doc::concat([
                 self.token(":", colon),
                 Doc::concat([Doc::Line, self.ty(ty)]).indent(),
-            ]))));
+            ])));
         }
         Doc::concat(docs)
     }
@@ -1992,10 +1969,7 @@ impl<'a> Formatter<'a> {
         }
         let flat = self.if_flat(cond, then_branch, else_branch.as_deref());
         let broken = self.if_broken(cond, then_branch, else_branch.as_deref());
-        Doc::Choice {
-            flat: Box::new(flat),
-            broken: Box::new(broken),
-        }
+        Doc::choice(flat, broken)
     }
 
     fn if_can_flat(&self, expr: &Expr) -> bool {
@@ -2184,7 +2158,7 @@ impl<'a> Formatter<'a> {
                 head.push(Doc::text(" "));
                 head.push(self.token("=>", arrow));
                 head.push(Doc::concat([Doc::Line, self.expr(body)]).indent());
-                let group = Doc::Group(Box::new(Doc::concat(head)));
+                let group = Doc::group(Doc::concat(head));
                 let comma = self.token_between(body.span.end, end_limit, ",");
                 let out = match comma {
                     Some(span) => {
@@ -2315,12 +2289,12 @@ impl<'a> Formatter<'a> {
         let body = self.stmt(stmt);
         let (suffix, _) = self.take_trailing(stmt.span.end);
         let (close_suffix, _) = self.take_trailing(close.end);
-        let block = Doc::Group(Box::new(Doc::concat([
+        let block = Doc::group(Doc::concat([
             self.token("{", Some(open)),
             Doc::concat([Doc::Line, lead.append(body).append(suffix)]).indent(),
             Doc::Line,
             Doc::text("}"),
-        ])));
+        ]));
         block.append(close_suffix)
     }
 
@@ -2365,10 +2339,10 @@ impl<'a> Formatter<'a> {
                 docs.push(self.pattern(pattern));
                 if let Some(ty) = ty {
                     let colon = self.token_between(pattern.span.end, ty.span.start, ":");
-                    docs.push(Doc::Group(Box::new(Doc::concat([
+                    docs.push(Doc::group(Doc::concat([
                         self.token(":", colon),
                         Doc::concat([Doc::Line, self.ty(ty)]).indent(),
-                    ]))));
+                    ])));
                 }
                 let eq_start = ty
                     .as_ref()
@@ -2425,19 +2399,15 @@ impl<'a> Formatter<'a> {
         if bracketed {
             Doc::concat([Doc::text(" "), self.expr(value)])
         } else {
-            Doc::Group(Box::new(Doc::concat([Doc::Indent(Box::new(Doc::concat(
-                [Doc::Line, self.expr(value)],
-            )))])))
+            Doc::group(Doc::concat([Doc::Indent(Box::new(Doc::concat([
+                Doc::Line,
+                self.expr(value),
+            ])))]))
         }
     }
 
     fn is_bracketed(&self, expr: &Expr) -> bool {
-        if !self
-            .program
-            .expression_parens
-            .get(&expr.id)
-            .map_or(true, |pairs| pairs.is_empty())
-        {
+        if !self.parentheses.expression_parens(expr.id).is_empty() {
             return true;
         }
         matches!(

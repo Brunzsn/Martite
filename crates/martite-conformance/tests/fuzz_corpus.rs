@@ -29,6 +29,7 @@ fn checker_corpus_replays_without_panicking() {
                 grants: Vec::new(),
                 limits,
                 edition: "1".into(),
+                parse: martite_syntax::ParseOptions::default(),
             },
         );
         files += 1;

@@ -50,7 +50,7 @@ struct Lexer<'a> {
     out: Lexed,
     depth: usize,
     depth_reported: bool,
-    last_sig: Option<TokenKind>,
+    last_sig_can_end_postfix: bool,
     postfix_dot: bool,
 }
 
@@ -60,46 +60,53 @@ impl<'a> Lexer<'a> {
         if pos == 0 && src.starts_with('\u{feff}') {
             pos = '\u{feff}'.len_utf8();
         }
+        let end = end.min(src.len());
+        let remaining = end.saturating_sub(pos);
         Self {
             src,
             pos,
-            end: end.min(src.len()),
+            end,
             limits,
-            out: Lexed::default(),
+            out: Lexed {
+                tokens: Vec::with_capacity(remaining / 4),
+                comments: Vec::with_capacity(remaining / 32),
+                diagnostics: Vec::new(),
+            },
             depth: 0,
             depth_reported: false,
-            last_sig: None,
+            last_sig_can_end_postfix: false,
             postfix_dot: false,
         }
     }
 
     fn run(mut self) -> Lexed {
+        let src = self.src;
+        let bytes = src.as_bytes();
         while self.pos < self.end {
             let was_postfix_dot = self.postfix_dot;
             self.postfix_dot = false;
 
-            let Some(ch) = self.peek() else { break };
-            match ch {
-                ' ' | '\t' | '\r' => {
-                    self.bump();
+            match bytes[self.pos] {
+                b' ' | b'\t' | b'\r' => {
+                    self.pos += 1;
                 }
-                '\n' => {
+                b'\n' => {
                     let start = self.pos;
-                    self.bump();
+                    self.pos += 1;
                     self.push(TokenKind::Newline, Span::new(start as u32, self.pos as u32));
                 }
-                '/' if self.peek_n(1) == Some(b'/') => self.comment(),
-                '"' => {
+                b'/' if self.peek_n(1) == Some(b'/') => self.comment(),
+                b'"' => {
                     let start = self.pos;
                     let kind = self.string();
                     self.push(kind, Span::new(start as u32, self.pos as u32));
                 }
-                '0'..='9' => {
+                b'0'..=b'9' => {
                     let start = self.pos;
                     let kind = self.number(was_postfix_dot);
                     self.push(kind, Span::new(start as u32, self.pos as u32));
                 }
-                c if c.is_ascii_alphabetic() || c == '_' => self.identifier(),
+                byte if byte.is_ascii_alphabetic() || byte == b'_' => self.identifier(),
                 _ => self.punctuation(),
             }
         }
@@ -111,29 +118,47 @@ impl<'a> Lexer<'a> {
         self.out
     }
 
+    #[inline]
+    fn peek_byte(&self) -> Option<u8> {
+        if self.pos < self.end {
+            self.src.as_bytes().get(self.pos).copied()
+        } else {
+            None
+        }
+    }
+
+    #[inline]
     fn peek(&self) -> Option<char> {
-        self.src[self.pos..self.end].chars().next()
+        let byte = self.peek_byte()?;
+        if byte.is_ascii() {
+            Some(byte as char)
+        } else {
+            self.src[self.pos..self.end].chars().next()
+        }
     }
 
     fn peek_n(&self, n: usize) -> Option<u8> {
         self.src.as_bytes().get(self.pos + n).copied()
     }
 
+    #[inline]
     fn bump(&mut self) -> Option<char> {
-        let ch = self.peek()?;
-        self.pos += ch.len_utf8();
-        Some(ch)
+        let byte = self.peek_byte()?;
+        if byte.is_ascii() {
+            self.pos += 1;
+            Some(byte as char)
+        } else {
+            let ch = self.src[self.pos..self.end].chars().next()?;
+            self.pos += ch.len_utf8();
+            Some(ch)
+        }
     }
 
     fn push(&mut self, kind: TokenKind, span: Span) {
-        let significant = !matches!(kind, TokenKind::Newline);
-        self.out.tokens.push(Token {
-            kind: kind.clone(),
-            span,
-        });
-        if significant {
-            self.last_sig = Some(kind);
+        if !matches!(kind, TokenKind::Newline) {
+            self.last_sig_can_end_postfix = kind.can_end_postfix();
         }
+        self.out.tokens.push(Token { kind, span });
     }
 
     fn error(&mut self, code: Code, span: Span, message: impl Into<String>) {
@@ -167,11 +192,11 @@ impl<'a> Lexer<'a> {
         self.bump();
         let doc = self.peek() == Some('/');
         let content_start = self.pos;
-        while let Some(ch) = self.peek() {
-            if ch == '\n' {
+        while let Some(byte) = self.peek_byte() {
+            if byte == b'\n' {
                 break;
             }
-            self.bump();
+            self.pos += 1;
         }
         let text = self.src[content_start..self.pos].to_string();
         self.out.comments.push(Comment {
@@ -183,9 +208,11 @@ impl<'a> Lexer<'a> {
 
     fn identifier(&mut self) {
         let start = self.pos;
-        while let Some(ch) = self.peek() {
-            if ch.is_ascii_alphanumeric() || ch == '_' {
-                self.bump();
+        let bytes = self.src.as_bytes();
+        while self.pos < self.end {
+            let byte = bytes[self.pos];
+            if byte.is_ascii_alphanumeric() || byte == b'_' {
+                self.pos += 1;
             } else {
                 break;
             }
@@ -230,14 +257,14 @@ impl<'a> Lexer<'a> {
         if postfix_dot {
             // After a postfix `.` the lexer always reads a plain decimal integer.
             let digits_start = self.pos;
-            while matches!(self.peek(), Some('0'..='9')) {
-                self.bump();
+            while matches!(self.peek_byte(), Some(b'0'..=b'9')) {
+                self.pos += 1;
             }
-            let text = &self.src[digits_start..self.pos];
             span.end = self.pos as u32;
-            return match text.parse::<i128>() {
-                Ok(v) => TokenKind::Int(v),
-                Err(_) => {
+            let digits = &self.src.as_bytes()[digits_start..self.pos];
+            return match parse_digits(digits, 10) {
+                Some(v) if v <= i128::MAX as u128 => TokenKind::Int(v as i128),
+                _ => {
                     self.error(Code::E001, span, "tuple index is out of range");
                     TokenKind::Int(0)
                 }
@@ -245,7 +272,7 @@ impl<'a> Lexer<'a> {
         }
 
         let mut radix = 10;
-        if self.peek() == Some('0') {
+        if self.peek_byte() == Some(b'0') {
             match self.peek_n(1) {
                 Some(b'x') | Some(b'X') => {
                     radix = 16;
@@ -262,15 +289,16 @@ impl<'a> Lexer<'a> {
         }
 
         if radix != 10 {
-            let text = self.scan_digits(radix, span);
-            if text.is_empty() {
+            let digits_start = self.pos;
+            let digits = self.scan_digits(radix, span);
+            if digits == 0 {
                 self.error(Code::E001, span, "expected digits after base prefix");
                 return TokenKind::Int(0);
             }
-            let cleaned: String = text.chars().filter(|c| *c != '_').collect();
+            let bytes = &self.src.as_bytes()[digits_start..self.pos];
             span.end = self.pos as u32;
-            return match u128::from_str_radix(&cleaned, radix) {
-                Ok(v) if v <= (i64::MAX as u128) + 1 => TokenKind::Int(v as i128),
+            return match parse_digits(bytes, radix) {
+                Some(v) if v <= (i64::MAX as u128) + 1 => TokenKind::Int(v as i128),
                 _ => {
                     self.error(Code::E001, span, "integer literal is out of range");
                     TokenKind::Int(0)
@@ -278,33 +306,27 @@ impl<'a> Lexer<'a> {
             };
         }
 
-        let int_text = self.scan_digits(10, span);
+        let int_start = self.pos;
+        let int_digits = self.scan_digits(10, span);
         let mut is_float = false;
-        let mut float_text = int_text.clone();
 
-        if self.peek() == Some('.')
-            && matches!(self.peek_n(1), Some(b'0'..=b'9'))
-            && self.peek_n(1) != Some(b'.')
-        {
+        if self.peek_byte() == Some(b'.') && matches!(self.peek_n(1), Some(b'0'..=b'9')) {
             is_float = true;
             self.bump();
-            float_text.push('.');
-            let frac = self.scan_digits(10, span);
-            if frac.is_empty() {
+            let digits = self.scan_digits(10, span);
+            if digits == 0 {
                 self.error(Code::E001, span, "expected digits after `.`");
             }
-            float_text.push_str(&frac);
         }
 
-        if matches!(self.peek(), Some('e') | Some('E')) {
+        if matches!(self.peek_byte(), Some(b'e') | Some(b'E')) {
             let save = self.pos;
-            let mut exp = String::new();
-            exp.push(self.bump().unwrap());
-            if matches!(self.peek(), Some('+') | Some('-')) {
-                exp.push(self.bump().unwrap());
+            self.bump();
+            if matches!(self.peek_byte(), Some(b'+') | Some(b'-')) {
+                self.bump();
             }
             let digits = self.scan_digits(10, span);
-            if digits.is_empty() {
+            if digits == 0 {
                 self.pos = save;
                 self.error(
                     Code::E001,
@@ -313,16 +335,13 @@ impl<'a> Lexer<'a> {
                 );
             } else {
                 is_float = true;
-                exp.push_str(&digits);
-                float_text.push_str(&exp);
             }
         }
 
         span.end = self.pos as u32;
         if is_float {
-            let cleaned: String = float_text.chars().filter(|c| *c != '_').collect();
-            return match cleaned.parse::<f64>() {
-                Ok(v) if v.is_finite() => TokenKind::Float(v),
+            return match parse_float(&self.src[start..self.pos]) {
+                Some(v) if v.is_finite() => TokenKind::Float(v),
                 _ => {
                     self.error(Code::E001, span, "float literal is out of range");
                     TokenKind::Float(0.0)
@@ -330,16 +349,16 @@ impl<'a> Lexer<'a> {
             };
         }
 
-        let cleaned: String = int_text.chars().filter(|c| *c != '_').collect();
-        if cleaned.len() > 1 && cleaned.starts_with('0') {
+        let int_bytes = &self.src.as_bytes()[int_start..self.pos];
+        if int_digits > 1 && int_bytes.first() == Some(&b'0') {
             self.error(
                 Code::E001,
                 span,
                 "leading zeros are not allowed (write 0 for zero)",
             );
         }
-        match cleaned.parse::<u128>() {
-            Ok(v) if v <= (i64::MAX as u128) + 1 => TokenKind::Int(v as i128),
+        match parse_digits(int_bytes, 10) {
+            Some(v) if v <= (i64::MAX as u128) + 1 => TokenKind::Int(v as i128),
             _ => {
                 self.error(Code::E001, span, "integer literal is out of range");
                 TokenKind::Int(0)
@@ -347,23 +366,17 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn scan_digits(&mut self, radix: u32, span: Span) -> String {
-        let mut out = String::new();
+    fn scan_digits(&mut self, radix: u32, span: Span) -> usize {
+        let mut digits = 0;
         let mut prev_digit = false;
-        loop {
-            let Some(ch) = self.peek() else { break };
-            let is_digit = match radix {
-                2 => matches!(ch, '0'..='1'),
-                16 => ch.is_ascii_hexdigit(),
-                _ => ch.is_ascii_digit(),
-            };
-            if is_digit {
-                out.push(ch);
+        while let Some(byte) = self.peek_byte() {
+            if is_digit_for(byte, radix) {
+                digits += 1;
                 prev_digit = true;
-                self.bump();
-            } else if ch == '_' {
+                self.pos += 1;
+            } else if byte == b'_' {
                 let next_ok = match radix {
-                    2 => matches!(self.peek_n(1), Some(b'0'..=b'1')),
+                    2 => matches!(self.peek_n(1), Some(b'0' | b'1')),
                     16 => matches!(
                         self.peek_n(1),
                         Some(b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F')
@@ -378,12 +391,12 @@ impl<'a> Lexer<'a> {
                     );
                 }
                 prev_digit = false;
-                self.bump();
+                self.pos += 1;
             } else {
                 break;
             }
         }
-        out
+        digits
     }
 
     fn string(&mut self) -> TokenKind {
@@ -676,10 +689,7 @@ impl<'a> Lexer<'a> {
                         self.push(TokenKind::DotDot, Span::new(start as u32, self.pos as u32));
                     }
                 } else {
-                    self.postfix_dot = self
-                        .last_sig
-                        .as_ref()
-                        .is_some_and(TokenKind::can_end_postfix);
+                    self.postfix_dot = self.last_sig_can_end_postfix;
                     one(self, TokenKind::Dot);
                 }
             }
@@ -698,6 +708,73 @@ impl<'a> Lexer<'a> {
                 );
             }
         }
+    }
+}
+
+#[inline]
+fn is_digit_for(byte: u8, radix: u32) -> bool {
+    match radix {
+        2 => matches!(byte, b'0'..=b'1'),
+        16 => byte.is_ascii_hexdigit(),
+        _ => byte.is_ascii_digit(),
+    }
+}
+
+fn digit_value(byte: u8, radix: u32) -> Option<u32> {
+    let value = match byte {
+        b'0'..=b'9' => (byte - b'0') as u32,
+        b'a'..=b'f' => (byte - b'a' + 10) as u32,
+        b'A'..=b'F' => (byte - b'A' + 10) as u32,
+        _ => return None,
+    };
+    (value < radix).then_some(value)
+}
+
+fn parse_digits(bytes: &[u8], radix: u32) -> Option<u128> {
+    let mut value = 0u128;
+    for &byte in bytes {
+        if byte == b'_' {
+            continue;
+        }
+        let digit = digit_value(byte, radix)?;
+        value = value
+            .checked_mul(radix as u128)?
+            .checked_add(digit as u128)?;
+    }
+    Some(value)
+}
+
+/// Parse a numeric spelling, ignoring digit separators. Typical literals are
+/// parsed straight from the source slice; only long literals with `_` need a
+/// heap allocation.
+fn parse_float(spelling: &str) -> Option<f64> {
+    let bytes = spelling.as_bytes();
+    if !bytes.contains(&b'_') {
+        return spelling.parse::<f64>().ok();
+    }
+    const STACK: usize = 64;
+    let mut scratch = [0u8; STACK];
+    let mut len = 0;
+    let mut fits = true;
+    for &byte in bytes {
+        if byte == b'_' {
+            continue;
+        }
+        if len == STACK {
+            fits = false;
+            break;
+        }
+        scratch[len] = byte;
+        len += 1;
+    }
+    if fits {
+        std::str::from_utf8(&scratch[..len])
+            .ok()?
+            .parse::<f64>()
+            .ok()
+    } else {
+        let cleaned: String = spelling.chars().filter(|c| *c != '_').collect();
+        cleaned.parse::<f64>().ok()
     }
 }
 
@@ -764,11 +841,14 @@ fn is_pascal(text: &str) -> bool {
         Some(c) if c.is_ascii_uppercase() => {}
         _ => return false,
     }
-    let rest: Vec<char> = chars.collect();
-    if !rest.iter().all(|c| c.is_ascii_alphanumeric()) {
-        return false;
+    let mut has_lowercase = false;
+    for c in chars {
+        if !c.is_ascii_alphanumeric() {
+            return false;
+        }
+        has_lowercase |= c.is_ascii_lowercase();
     }
-    text.len() == 1 || rest.iter().any(|c| c.is_ascii_lowercase())
+    text.len() == 1 || has_lowercase
 }
 
 fn is_screaming(text: &str) -> bool {
@@ -917,6 +997,101 @@ mod tests {
                 TokenKind::Int(1)
             ]
         );
+    }
+
+    #[test]
+    fn numeric_literals_parse_directly() {
+        assert_eq!(kinds("0")[0], TokenKind::Int(0));
+        assert_eq!(kinds("0xFF")[0], TokenKind::Int(255));
+        assert_eq!(kinds("0b1010_1010")[0], TokenKind::Int(170));
+        assert_eq!(kinds("1_000_000")[0], TokenKind::Int(1_000_000));
+        assert_eq!(
+            kinds("9223372036854775807")[0],
+            TokenKind::Int(i64::MAX as i128)
+        );
+        assert_eq!(
+            kinds("9223372036854775808")[0],
+            TokenKind::Int((i64::MAX as i128) + 1)
+        );
+        assert_eq!(
+            kinds("0x8000000000000000")[0],
+            TokenKind::Int((i64::MAX as i128) + 1)
+        );
+        assert_eq!(kinds("1.5")[0], TokenKind::Float(1.5));
+        assert_eq!(kinds("1_0.5_0e1_0")[0], TokenKind::Float(105_000_000_000.0));
+        assert_eq!(kinds("1E+5")[0], TokenKind::Float(100_000.0));
+        assert_eq!(kinds("1e-2")[0], TokenKind::Float(0.01));
+    }
+
+    #[test]
+    fn numeric_errors_keep_their_spans() {
+        let cases = [
+            ("00", Span::new(0, 2), "leading zeros"),
+            ("0_1", Span::new(0, 3), "leading zeros"),
+            (
+                "9223372036854775809",
+                Span::new(0, 19),
+                "integer literal is out of range",
+            ),
+            (
+                "0x8000000000000001",
+                Span::new(0, 18),
+                "integer literal is out of range",
+            ),
+            ("1e", Span::new(0, 1), "malformed exponent"),
+            ("1e+", Span::new(0, 1), "malformed exponent"),
+            ("1e999", Span::new(0, 5), "float literal is out of range"),
+            ("0x", Span::new(0, 0), "expected digits after base prefix"),
+            (
+                "t.170141183460469231731687303715884105728",
+                Span::new(2, 41),
+                "tuple index is out of range",
+            ),
+        ];
+        for (src, span, message) in cases {
+            let out = lex(src, LoadLimits::default());
+            let diagnostic = out
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.message.contains(message))
+                .unwrap_or_else(|| panic!("{src}: missing {message:?}: {:?}", out.diagnostics));
+            assert_eq!(diagnostic.code, Code::E001, "{src}");
+            assert_eq!(diagnostic.span, Some(span), "{src}: {}", diagnostic.message);
+        }
+    }
+
+    #[test]
+    fn numeric_underscore_errors_keep_zero_width_spans() {
+        let out = lex("1__0", LoadLimits::default());
+        let spans: Vec<_> = out.diagnostics.iter().map(|d| d.span).collect();
+        assert_eq!(spans, vec![Some(Span::new(0, 0)), Some(Span::new(0, 0))]);
+    }
+
+    #[test]
+    fn postfix_state_survives_newlines_and_comments() {
+        for src in [
+            "t.9223372036854775809",
+            "t\n.9223372036854775809",
+            "t // comment\n.9223372036854775809",
+        ] {
+            let out = lex(src, LoadLimits::default());
+            assert!(out.diagnostics.is_empty(), "{src}: {:?}", out.diagnostics);
+        }
+    }
+
+    #[test]
+    fn non_ascii_comments_and_bom_are_handled() {
+        let out = lex(
+            "\u{feff}fn main() { let x = \"héllo\" } // ünïcode\n",
+            LoadLimits::default(),
+        );
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    #[test]
+    fn non_ascii_outside_strings_is_an_error() {
+        let out = lex("let café = 1", LoadLimits::default());
+        assert!(out.diagnostics.iter().any(|d| d.code == Code::E001));
     }
 
     #[test]

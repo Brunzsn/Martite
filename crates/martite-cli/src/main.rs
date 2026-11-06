@@ -12,7 +12,7 @@ use martite_driver::{LoadOptions, load};
 use martite_lint::{LintInputs, ManifestInput, SettingsResolver, normalize_path, sort_diagnostics};
 use martite_resolve::InterfaceSource;
 use martite_runtime::{ExecLimits, Runtime, Trap, Value};
-use martite_syntax::{parse_interface, parse_source};
+use martite_syntax::{ParseOptions, parse_interface_with, parse_source_with};
 
 const USAGE: &str = "\
 Martite language toolchain
@@ -619,14 +619,14 @@ fn format_file(path: &Path, args: &FmtArgs) -> Result<ExitCode, String> {
 
 fn verify_format(before: &str, after: &str, interface: bool) -> Result<(), String> {
     let left = if interface {
-        parse_interface(before, LoadLimits::default())
+        parse_interface_with(before, LoadLimits::default(), ParseOptions::TOOLING)
     } else {
-        parse_source(before, LoadLimits::default())
+        parse_source_with(before, LoadLimits::default(), ParseOptions::TOOLING)
     };
     let right = if interface {
-        parse_interface(after, LoadLimits::default())
+        parse_interface_with(after, LoadLimits::default(), ParseOptions::TOOLING)
     } else {
-        parse_source(after, LoadLimits::default())
+        parse_source_with(after, LoadLimits::default(), ParseOptions::TOOLING)
     };
     if right.diagnostics.iter().any(|diagnostic| {
         matches!(diagnostic.code, Code::E001 | Code::E002 | Code::E003)
@@ -928,6 +928,7 @@ fn fix_project(
                 grants,
                 limits: LoadLimits::default(),
                 edition,
+                parse: ParseOptions::TOOLING,
             },
         );
         last.clear();
@@ -1177,6 +1178,7 @@ fn cmd_lint(args: &[String]) -> ExitCode {
                 grants: spec.grants,
                 limits: LoadLimits::default(),
                 edition: spec.edition,
+                parse: ParseOptions::TOOLING,
             },
         );
         render_all(&loaded.diagnostics, &loaded.sources, &mut rendered);
@@ -1252,7 +1254,7 @@ fn lint_syntax_only_mode(args: &LintArgs) -> ExitCode {
     let mut had_parse_error = false;
     for path in files {
         let text = match std::fs::read_to_string(&path) {
-            Ok(text) => normalize_source(&text),
+            Ok(text) => normalize_source(&text).into_owned(),
             Err(error) => {
                 eprintln!("error: cannot read {}: {error}", path.display());
                 return ExitCode::from(2);
@@ -1264,7 +1266,7 @@ fn lint_syntax_only_mode(args: &LintArgs) -> ExitCode {
             .display()
             .to_string();
         let source = sources.add(display, text.clone());
-        let parsed = parse_source(&text, LoadLimits::default());
+        let parsed = parse_source_with(&text, LoadLimits::default(), ParseOptions::TOOLING);
         if !parsed.diagnostics.is_empty() {
             had_parse_error = true;
             let mut parse_diagnostics = parsed.diagnostics;
@@ -1446,6 +1448,7 @@ fn cmd_check(args: &[String], lint: bool) -> ExitCode {
             grants,
             limits: load_limits,
             edition,
+            parse: ParseOptions::default(),
         },
     );
     print_diagnostics(&loaded.diagnostics, &loaded.sources, parsed.json);
@@ -1529,6 +1532,7 @@ fn cmd_test(args: &[String]) -> ExitCode {
             grants,
             limits: LoadLimits::default(),
             edition: LANG_EDITION.into(),
+            parse: ParseOptions::default(),
         },
     );
     if loaded.has_errors() {
