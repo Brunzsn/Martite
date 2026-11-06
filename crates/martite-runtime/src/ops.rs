@@ -63,16 +63,7 @@ pub fn value_eq(a: &Value, b: &Value) -> bool {
         },
         (Handle(a), Handle(b)) => a.type_id == b.type_id && a.token == b.token,
         (Builtin(a), Builtin(b)) => a == b,
-        (
-            BuiltinModuleFn {
-                module: am,
-                name: an,
-            },
-            BuiltinModuleFn {
-                module: bm,
-                name: bn,
-            },
-        ) => am == bm && an == bn,
+        (BuiltinModuleFn(a), BuiltinModuleFn(b)) => a == b,
         _ => false,
     }
 }
@@ -166,7 +157,7 @@ fn type_rank(value: &Value) -> u8 {
         Value::Result(_) => 12,
         Value::Fn(_) => 13,
         Value::Builtin(_) => 14,
-        Value::BuiltinModuleFn { .. } => 15,
+        Value::BuiltinModuleFn(_) => 15,
         Value::Handle(_) => 16,
     }
 }
@@ -317,7 +308,7 @@ fn write_show(out: &mut String, value: &Value, types: &TypeTable, top: bool) {
                 .unwrap_or("Handle");
             let _ = write!(out, "<{name}>");
         }
-        Value::Fn(_) | Value::Builtin(_) | Value::BuiltinModuleFn { .. } => {
+        Value::Fn(_) | Value::Builtin(_) | Value::BuiltinModuleFn(_) => {
             out.push_str("<fn>");
         }
     }

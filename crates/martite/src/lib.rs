@@ -979,7 +979,7 @@ fn encode_into(out: &mut Vec<u8>, value: &Value, program: &CheckedProgram) {
             write_len(out, value.type_id.0 as usize);
             write_bytes(out, value.token.as_bytes());
         }
-        Fn(_) | Builtin(_) | BuiltinModuleFn { .. } => out.push(14),
+        Fn(_) | Builtin(_) | BuiltinModuleFn(_) => out.push(14),
     }
 }
 
@@ -1350,7 +1350,7 @@ fn validate_snapshot_value(
                 Err("snapshot handle type is not opaque".into())
             }
         }
-        Value::Fn(_) | Value::Builtin(_) | Value::BuiltinModuleFn { .. } => {
+        Value::Fn(_) | Value::Builtin(_) | Value::BuiltinModuleFn(_) => {
             Err("snapshot contains a function value".into())
         }
     }

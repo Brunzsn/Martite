@@ -779,9 +779,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
     }
 
-    fn closure_arg<'a>(&self, args: &'a [Value], index: usize) -> EvalResult<&'a Closure> {
+    fn closure_arg<'a>(&self, args: &'a [Value], index: usize) -> EvalResult<&'a FnValue> {
         match args.get(index) {
-            Some(Value::Fn(closure)) => Ok(closure.as_ref()),
+            Some(Value::Fn(function)) => Ok(function),
             _ => self.trap(self.internal_panic("expected a function argument")),
         }
     }

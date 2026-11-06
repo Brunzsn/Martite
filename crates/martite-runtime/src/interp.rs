@@ -15,7 +15,7 @@ use martite_syntax::{
 use crate::cost::{comparison_cost, show_slots};
 use crate::ops::{show, value_eq, value_ord};
 use crate::value::{
-    Closure, ClosureTarget, EnumValue, MAX_VALUE_DEPTH, OrderedMap, StructValue, Value,
+    Closure, ClosureTarget, EnumValue, FnValue, MAX_VALUE_DEPTH, OrderedMap, StructValue, Value,
     key_from_value, key_to_value, key_value_size, value_depth_exceeds,
 };
 
@@ -508,7 +508,11 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
     }
 
-    fn call_closure(&mut self, closure: &Closure, args: Vec<Value>) -> Result<Value, Trap> {
+    fn call_closure(&mut self, function: &FnValue, args: Vec<Value>) -> Result<Value, Trap> {
+        let closure = match function {
+            FnValue::Def(def) => return self.call_def(*def, args).map(|(value, _)| value),
+            FnValue::Closure(closure) => closure,
+        };
         match &closure.target {
             ClosureTarget::Def(def) => self.call_def(*def, args).map(|(value, _)| value),
             ClosureTarget::Lambda { node } => {
@@ -911,10 +915,10 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     Some(Rc::new(values))
                 };
                 self.note_alloc(16);
-                Ok(Value::Fn(Rc::new(Closure {
+                Ok(Value::Fn(FnValue::Closure(Rc::new(Closure {
                     target: ClosureTarget::Lambda { node: expr.id },
                     captures,
-                })))
+                }))))
             }
             ExprKind::Block(block) => self.eval_block(block),
             ExprKind::Field { .. } => self.eval_field(expr),
@@ -998,13 +1002,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             Some(Resolution::Const(def)) => self.materialize_const(def, expr.span),
             Some(Resolution::Fn(def))
             | Some(Resolution::Handler(def))
-            | Some(Resolution::Test(def)) => {
-                self.note_alloc(16);
-                Ok(Value::Fn(Rc::new(Closure {
-                    target: ClosureTarget::Def(def),
-                    captures: None,
-                })))
-            }
+            | Some(Resolution::Test(def)) => Ok(Value::Fn(FnValue::Def(def))),
             Some(Resolution::PreludeVariant(PreludeVariant::None)) => Ok(Value::Option(None)),
             Some(Resolution::PreludeVariant(variant)) => {
                 self.note_alloc(16);
@@ -1049,11 +1047,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             self.note_value(&value);
             return Ok(value);
         }
-        self.note_alloc(16);
-        Ok(Value::Fn(Rc::new(Closure {
-            target: ClosureTarget::Def(def),
-            captures: None,
-        })))
+        Ok(Value::Fn(FnValue::Def(def)))
     }
 
     fn value_of_builtin_item(&self, item: &BuiltinItem) -> EvalResult<Value> {
@@ -1061,10 +1055,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             ("std.math", "PI") => Ok(Value::Float(std::f64::consts::PI)),
             ("std.math", "EULER") => Ok(Value::Float(std::f64::consts::E)),
             ("std.json", "Json") => self.trap(self.internal_panic("type used as a value")),
-            (module, name) => Ok(Value::BuiltinModuleFn {
-                module: module.to_string(),
-                name: name.to_string(),
-            }),
+            _ => Ok(Value::BuiltinModuleFn(item.id)),
         }
     }
 
@@ -1217,8 +1208,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
         match callee_value {
             Value::Fn(closure) => self.call_closure(&closure, values).map_err(EvalError::Trap),
             Value::Builtin(function) => self.call_builtin_values(function, values, expr.span),
-            Value::BuiltinModuleFn { module, name } => {
-                self.call_builtin_module_values(&module, &name, values, expr.span)
+            Value::BuiltinModuleFn(id) => {
+                let item = id.item();
+                self.call_builtin_module_values(item.module, item.name, values, expr.span)
             }
             _ => self.trap(self.internal_panic("callee is not callable")),
         }

@@ -6,7 +6,7 @@ pub mod program;
 pub mod ty;
 
 pub use checker::check;
-pub use martite_resolve::{BuiltinItem, DefId, DefKind, ModuleId, ModuleTarget};
+pub use martite_resolve::{BuiltinItem, BuiltinItemId, DefId, DefKind, ModuleId, ModuleTarget};
 pub use program::{
     BindingInfo, BuiltinFn, BuiltinReceiver, CheckedProgram, ConstInfo, ConstValue, EntryKind,
     FnKind, FnSig, HookSig, LambdaInfo, ParamSig, PatResolution, PreludeVariant, Resolution,

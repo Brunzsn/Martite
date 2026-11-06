@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use indexmap::IndexMap;
-use martite_check::{BindingId, BuiltinFn, DefId, TypeId};
+use martite_check::{BindingId, BuiltinFn, BuiltinItemId, DefId, TypeId};
 use martite_syntax::NodeId;
 
 #[derive(Debug, Clone)]
@@ -24,12 +24,9 @@ pub enum Value {
     Enum(Rc<EnumValue>),
     Option(Option<Box<Value>>),
     Result(Result<Box<Value>, Box<Value>>),
-    Fn(Rc<Closure>),
+    Fn(FnValue),
     Builtin(BuiltinFn),
-    BuiltinModuleFn {
-        module: String,
-        name: String,
-    },
+    BuiltinModuleFn(BuiltinItemId),
     Handle(Rc<HandleValue>),
 }
 
@@ -64,6 +61,16 @@ pub struct Closure {
 pub enum ClosureTarget {
     Def(DefId),
     Lambda { node: NodeId },
+}
+
+/// A callable function value.
+///
+/// Free functions hold only their `DefId`; the `Rc<Closure>` allocation is
+/// reserved for lambdas, which may capture a local environment.
+#[derive(Debug, Clone)]
+pub enum FnValue {
+    Def(DefId),
+    Closure(Rc<Closure>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -162,10 +169,11 @@ pub fn value_depth_exceeds(value: &Value, limit: usize) -> bool {
         Value::Struct(value) => !value.fields.is_empty(),
         Value::Enum(value) => !value.payload.is_empty(),
         Value::Option(Some(_)) | Value::Result(_) => true,
-        Value::Fn(closure) => closure
+        Value::Fn(FnValue::Closure(closure)) => closure
             .captures
             .as_ref()
             .is_some_and(|captures| !captures.is_empty()),
+        Value::Fn(FnValue::Def(_)) => false,
         _ => false,
     };
     if !has_children {
@@ -203,7 +211,7 @@ pub fn value_depth_exceeds(value: &Value, limit: usize) -> bool {
             Value::Option(Some(value)) | Value::Result(Ok(value)) | Value::Result(Err(value)) => {
                 stack.push((value, depth + 1));
             }
-            Value::Fn(closure) => {
+            Value::Fn(FnValue::Closure(closure)) => {
                 if let Some(captures) = &closure.captures {
                     for value in captures.values() {
                         stack.push((value, depth + 1));
@@ -217,8 +225,9 @@ pub fn value_depth_exceeds(value: &Value, limit: usize) -> bool {
             | Value::Str(_)
             | Value::Range { .. }
             | Value::Option(None)
+            | Value::Fn(FnValue::Def(_))
             | Value::Builtin(_)
-            | Value::BuiltinModuleFn { .. }
+            | Value::BuiltinModuleFn(_)
             | Value::Handle(_) => {}
         }
     }
@@ -430,7 +439,8 @@ impl Value {
             Value::Result(result) => match result {
                 Ok(v) | Err(v) => 16 + v.size_bytes(seen),
             },
-            Value::Fn(closure) => {
+            Value::Fn(FnValue::Def(_)) => 0,
+            Value::Fn(FnValue::Closure(closure)) => {
                 let ptr = Rc::as_ptr(closure) as *const () as usize;
                 if !seen.insert(ptr) {
                     return 0;
@@ -443,7 +453,7 @@ impl Value {
                 }
                 total
             }
-            Value::Builtin(_) | Value::BuiltinModuleFn { .. } => 0,
+            Value::Builtin(_) | Value::BuiltinModuleFn(_) => 0,
             Value::Handle(handle) => {
                 let ptr = Rc::as_ptr(handle) as *const () as usize;
                 if !seen.insert(ptr) {
@@ -519,5 +529,16 @@ mod tests {
             value = Value::list(vec![value]);
         }
         assert!(value_depth_exceeds(&value, MAX_VALUE_DEPTH));
+    }
+
+    #[test]
+    fn value_stays_compact() {
+        if cfg!(target_pointer_width = "64") {
+            // `Range` is the largest payload, and rustc uses the `inclusive`
+            // bool's niche for the enum tag. Keep this assertion so
+            // value-representation regressions are visible in tests instead
+            // of only in benchmarks.
+            assert_eq!(std::mem::size_of::<Value>(), 24);
+        }
     }
 }
