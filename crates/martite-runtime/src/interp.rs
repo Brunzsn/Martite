@@ -15,8 +15,8 @@ use martite_syntax::{
 use crate::cost::{comparison_cost, show_slots};
 use crate::ops::{show, value_eq, value_ord};
 use crate::value::{
-    Closure, ClosureTarget, EnumValue, MAX_VALUE_DEPTH, OrderedMap, StructValue, Value,
-    key_from_value, key_to_value, key_value_size, value_depth_exceeds,
+    Closure, ClosureTarget, EnumValue, MAX_VALUE_DEPTH, MapValue, OrderedMap, SeqValue,
+    StructValue, Value, key_from_value, key_to_value, key_value_size, value_depth_exceeds,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -316,8 +316,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
     }
 
     fn note_value(&mut self, value: &Value) {
-        let bytes = value.size_bytes(&mut HashSet::new());
-        self.note_alloc(bytes);
+        self.note_alloc(value.meta().bytes);
     }
 
     fn note_values(&mut self, values: &[Value]) {
@@ -911,10 +910,10 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     Some(Rc::new(values))
                 };
                 self.note_alloc(16);
-                Ok(Value::Fn(Rc::new(Closure {
-                    target: ClosureTarget::Lambda { node: expr.id },
+                Ok(Value::Fn(Rc::new(Closure::new(
+                    ClosureTarget::Lambda { node: expr.id },
                     captures,
-                })))
+                ))))
             }
             ExprKind::Block(block) => self.eval_block(block),
             ExprKind::Field { .. } => self.eval_field(expr),
@@ -1000,10 +999,10 @@ impl<'p, 'h> Runtime<'p, 'h> {
             | Some(Resolution::Handler(def))
             | Some(Resolution::Test(def)) => {
                 self.note_alloc(16);
-                Ok(Value::Fn(Rc::new(Closure {
-                    target: ClosureTarget::Def(def),
-                    captures: None,
-                })))
+                Ok(Value::Fn(Rc::new(Closure::new(
+                    ClosureTarget::Def(def),
+                    None,
+                ))))
             }
             Some(Resolution::PreludeVariant(PreludeVariant::None)) => Ok(Value::Option(None)),
             Some(Resolution::PreludeVariant(variant)) => {
@@ -1026,11 +1025,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     .unwrap_or(0);
                 if payload == 0 {
                     self.note_alloc(16);
-                    Ok(Value::Enum(Rc::new(EnumValue {
-                        type_id: id,
-                        variant: index,
-                        payload: Vec::new(),
-                    })))
+                    Ok(Value::Enum(Rc::new(EnumValue::new(id, index, Vec::new()))))
                 } else {
                     self.trap(self.internal_panic("variant constructor used as a value"))
                 }
@@ -1050,10 +1045,10 @@ impl<'p, 'h> Runtime<'p, 'h> {
             return Ok(value);
         }
         self.note_alloc(16);
-        Ok(Value::Fn(Rc::new(Closure {
-            target: ClosureTarget::Def(def),
-            captures: None,
-        })))
+        Ok(Value::Fn(Rc::new(Closure::new(
+            ClosureTarget::Def(def),
+            None,
+        ))))
     }
 
     fn value_of_builtin_item(&self, item: &BuiltinItem) -> EvalResult<Value> {
@@ -1095,11 +1090,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             Some(Resolution::Variant(id, index)) => {
                 self.note_alloc(16);
-                Ok(Value::Enum(Rc::new(EnumValue {
-                    type_id: id,
-                    variant: index,
-                    payload: Vec::new(),
-                })))
+                Ok(Value::Enum(Rc::new(EnumValue::new(id, index, Vec::new()))))
             }
             Some(Resolution::ModuleItem(def)) => self.value_of_def(def, expr.span),
             Some(Resolution::BuiltinItem(item)) => self.value_of_builtin_item(&item),
@@ -1150,10 +1141,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
         self.charge(out.len() as u64)?;
         self.note_alloc(16 + 8 * out.len() as u64);
-        Ok(Value::Struct(Rc::new(StructValue {
-            type_id,
-            fields: out,
-        })))
+        Ok(Value::Struct(Rc::new(StructValue::new(type_id, out))))
     }
 
     // ------------------------------------------------------------------
@@ -1329,11 +1317,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
         self.charge(payload.len() as u64)?;
         self.note_alloc(16 + 8 * payload.len() as u64);
-        let value = Value::Enum(Rc::new(EnumValue {
-            type_id,
-            variant: index,
-            payload,
-        }));
+        let value = Value::Enum(Rc::new(EnumValue::new(type_id, index, payload)));
         self.check_value_depth(&value, span)?;
         Ok(value)
     }
@@ -1468,9 +1452,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
 
     fn cow_vec_mut<'a>(
         &mut self,
-        items: &'a mut Rc<Vec<Value>>,
+        items: &'a mut Rc<SeqValue>,
         slots: usize,
-    ) -> EvalResult<&'a mut Vec<Value>> {
+    ) -> EvalResult<&'a mut SeqValue> {
         if Rc::strong_count(items) != 1 {
             self.charge(slots as u64)?;
             self.note_alloc(16 + 8 * slots as u64);
@@ -1480,9 +1464,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
 
     fn cow_map_mut<'a>(
         &mut self,
-        map: &'a mut Rc<OrderedMap>,
+        map: &'a mut Rc<MapValue>,
         slots: usize,
-    ) -> EvalResult<&'a mut OrderedMap> {
+    ) -> EvalResult<&'a mut MapValue> {
         if Rc::strong_count(map) != 1 {
             self.charge(slots as u64)?;
             self.note_alloc(16 + 8 * slots as u64);
@@ -1502,53 +1486,94 @@ impl<'p, 'h> Runtime<'p, 'h> {
         Ok(Rc::make_mut(value))
     }
 
-    fn place_child_mut<'a>(
-        &mut self,
-        value: &'a mut Value,
-        accessor: &Accessor,
-    ) -> EvalResult<&'a mut Value> {
-        match (value, accessor) {
-            (Value::Struct(struct_value), Accessor::Field(index)) => {
-                let slots = struct_value.fields.len();
-                let struct_value = self.cow_struct_mut(struct_value, slots)?;
-                struct_value.fields.get_mut(*index).ok_or_else(|| {
-                    EvalError::Trap(self.internal_panic("struct field out of range"))
-                })
-            }
-            (Value::Tuple(items), Accessor::Tuple(index)) => {
-                let slots = items.len();
-                let items = self.cow_vec_mut(items, slots)?;
-                items
-                    .get_mut(*index as usize)
-                    .ok_or_else(|| EvalError::Trap(self.internal_panic("tuple field out of range")))
-            }
-            (Value::List(items), Accessor::Index(Value::Int(index))) => {
-                let slots = items.len();
-                let items = self.cow_vec_mut(items, slots)?;
-                let index = *index;
-                if index < 0 || index as usize >= items.len() {
-                    return Err(EvalError::Trap(self.internal_panic("index out of bounds")));
-                }
-                Ok(&mut items[index as usize])
-            }
-            (Value::Map(map), Accessor::Index(key)) => {
-                let key =
-                    key_from_value(key).map_err(|msg| EvalError::Trap(self.internal_panic(msg)))?;
-                let slots = map.len().saturating_mul(2);
-                let map = self.cow_map_mut(map, slots)?;
-                map.get_mut(&key)
-                    .ok_or_else(|| EvalError::Trap(self.internal_panic("missing map key")))
-            }
-            _ => Err(EvalError::Trap(self.internal_panic("invalid place access"))),
-        }
-    }
-
     fn take_path_value(&mut self, value: &mut Value, accessors: &[Accessor]) -> EvalResult<Value> {
         let Some((first, rest)) = accessors.split_first() else {
             return Ok(std::mem::replace(value, Value::Unit));
         };
-        let slot = self.place_child_mut(value, first)?;
-        self.take_path_value(slot, rest)
+        match first {
+            Accessor::Field(index) => {
+                let Value::Struct(struct_value) = value else {
+                    return Err(EvalError::Trap(self.internal_panic("invalid place access")));
+                };
+                let slots = struct_value.fields.len();
+                let struct_value = self.cow_struct_mut(struct_value, slots)?;
+                let old = struct_value
+                    .fields
+                    .get(*index)
+                    .ok_or_else(|| {
+                        EvalError::Trap(self.internal_panic("struct field out of range"))
+                    })?
+                    .meta();
+                let taken = {
+                    let slot = struct_value.field_mut(*index).expect("field was checked");
+                    self.take_path_value(slot, rest)?
+                };
+                let new = struct_value.fields[*index].meta();
+                struct_value.note_field_replaced(old, new);
+                Ok(taken)
+            }
+            Accessor::Tuple(index) => {
+                let Value::Tuple(items) = value else {
+                    return Err(EvalError::Trap(self.internal_panic("invalid place access")));
+                };
+                let slots = items.len();
+                let items = self.cow_vec_mut(items, slots)?;
+                let index = *index as usize;
+                let old = items
+                    .get(index)
+                    .ok_or_else(|| {
+                        EvalError::Trap(self.internal_panic("tuple field out of range"))
+                    })?
+                    .meta();
+                let taken = {
+                    let slot = items.slot_mut(index).expect("field was checked");
+                    self.take_path_value(slot, rest)?
+                };
+                let new = items[index].meta();
+                items.note_child_replaced(old, new);
+                Ok(taken)
+            }
+            Accessor::Index(index_value) => match value {
+                Value::List(items) => {
+                    let Value::Int(index) = index_value else {
+                        return Err(EvalError::Trap(self.internal_panic("invalid place access")));
+                    };
+                    let slots = items.len();
+                    let items = self.cow_vec_mut(items, slots)?;
+                    let index = *index;
+                    if index < 0 || index as usize >= items.len() {
+                        return Err(EvalError::Trap(self.internal_panic("index out of bounds")));
+                    }
+                    let index = index as usize;
+                    let old = items[index].meta();
+                    let taken = {
+                        let slot = items.slot_mut(index).expect("index was checked");
+                        self.take_path_value(slot, rest)?
+                    };
+                    let new = items[index].meta();
+                    items.note_child_replaced(old, new);
+                    Ok(taken)
+                }
+                Value::Map(map) => {
+                    let key = key_from_value(index_value)
+                        .map_err(|msg| EvalError::Trap(self.internal_panic(msg)))?;
+                    let slots = map.len().saturating_mul(2);
+                    let map = self.cow_map_mut(map, slots)?;
+                    let old = map
+                        .get(&key)
+                        .ok_or_else(|| EvalError::Trap(self.internal_panic("missing map key")))?
+                        .meta();
+                    let taken = {
+                        let slot = map.value_mut(&key).expect("key was checked");
+                        self.take_path_value(slot, rest)?
+                    };
+                    let new = map.get(&key).expect("key was checked").meta();
+                    map.note_value_replaced(&key, old, new);
+                    Ok(taken)
+                }
+                _ => Err(EvalError::Trap(self.internal_panic("invalid place access"))),
+            },
+        }
     }
 
     fn set_path(
@@ -1576,10 +1601,18 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 };
                 let slots = struct_value.fields.len();
                 let struct_value = self.cow_struct_mut(struct_value, slots)?;
-                let slot = struct_value.fields.get_mut(*index).ok_or_else(|| {
-                    EvalError::Trap(self.internal_panic("struct field out of range"))
-                })?;
-                self.set_path(slot, rest, new_value, child_remaining)
+                let old = struct_value
+                    .fields
+                    .get(*index)
+                    .ok_or_else(|| {
+                        EvalError::Trap(self.internal_panic("struct field out of range"))
+                    })?
+                    .meta();
+                let slot = struct_value.field_mut(*index).expect("field was checked");
+                let result = self.set_path(slot, rest, new_value, child_remaining);
+                let new = slot.meta();
+                struct_value.note_field_replaced(old, new);
+                result
             }
             Accessor::Tuple(index) => {
                 let Value::Tuple(items) = value else {
@@ -1587,10 +1620,18 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 };
                 let slots = items.len();
                 let items = self.cow_vec_mut(items, slots)?;
-                let slot = items.get_mut(*index as usize).ok_or_else(|| {
-                    EvalError::Trap(self.internal_panic("tuple field out of range"))
-                })?;
-                self.set_path(slot, rest, new_value, child_remaining)
+                let index = *index as usize;
+                let old = items
+                    .get(index)
+                    .ok_or_else(|| {
+                        EvalError::Trap(self.internal_panic("tuple field out of range"))
+                    })?
+                    .meta();
+                let slot = items.slot_mut(index).expect("field was checked");
+                let result = self.set_path(slot, rest, new_value, child_remaining);
+                let new = slot.meta();
+                items.note_child_replaced(old, new);
+                result
             }
             Accessor::Index(index_value) => match value {
                 Value::List(items) => {
@@ -1603,7 +1644,13 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     if index < 0 || index as usize >= items.len() {
                         return Err(EvalError::Trap(self.internal_panic("index out of bounds")));
                     }
-                    self.set_path(&mut items[index as usize], rest, new_value, child_remaining)
+                    let index = index as usize;
+                    let old = items[index].meta();
+                    let slot = items.slot_mut(index).expect("index was checked");
+                    let result = self.set_path(slot, rest, new_value, child_remaining);
+                    let new = slot.meta();
+                    items.note_child_replaced(old, new);
+                    result
                 }
                 Value::Map(map) => {
                     if value_depth_exceeds(index_value, child_remaining) {
@@ -1623,10 +1670,15 @@ impl<'p, 'h> Runtime<'p, 'h> {
                         map.insert(key, new_value);
                         Ok(())
                     } else {
-                        let slot = map.get_mut(&key).ok_or_else(|| {
-                            EvalError::Trap(self.internal_panic("missing map key"))
-                        })?;
-                        self.set_path(slot, rest, new_value, child_remaining)
+                        let old = map
+                            .get(&key)
+                            .ok_or_else(|| EvalError::Trap(self.internal_panic("missing map key")))?
+                            .meta();
+                        let slot = map.value_mut(&key).expect("key was checked");
+                        let result = self.set_path(slot, rest, new_value, child_remaining);
+                        let new = slot.meta();
+                        map.note_value_replaced(&key, old, new);
+                        result
                     }
                 }
                 _ => Err(EvalError::Trap(self.internal_panic("invalid place access"))),
@@ -2253,19 +2305,16 @@ impl<'p, 'h> Runtime<'p, 'h> {
                         }
                     }
                 }
-                Value::Struct(Rc::new(StructValue {
-                    type_id: *type_id,
-                    fields: values,
-                }))
+                Value::Struct(Rc::new(StructValue::new(*type_id, values)))
             }
-            ConstValue::Enum(type_id, variant, payload) => Value::Enum(Rc::new(EnumValue {
-                type_id: *type_id,
-                variant: *variant,
-                payload: payload
+            ConstValue::Enum(type_id, variant, payload) => Value::Enum(Rc::new(EnumValue::new(
+                *type_id,
+                *variant,
+                payload
                     .iter()
                     .map(|v| self.const_to_value(v, span))
                     .collect(),
-            })),
+            ))),
             ConstValue::Prelude(variant, payload) => {
                 let value = payload
                     .first()

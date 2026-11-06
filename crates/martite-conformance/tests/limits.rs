@@ -335,12 +335,7 @@ fn runtime_value_nesting_is_capped_at_128() {
         "#;
     let trap = run_case(Case::single(source)).expect_err("depth trap");
     assert!(matches!(trap, Trap::DepthExceeded), "{trap:?}");
-    assert!(
-        value_depth_exceeds(
-            &Value::List(std::rc::Rc::new(vec![Value::Int(1)])),
-            MAX_VALUE_DEPTH
-        ) == false
-    );
+    assert!(value_depth_exceeds(&Value::list(vec![Value::Int(1)]), MAX_VALUE_DEPTH) == false);
 }
 
 struct ChargingHost;
