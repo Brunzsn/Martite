@@ -81,6 +81,9 @@ pub struct LambdaInfo {
     pub params: Vec<LambdaParam>,
     pub body: LambdaBody,
     pub captures: Vec<BindingId>,
+    /// Resolved binding for each parameter whose pattern is a plain binding.
+    /// `None` means the runtime must use the general pattern binder.
+    pub param_bindings: Vec<Option<BindingId>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,7 +187,9 @@ pub enum EntryKind {
 pub struct CheckedProgram {
     pub resolved: ResolvedProgram,
     pub types: TypeTable,
-    pub functions: HashMap<DefId, FnSig>,
+    /// Dense table indexed by `DefId`. Entries are present for functions,
+    /// methods, handlers, and tests; other definitions hold `None`.
+    pub functions: Vec<Option<FnSig>>,
     pub methods: HashMap<(TypeId, String), DefId>,
     pub consts: HashMap<DefId, ConstInfo>,
     pub expr_types: HashMap<NodeId, Ty>,
@@ -213,7 +218,7 @@ pub struct CheckedProgram {
 
 impl CheckedProgram {
     pub fn fn_sig(&self, def: DefId) -> Option<&FnSig> {
-        self.functions.get(&def)
+        self.functions.get(def.0 as usize).and_then(Option::as_ref)
     }
 
     pub fn type_def(&self, id: TypeId) -> Option<&crate::ty::TypeDef> {
@@ -234,8 +239,7 @@ impl CheckedProgram {
             martite_syntax::Item::Test(t) if t.id == info.node => Some(&t.body),
             martite_syntax::Item::Impl(i) => i
                 .methods
-                .iter()
-                .find(|m| m.id == info.node)
+                .get(info.method_index?)
                 .and_then(|m| m.body.as_ref()),
             _ => None,
         }
@@ -247,7 +251,7 @@ impl CheckedProgram {
         let item = module.ast.items.get(info.item_index)?;
         match item {
             martite_syntax::Item::Fn(f) if f.id == info.node => Some(f),
-            martite_syntax::Item::Impl(i) => i.methods.iter().find(|m| m.id == info.node),
+            martite_syntax::Item::Impl(i) => i.methods.get(info.method_index?),
             _ => None,
         }
     }

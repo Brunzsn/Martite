@@ -1363,7 +1363,8 @@ impl<'a> Checked<'a> {
         let sigs: Vec<_> = self
             .program
             .functions
-            .values()
+            .iter()
+            .flatten()
             .filter(|sig| sig.module == self.module.id)
             .collect();
         for sig in sigs {
