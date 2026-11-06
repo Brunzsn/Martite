@@ -17,6 +17,54 @@ def human_time(nanoseconds: float) -> str:
         return f"{nanoseconds / 1_000_000:.3f} ms"
     return f"{nanoseconds / 1_000_000_000:.3f} s"
 
+def read_change(benchmark: Path) -> float | None:
+    estimates = benchmark.parent.parent / "change" / "estimates.json"
+    if not estimates.is_file():
+        return None
+    try:
+        change = json.loads(estimates.read_text(encoding="utf-8"))
+        return change["median"]["point_estimate"]
+    except (OSError, KeyError, ValueError):
+        return None
+
+def read_allocations(path: Path) -> dict[str, int]:
+    rows = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return rows
+    for line in lines:
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) < 4 or not parts[1].startswith("runtime/"):
+            continue
+        try:
+            rows[parts[1]] = int(parts[2])
+        except ValueError:
+            continue
+    return rows
+
+def allocation_summary(criterion: Path) -> list[str]:
+    allocations = criterion / "allocations.md"
+    if not allocations.is_file():
+        return []
+    candidate = read_allocations(allocations)
+    baseline = read_allocations(criterion / "allocations-baseline.md")
+    if not candidate or not baseline:
+        return ["", "## Runtime allocations", "", allocations.read_text(encoding="utf-8").strip()]
+
+    lines = [
+        "",
+        "## Runtime allocations",
+        "",
+        "| Benchmark | Baseline | Candidate | Delta |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    for name in sorted(candidate.keys() & baseline.keys()):
+        delta = candidate[name] - baseline[name]
+        formatted = f"{delta:+d}" if delta else "0"
+        lines.append(f"| `{name}` | {baseline[name]} | {candidate[name]} | {formatted} |")
+    return lines
+
 def target_root() -> Path:
     configured = os.environ.get("CARGO_TARGET_DIR")
     if configured:
@@ -46,7 +94,7 @@ def main() -> None:
         except (OSError, KeyError, ValueError):
             continue
         name = metadata.get("full_id") or metadata.get("title") or benchmark.parent.parent.name
-        rows.append((name, median))
+        rows.append((name, median, read_change(benchmark)))
 
     lines = ["## Martite benchmarks", ""]
     lines.append(f"- OS: `{platform.platform()}`")
@@ -57,20 +105,30 @@ def main() -> None:
     commit = os.environ.get("GITHUB_SHA", "")[:7]
     if commit:
         lines.append(f"- Commit: `{commit}`")
+    baseline = os.environ.get("BASELINE_SHA", "")[:7]
+    candidate = os.environ.get("CANDIDATE_SHA", "")[:7]
+    if baseline and candidate:
+        lines.append(f"- Baseline: `{baseline}`")
+        lines.append(f"- Candidate: `{candidate}`")
     lines.append("- Command: `cargo bench -p martite-bench`")
     lines.append("")
 
-    if rows:
+    has_change = any(change is not None for _, _, change in rows)
+    if rows and has_change:
+        lines.append("| Benchmark | Median | Change |")
+        lines.append("| --- | ---: | ---: |")
+        for name, median, change in sorted(rows):
+            formatted = f"{change * 100:+.1f}%" if change is not None else "—"
+            lines.append(f"| `{name}` | {human_time(median)} | {formatted} |")
+    elif rows:
         lines.append("| Benchmark | Median |")
         lines.append("| --- | ---: |")
-        for name, median in sorted(rows):
+        for name, median, _ in sorted(rows):
             lines.append(f"| `{name}` | {human_time(median)} |")
     else:
         lines.append("No Criterion results were found.")
 
-    allocations = criterion / "allocations.md"
-    if allocations.is_file():
-        lines.extend(["", "## Runtime allocations", "", allocations.read_text(encoding="utf-8").strip()])
+    lines.extend(allocation_summary(criterion))
 
     summary = "\n".join(lines) + "\n"
     destination = os.environ.get("GITHUB_STEP_SUMMARY")

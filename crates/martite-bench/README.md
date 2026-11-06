@@ -53,6 +53,11 @@ machines. Keep the machine idle and run the same target on the same OS and
 toolchain when comparing. `--baseline` is forwarded to every Criterion target;
 the allocation target ignores Criterion flags and always prints its table.
 
+For a same-runner CI comparison, dispatch the **Benchmarks Comparison** workflow
+with a baseline and candidate ref. It checks out both revisions in the same job,
+runs the suite once per revision, and reports Criterion change percentages plus
+allocation deltas in the job summary.
+
 ## Groups and fixtures
 
 | Group | Benchmarks | Fixtures |

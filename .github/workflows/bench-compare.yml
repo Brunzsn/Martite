@@ -1,0 +1,86 @@
+name: Benchmarks Comparison
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: Baseline git ref or commit (must contain the benchmark suite)
+        required: true
+        default: HEAD~1
+      candidate:
+        description: Candidate git ref or commit (must contain the benchmark suite)
+        required: true
+        default: HEAD
+
+jobs:
+  benchmark:
+    name: compare (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: python3
+          - os: windows-latest
+            python: python
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-compare
+
+      - name: Resolve revisions
+        shell: bash
+        run: |
+          echo "BASELINE_SHA=$(git rev-parse '${{ inputs.baseline }}')" >> "$GITHUB_ENV"
+          echo "CANDIDATE_SHA=$(git rev-parse '${{ inputs.candidate }}')" >> "$GITHUB_ENV"
+
+      - name: Save summary script
+        shell: bash
+        run: cp .github/scripts/bench_summary.py "${{ runner.temp }}/bench_summary.py"
+
+      - name: Check out baseline
+        shell: bash
+        run: git checkout --force "$BASELINE_SHA"
+
+      - name: Build baseline CLI
+        run: cargo build --release -p martite-cli
+
+      - name: Compile baseline benchmarks
+        run: cargo bench -p martite-bench --no-run
+
+      - name: Clear stale Criterion results
+        run: ${{ matrix.python }} -c "import shutil; shutil.rmtree('target/criterion', ignore_errors=True)"
+
+      - name: Run baseline benchmarks
+        run: cargo bench -p martite-bench -- --save-baseline before
+
+      - name: Save baseline allocations
+        run: ${{ matrix.python }} -c "import shutil; shutil.copyfile('target/criterion/allocations.md', 'target/criterion/allocations-baseline.md')"
+
+      - name: Check out candidate
+        shell: bash
+        run: git checkout --force "$CANDIDATE_SHA"
+
+      - name: Build candidate CLI
+        run: cargo build --release -p martite-cli
+
+      - name: Run candidate benchmarks
+        run: cargo bench -p martite-bench -- --baseline before
+
+      - name: Write benchmark summary
+        if: always()
+        run: ${{ matrix.python }} "${{ runner.temp }}/bench_summary.py"
+
+      - name: Upload Criterion results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-compare-${{ matrix.os }}
+          path: target/criterion
+          if-no-files-found: ignore
