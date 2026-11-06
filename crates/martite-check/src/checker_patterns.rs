@@ -812,7 +812,8 @@ impl Checker {
                         .insert(pat.id, PatResolution::Struct(type_id));
                 }
                 let mut named = HashSet::new();
-                for field in fields {
+                let mut slots = Vec::with_capacity(fields.len());
+                for (source, field) in fields.iter().enumerate() {
                     if !named.insert(field.name.clone()) {
                         self.err_at(
                             module,
@@ -822,12 +823,11 @@ impl Checker {
                         );
                         continue;
                     }
-                    if let Some((_, field_ty)) =
-                        def_fields.iter().find(|(n, _)| n == &field.name)
-                    {
+                    if let Some(decl) = def_fields.iter().position(|(n, _)| n == &field.name) {
+                        slots.push((source, decl));
                         self.check_pattern_with(
                             &field.pattern,
-                            field_ty,
+                            &def_fields[decl].1,
                             mode,
                             mutable,
                             bindings,
@@ -841,6 +841,9 @@ impl Checker {
                             format!("unknown field `{}`", field.name),
                         );
                     }
+                }
+                if type_id != TypeId(0) {
+                    self.struct_pattern_fields.insert(pat.id, slots);
                 }
                 if !rest {
                     for (field_name, _) in &def_fields {

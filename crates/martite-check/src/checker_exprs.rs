@@ -2480,6 +2480,17 @@ impl Checker {
         }
         let named = Ty::Named(type_id, type_args.clone());
         self.resolutions.insert(expr.id, Resolution::TypeName(type_id));
+        let slots = fields
+            .iter()
+            .enumerate()
+            .filter_map(|(source, field)| {
+                decl_fields
+                    .iter()
+                    .position(|decl| decl.name == field.name)
+                    .map(|decl| (source, decl))
+            })
+            .collect();
+        self.struct_lit_fields.insert(expr.id, slots);
 
         if let Some(base) = base {
             self.check_expr(base, Some(&named), infer);

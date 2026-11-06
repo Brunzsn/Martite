@@ -190,6 +190,12 @@ pub struct CheckedProgram {
     pub expr_types: HashMap<NodeId, Ty>,
     pub resolutions: HashMap<NodeId, Resolution>,
     pub pattern_resolutions: HashMap<NodeId, PatResolution>,
+    /// Declaration slots for struct literals, keyed by the literal's `NodeId`.
+    /// Each pair is `(index in the literal's fields, declaration index)`.
+    pub struct_lit_fields: HashMap<NodeId, Vec<(usize, usize)>>,
+    /// Declaration slots for struct patterns, keyed by the pattern's `NodeId`.
+    /// Each pair is `(index in the pattern's fields, declaration index)`.
+    pub struct_pattern_fields: HashMap<NodeId, Vec<(usize, usize)>>,
     pub bindings: HashMap<BindingId, BindingInfo>,
     pub pattern_bindings: HashMap<NodeId, BindingId>,
     pub param_bindings: HashMap<NodeId, BindingId>,

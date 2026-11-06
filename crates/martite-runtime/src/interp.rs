@@ -131,6 +131,10 @@ pub struct Runtime<'p, 'h> {
 
 struct Frame<'p> {
     locals: HashMap<BindingId, Value>,
+    /// Undo log for bindings introduced by an attempted match pattern. Each
+    /// entry restores the previous value, or removes the binding when it was
+    /// absent.
+    undo: Vec<(BindingId, Option<Value>)>,
     captures: Option<Rc<HashMap<BindingId, Value>>>,
     source: SourceId,
     name: &'p str,
@@ -422,6 +426,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
         self.frames.push(Frame {
             locals,
+            undo: Vec::new(),
             captures: None,
             source,
             name: sig.name.as_str(),
@@ -522,6 +527,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let source = self.frames.last().map(|f| f.source).unwrap_or(SourceId(0));
                 self.frames.push(Frame {
                     locals: HashMap::new(),
+                    undo: Vec::new(),
                     captures: closure.captures.clone(),
                     source,
                     name: "<lambda>",
@@ -868,21 +874,22 @@ impl<'p, 'h> Runtime<'p, 'h> {
             ExprKind::Match { scrutinee, arms } => {
                 let value = self.eval_expr(scrutinee)?;
                 for arm in arms {
-                    let saved = self.current_locals().clone();
+                    let mark = self.locals_mark();
                     if self.match_pattern(&arm.pattern, &value)? {
                         if let Some(guard) = &arm.guard {
                             let pass = self.eval_expr(guard)?;
                             if !matches!(pass, Value::Bool(true)) {
-                                *self.current_locals_mut() = saved;
+                                self.rollback_locals(mark);
                                 continue;
                             }
                         }
+                        self.commit_locals(mark);
                         return match &arm.body {
                             MatchBody::Block(block) => self.eval_block(block),
                             MatchBody::Expr(expr) => self.eval_expr(expr),
                         };
                     }
-                    *self.current_locals_mut() = saved;
+                    self.rollback_locals(mark);
                 }
                 self.trap(self.internal_panic("match fell through"))
             }
@@ -1109,35 +1116,36 @@ impl<'p, 'h> Runtime<'p, 'h> {
         fields: &[martite_syntax::FieldInit],
         base: Option<&Expr>,
     ) -> EvalResult<Value> {
-        let Some(Resolution::TypeName(type_id)) = self.program.resolution(expr.id).copied() else {
+        let program = self.program;
+        let Some(Resolution::TypeName(type_id)) = program.resolution(expr.id).copied() else {
             return self.trap(self.internal_panic("struct literal has no type"));
         };
-        let mut values: HashMap<String, Value> = HashMap::new();
+        let decl_count = match program.types.get(type_id).map(|def| &def.kind) {
+            Some(martite_check::TypeDefKind::Struct { fields }) => fields.len(),
+            _ => return self.trap(self.internal_panic("unknown struct type")),
+        };
+        let mut out = vec![Value::Unit; decl_count];
         if let Some(base) = base {
-            let base = self.eval_expr(base)?;
-            if let Value::Struct(struct_value) = base {
-                if let Some(def) = self.program.types.get(struct_value.type_id) {
-                    if let martite_check::TypeDefKind::Struct { fields } = &def.kind {
-                        for (field, value) in fields.iter().zip(struct_value.fields.iter()) {
-                            values.insert(field.name.clone(), value.clone());
-                        }
+            if let Value::Struct(struct_value) = self.eval_expr(base)? {
+                if struct_value.type_id == type_id {
+                    for (slot, value) in out.iter_mut().zip(struct_value.fields.iter()) {
+                        *slot = value.clone();
                     }
                 }
             }
         }
-        for field in fields {
-            if let Some(value) = &field.value {
-                let value = self.eval_expr(value)?;
-                values.insert(field.name.clone(), value);
-            }
-        }
-        let Some(def) = self.program.types.get(type_id) else {
-            return self.trap(self.internal_panic("unknown struct type"));
-        };
-        let mut out = Vec::new();
-        if let martite_check::TypeDefKind::Struct { fields } = &def.kind {
-            for field in fields {
-                out.push(values.remove(&field.name).unwrap_or(Value::Unit));
+        if let Some(slots) = program.struct_lit_fields.get(&expr.id) {
+            for &(source, decl) in slots {
+                let Some(field) = fields.get(source) else {
+                    continue;
+                };
+                let Some(value_expr) = &field.value else {
+                    continue;
+                };
+                let value = self.eval_expr(value_expr)?;
+                if let Some(slot) = out.get_mut(decl) {
+                    *slot = value;
+                }
             }
         }
         self.charge(out.len() as u64)?;
@@ -1831,8 +1839,8 @@ impl<'p, 'h> Runtime<'p, 'h> {
     fn bind_pattern(&mut self, pattern: &Pattern, value: &Value) {
         match &pattern.kind {
             PatKind::Bind(_) => {
-                if let Some(id) = self.program.pattern_bindings.get(&pattern.id) {
-                    self.current_locals_mut().insert(*id, value.clone());
+                if let Some(id) = self.program.pattern_bindings.get(&pattern.id).copied() {
+                    self.current_locals_mut().insert(id, value.clone());
                 }
             }
             PatKind::Tuple(items) => {
@@ -1843,34 +1851,29 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 }
             }
             PatKind::Variant { args, .. } => {
-                let payload: Vec<Value> = match value {
-                    Value::Option(Some(v)) => vec![(**v).clone()],
-                    Value::Option(None) => Vec::new(),
-                    Value::Result(Ok(v)) => vec![(**v).clone()],
-                    Value::Result(Err(v)) => vec![(**v).clone()],
-                    Value::Enum(e) => e.payload.clone(),
-                    _ => Vec::new(),
+                let Some(payload) = variant_payload(value) else {
+                    return;
                 };
                 for (arg, value) in args.iter().zip(payload.iter()) {
                     self.bind_pattern(arg, value);
                 }
             }
             PatKind::Struct { fields, .. } => {
-                if let Value::Struct(struct_value) = value {
-                    if let Some(def) = self.program.types.get(struct_value.type_id) {
-                        if let martite_check::TypeDefKind::Struct { fields: def_fields } = &def.kind
-                        {
-                            for field in fields {
-                                if let Some(index) =
-                                    def_fields.iter().position(|f| f.name == field.name)
-                                {
-                                    if let Some(value) = struct_value.fields.get(index) {
-                                        self.bind_pattern(&field.pattern, value);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                let Value::Struct(struct_value) = value else {
+                    return;
+                };
+                let program = self.program;
+                let Some(slots) = program.struct_pattern_fields.get(&pattern.id) else {
+                    return;
+                };
+                for &(source, decl) in slots {
+                    let Some(field) = fields.get(source) else {
+                        continue;
+                    };
+                    let Some(value) = struct_value.fields.get(decl) else {
+                        continue;
+                    };
+                    self.bind_pattern(&field.pattern, value);
                 }
             }
             PatKind::Or(alternatives) => {
@@ -1886,8 +1889,8 @@ impl<'p, 'h> Runtime<'p, 'h> {
         match &pattern.kind {
             PatKind::Wild => Ok(true),
             PatKind::Bind(_) => {
-                if let Some(id) = self.program.pattern_bindings.get(&pattern.id) {
-                    self.current_locals_mut().insert(*id, value.clone());
+                if let Some(id) = self.program.pattern_bindings.get(&pattern.id).copied() {
+                    self.bind_match_local(id, value.clone());
                 }
                 Ok(true)
             }
@@ -1909,13 +1912,8 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 Ok(true)
             }
             PatKind::Variant { args, .. } => {
-                let payload: Vec<Value> = match value {
-                    Value::Option(Some(v)) => vec![(**v).clone()],
-                    Value::Option(None) => Vec::new(),
-                    Value::Result(Ok(v)) => vec![(**v).clone()],
-                    Value::Result(Err(v)) => vec![(**v).clone()],
-                    Value::Enum(e) => e.payload.clone(),
-                    _ => return Ok(false),
+                let Some(payload) = variant_payload(value) else {
+                    return Ok(false);
                 };
                 let matched = match self.program.pattern_resolutions.get(&pattern.id) {
                     Some(PatResolution::Prelude(PreludeVariant::Some)) => {
@@ -1949,17 +1947,15 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let Value::Struct(struct_value) = value else {
                     return Ok(false);
                 };
-                let Some(def) = self.program.types.get(struct_value.type_id) else {
+                let program = self.program;
+                let Some(slots) = program.struct_pattern_fields.get(&pattern.id) else {
                     return Ok(false);
                 };
-                let martite_check::TypeDefKind::Struct { fields: def_fields } = &def.kind else {
-                    return Ok(false);
-                };
-                for field in fields {
-                    let Some(index) = def_fields.iter().position(|f| f.name == field.name) else {
+                for &(source, decl) in slots {
+                    let Some(field) = fields.get(source) else {
                         return Ok(false);
                     };
-                    let Some(value) = struct_value.fields.get(index) else {
+                    let Some(value) = struct_value.fields.get(decl) else {
                         return Ok(false);
                     };
                     if !self.match_pattern(&field.pattern, value)? {
@@ -1969,14 +1965,13 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 Ok(true)
             }
             PatKind::Or(alternatives) => {
-                let saved = self.current_locals().clone();
+                let mark = self.locals_mark();
                 for alternative in alternatives {
-                    *self.current_locals_mut() = saved.clone();
                     if self.match_pattern(alternative, value)? {
                         return Ok(true);
                     }
+                    self.rollback_locals(mark);
                 }
-                *self.current_locals_mut() = saved;
                 Ok(false)
             }
         }
@@ -1992,12 +1987,37 @@ impl<'p, 'h> Runtime<'p, 'h> {
         })
     }
 
-    fn current_locals(&self) -> &HashMap<BindingId, Value> {
-        &self.frames.last().expect("frame").locals
-    }
-
     fn current_locals_mut(&mut self) -> &mut HashMap<BindingId, Value> {
         &mut self.frames.last_mut().expect("frame").locals
+    }
+
+    fn locals_mark(&self) -> usize {
+        self.frames.last().expect("frame").undo.len()
+    }
+
+    fn bind_match_local(&mut self, id: BindingId, value: Value) {
+        let frame = self.frames.last_mut().expect("frame");
+        let previous = frame.locals.insert(id, value);
+        frame.undo.push((id, previous));
+    }
+
+    fn rollback_locals(&mut self, mark: usize) {
+        let frame = self.frames.last_mut().expect("frame");
+        while frame.undo.len() > mark {
+            let (id, previous) = frame.undo.pop().expect("undo entry");
+            match previous {
+                Some(value) => {
+                    frame.locals.insert(id, value);
+                }
+                None => {
+                    frame.locals.remove(&id);
+                }
+            }
+        }
+    }
+
+    fn commit_locals(&mut self, mark: usize) {
+        self.frames.last_mut().expect("frame").undo.truncate(mark);
     }
 
     // ------------------------------------------------------------------
@@ -2267,6 +2287,17 @@ impl<'p, 'h> Runtime<'p, 'h> {
 }
 
 include!("builtins.rs");
+
+fn variant_payload(value: &Value) -> Option<&[Value]> {
+    match value {
+        Value::Option(Some(value)) => Some(std::slice::from_ref(value.as_ref())),
+        Value::Option(None) => Some(&[]),
+        Value::Result(Ok(value)) => Some(std::slice::from_ref(value.as_ref())),
+        Value::Result(Err(value)) => Some(std::slice::from_ref(value.as_ref())),
+        Value::Enum(value) => Some(&value.payload),
+        _ => None,
+    }
+}
 
 fn take_writeback(updated: &mut Vec<(usize, Value)>, index: usize) -> Option<Value> {
     let position = updated.iter().position(|(slot, _)| *slot == index)?;
