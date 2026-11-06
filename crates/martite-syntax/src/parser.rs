@@ -93,13 +93,22 @@ pub fn parse_source(source: &str, limits: LoadLimits) -> ParseOutput {
 /// Parse a source file with explicit options.
 pub fn parse_source_with(source: &str, limits: LoadLimits, options: ParseOptions) -> ParseOutput {
     let source = normalize_source(source);
-    Parser::new(&source, limits, false, options).parse_program()
+    parse_source_normalized_with_options(&source, limits, options)
 }
 
 /// Parse source that has already been normalized with
 /// [`normalize_source`](martite_base::normalize_source).
 pub fn parse_source_normalized(source: &str, limits: LoadLimits) -> ParseOutput {
-    Parser::new(source, limits, false, ParseOptions::default()).parse_program()
+    parse_source_normalized_with_options(source, limits, ParseOptions::default())
+}
+
+/// Parse already-normalized source with explicit options.
+pub fn parse_source_normalized_with_options(
+    source: &str,
+    limits: LoadLimits,
+    options: ParseOptions,
+) -> ParseOutput {
+    Parser::new(source, limits, false, options).parse_program()
 }
 
 pub fn parse_interface(source: &str, limits: LoadLimits) -> ParseOutput {
@@ -113,18 +122,36 @@ pub fn parse_interface_with(
     options: ParseOptions,
 ) -> ParseOutput {
     let source = normalize_source(source);
-    Parser::new(&source, limits, true, options).parse_program()
+    parse_interface_normalized_with_options(&source, limits, options)
 }
 
 /// Parse an interface that has already been normalized with
 /// [`normalize_source`](martite_base::normalize_source).
 pub fn parse_interface_normalized(source: &str, limits: LoadLimits) -> ParseOutput {
-    Parser::new(source, limits, true, ParseOptions::default()).parse_program()
+    parse_interface_normalized_with_options(source, limits, ParseOptions::default())
+}
+
+/// Parse an already-normalized interface with explicit options.
+pub fn parse_interface_normalized_with_options(
+    source: &str,
+    limits: LoadLimits,
+    options: ParseOptions,
+) -> ParseOutput {
+    Parser::new(source, limits, true, options).parse_program()
 }
 
 /// Parse already-normalized source and return the token stream for the
 /// formatter. Normal checking uses [`parse_source`] and does not retain tokens.
 pub fn parse_source_normalized_with_tokens(
+    source: &str,
+    limits: LoadLimits,
+) -> (ParseOutput, Vec<Token>) {
+    parse_source_normalized_with_tokens_with_options(source, limits, ParseOptions::default())
+}
+
+/// Parse already-normalized source with explicit options and return the token
+/// stream for the formatter.
+pub fn parse_source_normalized_with_tokens_with_options(
     source: &str,
     limits: LoadLimits,
     options: ParseOptions,
@@ -135,6 +162,15 @@ pub fn parse_source_normalized_with_tokens(
 /// Parse an already-normalized interface and return the token stream for the
 /// formatter.
 pub fn parse_interface_normalized_with_tokens(
+    source: &str,
+    limits: LoadLimits,
+) -> (ParseOutput, Vec<Token>) {
+    parse_interface_normalized_with_tokens_with_options(source, limits, ParseOptions::default())
+}
+
+/// Parse an already-normalized interface with explicit options and return the
+/// token stream for the formatter.
+pub fn parse_interface_normalized_with_tokens_with_options(
     source: &str,
     limits: LoadLimits,
     options: ParseOptions,

@@ -8,8 +8,9 @@ mod verify;
 use martite_base::{Code, Diagnostic, LoadLimits, normalize_source};
 use martite_config::FmtConfig;
 use martite_syntax::{
-    ParenthesisTables, ParseOptions, Program, Token, parse_interface_normalized_with_tokens,
-    parse_source_normalized_with_tokens,
+    ParenthesisTables, ParseOptions, Program, Token,
+    parse_interface_normalized_with_tokens_with_options,
+    parse_source_normalized_with_tokens_with_options,
 };
 
 pub use verify::{comment_multiset, structurally_equal};
@@ -44,13 +45,13 @@ pub fn format_interface(source: &str, config: &FmtConfig) -> FormatOutput {
 fn format_mode(source: &str, config: &FmtConfig, interface: bool) -> FormatOutput {
     let source = normalize_source(source);
     let (parsed, tokens) = if interface {
-        parse_interface_normalized_with_tokens(
+        parse_interface_normalized_with_tokens_with_options(
             source.as_ref(),
             LoadLimits::default(),
             ParseOptions::TOOLING,
         )
     } else {
-        parse_source_normalized_with_tokens(
+        parse_source_normalized_with_tokens_with_options(
             source.as_ref(),
             LoadLimits::default(),
             ParseOptions::TOOLING,
