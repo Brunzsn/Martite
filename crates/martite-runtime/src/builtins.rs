@@ -15,17 +15,24 @@ impl<'p, 'h> Runtime<'p, 'h> {
             BuiltinReceiver::Map => matches!(name, "remove" | "clear"),
             _ => false,
         };
-        let mut receiver_value = if mut_self {
-            let place = self.eval_place(base)?;
-            let value = self.read_place(&place)?;
-            Some((place, value))
-        } else {
-            None
-        };
-        let mut value = match &receiver_value {
-            Some((_, value)) => value.clone(),
-            None => self.eval_expr(base)?,
-        };
+        if !mut_self {
+            let mut value = self.eval_expr(base)?;
+            let mut values = Vec::with_capacity(args.len());
+            for arg in args {
+                if arg.mutable {
+                    return self.trap(self.internal_panic("unexpected mut argument"));
+                }
+                values.push(self.eval_expr(&arg.expr)?);
+            }
+            let result =
+                self.apply_builtin_method(receiver, name, &mut value, values, expr.span)?;
+            self.check_value_depth(&result, expr.span)?;
+            self.note_value(&result);
+            return Ok(result);
+        }
+
+        let place = self.eval_place(base)?;
+        let snapshot = self.read_place(&place)?;
         let mut values = Vec::with_capacity(args.len());
         for arg in args {
             if arg.mutable {
@@ -33,12 +40,27 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             values.push(self.eval_expr(&arg.expr)?);
         }
-        let result = self.apply_builtin_method(receiver, name, &mut value, values, expr.span)?;
-        if let Some((place, _)) = receiver_value.take() {
-            self.write_place(place, value)?;
-        }
+        self.check_builtin_mutation_depth(name, &values, place.accessors.len())?;
+
+        let mut root = self.take_place_root(&place)?;
+        let mut value = snapshot;
+        let result = if place.accessors.is_empty() {
+            drop(root);
+            let result =
+                self.apply_builtin_method(receiver, name, &mut value, values, expr.span)?;
+            self.current_locals_mut().insert(place.root, value);
+            result
+        } else {
+            let replaced = self.take_path_value(&mut root, &place.accessors)?;
+            drop(replaced);
+            let result =
+                self.apply_builtin_method(receiver, name, &mut value, values, expr.span)?;
+            self.set_path(&mut root, &place.accessors, value, MAX_VALUE_DEPTH)?;
+            self.current_locals_mut().insert(place.root, root);
+            result
+        };
         self.check_value_depth(&result, expr.span)?;
-        self.check_value_memory(&result)?;
+        self.note_value(&result);
         Ok(result)
     }
 
@@ -192,8 +214,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             "sorted" => {
                 let mut out: Vec<Value> = items.iter().cloned().collect();
-                let n = out.len() as u64;
-                self.charge(n * (n + 1).ilog2().max(1) as u64)?;
+                self.charge(crate::cost::sort_cost(out.len() as u64))?;
                 out.sort_by(value_ord);
                 self.ensure_deadline()?;
                 Ok(Value::list(out))
@@ -201,8 +222,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             "sorted_by" => {
                 let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
-                let n = snapshot.len() as u64;
-                self.charge(n.saturating_mul((n + 1).ilog2().max(1) as u64))?;
+                self.charge(crate::cost::sort_cost(snapshot.len() as u64))?;
                 let mut keyed = Vec::with_capacity(snapshot.len());
                 for item in snapshot.iter() {
                     let key = self
@@ -228,55 +248,80 @@ impl<'p, 'h> Runtime<'p, 'h> {
                         out.push_str(s);
                     }
                 }
+                self.charge(items.len() as u64)?;
                 self.charge((out.len() as u64).div_ceil(8))?;
                 Ok(Value::str(out))
             }
             "push" => {
                 let value = args.into_iter().next().unwrap_or(Value::Unit);
+                let n = items.len();
                 self.charge(1)?;
-                Rc::make_mut(items).push(value);
+                self.note_alloc(8);
+                let list = self.cow_vec_mut(items, n)?;
+                list.push(value);
                 Ok(Value::Unit)
             }
-            "pop" => Ok(Rc::make_mut(items)
-                .pop()
-                .map(|v| Value::Option(Some(Box::new(v))))
-                .unwrap_or(Value::Option(None))),
+            "pop" => {
+                let n = items.len();
+                self.charge(1)?;
+                let list = self.cow_vec_mut(items, n)?;
+                Ok(list
+                    .pop()
+                    .map(|v| Value::Option(Some(Box::new(v))))
+                    .unwrap_or(Value::Option(None)))
+            }
             "sort" => {
-                let n = items.len() as u64;
-                self.charge(n * (n + 1).ilog2().max(1) as u64)?;
-                Rc::make_mut(items).sort_by(value_ord);
+                let n = items.len();
+                self.charge(crate::cost::sort_cost(n as u64))?;
+                let list = self.cow_vec_mut(items, n)?;
+                list.sort_by(value_ord);
                 self.ensure_deadline()?;
                 Ok(Value::Unit)
             }
             "insert" => {
                 let index = int_arg(&args, 0).unwrap_or(0);
                 let value = args.into_iter().nth(1).unwrap_or(Value::Unit);
-                let list = Rc::make_mut(items);
-                if index < 0 || index as usize > list.len() {
+                let n = items.len();
+                if index < 0 || index as usize > n {
                     return self.trap(self.panic("list insert index out of bounds", span));
                 }
-                list.insert(index as usize, value);
+                let index = index as usize;
+                self.charge((n - index + 1) as u64)?;
+                self.note_alloc(8);
+                let list = self.cow_vec_mut(items, n)?;
+                list.insert(index, value);
                 Ok(Value::Unit)
             }
             "remove_at" => {
                 let index = int_arg(&args, 0).unwrap_or(0);
-                let list = Rc::make_mut(items);
-                if index < 0 || index as usize >= list.len() {
+                let n = items.len();
+                if index < 0 || index as usize >= n {
                     return self.trap(self.panic("list index out of bounds", span));
                 }
-                Ok(list.remove(index as usize))
+                let index = index as usize;
+                self.charge((n - index) as u64)?;
+                let list = self.cow_vec_mut(items, n)?;
+                Ok(list.remove(index))
             }
             "extend" => {
                 let other = args.into_iter().next().unwrap_or(Value::Unit);
                 if let Value::List(other) = other {
+                    let n = items.len();
                     self.charge(other.len() as u64)?;
-                    Rc::make_mut(items).extend(other.iter().cloned());
+                    self.note_alloc(8 * other.len() as u64);
+                    let list = self.cow_vec_mut(items, n)?;
+                    list.extend(other.iter().cloned());
                 }
                 Ok(Value::Unit)
             }
             "clear" => {
                 self.charge(items.len() as u64)?;
-                Rc::make_mut(items).clear();
+                if Rc::strong_count(items) == 1 {
+                    Rc::make_mut(items).clear();
+                } else {
+                    self.note_alloc(16);
+                    *items = Rc::new(Vec::new());
+                }
                 Ok(Value::Unit)
             }
             _ => self.trap(self.internal_panic(format!("unknown list method `{name}`"))),
@@ -322,7 +367,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 Ok(Value::list(map.values()))
             }
             "entries" => {
-                self.charge(map.len() as u64)?;
+                self.charge(map.len().saturating_mul(2) as u64)?;
                 Ok(Value::list(
                     map.entries()
                         .iter()
@@ -334,14 +379,27 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let key = args.first().cloned().unwrap_or(Value::Unit);
                 let key = key_from_value(&key)
                     .map_err(|msg| EvalError::Trap(self.panic(msg, span)))?;
-                let removed = Rc::make_mut(map).remove(&key);
-                Ok(removed
-                    .map(|v| Value::Option(Some(Box::new(v))))
-                    .unwrap_or(Value::Option(None)))
+                if map.get(&key).is_none() {
+                    return Ok(Value::Option(None));
+                }
+                let n = map.len();
+                let slots = n.saturating_mul(2);
+                let map = self.cow_map_mut(map, slots)?;
+                let (index, removed) = map
+                    .remove_with_index(&key)
+                    .expect("key was checked before mutation");
+                self.charge(((n - index) * 2) as u64)?;
+                Ok(Value::Option(Some(Box::new(removed))))
             }
             "clear" => {
-                self.charge(map.len() as u64)?;
-                Rc::make_mut(map).clear();
+                let n = map.len();
+                self.charge(n.saturating_mul(2) as u64)?;
+                if Rc::strong_count(map) == 1 {
+                    Rc::make_mut(map).clear();
+                } else {
+                    self.note_alloc(16);
+                    *map = Rc::new(OrderedMap::new());
+                }
                 Ok(Value::Unit)
             }
             _ => self.trap(self.internal_panic(format!("unknown map method `{name}`"))),

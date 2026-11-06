@@ -42,12 +42,12 @@ const FUEL_ROWS: &[FuelRow] = &[
     FuelRow {
         name: "list show slots",
         source: "fn main() { let xs = [1, 2, 3]\nprint(\"{xs}\") }",
-        expected: 15,
+        expected: 18,
     },
     FuelRow {
         name: "map literal slots",
         source: "fn main() { let table = {\"a\": 1, \"b\": 2}\nprint(\"{table}\") }",
-        expected: 19,
+        expected: 23,
     },
     FuelRow {
         name: "string concatenation",
@@ -57,7 +57,7 @@ const FUEL_ROWS: &[FuelRow] = &[
     FuelRow {
         name: "sorting",
         source: "fn main() { let xs = [3, 1, 2]\nlet ys = xs.sorted()\nprint(\"{ys}\") }",
-        expected: 23,
+        expected: 26,
     },
     FuelRow {
         name: "print bytes",
@@ -82,17 +82,87 @@ const FUEL_ROWS: &[FuelRow] = &[
     FuelRow {
         name: "map equality slots",
         source: "fn main() { let a = {\"x\": 1, \"y\": 2}\nlet b = {\"x\": 1, \"y\": 2}\nlet same = a == b\nprint(\"{same}\") }",
-        expected: 35,
+        expected: 37,
     },
     FuelRow {
         name: "list map slots",
         source: "fn main() { let ys = [1, 2, 3].map(fn(x) => x + 1)\nprint(\"{ys}\") }",
-        expected: 29,
+        expected: 32,
     },
     FuelRow {
         name: "list extend slots",
         source: "fn main() { var xs = [1, 2]\nxs.extend([3, 4])\nprint(\"{xs}\") }",
-        expected: 21,
+        expected: 25,
+    },
+    FuelRow {
+        name: "sorting two items",
+        source: "fn main() { let xs = [2, 1]\nlet ys = xs.sorted() }",
+        expected: 12,
+    },
+    FuelRow {
+        name: "sorting four items",
+        source: "fn main() { let xs = [4, 3, 2, 1]\nlet ys = xs.sorted() }",
+        expected: 24,
+    },
+    FuelRow {
+        name: "sorting eight items",
+        source: "fn main() { let xs = [8, 7, 6, 5, 4, 3, 2, 1]\nlet ys = xs.sorted() }",
+        expected: 52,
+    },
+    FuelRow {
+        name: "nested show slots",
+        source: "fn main() { let xs = [[1, 2], [3]]\nprint(\"{xs}\") }",
+        expected: 24,
+    },
+    FuelRow {
+        name: "join slots and bytes",
+        source: "fn main() { let xs = [\"ab\", \"cd\"]\nprint(xs.join(\",\")) }",
+        expected: 17,
+    },
+    FuelRow {
+        name: "unique push has no copy",
+        source: "fn main() { var xs = [1, 2, 3]\nxs.push(4) }",
+        expected: 11,
+    },
+    FuelRow {
+        name: "shared push copies the list",
+        source: "fn main() { var xs = [1, 2, 3]\nlet keep = xs\nxs.push(4) }",
+        expected: 15,
+    },
+    FuelRow {
+        name: "unique insert shifts only",
+        source: "fn main() { var xs = [1, 2, 3, 4]\nxs.insert(1, 9) }",
+        expected: 17,
+    },
+    FuelRow {
+        name: "shared insert copies and shifts",
+        source: "fn main() { var xs = [1, 2, 3, 4]\nlet keep = xs\nxs.insert(1, 9) }",
+        expected: 22,
+    },
+    FuelRow {
+        name: "unique remove shifts only",
+        source: "fn main() { var xs = [1, 2, 3, 4]\nlet _removed = xs.remove_at(1) }",
+        expected: 15,
+    },
+    FuelRow {
+        name: "shared remove copies and shifts",
+        source: "fn main() { var xs = [1, 2, 3, 4]\nlet keep = xs\nlet _removed = xs.remove_at(1) }",
+        expected: 20,
+    },
+    FuelRow {
+        name: "unique nested assignment has no copy",
+        source: "struct Box { xs: list[int] }\nfn main() { var box = Box { xs: [1, 2] }\nbox.xs[0] = 9 }",
+        expected: 10,
+    },
+    FuelRow {
+        name: "shared nested assignment copies parents",
+        source: "struct Box { xs: list[int] }\nfn main() { var box = Box { xs: [1, 2] }\nlet keep = box\nbox.xs[0] = 9 }",
+        expected: 14,
+    },
+    FuelRow {
+        name: "nested equality slots",
+        source: "fn main() { let a = [[1, 2], [3]]\nlet b = [[1, 2], [3]]\nlet same = a == b\nprint(\"{same}\") }",
+        expected: 36,
     },
 ];
 
@@ -131,6 +201,18 @@ fn memory_costs_are_golden() {
             "memory for {name}"
         );
     }
+}
+
+#[test]
+fn repeated_small_allocations_do_not_inflate_memory() {
+    let short = min_memory(&Case::single(
+        "fn main() { var i = 0\nwhile i < 10 { let xs = [i, i]\n i += 1 } }",
+    ));
+    let long = min_memory(&Case::single(
+        "fn main() { var i = 0\nwhile i < 1000 { let xs = [i, i]\n i += 1 } }",
+    ));
+    assert_eq!(long, short);
+    assert_eq!(long, 32);
 }
 
 #[test]
@@ -203,6 +285,36 @@ fn depth_and_deadline_limits_are_enforced() {
         ),
         Err(Trap::Deadline)
     ));
+}
+
+#[test]
+fn container_mutation_rechecks_value_depth() {
+    let build = r#"
+        enum Nested { Leaf, Next(Nested) }
+        fn build(n: int) -> Nested {
+            var value = Nested.Leaf
+            var i = 0
+            while i < n {
+                value = Nested.Next(value)
+                i += 1
+            }
+            value
+        }
+    "#;
+    for mutation in [
+        "var xs: list[Nested] = []\n    xs.push(build(127))",
+        "var xs: list[Nested] = []\n    xs.insert(0, build(127))",
+        "var table: map[str, Nested] = {}\n    table[\"key\"] = build(127)",
+    ] {
+        let source = format!("{build}\nfn main() {{\n    {mutation}\n}}");
+        let trap = run_case(Case::single(&source)).expect_err("depth trap");
+        assert!(matches!(trap, Trap::DepthExceeded), "{trap:?}");
+    }
+
+    let source = format!(
+        "{build}\nfn main() {{\n    var xs: list[Nested] = []\n    xs.push(build(126))\n    xs.insert(1, build(126))\n    var table: map[str, Nested] = {{}}\n    table[\"key\"] = build(126)\n}}"
+    );
+    assert!(run_case(Case::single(&source)).is_ok());
 }
 
 #[test]

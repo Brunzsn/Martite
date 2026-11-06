@@ -102,6 +102,13 @@ impl OrderedMap {
         self.entries.shift_remove(key)
     }
 
+    /// Remove a key in O(n), returning its former index for fuel accounting.
+    pub fn remove_with_index(&mut self, key: &Key) -> Option<(usize, Value)> {
+        self.entries
+            .shift_remove_full(key)
+            .map(|(index, _, value)| (index, value))
+    }
+
     pub fn clear(&mut self) {
         self.entries.clear();
     }
@@ -430,7 +437,7 @@ impl Value {
     }
 }
 
-fn key_value_size(key: &KeyValue) -> u64 {
+pub(crate) fn key_value_size(key: &KeyValue) -> u64 {
     match key {
         KeyValue::Int(_) | KeyValue::Bool(_) => 0,
         KeyValue::Str(s) => 16 + s.len() as u64,

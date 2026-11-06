@@ -1,5 +1,6 @@
 //! Tree-walking interpreter and standard library for Martite.
 
+mod cost;
 pub mod interp;
 pub mod json;
 pub mod ops;
