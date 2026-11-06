@@ -765,7 +765,7 @@ impl<'a> Analysis<'a> {
                 }
             }
             (ExprKind::Field { base, .. }, Some(Resolution::BuiltinMethod { receiver, name }))
-                if builtin_mutates(receiver, &name) =>
+                if builtin_mutates(receiver, name) =>
             {
                 self.walk_expr(base, walk.with_access(Access::Write));
                 for arg in args {
@@ -860,7 +860,7 @@ impl<'a> Analysis<'a> {
             Resolution::BuiltinItem(item) => {
                 let uses = self.builtin_uses.entry(walk.module.id).or_default();
                 if !uses.contains(item) {
-                    uses.push(item.clone());
+                    uses.push(*item);
                 }
             }
             _ => {}
@@ -931,7 +931,7 @@ pub fn stable(program: &CheckedProgram, expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Field { base, .. } => match program.resolution(expr.id) {
             Some(Resolution::BuiltinMethod { name, .. }) => {
-                builtin_is_stable(name) && stable(program, base)
+                builtin_is_stable(*name) && stable(program, base)
             }
             Some(Resolution::Method(_)) => false,
             _ => stable(program, base),
@@ -940,7 +940,7 @@ pub fn stable(program: &CheckedProgram, expr: &Expr) -> bool {
             let Some(Resolution::BuiltinMethod { name, .. }) = program.resolution(callee.id) else {
                 return false;
             };
-            if !builtin_is_stable(name)
+            if !builtin_is_stable(*name)
                 || !args.iter().all(|arg| side_effect_free(program, &arg.expr))
             {
                 return false;

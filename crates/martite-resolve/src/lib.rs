@@ -53,11 +53,37 @@ pub enum ModuleTarget {
     Builtin(&'static str),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinItem {
-    pub module: String,
-    pub name: String,
+    pub module: &'static str,
+    pub name: &'static str,
     pub kind: DefKind,
+}
+
+/// Look up a builtin module item by its canonical name.
+///
+/// The returned names are always `'static`, so `BuiltinItem` stays `Copy` and
+/// resolution never allocates when recording a builtin lookup.
+pub fn builtin_item(module: &str, name: &str) -> Option<BuiltinItem> {
+    let (module, name, kind) = match (module, name) {
+        ("std.math", "PI") => ("std.math", "PI", DefKind::Const),
+        ("std.math", "EULER") => ("std.math", "EULER", DefKind::Const),
+        ("std.math", "min") => ("std.math", "min", DefKind::Fn),
+        ("std.math", "max") => ("std.math", "max", DefKind::Fn),
+        ("std.math", "clamp") => ("std.math", "clamp", DefKind::Fn),
+        ("std.math", "sin") => ("std.math", "sin", DefKind::Fn),
+        ("std.math", "cos") => ("std.math", "cos", DefKind::Fn),
+        ("std.math", "tan") => ("std.math", "tan", DefKind::Fn),
+        ("std.math", "atan2") => ("std.math", "atan2", DefKind::Fn),
+        ("std.math", "exp") => ("std.math", "exp", DefKind::Fn),
+        ("std.math", "ln") => ("std.math", "ln", DefKind::Fn),
+        ("std.math", "log10") => ("std.math", "log10", DefKind::Fn),
+        ("std.json", "Json") => ("std.json", "Json", DefKind::Enum),
+        ("std.json", "parse") => ("std.json", "parse", DefKind::Fn),
+        ("std.json", "stringify") => ("std.json", "stringify", DefKind::Fn),
+        _ => return None,
+    };
+    Some(BuiltinItem { module, name, kind })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1011,7 +1037,7 @@ impl<'a> Loader<'a> {
                     });
                 }
                 UseResolved::BuiltinItem(module, item_name) => {
-                    let Some(kind) = builtin_item_kind(&module, &item_name) else {
+                    let Some(item) = builtin_item(&module, &item_name) else {
                         self.diag_at(
                             module_id,
                             use_decl.span,
@@ -1020,8 +1046,11 @@ impl<'a> Loader<'a> {
                         );
                         continue;
                     };
-                    let alias = use_decl.alias.clone().unwrap_or(item_name.clone());
-                    let class_ok = match kind {
+                    let alias = use_decl
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| item.name.to_string());
+                    let class_ok = match item.kind {
                         DefKind::Fn | DefKind::Handler | DefKind::Method => is_snake_case(&alias),
                         DefKind::Struct | DefKind::Enum => is_pascal_case(&alias),
                         DefKind::Const => is_screaming_case(&alias),
@@ -1043,15 +1072,10 @@ impl<'a> Loader<'a> {
                             format!("duplicate import binding `{alias}`"),
                         );
                     } else {
-                        let item = BuiltinItem {
-                            module,
-                            name: item_name.clone(),
-                            kind,
-                        };
                         self.modules[module_id.0 as usize]
                             .symbols
                             .builtin_items
-                            .insert(alias, item.clone());
+                            .insert(alias, item);
                         self.modules[module_id.0 as usize].uses.push(UseBinding {
                             decl_node: use_decl.id,
                             span: use_decl.span,
@@ -1317,24 +1341,6 @@ fn is_screaming_case(name: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
-fn builtin_item_kind(module: &str, name: &str) -> Option<DefKind> {
-    match module {
-        "std.math" => match name {
-            "PI" | "EULER" => Some(DefKind::Const),
-            "min" | "max" | "clamp" | "sin" | "cos" | "tan" | "atan2" | "exp" | "ln" | "log10" => {
-                Some(DefKind::Fn)
-            }
-            _ => None,
-        },
-        "std.json" => match name {
-            "Json" => Some(DefKind::Enum),
-            "parse" | "stringify" => Some(DefKind::Fn),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
 fn collect_const_refs(expr: &Expr, out: &mut Vec<String>) {
     match &expr.kind {
         ExprKind::Var(name) => out.push(name.clone()),
@@ -1495,6 +1501,39 @@ mod tests {
         assert!(main.symbols.modules.contains_key("shapes"));
         assert!(main.symbols.types.contains_key("Circle"));
         assert!(main.symbols.consts.contains_key("MAX_SIZE"));
+    }
+
+    #[test]
+    fn builtin_items_are_canonical_and_static() {
+        let (_sources, out) = resolve_text(
+            &[(
+                "main.mt",
+                "use std.math.EULER\nuse std.json.parse\nfn main() {}\n",
+            )],
+            "main.mt",
+        );
+        assert!(!out.has_errors(), "unexpected errors");
+        let program = out.program.expect("program");
+        let symbols = &program.entry_module().symbols;
+
+        let euler = symbols.builtin_items.get("EULER").copied().expect("EULER");
+        assert_eq!(euler.module, "std.math");
+        assert_eq!(euler.name, "EULER");
+        assert_eq!(euler.kind, DefKind::Const);
+
+        let parse = symbols.builtin_items.get("parse").copied().expect("parse");
+        assert_eq!(parse.module, "std.json");
+        assert_eq!(parse.name, "parse");
+        assert_eq!(parse.kind, DefKind::Fn);
+    }
+
+    #[test]
+    fn unknown_builtin_item_is_e106() {
+        let (_sources, out) = resolve_text(
+            &[("main.mt", "use std.math.nope\nfn main() {}\n")],
+            "main.mt",
+        );
+        assert!(out.diagnostics.iter().any(|d| d.code == Code::E106));
     }
 
     #[test]

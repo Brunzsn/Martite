@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use martite_base::{SourceId, Span};
 use martite_check::{
-    BindingId, BuiltinFn, BuiltinItem, BuiltinReceiver, CheckedProgram, ConstValue, DefId, DefKind,
-    FnKind, PatResolution, PreludeVariant, Resolution,
+    BindingId, BuiltinFn, BuiltinItem, BuiltinReceiver, CheckedProgram, ConstValue, DefId, FnKind,
+    PatResolution, PreludeVariant, Resolution,
 };
 use martite_syntax::{
     AssignOp, BinaryOp, Block, Expr, ExprKind, LambdaBody, MatchBody, PatKind, Pattern, Stmt,
@@ -881,7 +881,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         let ExprKind::Var(_) = &expr.kind else {
             unreachable!()
         };
-        match self.program.resolution(expr.id).cloned() {
+        match self.program.resolution(expr.id).copied() {
             Some(Resolution::Local(id)) => self
                 .current_locals()
                 .get(&id)
@@ -939,7 +939,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
     }
 
     fn value_of_builtin_item(&self, item: &BuiltinItem) -> EvalResult<Value> {
-        match (item.module.as_str(), item.name.as_str()) {
+        match (item.module, item.name) {
             ("std.math", "PI") => Ok(Value::Float(std::f64::consts::PI)),
             ("std.math", "EULER") => Ok(Value::Float(std::f64::consts::E)),
             ("std.json", "Json") => self.trap(self.internal_panic("type used as a value")),
@@ -954,7 +954,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         let ExprKind::Field { base, .. } = &expr.kind else {
             unreachable!()
         };
-        match self.program.resolution(expr.id).cloned() {
+        match self.program.resolution(expr.id).copied() {
             Some(Resolution::StructField(index)) => {
                 let value = self.eval_expr(base)?;
                 match value {
@@ -995,7 +995,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         fields: &[martite_syntax::FieldInit],
         base: Option<&Expr>,
     ) -> EvalResult<Value> {
-        let Some(Resolution::TypeName(type_id)) = self.program.resolution(expr.id).cloned() else {
+        let Some(Resolution::TypeName(type_id)) = self.program.resolution(expr.id).copied() else {
             return self.trap(self.internal_panic("struct literal has no type"));
         };
         let mut values: HashMap<String, Value> = HashMap::new();
@@ -1042,7 +1042,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             unreachable!()
         };
         if let ExprKind::Field { base, .. } = &callee.kind {
-            match self.program.resolution(callee.id).cloned() {
+            match self.program.resolution(callee.id).copied() {
                 Some(Resolution::Method(def)) => {
                     return self.call_method(expr, def, base, args);
                 }
@@ -1062,7 +1062,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
         }
         if let ExprKind::Var(_) = &callee.kind {
-            match self.program.resolution(callee.id).cloned() {
+            match self.program.resolution(callee.id).copied() {
                 Some(Resolution::Fn(def))
                 | Some(Resolution::Handler(def))
                 | Some(Resolution::Test(def)) => {
@@ -1095,12 +1095,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             Value::Fn(closure) => self.call_closure(&closure, values).map_err(EvalError::Trap),
             Value::Builtin(function) => self.call_builtin_values(function, values, expr.span),
             Value::BuiltinModuleFn { module, name } => {
-                let item = BuiltinItem {
-                    module,
-                    name,
-                    kind: DefKind::Fn,
-                };
-                self.call_builtin_module_values(&item, values, expr.span)
+                self.call_builtin_module_values(&module, &name, values, expr.span)
             }
             _ => self.trap(self.internal_panic("callee is not callable")),
         }
@@ -1259,7 +1254,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             ExprKind::Field { base, name } => {
                 let mut place = self.eval_place(base)?;
-                let accessor = match self.program.resolution(expr.id).cloned() {
+                let accessor = match self.program.resolution(expr.id).copied() {
                     Some(Resolution::StructField(index)) => Accessor::Field(index),
                     Some(Resolution::TupleField(index)) => Accessor::Tuple(index),
                     _ => {
@@ -1396,23 +1391,24 @@ impl<'p, 'h> Runtime<'p, 'h> {
         for arg in args {
             values.push(self.eval_expr(&arg.expr)?);
         }
-        self.call_builtin_module_values(item, values, span)
+        self.call_builtin_module_values(item.module, item.name, values, span)
     }
 
     fn call_builtin_module_values(
         &mut self,
-        item: &BuiltinItem,
+        module: &str,
+        name: &str,
         values: Vec<Value>,
         span: Span,
     ) -> EvalResult<Value> {
-        match (item.module.as_str(), item.name.as_str()) {
+        match (module, name) {
             ("std.math", "min") | ("std.math", "max") => {
                 let mut iter = values.into_iter();
                 let a = iter.next().unwrap_or(Value::Unit);
                 let b = iter.next().unwrap_or(Value::Unit);
                 let ord = value_ord(&a, &b);
                 Ok(
-                    if (item.name == "min" && ord.is_le()) || (item.name == "max" && ord.is_ge()) {
+                    if (name == "min" && ord.is_le()) || (name == "max" && ord.is_ge()) {
                         a
                     } else {
                         b

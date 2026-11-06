@@ -1198,7 +1198,7 @@ impl<'a> Checked<'a> {
         else {
             return;
         };
-        let name = name.as_str();
+        let name = *name;
         let (message, help): (&str, &str) = match (receiver, name) {
             (BuiltinReceiver::List, "insert") => (
                 "`insert` can panic",

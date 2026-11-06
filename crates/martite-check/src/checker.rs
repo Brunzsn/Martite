@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use martite_base::{Code, Diagnostic, Severity, Span};
-use martite_resolve::{BuiltinItem, DefId, DefKind, ModuleId, ModuleTarget, ResolvedProgram};
+use martite_resolve::{
+    BuiltinItem, DefId, DefKind, ModuleId, ModuleTarget, ResolvedProgram, builtin_item,
+};
 use martite_syntax::*;
 
 use crate::exhaustive::is_exhaustive;

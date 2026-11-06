@@ -7,7 +7,7 @@ enum FieldKind {
     Method(DefId),
     BuiltinMethod {
         receiver: BuiltinReceiver,
-        name: String,
+        name: &'static str,
         mut_self: bool,
     },
     Variant(TypeId, usize),
@@ -959,8 +959,8 @@ impl Checker {
             self.resolutions.insert(expr.id, Resolution::Const(def));
             return ty;
         }
-        if let Some(item) = symbols.builtin_items.get(name).cloned() {
-            self.resolutions.insert(expr.id, Resolution::BuiltinItem(item.clone()));
+        if let Some(item) = symbols.builtin_items.get(name).copied() {
+            self.resolutions.insert(expr.id, Resolution::BuiltinItem(item));
             return self.builtin_item_ty(&item);
         }
         if symbols.modules.contains_key(name) {
@@ -1018,7 +1018,7 @@ impl Checker {
     }
 
     fn builtin_item_ty(&self, item: &BuiltinItem) -> Ty {
-        match (item.module.as_str(), item.name.as_str()) {
+        match (item.module, item.name) {
             ("std.math", "PI") | ("std.math", "EULER") => Ty::Float,
             ("std.math", "min" | "max" | "clamp") => {
                 Ty::Fn(vec![Ty::Param(0), Ty::Param(0)], Box::new(Ty::Param(0)))
@@ -1069,7 +1069,7 @@ impl Checker {
                         return self.record_field(expr, result);
                     }
                 }
-                if let Some(item) = symbols.builtin_items.get(base_name).cloned() {
+                if let Some(item) = symbols.builtin_items.get(base_name).copied() {
                     if item.name == "Json" {
                         let id = self.json_type.unwrap_or(TypeId(0));
                         let result = self.resolve_type_field(expr, id, name, expected, infer);
@@ -1106,7 +1106,7 @@ impl Checker {
                     expr.id,
                     Resolution::BuiltinMethod {
                         receiver: *receiver,
-                        name: name.clone(),
+                        name: *name,
                     },
                 );
             }
@@ -1120,7 +1120,7 @@ impl Checker {
             }
             FieldKind::BuiltinItem(item) => {
                 self.resolutions
-                    .insert(expr.id, Resolution::BuiltinItem(item.clone()));
+                    .insert(expr.id, Resolution::BuiltinItem(*item));
             }
         }
         result
@@ -1199,17 +1199,7 @@ impl Checker {
                 }
             }
             ModuleTarget::Builtin(module_name) => {
-                let item = BuiltinItem {
-                    module: module_name.to_string(),
-                    name: name.clone(),
-                    kind: match name.as_str() {
-                        "PI" | "EULER" => DefKind::Const,
-                        "Json" => DefKind::Enum,
-                        _ => DefKind::Fn,
-                    },
-                };
-                let ty = self.builtin_item_ty(&item);
-                if ty.is_error() {
+                let Some(item) = builtin_item(module_name, name) else {
                     let module = self.current_module();
                     self.err_at(
                         module,
@@ -1217,7 +1207,12 @@ impl Checker {
                         Code::E106,
                         format!("`{module_name}` has no item `{name}`"),
                     );
-                }
+                    return FieldResult {
+                        ty: Ty::Error,
+                        kind: FieldKind::Value,
+                    };
+                };
+                let ty = self.builtin_item_ty(&item);
                 let _ = infer;
                 FieldResult {
                     ty,
@@ -1439,7 +1434,7 @@ impl Checker {
                             ty: Ty::Error,
                             kind: FieldKind::BuiltinMethod {
                                 receiver,
-                                name: name.clone(),
+                                name: info.name,
                                 mut_self: info.mut_self,
                             },
                         };
@@ -1515,7 +1510,7 @@ impl Checker {
                     return self.check_builtin_method(
                         expr,
                         receiver,
-                        &name,
+                        name,
                         &receiver_ty,
                         args,
                         expected,
@@ -1540,7 +1535,7 @@ impl Checker {
         let callee_raw = self.check_expr(callee, None, infer);
         let callee_ty = infer.resolve(&callee_raw);
         if let Some(Resolution::Fn(def) | Resolution::Handler(def)) =
-            self.resolutions.get(&callee.id).cloned()
+            self.resolutions.get(&callee.id).copied()
         {
             if matches!(
                 self.resolutions.get(&callee.id),
@@ -1557,7 +1552,7 @@ impl Checker {
             }
             return self.check_fn_call(expr, def, args, expected, None, infer);
         }
-        if let Some(Resolution::BuiltinFn(function)) = self.resolutions.get(&callee.id).cloned() {
+        if let Some(Resolution::BuiltinFn(function)) = self.resolutions.get(&callee.id).copied() {
             return self.check_builtin_call(expr, function, args, infer);
         }
         let Ty::Fn(params, ret) = callee_ty else {
@@ -2164,7 +2159,7 @@ impl Checker {
         expected: Option<&Ty>,
         infer: &mut Infer,
     ) -> Ty {
-        match (item.module.as_str(), item.name.as_str()) {
+        match (item.module, item.name) {
             ("std.math", "min" | "max") => {
                 self.check_generic_ord_call(expr, args, expected, infer, 2)
             }
@@ -2580,11 +2575,12 @@ fn has_conflicting_alias(roots: &[(BindingId, bool)]) -> bool {
 
 #[derive(Clone, Copy)]
 struct BuiltinMethodInfo {
+    name: &'static str,
     mut_self: bool,
 }
 
 fn builtin_method_info(receiver: BuiltinReceiver, name: &str) -> Option<BuiltinMethodInfo> {
-    let (known, mut_self): (&[&str], bool) = match receiver {
+    let (known, mut_self): (&'static [&'static str], bool) = match receiver {
         BuiltinReceiver::List => (
             &[
                 "len", "get", "first", "last", "contains", "map", "filter", "fold", "any",
@@ -2642,7 +2638,8 @@ fn builtin_method_info(receiver: BuiltinReceiver, name: &str) -> Option<BuiltinM
             false,
         ),
     };
-    known.contains(&name).then_some(BuiltinMethodInfo { mut_self })
+    let name = known.iter().find(|candidate| **candidate == name)?;
+    Some(BuiltinMethodInfo { name, mut_self })
 }
 
 fn builtin_receiver(ty: &Ty) -> Option<BuiltinReceiver> {

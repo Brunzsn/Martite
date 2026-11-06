@@ -33,7 +33,7 @@ pub enum BuiltinReceiver {
     Result,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum Resolution {
     Local(BindingId),
     Const(DefId),
@@ -52,7 +52,7 @@ pub enum Resolution {
     Method(DefId),
     BuiltinMethod {
         receiver: BuiltinReceiver,
-        name: String,
+        name: &'static str,
     },
 }
 
