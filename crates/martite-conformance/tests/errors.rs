@@ -20,6 +20,13 @@ const ROWS: &[ErrorRow] = &[
         message: "escape",
     },
     ErrorRow {
+        code: Code::E001,
+        fail: "fn main() { let x = 0_1 }",
+        pass: "fn main() { let x = 1_000 }",
+        span: Some("0_1"),
+        message: "leading zeros",
+    },
+    ErrorRow {
         code: Code::E003,
         fail: "fn main( { }",
         pass: "fn main() { }",

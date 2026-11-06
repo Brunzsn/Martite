@@ -1254,7 +1254,7 @@ fn lint_syntax_only_mode(args: &LintArgs) -> ExitCode {
     let mut had_parse_error = false;
     for path in files {
         let text = match std::fs::read_to_string(&path) {
-            Ok(text) => normalize_source(&text),
+            Ok(text) => normalize_source(&text).into_owned(),
             Err(error) => {
                 eprintln!("error: cannot read {}: {error}", path.display());
                 return ExitCode::from(2);

@@ -8,7 +8,8 @@ mod verify;
 use martite_base::{Code, Diagnostic, LoadLimits, normalize_source};
 use martite_config::FmtConfig;
 use martite_syntax::{
-    ParenthesisTables, ParseOptions, Program, lex, parse_interface_with, parse_source_with,
+    ParenthesisTables, ParseOptions, Program, Token, parse_interface_normalized_with_tokens,
+    parse_source_normalized_with_tokens,
 };
 
 pub use verify::{comment_multiset, structurally_equal};
@@ -42,10 +43,18 @@ pub fn format_interface(source: &str, config: &FmtConfig) -> FormatOutput {
 
 fn format_mode(source: &str, config: &FmtConfig, interface: bool) -> FormatOutput {
     let source = normalize_source(source);
-    let parsed = if interface {
-        parse_interface_with(&source, LoadLimits::default(), ParseOptions::TOOLING)
+    let (parsed, tokens) = if interface {
+        parse_interface_normalized_with_tokens(
+            source.as_ref(),
+            LoadLimits::default(),
+            ParseOptions::TOOLING,
+        )
     } else {
-        parse_source_with(&source, LoadLimits::default(), ParseOptions::TOOLING)
+        parse_source_normalized_with_tokens(
+            source.as_ref(),
+            LoadLimits::default(),
+            ParseOptions::TOOLING,
+        )
     };
     let has_syntax_error = parsed.diagnostics.iter().any(|diagnostic| {
         matches!(diagnostic.code, Code::E001 | Code::E002 | Code::E003)
@@ -67,7 +76,13 @@ fn format_mode(source: &str, config: &FmtConfig, interface: bool) -> FormatOutpu
         .program
         .parentheses()
         .expect("tooling parse records parentheses");
-    let text = format_parsed(&source, &parsed.program, parentheses, config);
+    let text = format_parsed(
+        source.as_ref(),
+        &parsed.program,
+        parentheses,
+        tokens,
+        config,
+    );
     FormatOutput {
         text: Some(text),
         diagnostics: Vec::new(),
@@ -81,10 +96,10 @@ fn format_parsed(
     source: &str,
     program: &Program,
     parentheses: &ParenthesisTables,
+    tokens: Vec<Token>,
     config: &FmtConfig,
 ) -> String {
-    let lexed = lex(source, LoadLimits::default());
-    format::format_program(source, program, parentheses, lexed.tokens, config)
+    format::format_program(source, program, parentheses, tokens, config)
 }
 
 #[cfg(test)]
