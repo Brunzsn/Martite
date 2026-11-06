@@ -13,6 +13,7 @@ use martite_resolve::{DefId, InterfaceSource};
 use martite_runtime::{
     ExecLimits, HostContext, HostDispatcher, HostFault, MAX_VALUE_DEPTH, Runtime, Trap, Value,
 };
+use martite_syntax::ParseOptions;
 
 pub use martite_base::{SourceId, Span};
 pub use martite_runtime::{ExecLimits as Limits, Value as HostValue, show};
@@ -264,6 +265,7 @@ impl Engine {
                 grants: manifest.grants.clone(),
                 limits: self.load_limits,
                 edition: manifest.lang.clone(),
+                parse: ParseOptions::default(),
             },
         );
         if loaded.has_errors() {
@@ -353,6 +355,7 @@ impl Engine {
                 grants: self.interfaces.iter().map(|i| i.path.clone()).collect(),
                 limits: self.load_limits,
                 edition: LANG_EDITION.into(),
+                parse: ParseOptions::default(),
             },
         );
         if loaded.has_errors() {

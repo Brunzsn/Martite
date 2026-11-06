@@ -7,7 +7,7 @@ use martite_fmt::{format_interface, format_source, structurally_equal};
 use martite_lint::{LintInputs, SettingsResolver, lint};
 use martite_resolve::InterfaceSource;
 use martite_runtime::{ExecLimits, Runtime, Value};
-use martite_syntax::{parse_interface, parse_source};
+use martite_syntax::{parse_interface, parse_source, parse_source_with};
 
 fn bench_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/bench")
@@ -81,11 +81,16 @@ fn load_fixture(name: &str) -> LoadedProgram {
             grants,
             limits: LoadLimits::default(),
             edition: "1".into(),
+            parse: martite_syntax::ParseOptions::default(),
         },
     )
 }
 
 fn load_single(path: &Path) -> LoadedProgram {
+    load_single_with_parse(path, martite_syntax::ParseOptions::default())
+}
+
+fn load_single_with_parse(path: &Path, parse: martite_syntax::ParseOptions) -> LoadedProgram {
     let mut provider = MemoryProvider::new();
     let name = path
         .file_name()
@@ -100,6 +105,7 @@ fn load_single(path: &Path) -> LoadedProgram {
             grants: Vec::new(),
             limits: LoadLimits::default(),
             edition: "1".into(),
+            parse,
         },
     )
 }
@@ -126,7 +132,11 @@ fn syntax_fixtures_parse_and_format_idempotently() {
         let name = relative(&root, &path);
         match path.extension().and_then(|ext| ext.to_str()) {
             Some("mt") => {
-                let parsed = parse_source(&source, LoadLimits::default());
+                let parsed = parse_source_with(
+                    &source,
+                    LoadLimits::default(),
+                    martite_syntax::ParseOptions::TOOLING,
+                );
                 assert!(
                     parsed.diagnostics.is_empty(),
                     "{name} does not parse: {:?}",
@@ -145,7 +155,11 @@ fn syntax_fixtures_parse_and_format_idempotently() {
                     Some(first.as_str()),
                     "{name} is not idempotent"
                 );
-                let reparsed = parse_source(&first, LoadLimits::default());
+                let reparsed = parse_source_with(
+                    &first,
+                    LoadLimits::default(),
+                    martite_syntax::ParseOptions::TOOLING,
+                );
                 assert!(
                     structurally_equal(&parsed.program, &reparsed.program),
                     "{name} changed the AST"
@@ -199,7 +213,7 @@ fn load_fixtures_type_check_cleanly() {
 fn lint_fixtures_type_check_and_exercise_rules() {
     let root = bench_root().join("lint");
     for path in walk(&root) {
-        let loaded = load_single(&path);
+        let loaded = load_single_with_parse(&path, martite_syntax::ParseOptions::TOOLING);
         assert_clean(&loaded);
         let config = ToolConfig {
             lint_preset: Some("recommended".into()),

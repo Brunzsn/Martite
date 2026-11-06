@@ -5,8 +5,8 @@ use martite_config::{EndOfLine, FmtConfig};
 use martite_syntax::{
     Arg, AssignOp, BinaryOp, Block, Comment, ConstDecl, EnumDecl, Expr, ExprKind, Field, FieldInit,
     FieldName, FieldPat, FnDecl, GenericParam, ImplDecl, Item, LambdaBody, LambdaParam, MatchArm,
-    MatchBody, OnDecl, Param, ParamKind, PatKind, Pattern, Program, Stmt, StmtKind, StructDecl,
-    TestDecl, Token, TokenKind, TyExpr, TyKind, UnaryOp, UseDecl, Variant,
+    MatchBody, OnDecl, Param, ParamKind, ParenthesisTables, PatKind, Pattern, Program, Stmt,
+    StmtKind, StructDecl, TestDecl, Token, TokenKind, TyExpr, TyKind, UnaryOp, UseDecl, Variant,
 };
 
 use crate::doc::{Doc, Renderer};
@@ -15,10 +15,11 @@ use crate::normalize;
 pub(crate) fn format_program(
     source: &str,
     program: &Program,
+    parentheses: &ParenthesisTables,
     tokens: Vec<Token>,
     config: &FmtConfig,
 ) -> String {
-    let mut formatter = Formatter::new(source, program, tokens, config);
+    let mut formatter = Formatter::new(source, program, parentheses, tokens, config);
     let doc = formatter.program_doc();
     let eol = match config.end_of_line {
         EndOfLine::Lf => "\n",
@@ -86,6 +87,7 @@ fn op_class(op: BinaryOp) -> OpClass {
 struct Formatter<'a> {
     source: &'a str,
     program: &'a Program,
+    parentheses: &'a ParenthesisTables,
     tokens: Vec<Token>,
     config: &'a FmtConfig,
     used: Vec<bool>,
@@ -96,12 +98,14 @@ impl<'a> Formatter<'a> {
     fn new(
         source: &'a str,
         program: &'a Program,
+        parentheses: &'a ParenthesisTables,
         tokens: Vec<Token>,
         config: &'a FmtConfig,
     ) -> Self {
         Self {
             source,
             program,
+            parentheses,
             tokens,
             config,
             used: vec![false; program.comments.len()],
@@ -985,19 +989,14 @@ impl<'a> Formatter<'a> {
     }
 
     fn ty(&mut self, ty: &TyExpr) -> Doc {
-        let pairs = self
-            .program
-            .type_parens
-            .get(&ty.id)
-            .cloned()
-            .unwrap_or_default();
+        let pairs = self.parentheses.type_parens(ty.id);
         let start = pairs
             .last()
             .map(|pair| pair.open.start)
             .unwrap_or(ty.span.start);
         let lead = self.leading_before(start);
         let mut index = pairs.len();
-        let core = self.wrap_type_parens(&pairs, &mut index, ty);
+        let core = self.wrap_type_parens(pairs, &mut index, ty);
         lead.append(core)
     }
 
@@ -1100,19 +1099,14 @@ impl<'a> Formatter<'a> {
     // ----- patterns -------------------------------------------------------
 
     fn pattern(&mut self, pattern: &Pattern) -> Doc {
-        let pairs = self
-            .program
-            .pattern_parens
-            .get(&pattern.id)
-            .cloned()
-            .unwrap_or_default();
+        let pairs = self.parentheses.pattern_parens(pattern.id);
         let start = pairs
             .last()
             .map(|pair| pair.open.start)
             .unwrap_or(pattern.span.start);
         let lead = self.leading_before(start);
         let mut index = pairs.len();
-        let core = self.wrap_pattern_parens(&pairs, &mut index, pattern);
+        let core = self.wrap_pattern_parens(pairs, &mut index, pattern);
         lead.append(core)
     }
 
@@ -1279,19 +1273,14 @@ impl<'a> Formatter<'a> {
     // ----- expressions ---------------------------------------------------
 
     fn expr(&mut self, expr: &Expr) -> Doc {
-        let pairs = self
-            .program
-            .expression_parens
-            .get(&expr.id)
-            .cloned()
-            .unwrap_or_default();
+        let pairs = self.parentheses.expression_parens(expr.id);
         let start = pairs
             .last()
             .map(|pair| pair.open.start)
             .unwrap_or(expr.span.start);
         let lead = self.leading_before(start);
         let mut index = pairs.len();
-        let core = self.wrap_expr_parens(&pairs, &mut index, expr);
+        let core = self.wrap_expr_parens(pairs, &mut index, expr);
         lead.append(core)
     }
 
@@ -1606,12 +1595,7 @@ impl<'a> Formatter<'a> {
         ops: &mut Vec<BinaryOp>,
         root: bool,
     ) {
-        let parenthesized = !root
-            && self
-                .program
-                .expression_parens
-                .get(&expr.id)
-                .is_some_and(|pairs| !pairs.is_empty());
+        let parenthesized = !root && !self.parentheses.expression_parens(expr.id).is_empty();
         let ExprKind::Binary { op, lhs, rhs } = &expr.kind else {
             operands.push(expr);
             return;
@@ -2432,12 +2416,7 @@ impl<'a> Formatter<'a> {
     }
 
     fn is_bracketed(&self, expr: &Expr) -> bool {
-        if !self
-            .program
-            .expression_parens
-            .get(&expr.id)
-            .map_or(true, |pairs| pairs.is_empty())
-        {
+        if !self.parentheses.expression_parens(expr.id).is_empty() {
             return true;
         }
         matches!(

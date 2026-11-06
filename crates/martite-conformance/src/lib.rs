@@ -10,6 +10,7 @@ use martite_driver::{LoadOptions, LoadedProgram, load};
 use martite_lint::{LintInputs, ManifestInput, SettingsResolver, lint};
 use martite_resolve::InterfaceSource;
 use martite_runtime::{ExecLimits, MainResult, Runtime, Trap, Value};
+use martite_syntax::ParseOptions;
 
 #[derive(Debug, Clone)]
 pub struct Case {
@@ -67,6 +68,10 @@ impl Case {
     }
 
     pub fn load(&self) -> LoadedProgram {
+        self.load_with_parse(ParseOptions::default())
+    }
+
+    pub fn load_with_parse(&self, parse: ParseOptions) -> LoadedProgram {
         let mut provider = MemoryProvider::new();
         for (path, text) in &self.files {
             provider.insert(path.clone(), text.clone());
@@ -79,6 +84,7 @@ impl Case {
                 grants: self.grants.clone(),
                 limits: self.limits,
                 edition: self.edition.clone(),
+                parse,
             },
         )
     }
@@ -263,7 +269,7 @@ pub fn lint_case(
     selected: Option<HashSet<Code>>,
     manifest_text: Option<&str>,
 ) -> LintRun {
-    let loaded = case.load();
+    let loaded = case.load_with_parse(ParseOptions::TOOLING);
     let errors: Vec<&Diagnostic> = loaded
         .diagnostics
         .iter()

@@ -194,6 +194,7 @@ pub struct ResolveOptions {
     pub interfaces: Vec<InterfaceSource>,
     pub grants: Vec<String>,
     pub limits: LoadLimits,
+    pub parse: ParseOptions,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -434,9 +435,9 @@ impl<'a> Loader<'a> {
 
         let source = self.sources.add(file_name, text.clone());
         let parsed = if is_interface {
-            parse_interface(&text, self.options.limits)
+            parse_interface_with(&text, self.options.limits, self.options.parse)
         } else {
-            parse_source(&text, self.options.limits)
+            parse_source_with(&text, self.options.limits, self.options.parse)
         };
         self.push_syntax_diagnostics(parsed.diagnostics, source);
 
@@ -1468,6 +1469,7 @@ mod tests {
                 interfaces: Vec::new(),
                 grants: Vec::new(),
                 limits: LoadLimits::default(),
+                parse: ParseOptions::default(),
             },
             &mut sources,
         );

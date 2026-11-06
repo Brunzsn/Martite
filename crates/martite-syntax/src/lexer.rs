@@ -50,7 +50,7 @@ struct Lexer<'a> {
     out: Lexed,
     depth: usize,
     depth_reported: bool,
-    last_sig: Option<TokenKind>,
+    last_sig_can_end_postfix: bool,
     postfix_dot: bool,
 }
 
@@ -68,7 +68,7 @@ impl<'a> Lexer<'a> {
             out: Lexed::default(),
             depth: 0,
             depth_reported: false,
-            last_sig: None,
+            last_sig_can_end_postfix: false,
             postfix_dot: false,
         }
     }
@@ -126,14 +126,10 @@ impl<'a> Lexer<'a> {
     }
 
     fn push(&mut self, kind: TokenKind, span: Span) {
-        let significant = !matches!(kind, TokenKind::Newline);
-        self.out.tokens.push(Token {
-            kind: kind.clone(),
-            span,
-        });
-        if significant {
-            self.last_sig = Some(kind);
+        if !matches!(kind, TokenKind::Newline) {
+            self.last_sig_can_end_postfix = kind.can_end_postfix();
         }
+        self.out.tokens.push(Token { kind, span });
     }
 
     fn error(&mut self, code: Code, span: Span, message: impl Into<String>) {
@@ -676,10 +672,7 @@ impl<'a> Lexer<'a> {
                         self.push(TokenKind::DotDot, Span::new(start as u32, self.pos as u32));
                     }
                 } else {
-                    self.postfix_dot = self
-                        .last_sig
-                        .as_ref()
-                        .is_some_and(TokenKind::can_end_postfix);
+                    self.postfix_dot = self.last_sig_can_end_postfix;
                     one(self, TokenKind::Dot);
                 }
             }

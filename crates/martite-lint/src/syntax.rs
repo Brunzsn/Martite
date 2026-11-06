@@ -884,7 +884,7 @@ impl<'a> SyntaxCtx<'a> {
         let mut mixed = Vec::new();
         for child in [lhs, rhs] {
             if let ExprKind::Binary { op: child_op, .. } = &child.kind {
-                if *child_op == opposite && !self.program.parenthesized.contains(&child.id) {
+                if *child_op == opposite && !self.program.is_parenthesized(child.id) {
                     mixed.push(child);
                 }
             }
