@@ -153,6 +153,24 @@ pub const MAX_VALUE_DEPTH: usize = 128;
 /// This is deliberately iterative: it is used to reject values before
 /// recursive consumers (`Show`, equality, snapshots, drop glue) can see them.
 pub fn value_depth_exceeds(value: &Value, limit: usize) -> bool {
+    if limit == 0 {
+        return true;
+    }
+    let has_children = match value {
+        Value::List(items) | Value::Tuple(items) => !items.is_empty(),
+        Value::Map(map) => !map.is_empty(),
+        Value::Struct(value) => !value.fields.is_empty(),
+        Value::Enum(value) => !value.payload.is_empty(),
+        Value::Option(Some(_)) | Value::Result(_) => true,
+        Value::Fn(closure) => closure
+            .captures
+            .as_ref()
+            .is_some_and(|captures| !captures.is_empty()),
+        _ => false,
+    };
+    if !has_children {
+        return false;
+    }
     let mut stack = vec![(value, 1usize)];
     while let Some((value, depth)) = stack.pop() {
         if depth > limit {

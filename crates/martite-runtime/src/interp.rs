@@ -1442,10 +1442,6 @@ impl<'p, 'h> Runtime<'p, 'h> {
     }
 
     fn write_place(&mut self, place: Place, value: Value) -> EvalResult<()> {
-        let remaining = MAX_VALUE_DEPTH.saturating_sub(place.accessors.len());
-        if value_depth_exceeds(&value, remaining) {
-            return Err(EvalError::Trap(Trap::DepthExceeded));
-        }
         let mut root = self.take_place_root(&place)?;
         self.set_path(&mut root, &place.accessors, value, MAX_VALUE_DEPTH)?;
         self.current_locals_mut().insert(place.root, root);
