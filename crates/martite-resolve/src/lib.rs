@@ -1,6 +1,7 @@
 //! Module graph, imports, and top-level name resolution for Martite.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use martite_base::{
     Code, Diagnostic, LoadLimits, Severity, SourceId, SourceMap, SourceProvider, Span,
@@ -129,7 +130,9 @@ pub struct Module {
     pub id: ModuleId,
     pub path: String,
     pub source: SourceId,
-    pub ast: Program,
+    /// Parsed module AST shared by reference so resolver and checker passes can
+    /// borrow it without deep-cloning the item list.
+    pub ast: Rc<Program>,
     pub is_interface: bool,
     pub is_host: bool,
     pub symbols: Symbols,
@@ -445,7 +448,7 @@ impl<'a> Loader<'a> {
             id,
             path: path.to_string(),
             source,
-            ast: parsed.program,
+            ast: Rc::new(parsed.program),
             is_interface,
             is_host: is_interface,
             symbols: Symbols::default(),
@@ -572,12 +575,12 @@ impl<'a> Loader<'a> {
     }
 
     fn build_local_symbols(&mut self, module_id: ModuleId) {
-        let items = self.modules[module_id.0 as usize].ast.items.clone();
+        let ast = Rc::clone(&self.modules[module_id.0 as usize].ast);
         let is_interface = self.modules[module_id.0 as usize].is_interface;
         let is_root = self.entry == Some(module_id);
         let mut test_names = HashSet::new();
 
-        for (index, item) in items.iter().enumerate() {
+        for (index, item) in ast.items.iter().enumerate() {
             match item {
                 Item::Use(_) => {}
                 Item::Fn(f) => {
@@ -764,9 +767,9 @@ impl<'a> Loader<'a> {
     fn build_impls(&mut self) {
         for i in 0..self.modules.len() {
             let module_id = ModuleId(i as u32);
-            let items = self.modules[i].ast.items.clone();
+            let ast = Rc::clone(&self.modules[i].ast);
             let mut methods_by_type: HashMap<String, HashSet<String>> = HashMap::new();
-            for (index, item) in items.iter().enumerate() {
+            for (index, item) in ast.items.iter().enumerate() {
                 let Item::Impl(imp) = item else {
                     continue;
                 };
@@ -785,7 +788,7 @@ impl<'a> Loader<'a> {
                     continue;
                 };
                 let type_index = self.defs[type_def.0 as usize].item_index;
-                let expected_args = match &items[type_index] {
+                let expected_args = match &ast.items[type_index] {
                     Item::Struct(s) => s.generics.len(),
                     Item::Enum(e) => e.generics.len(),
                     _ => 0,
@@ -813,7 +816,7 @@ impl<'a> Loader<'a> {
                         ),
                     );
                 }
-                let field_names: HashSet<String> = match &items[type_index] {
+                let field_names: HashSet<String> = match &ast.items[type_index] {
                     Item::Struct(s) => s.fields.iter().map(|f| f.name.clone()).collect(),
                     _ => HashSet::new(),
                 };
@@ -866,9 +869,9 @@ impl<'a> Loader<'a> {
     }
 
     fn resolve_uses(&mut self, module_id: ModuleId) {
-        let items = self.modules[module_id.0 as usize].ast.items.clone();
+        let ast = Rc::clone(&self.modules[module_id.0 as usize].ast);
         let is_interface = self.modules[module_id.0 as usize].is_interface;
-        for item in &items {
+        for item in ast.items.iter() {
             let Item::Use(use_decl) = item else {
                 continue;
             };
@@ -1130,10 +1133,10 @@ impl<'a> Loader<'a> {
             if !self.modules[i].is_interface {
                 continue;
             }
-            let items = self.modules[i].ast.items.clone();
+            let ast = Rc::clone(&self.modules[i].ast);
             let source = self.modules[i].source;
             let path = self.modules[i].path.clone();
-            for item in &items {
+            for item in ast.items.iter() {
                 if let Item::On(hook) = item {
                     if hook.name == "init" || hook.name == "shutdown" {
                         self.diag(
@@ -1170,10 +1173,10 @@ impl<'a> Loader<'a> {
             if self.modules[i].is_interface {
                 continue;
             }
-            let items = self.modules[i].ast.items.clone();
+            let ast = Rc::clone(&self.modules[i].ast);
             let source = self.modules[i].source;
             let is_root = self.modules[i].id == entry;
-            for item in &items {
+            for item in ast.items.iter() {
                 match item {
                     Item::Fn(f) if f.name == "main" && is_root => {
                         root_main = Some(f.span);
@@ -1219,11 +1222,15 @@ impl<'a> Loader<'a> {
 
     fn check_const_cycles(&mut self) {
         for i in 0..self.modules.len() {
-            let items = self.modules[i].ast.items.clone();
-            let mut consts: HashMap<String, (usize, Span, NodeId)> = HashMap::new();
-            for (index, item) in items.iter().enumerate() {
+            let ast = Rc::clone(&self.modules[i].ast);
+            // Collect the value references once per constant so cycle checking
+            // never has to touch (or clone) the module AST while recursing.
+            let mut consts: HashMap<String, (Span, Vec<String>)> = HashMap::new();
+            for item in ast.items.iter() {
                 if let Item::Const(c) = item {
-                    consts.insert(c.name.clone(), (index, c.span, c.value.id));
+                    let mut refs = Vec::new();
+                    collect_const_refs(&c.value, &mut refs);
+                    consts.insert(c.name.clone(), (c.span, refs));
                 }
             }
             let mut state: HashMap<String, u8> = HashMap::new();
@@ -1239,7 +1246,7 @@ impl<'a> Loader<'a> {
     fn visit_const(
         &mut self,
         name: &str,
-        consts: &HashMap<String, (usize, Span, NodeId)>,
+        consts: &HashMap<String, (Span, Vec<String>)>,
         state: &mut HashMap<String, u8>,
         stack: &mut Vec<String>,
         module: ModuleId,
@@ -1247,7 +1254,7 @@ impl<'a> Loader<'a> {
         match state.get(name).copied() {
             Some(2) => return,
             Some(1) => {
-                if let Some((_, span, _)) = consts.get(name) {
+                if let Some((span, _)) = consts.get(name) {
                     self.diag_at(
                         module,
                         *span,
@@ -1261,15 +1268,10 @@ impl<'a> Loader<'a> {
         }
         state.insert(name.to_string(), 1);
         stack.push(name.to_string());
-        let items = self.modules[module.0 as usize].ast.items.clone();
-        if let Some((index, _, _)) = consts.get(name) {
-            if let Item::Const(c) = &items[*index] {
-                let mut refs = Vec::new();
-                collect_const_refs(&c.value, &mut refs);
-                for r in refs {
-                    if consts.contains_key(&r) {
-                        self.visit_const(&r, consts, state, stack, module);
-                    }
+        if let Some((_, refs)) = consts.get(name) {
+            for r in refs {
+                if consts.contains_key(r) {
+                    self.visit_const(r, consts, state, stack, module);
                 }
             }
         }
