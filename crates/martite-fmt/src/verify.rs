@@ -12,6 +12,10 @@ use crate::normalize;
 /// Compare two programs without considering spans or node IDs. Import runs are
 /// compared after sorting, because the formatter canonically sorts them.
 pub fn structurally_equal(left: &Program, right: &Program) -> bool {
+    assert!(
+        left.records_parentheses() && right.records_parentheses(),
+        "structurally_equal requires programs parsed with ParseOptions::TOOLING"
+    );
     if left.is_interface != right.is_interface {
         return false;
     }
@@ -583,15 +587,21 @@ impl Cmp<'_> {
     }
 
     fn expr_parens(&self, program: &Program, expr: &Expr) -> usize {
-        program.expression_parens.get(&expr.id).map_or(0, Vec::len)
+        program
+            .parentheses()
+            .map_or(0, |tables| tables.expression_parens(expr.id).len())
     }
 
     fn type_parens(&self, program: &Program, ty: &TyExpr) -> usize {
-        program.type_parens.get(&ty.id).map_or(0, Vec::len)
+        program
+            .parentheses()
+            .map_or(0, |tables| tables.type_parens(ty.id).len())
     }
 
     fn pattern_parens(&self, program: &Program, pattern: &Pattern) -> usize {
-        program.pattern_parens.get(&pattern.id).map_or(0, Vec::len)
+        program
+            .parentheses()
+            .map_or(0, |tables| tables.pattern_parens(pattern.id).len())
     }
 }
 
@@ -611,11 +621,11 @@ fn _types(_: AssignOp, _: BinaryOp, _: UnaryOp, _: PrimTy, _: Bound, _: Arg) {}
 mod tests {
     use super::*;
     use martite_base::LoadLimits;
-    use martite_syntax::parse_source;
+    use martite_syntax::{ParseOptions, parse_source_with};
 
     fn equal(left: &str, right: &str) -> bool {
-        let left = parse_source(left, LoadLimits::default()).program;
-        let right = parse_source(right, LoadLimits::default()).program;
+        let left = parse_source_with(left, LoadLimits::default(), ParseOptions::TOOLING).program;
+        let right = parse_source_with(right, LoadLimits::default(), ParseOptions::TOOLING).program;
         structurally_equal(&left, &right)
     }
 

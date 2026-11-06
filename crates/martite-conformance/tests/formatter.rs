@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use martite_base::LoadLimits;
 use martite_config::{FmtConfig, ToolConfig};
 use martite_fmt::{format_source, structurally_equal};
-use martite_syntax::parse_source;
+use martite_syntax::{ParseOptions, parse_source_with};
 
 use martite_conformance::{Case, lint_case};
 
@@ -18,7 +18,7 @@ fn format(source: &str) -> String {
 }
 
 fn parse(source: &str) -> martite_syntax::Program {
-    let parsed = parse_source(source, LoadLimits::default());
+    let parsed = parse_source_with(source, LoadLimits::default(), ParseOptions::TOOLING);
     assert!(
         parsed.diagnostics.is_empty(),
         "parse diagnostics: {:?}\n{source}",

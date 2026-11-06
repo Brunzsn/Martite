@@ -3,7 +3,7 @@ use martite_config::ToolConfig;
 use martite_driver::{LoadOptions, load};
 use martite_lint::{LintInputs, ManifestInput, SettingsResolver, lint, lint_syntax_only};
 use martite_resolve::InterfaceSource;
-use martite_syntax::parse_source;
+use martite_syntax::{ParseOptions, parse_source_with};
 
 fn resolver(preset: &str) -> SettingsResolver {
     let config = ToolConfig {
@@ -35,6 +35,7 @@ fn lint_script_with(source: &str, settings: &SettingsResolver) -> Vec<Code> {
             grants: Vec::new(),
             limits: Default::default(),
             edition: "1".into(),
+            parse: ParseOptions::TOOLING,
         },
     );
     assert!(
@@ -71,7 +72,7 @@ fn main() {
     print(value)
 }
 "#;
-    let parsed = parse_source(source, Default::default());
+    let parsed = parse_source_with(source, Default::default(), ParseOptions::TOOLING);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let settings = resolver("recommended").resolve("main.mt");
     let diagnostics = lint_syntax_only(SourceId(0), source, &parsed.program, &settings);
@@ -130,6 +131,7 @@ fn plugin_case(source: &str, grants: &[&str], interfaces: &[(&str, &str)]) -> Ve
             grants: grants.iter().map(|grant| (*grant).into()).collect(),
             limits: Default::default(),
             edition: "1".into(),
+            parse: ParseOptions::TOOLING,
         },
     );
     assert!(
@@ -222,6 +224,7 @@ fn l020_reports_unused_grant() {
             grants: vec!["app.editor".into(), "app.unused".into()],
             limits: Default::default(),
             edition: "1".into(),
+            parse: ParseOptions::TOOLING,
         },
     );
     assert!(!loaded.has_errors(), "{:?}", codes(&loaded.diagnostics));
@@ -290,7 +293,7 @@ fn main() {
     print("{work(1, 2, 3, 4, 5, 6)}")
 }
 "#;
-    let parsed = parse_source(source, Default::default());
+    let parsed = parse_source_with(source, Default::default(), ParseOptions::TOOLING);
     assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
     let config = ToolConfig {
         lint_preset: Some("strict".into()),
