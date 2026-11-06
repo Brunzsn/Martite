@@ -7,6 +7,9 @@ description = "Criterion benchmarks for the Martite compiler, runtime, and CLI"
 publish = false
 autobenches = false
 
+[lib]
+bench = false
+
 [dependencies]
 martite.workspace = true
 martite-base.workspace = true
