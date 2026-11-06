@@ -310,7 +310,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     self.charge(other.len() as u64)?;
                     self.note_alloc(8 * other.len() as u64);
                     let list = self.cow_vec_mut(items, n)?;
-                    list.extend(other.iter().cloned());
+                    list.extend_values(other.iter().cloned());
                 }
                 Ok(Value::Unit)
             }
@@ -320,7 +320,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     Rc::make_mut(items).clear();
                 } else {
                     self.note_alloc(16);
-                    *items = Rc::new(Vec::new());
+                    *items = Rc::new(SeqValue::new(Vec::new()));
                 }
                 Ok(Value::Unit)
             }
@@ -398,7 +398,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     Rc::make_mut(map).clear();
                 } else {
                     self.note_alloc(16);
-                    *map = Rc::new(OrderedMap::new());
+                    *map = Rc::new(MapValue::new(OrderedMap::new()));
                 }
                 Ok(Value::Unit)
             }

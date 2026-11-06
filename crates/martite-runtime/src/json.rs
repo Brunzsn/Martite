@@ -18,11 +18,7 @@ fn convert(json: JsonValue, json_type: TypeId, depth: usize) -> Result<Value, St
         return Err("JSON nesting is too deep".into());
     }
     let variant = |index: usize, payload: Vec<Value>| {
-        Value::Enum(Rc::new(EnumValue {
-            type_id: json_type,
-            variant: index,
-            payload,
-        }))
+        Value::Enum(Rc::new(EnumValue::new(json_type, index, payload)))
     };
     Ok(match json {
         JsonValue::Null => variant(0, Vec::new()),
