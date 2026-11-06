@@ -1,5 +1,5 @@
 
-impl Checker {
+impl<'a> Checker<'a> {
     fn check_method_arg(
         &mut self,
         args: &[Arg],

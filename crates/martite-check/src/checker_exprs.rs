@@ -28,7 +28,7 @@ enum PatMode {
     For,
 }
 
-impl Checker {
+impl<'a> Checker<'a> {
     fn err_at(&mut self, module: ModuleId, span: Span, code: Code, message: impl Into<String>) {
         let source = self.resolved.module(module).source;
         let mut d = Diagnostic::error(code, message);
@@ -950,9 +950,10 @@ impl Checker {
         }
 
         let module = self.current_module();
-        let symbols = self.resolved.module(module).symbols.clone();
+        let resolved = self.resolved;
+        let symbols = &resolved.module(module).symbols;
         if let Some(def) = symbols.values.get(name).copied() {
-            let info = self.resolved.def(def).clone();
+            let info = resolved.def(def);
             if let Some(sig) = self.functions.get(&def).cloned() {
                 let ty = Ty::Fn(
                     sig.params.iter().map(|p| p.ty.clone()).collect(),
@@ -1078,7 +1079,8 @@ impl Checker {
         if let ExprKind::Var(base_name) = &base.kind {
             if self.lookup_local(base_name).is_none() && base_name != "self" {
                 let module = self.current_module();
-                let symbols = self.resolved.module(module).symbols.clone();
+                let resolved = self.resolved;
+                let symbols = &resolved.module(module).symbols;
                 if let Some(target) = symbols.modules.get(base_name).copied() {
                     let result = self.resolve_module_field(expr, target, name, expected, infer);
                     return self.record_field(expr, result);
@@ -1164,9 +1166,10 @@ impl Checker {
         };
         match target {
             ModuleTarget::Source(mid) | ModuleTarget::Interface(mid) => {
-                let target_module = self.resolved.module(mid).clone();
+                let resolved = self.resolved;
+                let target_module = resolved.module(mid);
                 if let Some(def) = target_module.symbols.values.get(name).copied() {
-                    let info = self.resolved.def(def).clone();
+                    let info = resolved.def(def);
                     if mid != self.current_module() && !info.is_pub {
                         let module = self.current_module();
                         self.err_at(module, expr.span, Code::E106, format!("`{name}` is private"));
@@ -1187,7 +1190,7 @@ impl Checker {
                     }
                 }
                 if let Some(def) = target_module.symbols.consts.get(name).copied() {
-                    let info = self.resolved.def(def).clone();
+                    let info = resolved.def(def);
                     if mid != self.current_module() && !info.is_pub {
                         let module = self.current_module();
                         self.err_at(module, expr.span, Code::E106, format!("`{name}` is private"));
@@ -2444,7 +2447,8 @@ impl Checker {
         infer: &mut Infer,
     ) -> Ty {
         let module = self.current_module();
-        let symbols = self.resolved.module(module).symbols.clone();
+        let resolved = self.resolved;
+        let symbols = &resolved.module(module).symbols;
         let Some(def) = symbols.types.get(name).copied() else {
             self.err_at(module, expr.span, Code::E101, format!("unknown type `{name}`"));
             return Ty::Error;

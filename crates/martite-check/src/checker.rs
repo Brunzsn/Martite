@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use martite_base::{Code, Diagnostic, Severity, Span};
 use martite_resolve::{
@@ -11,14 +12,66 @@ use crate::program::*;
 use crate::ty::*;
 
 pub fn check(resolved: ResolvedProgram) -> crate::CheckOutput {
-    let mut checker = Checker::new(resolved);
+    let mut checker = Checker::new(&resolved);
     checker.run();
     let has_errors = checker
         .diagnostics
         .iter()
         .any(|d| d.severity == Severity::Error);
-    let diagnostics = checker.diagnostics.clone();
-    let program = checker.into_program();
+    let Checker {
+        diagnostics,
+        types,
+        json_type,
+        functions,
+        methods,
+        consts,
+        expr_types,
+        resolutions,
+        pattern_resolutions,
+        struct_lit_fields,
+        struct_pattern_fields,
+        bindings,
+        pattern_bindings,
+        param_bindings,
+        lambdas,
+        handlers,
+        hooks,
+        tests,
+        state_type,
+        init,
+        shutdown,
+        main,
+        entry_kind,
+        ..
+    } = checker;
+    let program = CheckedProgram {
+        resolved,
+        types,
+        functions: functions
+            .into_iter()
+            .map(|(def, sig)| (def, Rc::unwrap_or_clone(sig)))
+            .collect(),
+        methods,
+        consts,
+        expr_types,
+        resolutions,
+        pattern_resolutions,
+        struct_lit_fields,
+        struct_pattern_fields,
+        bindings,
+        pattern_bindings,
+        param_bindings,
+        lambdas,
+        handlers,
+        hooks,
+        tests,
+        state_type,
+        init,
+        shutdown,
+        main,
+        entry_kind,
+        json_type,
+    };
     crate::CheckOutput {
         program: if has_errors { None } else { Some(program) },
         diagnostics,
@@ -45,13 +98,13 @@ struct LambdaCaptureCtx {
     captures: HashSet<BindingId>,
 }
 
-struct Checker {
-    resolved: ResolvedProgram,
+struct Checker<'a> {
+    resolved: &'a ResolvedProgram,
     diagnostics: Vec<Diagnostic>,
     types: TypeTable,
     json_type: Option<TypeId>,
     def_to_type: HashMap<DefId, TypeId>,
-    functions: HashMap<DefId, FnSig>,
+    functions: HashMap<DefId, Rc<FnSig>>,
     methods: HashMap<(TypeId, String), DefId>,
     const_types: HashMap<DefId, Ty>,
     consts: HashMap<DefId, ConstInfo>,
@@ -78,8 +131,8 @@ struct Checker {
     ctx: Option<FnCtx>,
 }
 
-impl Checker {
-    fn new(resolved: ResolvedProgram) -> Self {
+impl<'a> Checker<'a> {
+    fn new(resolved: &'a ResolvedProgram) -> Self {
         Self {
             resolved,
             diagnostics: Vec::new(),
@@ -124,39 +177,12 @@ impl Checker {
         self.check_bodies();
     }
 
-    fn into_program(self) -> CheckedProgram {
-        CheckedProgram {
-            resolved: self.resolved,
-            types: self.types,
-            functions: self.functions,
-            methods: self.methods,
-            consts: self.consts,
-            expr_types: self.expr_types,
-            resolutions: self.resolutions,
-            pattern_resolutions: self.pattern_resolutions,
-            struct_lit_fields: self.struct_lit_fields,
-            struct_pattern_fields: self.struct_pattern_fields,
-            bindings: self.bindings,
-            pattern_bindings: self.pattern_bindings,
-            param_bindings: self.param_bindings,
-            lambdas: self.lambdas,
-            handlers: self.handlers,
-            hooks: self.hooks,
-            tests: self.tests,
-            state_type: self.state_type,
-            init: self.init,
-            shutdown: self.shutdown,
-            main: self.main,
-            entry_kind: self.entry_kind,
-            json_type: self.json_type,
-        }
-    }
-
     // ------------------------------------------------------------------
     // Types
     // ------------------------------------------------------------------
 
     fn collect_types(&mut self) {
+        let resolved = self.resolved;
         let json = self.types.add(TypeDef {
             id: TypeId(0),
             name: "Json".into(),
@@ -202,19 +228,19 @@ impl Checker {
             ],
         };
 
-        for i in 0..self.resolved.modules.len() {
+        for i in 0..resolved.modules.len() {
             let module_id = ModuleId(i as u32);
-            let items = self.resolved.module(module_id).ast.items.clone();
-            let is_interface = self.resolved.module(module_id).is_interface;
-            for item in &items {
+            let module = resolved.module(module_id);
+            let is_interface = module.is_interface;
+            for item in &module.ast.items {
                 let (def, name, generics) = match item {
                     Item::Struct(s) => (
-                        self.resolved.node_to_def.get(&s.id).copied(),
+                        resolved.node_to_def.get(&s.id).copied(),
                         &s.name,
                         &s.generics,
                     ),
                     Item::Enum(e) => (
-                        self.resolved.node_to_def.get(&e.id).copied(),
+                        resolved.node_to_def.get(&e.id).copied(),
                         &e.name,
                         &e.generics,
                     ),
@@ -249,10 +275,9 @@ impl Checker {
         let entries: Vec<(DefId, TypeId)> =
             self.def_to_type.iter().map(|(a, b)| (*a, *b)).collect();
         for (def, type_id) in entries {
-            let info = self.resolved.def(def).clone();
+            let info = resolved.def(def);
             let module_id = info.module;
-            let items = self.resolved.module(module_id).ast.items.clone();
-            let Some(item) = items.get(info.item_index) else {
+            let Some(item) = resolved.module(module_id).ast.items.get(info.item_index) else {
                 continue;
             };
             let params = self
@@ -337,17 +362,17 @@ impl Checker {
     // ------------------------------------------------------------------
 
     fn collect_hooks(&mut self) {
-        let interface_modules: Vec<ModuleId> = self
-            .resolved
+        let resolved = self.resolved;
+        let interface_modules: Vec<ModuleId> = resolved
             .modules
             .iter()
             .filter(|m| m.is_interface)
             .map(|m| m.id)
             .collect();
         for module_id in interface_modules {
-            let items = self.resolved.module(module_id).ast.items.clone();
-            let source = self.resolved.module(module_id).source;
-            for item in &items {
+            let module = resolved.module(module_id);
+            let source = module.source;
+            for item in &module.ast.items {
                 let Item::On(hook) = item else { continue };
                 let mut params = Vec::new();
                 for param in &hook.params {
@@ -388,17 +413,18 @@ impl Checker {
     }
 
     fn collect_signatures(&mut self) {
-        for i in 0..self.resolved.modules.len() {
+        let resolved = self.resolved;
+        for i in 0..resolved.modules.len() {
             let module_id = ModuleId(i as u32);
-            let items = self.resolved.module(module_id).ast.items.clone();
-            let is_interface = self.resolved.module(module_id).is_interface;
-            for item in &items {
+            let module = resolved.module(module_id);
+            let is_interface = module.is_interface;
+            for item in &module.ast.items {
                 match item {
                     Item::Fn(f) => {
-                        if f.name == "main" && module_id == self.resolved.entry {
+                        if f.name == "main" && module_id == resolved.entry {
                             // Checked later by decide_entry.
                         }
-                        let Some(def) = self.resolved.node_to_def.get(&f.id).copied() else {
+                        let Some(def) = resolved.node_to_def.get(&f.id).copied() else {
                             continue;
                         };
                         let type_params: Vec<TypeParam> = f
@@ -445,7 +471,7 @@ impl Checker {
                         };
                         self.functions.insert(
                             def,
-                            FnSig {
+                            Rc::new(FnSig {
                                 def,
                                 node: f.id,
                                 module: module_id,
@@ -461,16 +487,16 @@ impl Checker {
                                 },
                                 span: f.span,
                                 is_pub: f.is_pub || is_interface,
-                            },
+                            }),
                         );
                     }
                     Item::Test(t) => {
-                        let Some(def) = self.resolved.node_to_def.get(&t.id).copied() else {
+                        let Some(def) = resolved.node_to_def.get(&t.id).copied() else {
                             continue;
                         };
                         self.functions.insert(
                             def,
-                            FnSig {
+                            Rc::new(FnSig {
                                 def,
                                 node: t.id,
                                 module: module_id,
@@ -482,7 +508,7 @@ impl Checker {
                                 kind: FnKind::Test,
                                 span: t.span,
                                 is_pub: false,
-                            },
+                            }),
                         );
                         self.tests.push(def);
                     }
@@ -605,7 +631,7 @@ impl Checker {
             };
             self.functions.insert(
                 def,
-                FnSig {
+                Rc::new(FnSig {
                     def,
                     node: method.id,
                     module: module_id,
@@ -617,7 +643,7 @@ impl Checker {
                     kind: FnKind::Method(type_id),
                     span: method.span,
                     is_pub: method.is_pub,
-                },
+                }),
             );
             self.methods.insert((type_id, method.name.clone()), def);
         }
@@ -663,17 +689,18 @@ impl Checker {
     }
 
     fn collect_handlers(&mut self) {
-        let root = self.resolved.entry;
-        let items = self.resolved.module(root).ast.items.clone();
+        let resolved = self.resolved;
+        let root = resolved.entry;
+        let items = &resolved.module(root).ast.items;
 
         let init_item = items.iter().find_map(|item| match item {
-            Item::On(o) if o.name == "init" => Some(o.clone()),
+            Item::On(o) if o.name == "init" => Some(o),
             _ => None,
         });
 
         let mut state = None;
-        if let Some(init) = &init_item {
-            let Some(def) = self.resolved.node_to_def.get(&init.id).copied() else {
+        if let Some(init) = init_item {
+            let Some(def) = resolved.node_to_def.get(&init.id).copied() else {
                 return;
             };
             self.init = Some(def);
@@ -739,7 +766,7 @@ impl Checker {
             state = Some(ret.clone());
             self.functions.insert(
                 def,
-                FnSig {
+                Rc::new(FnSig {
                     def,
                     node: init.id,
                     module: root,
@@ -751,18 +778,18 @@ impl Checker {
                     kind: FnKind::Handler,
                     span: init.span,
                     is_pub: false,
-                },
+                }),
             );
             self.handlers.insert("init".into(), def);
         }
         self.state_type = state.clone();
 
-        for item in &items {
+        for item in items {
             let Item::On(handler) = item else { continue };
             if handler.name == "init" {
                 continue;
             }
-            let Some(def) = self.resolved.node_to_def.get(&handler.id).copied() else {
+            let Some(def) = resolved.node_to_def.get(&handler.id).copied() else {
                 continue;
             };
             let is_shutdown = handler.name == "shutdown";
@@ -896,7 +923,7 @@ impl Checker {
             }
             self.functions.insert(
                 def,
-                FnSig {
+                Rc::new(FnSig {
                     def,
                     node: handler.id,
                     module: root,
@@ -908,7 +935,7 @@ impl Checker {
                     kind: FnKind::Handler,
                     span: handler.span,
                     is_pub: false,
-                },
+                }),
             );
         }
     }
@@ -1010,12 +1037,14 @@ impl Checker {
     // ------------------------------------------------------------------
 
     fn check_consts(&mut self) {
-        for i in 0..self.resolved.modules.len() {
+        let resolved = self.resolved;
+        let mut defs: Vec<(DefId, ModuleId, &ConstDecl)> = Vec::new();
+        for i in 0..resolved.modules.len() {
             let module_id = ModuleId(i as u32);
-            let items = self.resolved.module(module_id).ast.items.clone();
-            for item in &items {
+            let module = resolved.module(module_id);
+            for item in &module.ast.items {
                 let Item::Const(c) = item else { continue };
-                let Some(def) = self.resolved.node_to_def.get(&c.id).copied() else {
+                let Some(def) = resolved.node_to_def.get(&c.id).copied() else {
                     continue;
                 };
                 let ty = match self.resolve_ty_in(module_id, &c.ty, &[]) {
@@ -1026,19 +1055,7 @@ impl Checker {
                     }
                 };
                 self.const_types.insert(def, ty);
-            }
-        }
-
-        let mut defs = Vec::new();
-        for i in 0..self.resolved.modules.len() {
-            let module_id = ModuleId(i as u32);
-            let items = self.resolved.module(module_id).ast.items.clone();
-            for item in &items {
-                if let Item::Const(c) = item {
-                    if let Some(def) = self.resolved.node_to_def.get(&c.id).copied() {
-                        defs.push((def, module_id, c.clone()));
-                    }
-                }
+                defs.push((def, module_id, c));
             }
         }
 
@@ -1093,15 +1110,13 @@ impl Checker {
         if !visiting.insert(def) {
             return Err("constant cycle".into());
         }
-        let info = self.resolved.def(def).clone();
-        let value_expr = {
-            let module = self.resolved.module(info.module);
-            let Some(Item::Const(c)) = module.ast.items.get(info.item_index) else {
-                return Err("not a constant".into());
-            };
-            c.value.clone()
+        let resolved = self.resolved;
+        let info = resolved.def(def);
+        let module = resolved.module(info.module);
+        let Some(Item::Const(c)) = module.ast.items.get(info.item_index) else {
+            return Err("not a constant".into());
         };
-        let value = self.eval_const_expr(&value_expr, visiting)?;
+        let value = self.eval_const_expr(&c.value, visiting)?;
         visiting.remove(&def);
         Ok(value)
     }
@@ -1226,34 +1241,34 @@ impl Checker {
         let mut defs: Vec<DefId> = self.functions.keys().copied().collect();
         defs.sort_by_key(|d| d.0);
         for def in defs {
-            let sig = match self.functions.get(&def).cloned() {
-                Some(s) => s,
+            let sig = match self.functions.get(&def) {
+                Some(s) => Rc::clone(s),
                 None => continue,
             };
             if sig.kind == FnKind::Host {
                 continue;
             }
-            let body = match self.function_block(def) {
-                Some(b) => b,
-                None => continue,
+            let Some(body) = self.function_block(def) else {
+                continue;
             };
-            self.check_function_body(&sig, &body);
+            self.check_function_body(&sig, body);
         }
     }
 
-    fn function_block(&self, def: DefId) -> Option<Block> {
-        let info = self.resolved.def(def);
-        let module = self.resolved.module(info.module);
+    fn function_block(&self, def: DefId) -> Option<&'a Block> {
+        let resolved = self.resolved;
+        let info = resolved.def(def);
+        let module = resolved.module(info.module);
         let item = module.ast.items.get(info.item_index)?;
         match item {
-            Item::Fn(f) if f.id == info.node => f.body.clone(),
-            Item::On(o) if o.id == info.node => Some(o.body.clone()),
-            Item::Test(t) if t.id == info.node => Some(t.body.clone()),
+            Item::Fn(f) if f.id == info.node => f.body.as_ref(),
+            Item::On(o) if o.id == info.node => Some(&o.body),
+            Item::Test(t) if t.id == info.node => Some(&t.body),
             Item::Impl(i) => i
                 .methods
                 .iter()
                 .find(|m| m.id == info.node)
-                .and_then(|m| m.body.clone()),
+                .and_then(|m| m.body.as_ref()),
             _ => None,
         }
     }
