@@ -42,10 +42,10 @@ Criterion stores results under `target/criterion`. Save a baseline before a
 performance change and compare against it afterwards:
 
 ```sh
-cargo bench -p martite-bench -- --save-baseline before
+cargo bench -p martite-bench --benches -- --save-baseline before
 # make the change
-cargo bench -p martite-bench -- --baseline before
-cargo bench -p martite-bench -- --baseline before --save-baseline after
+cargo bench -p martite-bench --benches -- --baseline before
+cargo bench -p martite-bench --benches -- --baseline before --save-baseline after
 ```
 
 Compare `change: [...]` in the Criterion output, not absolute times across
