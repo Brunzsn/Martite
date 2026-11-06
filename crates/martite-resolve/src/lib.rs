@@ -7,6 +7,7 @@ use martite_base::{
     Code, Diagnostic, LoadLimits, Severity, SourceId, SourceMap, SourceProvider, Span,
 };
 use martite_syntax::*;
+use rustc_hash::FxHashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DefId(pub u32);
@@ -144,7 +145,7 @@ pub struct ResolvedProgram {
     pub modules: Vec<Module>,
     pub entry: ModuleId,
     pub defs: Vec<DefInfo>,
-    pub node_to_def: HashMap<NodeId, DefId>,
+    pub node_to_def: FxHashMap<NodeId, DefId>,
     pub grants: Vec<String>,
     /// One past the highest `NodeId` allocated while loading this program.
     /// Every node ID in the program is smaller than this bound.
@@ -239,7 +240,7 @@ struct Loader<'a> {
     modules: Vec<Module>,
     by_path: HashMap<String, ModuleId>,
     defs: Vec<DefInfo>,
-    node_to_def: HashMap<NodeId, DefId>,
+    node_to_def: FxHashMap<NodeId, DefId>,
     node_ids: NodeIdAllocator,
     interfaces: HashMap<String, InterfaceSource>,
     file_cache: HashMap<String, Option<String>>,
@@ -267,7 +268,7 @@ impl<'a> Loader<'a> {
             modules: Vec::new(),
             by_path: HashMap::new(),
             defs: Vec::new(),
-            node_to_def: HashMap::new(),
+            node_to_def: FxHashMap::default(),
             node_ids: NodeIdAllocator::new(),
             interfaces,
             file_cache: HashMap::new(),

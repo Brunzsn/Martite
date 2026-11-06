@@ -29,6 +29,7 @@ cap-std = "4.0"
 blake3 = "1.8"
 lexopt = "0.3.2"
 proptest = "1.12"
+rustc-hash = "2.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

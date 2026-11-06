@@ -3,6 +3,7 @@ use std::fmt;
 
 use martite_resolve::{DefId, ModuleId};
 use martite_syntax::Bound;
+use rustc_hash::FxHashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TypeId(pub u32);
@@ -368,7 +369,7 @@ pub fn instantiate_params(ty: &Ty, vars: &[Ty]) -> Ty {
 
 pub struct TypeResolver<'a> {
     pub types: &'a TypeTable,
-    pub def_to_type: &'a HashMap<DefId, TypeId>,
+    pub def_to_type: &'a FxHashMap<DefId, TypeId>,
     pub builtin_json: Option<TypeId>,
     pub type_param_names: &'a [String],
     pub imported_builtin_types: &'a HashMap<String, TypeId>,
