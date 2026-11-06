@@ -52,13 +52,21 @@ jobs:
         run: cargo build --release -p martite-cli
 
       - name: Compile baseline benchmarks
-        run: cargo bench -p martite-bench --benches --no-run
+        run: >-
+          cargo bench -p martite-bench
+          --bench lexer --bench parser --bench load_check --bench lint
+          --bench runtime --bench formatter --bench cli --bench allocations
+          --no-run
 
       - name: Clear stale Criterion results
         run: ${{ matrix.python }} -c "import shutil; shutil.rmtree('target/criterion', ignore_errors=True)"
 
       - name: Run baseline benchmarks
-        run: cargo bench -p martite-bench --benches -- --save-baseline before
+        run: >-
+          cargo bench -p martite-bench
+          --bench lexer --bench parser --bench load_check --bench lint
+          --bench runtime --bench formatter --bench cli --bench allocations
+          -- --save-baseline before
 
       - name: Save baseline allocations
         run: ${{ matrix.python }} -c "import shutil; shutil.copyfile('target/criterion/allocations.md', 'target/criterion/allocations-baseline.md')"
@@ -71,7 +79,11 @@ jobs:
         run: cargo build --release -p martite-cli
 
       - name: Run candidate benchmarks
-        run: cargo bench -p martite-bench --benches -- --baseline before
+        run: >-
+          cargo bench -p martite-bench
+          --bench lexer --bench parser --bench load_check --bench lint
+          --bench runtime --bench formatter --bench cli --bench allocations
+          -- --baseline before
 
       - name: Write benchmark summary
         if: always()
