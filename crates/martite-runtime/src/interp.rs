@@ -125,6 +125,7 @@ pub struct Runtime<'p, 'h> {
 
 struct Frame<'p> {
     locals: HashMap<BindingId, Value>,
+    captures: Option<Rc<HashMap<BindingId, Value>>>,
     source: SourceId,
     name: &'p str,
 }
@@ -304,6 +305,11 @@ impl<'p, 'h> Runtime<'p, 'h> {
             for value in frame.locals.values() {
                 total = total.saturating_add(value.size_bytes(&mut seen));
             }
+            if let Some(captures) = &frame.captures {
+                for value in captures.values() {
+                    total = total.saturating_add(value.size_bytes(&mut seen));
+                }
+            }
         }
         if let Some(value) = extra {
             total = total.saturating_add(value.size_bytes(&mut seen));
@@ -372,6 +378,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
         self.frames.push(Frame {
             locals,
+            captures: None,
             source,
             name: sig.name.as_str(),
         });
@@ -459,7 +466,13 @@ impl<'p, 'h> Runtime<'p, 'h> {
     fn call_closure(&mut self, closure: &Closure, args: Vec<Value>) -> Result<Value, Trap> {
         match &closure.target {
             ClosureTarget::Def(def) => self.call_def(*def, args).map(|(value, _)| value),
-            ClosureTarget::Lambda { params, body } => {
+            ClosureTarget::Lambda { node } => {
+                let program = self.program;
+                let Some(lambda) = program.lambda(*node) else {
+                    return Err(self.internal_panic("missing lambda body"));
+                };
+                let params = &lambda.params;
+                let body = &lambda.body;
                 if params.len() != args.len() {
                     return Err(self.internal_panic("lambda argument count mismatch"));
                 }
@@ -468,7 +481,8 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 }
                 let source = self.frames.last().map(|f| f.source).unwrap_or(SourceId(0));
                 self.frames.push(Frame {
-                    locals: closure.captures.clone(),
+                    locals: HashMap::new(),
+                    captures: closure.captures.clone(),
                     source,
                     name: "<lambda>",
                 });
@@ -827,13 +841,28 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 }
                 self.trap(self.internal_panic("match fell through"))
             }
-            ExprKind::Lambda { params, body, .. } => Ok(Value::Fn(Rc::new(Closure {
-                target: ClosureTarget::Lambda {
-                    params: params.clone(),
-                    body: body.clone(),
-                },
-                captures: self.current_locals().clone(),
-            }))),
+            ExprKind::Lambda { .. } => {
+                let program = self.program;
+                let Some(info) = program.lambda(expr.id) else {
+                    return self.trap(self.internal_panic("missing lambda metadata"));
+                };
+                let captures = if info.captures.is_empty() {
+                    None
+                } else {
+                    let mut values = HashMap::with_capacity(info.captures.len());
+                    for id in &info.captures {
+                        let value = self.local_value(*id).cloned().ok_or_else(|| {
+                            EvalError::Trap(self.internal_panic("missing captured binding"))
+                        })?;
+                        values.insert(*id, value);
+                    }
+                    Some(Rc::new(values))
+                };
+                Ok(Value::Fn(Rc::new(Closure {
+                    target: ClosureTarget::Lambda { node: expr.id },
+                    captures,
+                })))
+            }
             ExprKind::Block(block) => self.eval_block(block),
             ExprKind::Field { .. } => self.eval_field(expr),
             ExprKind::Call { .. } => self.eval_call(expr),
@@ -902,8 +931,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         };
         match self.program.resolution(expr.id).copied() {
             Some(Resolution::Local(id)) => self
-                .current_locals()
-                .get(&id)
+                .local_value(id)
                 .cloned()
                 .ok_or_else(|| EvalError::Trap(self.internal_panic("unbound local"))),
             Some(Resolution::Const(def)) => self.materialize_const(def, expr.span),
@@ -911,7 +939,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             | Some(Resolution::Handler(def))
             | Some(Resolution::Test(def)) => Ok(Value::Fn(Rc::new(Closure {
                 target: ClosureTarget::Def(def),
-                captures: self.current_locals().clone(),
+                captures: None,
             }))),
             Some(Resolution::PreludeVariant(PreludeVariant::None)) => Ok(Value::Option(None)),
             Some(Resolution::PreludeVariant(variant)) => Ok(Value::Result(match variant {
@@ -953,7 +981,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
         Ok(Value::Fn(Rc::new(Closure {
             target: ClosureTarget::Def(def),
-            captures: self.current_locals().clone(),
+            captures: None,
         })))
     }
 
@@ -1300,8 +1328,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
 
     fn read_place(&self, place: &Place) -> EvalResult<Value> {
         let mut value = self
-            .current_locals()
-            .get(&place.root)
+            .local_value(place.root)
             .cloned()
             .ok_or_else(|| EvalError::Trap(self.internal_panic("unbound place root")))?;
         for accessor in &place.accessors {
@@ -1338,8 +1365,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
 
     fn write_place(&mut self, place: Place, value: Value) -> EvalResult<()> {
         let mut root = self
-            .current_locals()
-            .get(&place.root)
+            .local_value(place.root)
             .cloned()
             .ok_or_else(|| EvalError::Trap(self.internal_panic("unbound place root")))?;
         set_path(&mut root, &place.accessors, value)
@@ -1662,6 +1688,16 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 Ok(false)
             }
         }
+    }
+
+    fn local_value(&self, id: BindingId) -> Option<&Value> {
+        let frame = self.frames.last()?;
+        frame.locals.get(&id).or_else(|| {
+            frame
+                .captures
+                .as_ref()
+                .and_then(|captures| captures.get(&id))
+        })
     }
 
     fn current_locals(&self) -> &HashMap<BindingId, Value> {

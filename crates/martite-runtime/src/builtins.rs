@@ -101,26 +101,26 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 Ok(Value::Bool(items.iter().any(|v| value_eq(v, &needle))))
             }
             "map" => {
-                let closure = closure_arg(&args, 0);
+                let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
                 self.charge(snapshot.len() as u64)?;
                 let mut out = Vec::with_capacity(snapshot.len());
                 for item in snapshot.iter() {
                     out.push(
-                        self.call_closure(&closure, vec![item.clone()])
+                        self.call_closure(closure, vec![item.clone()])
                             .map_err(EvalError::Trap)?,
                     );
                 }
                 Ok(Value::list(out))
             }
             "filter" => {
-                let closure = closure_arg(&args, 0);
+                let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
                 self.charge(snapshot.len() as u64)?;
                 let mut out = Vec::new();
                 for item in snapshot.iter() {
                     let keep = self
-                        .call_closure(&closure, vec![item.clone()])
+                        .call_closure(closure, vec![item.clone()])
                         .map_err(EvalError::Trap)?;
                     if matches!(keep, Value::Bool(true)) {
                         out.push(item.clone());
@@ -129,24 +129,29 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 Ok(Value::list(out))
             }
             "fold" => {
-                let closure = closure_arg(&args, 1);
-                let mut init = args.into_iter().next().unwrap_or(Value::Unit);
+                let mut args = args;
+                let mut init = if args.is_empty() {
+                    Value::Unit
+                } else {
+                    args.remove(0)
+                };
+                let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
                 self.charge(snapshot.len() as u64)?;
                 for item in snapshot.iter() {
                     init = self
-                        .call_closure(&closure, vec![init, item.clone()])
+                        .call_closure(closure, vec![init, item.clone()])
                         .map_err(EvalError::Trap)?;
                 }
                 Ok(init)
             }
             "any" => {
-                let closure = closure_arg(&args, 0);
+                let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
                 for item in snapshot.iter() {
                     self.charge(1)?;
                     if matches!(
-                        self.call_closure(&closure, vec![item.clone()])
+                        self.call_closure(closure, vec![item.clone()])
                             .map_err(EvalError::Trap)?,
                         Value::Bool(true)
                     ) {
@@ -156,12 +161,12 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 Ok(Value::Bool(false))
             }
             "all" => {
-                let closure = closure_arg(&args, 0);
+                let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
                 for item in snapshot.iter() {
                     self.charge(1)?;
                     if !matches!(
-                        self.call_closure(&closure, vec![item.clone()])
+                        self.call_closure(closure, vec![item.clone()])
                             .map_err(EvalError::Trap)?,
                         Value::Bool(true)
                     ) {
@@ -194,14 +199,14 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 Ok(Value::list(out))
             }
             "sorted_by" => {
-                let closure = closure_arg(&args, 0);
+                let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
                 let n = snapshot.len() as u64;
                 self.charge(n.saturating_mul((n + 1).ilog2().max(1) as u64))?;
                 let mut keyed = Vec::with_capacity(snapshot.len());
                 for item in snapshot.iter() {
                     let key = self
-                        .call_closure(&closure, vec![item.clone()])
+                        .call_closure(closure, vec![item.clone()])
                         .map_err(EvalError::Trap)?;
                     keyed.push((key, item.clone()));
                 }
@@ -610,20 +615,20 @@ impl<'p, 'h> Runtime<'p, 'h> {
             "is_some" => Ok(Value::Bool(option.is_some())),
             "is_none" => Ok(Value::Bool(option.is_none())),
             "map" => {
-                let closure = closure_arg(&args, 0);
+                let closure = self.closure_arg(&args, 0)?;
                 match option.clone() {
                     Some(value) => Ok(Value::Option(Some(Box::new(
-                        self.call_closure(&closure, vec![*value])
+                        self.call_closure(closure, vec![*value])
                             .map_err(EvalError::Trap)?,
                     )))),
                     None => Ok(Value::Option(None)),
                 }
             }
             "and_then" => {
-                let closure = closure_arg(&args, 0);
+                let closure = self.closure_arg(&args, 0)?;
                 match option.clone() {
                     Some(value) => self
-                        .call_closure(&closure, vec![*value])
+                        .call_closure(closure, vec![*value])
                         .map_err(EvalError::Trap),
                     None => Ok(Value::Option(None)),
                 }
@@ -666,30 +671,30 @@ impl<'p, 'h> Runtime<'p, 'h> {
             "is_ok" => Ok(Value::Bool(result.is_ok())),
             "is_err" => Ok(Value::Bool(result.is_err())),
             "map" => {
-                let closure = closure_arg(&args, 0);
+                let closure = self.closure_arg(&args, 0)?;
                 match result.clone() {
                     Ok(value) => Ok(Value::Result(Ok(Box::new(
-                        self.call_closure(&closure, vec![*value])
+                        self.call_closure(closure, vec![*value])
                             .map_err(EvalError::Trap)?,
                     )))),
                     Err(error) => Ok(Value::Result(Err(error))),
                 }
             }
             "map_err" => {
-                let closure = closure_arg(&args, 0);
+                let closure = self.closure_arg(&args, 0)?;
                 match result.clone() {
                     Ok(value) => Ok(Value::Result(Ok(value))),
                     Err(error) => Ok(Value::Result(Err(Box::new(
-                        self.call_closure(&closure, vec![*error])
+                        self.call_closure(closure, vec![*error])
                             .map_err(EvalError::Trap)?,
                     )))),
                 }
             }
             "and_then" => {
-                let closure = closure_arg(&args, 0);
+                let closure = self.closure_arg(&args, 0)?;
                 match result.clone() {
                     Ok(value) => self
-                        .call_closure(&closure, vec![*value])
+                        .call_closure(closure, vec![*value])
                         .map_err(EvalError::Trap),
                     Err(error) => Ok(Value::Result(Err(error))),
                 }
@@ -715,22 +720,12 @@ impl<'p, 'h> Runtime<'p, 'h> {
             _ => self.trap(self.internal_panic(format!("unknown Result method `{name}`"))),
         }
     }
-}
 
-fn closure_arg(args: &[Value], index: usize) -> Closure {
-    match args.get(index) {
-        Some(Value::Fn(closure)) => (**closure).clone(),
-        _ => Closure {
-            target: ClosureTarget::Lambda {
-                params: Vec::new(),
-                body: LambdaBody::Expr(Box::new(Expr {
-                    id: martite_syntax::NodeId(0),
-                    span: Span::empty(0),
-                    kind: ExprKind::Unit,
-                })),
-            },
-            captures: HashMap::new(),
-        },
+    fn closure_arg<'a>(&self, args: &'a [Value], index: usize) -> EvalResult<&'a Closure> {
+        match args.get(index) {
+            Some(Value::Fn(closure)) => Ok(closure.as_ref()),
+            _ => self.trap(self.internal_panic("expected a function argument")),
+        }
     }
 }
 

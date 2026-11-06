@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use indexmap::IndexMap;
 use martite_check::{BindingId, BuiltinFn, DefId, TypeId};
-use martite_syntax::{LambdaBody, LambdaParam};
+use martite_syntax::NodeId;
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -55,16 +55,15 @@ pub struct HandleValue {
 #[derive(Debug, Clone)]
 pub struct Closure {
     pub target: ClosureTarget,
-    pub captures: HashMap<BindingId, Value>,
+    /// Captured free values. `None` for free-function values, which cannot
+    /// capture locals, and for lambdas with no free variables.
+    pub captures: Option<Rc<HashMap<BindingId, Value>>>,
 }
 
 #[derive(Debug, Clone)]
 pub enum ClosureTarget {
     Def(DefId),
-    Lambda {
-        params: Vec<LambdaParam>,
-        body: LambdaBody,
-    },
+    Lambda { node: NodeId },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -180,8 +179,10 @@ pub fn value_depth_exceeds(value: &Value, limit: usize) -> bool {
                 stack.push((value, depth + 1));
             }
             Value::Fn(closure) => {
-                for value in closure.captures.values() {
-                    stack.push((value, depth + 1));
+                if let Some(captures) = &closure.captures {
+                    for value in captures.values() {
+                        stack.push((value, depth + 1));
+                    }
                 }
             }
             Value::Unit
@@ -410,8 +411,10 @@ impl Value {
                     return 0;
                 }
                 let mut total = 16;
-                for value in closure.captures.values() {
-                    total += value.size_bytes(seen);
+                if let Some(captures) = &closure.captures {
+                    for value in captures.values() {
+                        total += value.size_bytes(seen);
+                    }
                 }
                 total
             }

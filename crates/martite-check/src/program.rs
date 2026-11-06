@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use martite_base::{SourceId, Span};
 use martite_resolve::{BuiltinItem, DefId, DefInfo, ModuleId, ModuleTarget, ResolvedProgram};
-use martite_syntax::{Block, FnDecl, NodeId};
+use martite_syntax::{Block, FnDecl, LambdaBody, LambdaParam, NodeId};
 
 use crate::ty::{BindingId, Ty, TypeId, TypeTable};
 
@@ -71,6 +71,16 @@ pub struct BindingInfo {
     pub declaration: NodeId,
     pub scope_depth: usize,
     pub is_self: bool,
+}
+
+/// Immutable lambda metadata owned by the checked program. Closures store the
+/// lambda's `NodeId` and this map supplies the AST without copying it per
+/// evaluation.
+#[derive(Debug, Clone)]
+pub struct LambdaInfo {
+    pub params: Vec<LambdaParam>,
+    pub body: LambdaBody,
+    pub captures: Vec<BindingId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +193,7 @@ pub struct CheckedProgram {
     pub bindings: HashMap<BindingId, BindingInfo>,
     pub pattern_bindings: HashMap<NodeId, BindingId>,
     pub param_bindings: HashMap<NodeId, BindingId>,
+    pub lambdas: HashMap<NodeId, LambdaInfo>,
     pub handlers: HashMap<String, DefId>,
     pub hooks: HashMap<String, HookSig>,
     pub tests: Vec<DefId>,
@@ -245,6 +256,10 @@ impl CheckedProgram {
 
     pub fn handler(&self, name: &str) -> Option<DefId> {
         self.handlers.get(name).copied()
+    }
+
+    pub fn lambda(&self, node: NodeId) -> Option<&LambdaInfo> {
+        self.lambdas.get(&node)
     }
 }
 

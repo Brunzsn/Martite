@@ -39,6 +39,12 @@ struct FnCtx {
     closure_boundary: Option<usize>,
 }
 
+struct LambdaCaptureCtx {
+    node: NodeId,
+    boundary: usize,
+    captures: HashSet<BindingId>,
+}
+
 struct Checker {
     resolved: ResolvedProgram,
     diagnostics: Vec<Diagnostic>,
@@ -55,6 +61,7 @@ struct Checker {
     bindings: HashMap<BindingId, BindingInfo>,
     pattern_bindings: HashMap<NodeId, BindingId>,
     param_bindings: HashMap<NodeId, BindingId>,
+    lambdas: HashMap<NodeId, LambdaInfo>,
     handlers: HashMap<String, DefId>,
     hooks: HashMap<String, HookSig>,
     tests: Vec<DefId>,
@@ -65,6 +72,7 @@ struct Checker {
     entry_kind: EntryKind,
     next_binding: u32,
     scopes: Vec<HashMap<String, BindingId>>,
+    lambda_stack: Vec<LambdaCaptureCtx>,
     ctx: Option<FnCtx>,
 }
 
@@ -86,6 +94,7 @@ impl Checker {
             bindings: HashMap::new(),
             pattern_bindings: HashMap::new(),
             param_bindings: HashMap::new(),
+            lambdas: HashMap::new(),
             handlers: HashMap::new(),
             hooks: HashMap::new(),
             tests: Vec::new(),
@@ -96,6 +105,7 @@ impl Checker {
             entry_kind: EntryKind::Library,
             next_binding: 0,
             scopes: Vec::new(),
+            lambda_stack: Vec::new(),
             ctx: None,
         }
     }
@@ -123,6 +133,7 @@ impl Checker {
             bindings: self.bindings,
             pattern_bindings: self.pattern_bindings,
             param_bindings: self.param_bindings,
+            lambdas: self.lambdas,
             handlers: self.handlers,
             hooks: self.hooks,
             tests: self.tests,
@@ -936,6 +947,17 @@ impl Checker {
             }
         }
         None
+    }
+
+    fn note_local_use(&mut self, id: BindingId) {
+        let Some(depth) = self.bindings.get(&id).map(|binding| binding.scope_depth) else {
+            return;
+        };
+        for lambda in &mut self.lambda_stack {
+            if depth < lambda.boundary {
+                lambda.captures.insert(id);
+            }
+        }
     }
 
     fn is_visible_name(&self, name: &str) -> bool {

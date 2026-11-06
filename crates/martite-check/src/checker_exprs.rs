@@ -196,7 +196,7 @@ impl Checker {
                 self.check_match(expr, scrutinee, arms, expected, infer)
             }
             ExprKind::Lambda { params, ret, body } => {
-                self.check_lambda(params, ret.as_ref(), body, expected, infer)
+                self.check_lambda(expr.id, params, ret.as_ref(), body, expected, infer)
             }
             ExprKind::Block(block) => self.check_block(block, expected, infer),
             ExprKind::Field { .. } => {
@@ -532,6 +532,7 @@ impl Checker {
 
     fn check_lambda(
         &mut self,
+        node: NodeId,
         params: &[LambdaParam],
         ret: Option<&TyExpr>,
         body: &LambdaBody,
@@ -575,6 +576,11 @@ impl Checker {
         let module = self.current_module();
         let saved_ctx = self.ctx.clone();
         let boundary = self.scopes.len();
+        self.lambda_stack.push(LambdaCaptureCtx {
+            node,
+            boundary,
+            captures: HashSet::new(),
+        });
         if let Some(ctx) = &mut self.ctx {
             ctx.return_ty = ret_ty.clone().unwrap_or(Ty::Error);
             ctx.loop_depth = 0;
@@ -615,6 +621,18 @@ impl Checker {
             LambdaBody::Expr(e) => self.check_expr(e, ret_ty.as_ref(), infer),
         };
         self.scopes.pop();
+        let lambda = self.lambda_stack.pop().expect("lambda capture context");
+        debug_assert_eq!(lambda.node, node);
+        let mut captures: Vec<BindingId> = lambda.captures.into_iter().collect();
+        captures.sort_unstable();
+        self.lambdas.insert(
+            node,
+            LambdaInfo {
+                params: params.to_vec(),
+                body: body.clone(),
+                captures,
+            },
+        );
         self.ctx = saved_ctx;
         let final_ret = ret_ty.unwrap_or(inferred_ret);
         Ty::Fn(param_tys, Box::new(final_ret))
@@ -906,6 +924,7 @@ impl Checker {
         if name == "self" {
             if let Some(ctx) = &self.ctx {
                 if let (Some(id), Some(ty)) = (ctx.self_binding, ctx.self_ty.clone()) {
+                    self.note_local_use(id);
                     self.resolutions.insert(expr.id, Resolution::Local(id));
                     return ty;
                 }
@@ -920,6 +939,7 @@ impl Checker {
             return Ty::Error;
         }
         if let Some(id) = self.lookup_local(name) {
+            self.note_local_use(id);
             let ty = self
                 .bindings
                 .get(&id)
