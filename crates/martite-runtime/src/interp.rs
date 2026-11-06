@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use martite_base::{SourceId, Span};
 use martite_check::{
     BindingId, BuiltinFn, BuiltinItem, BuiltinReceiver, CheckedProgram, ConstValue, DefId, FnKind,
-    PatResolution, PreludeVariant, Resolution,
+    FnSig, PatResolution, PreludeVariant, Resolution,
 };
 use martite_syntax::{
     AssignOp, BinaryOp, Block, Expr, ExprKind, LambdaBody, MatchBody, PatKind, Pattern, Stmt,
@@ -101,6 +101,8 @@ impl Trap {
 #[derive(Debug, Clone)]
 pub struct CallResult {
     pub value: Value,
+    /// Values of the `mut` parameters after the call, in declaration order.
+    /// Immutable parameters are not copied out.
     pub params: Vec<Value>,
 }
 
@@ -116,15 +118,15 @@ pub struct Runtime<'p, 'h> {
     fuel: u64,
     start: Instant,
     ticks: u64,
-    frames: Vec<Frame>,
+    frames: Vec<Frame<'p>>,
     log: Vec<String>,
     host: Option<&'h mut dyn HostDispatcher>,
 }
 
-struct Frame {
+struct Frame<'p> {
     locals: HashMap<BindingId, Value>,
     source: SourceId,
-    name: String,
+    name: &'p str,
 }
 
 enum EvalError {
@@ -189,8 +191,11 @@ impl<'p, 'h> Runtime<'p, 'h> {
 
     pub fn invoke(&mut self, def: DefId, args: Vec<Value>) -> Result<CallResult, Trap> {
         self.reset();
-        let (value, params) = self.call_def(def, args, None)?;
-        Ok(CallResult { value, params })
+        let (value, updated) = self.call_def(def, args)?;
+        Ok(CallResult {
+            value,
+            params: updated.into_iter().map(|(_, value)| value).collect(),
+        })
     }
 
     pub fn invoke_handler(
@@ -203,19 +208,20 @@ impl<'p, 'h> Runtime<'p, 'h> {
             return Ok(None);
         };
         self.reset();
-        let sig = self
-            .program
+        let program = self.program;
+        let sig = program
             .fn_sig(def)
-            .ok_or_else(|| self.internal_panic("missing handler signature"))?
-            .clone();
+            .ok_or_else(|| self.internal_panic("missing handler signature"))?;
+        let has_self = sig.has_self();
+        let self_mutable = sig.self_mutable();
         let mut call_args = Vec::new();
-        if sig.has_self() {
+        if has_self {
             call_args.push(state.clone().unwrap_or(Value::Unit));
         }
         call_args.extend(args);
-        let (value, params) = self.call_def(def, call_args, None)?;
-        if sig.self_param().is_some() && sig.self_mutable() {
-            *state = params.first().cloned();
+        let (value, mut updated) = self.call_def_sig(def, sig, call_args)?;
+        if has_self && self_mutable {
+            *state = take_writeback(&mut updated, 0);
         }
         Ok(Some(value))
     }
@@ -228,7 +234,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             trace: Vec::new(),
         })?;
         self.reset();
-        let (value, _) = self.call_def(main, Vec::new(), None)?;
+        let (value, _) = self.call_def(main, Vec::new())?;
         Ok(MainResult {
             value,
             log: self.take_log(),
@@ -247,7 +253,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             message: message.into(),
             source: self.frames.last().map(|f| f.source),
             span: None,
-            trace: self.frames.iter().map(|f| f.name.clone()).collect(),
+            trace: self.frames.iter().map(|f| f.name.to_string()).collect(),
         }
     }
 
@@ -256,7 +262,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             message: message.into(),
             source: self.frames.last().map(|f| f.source),
             span: Some(span),
-            trace: self.frames.iter().map(|f| f.name.clone()).collect(),
+            trace: self.frames.iter().map(|f| f.name.to_string()).collect(),
         }
     }
 
@@ -327,24 +333,30 @@ impl<'p, 'h> Runtime<'p, 'h> {
         &mut self,
         def: DefId,
         args: Vec<Value>,
-        captures: Option<HashMap<BindingId, Value>>,
-    ) -> Result<(Value, Vec<Value>), Trap> {
+    ) -> Result<(Value, Vec<(usize, Value)>), Trap> {
+        let program = self.program;
+        let sig = program
+            .fn_sig(def)
+            .ok_or_else(|| self.internal_panic("missing function signature"))?;
+        self.call_def_sig(def, sig, args)
+    }
+
+    fn call_def_sig(
+        &mut self,
+        def: DefId,
+        sig: &'p FnSig,
+        args: Vec<Value>,
+    ) -> Result<(Value, Vec<(usize, Value)>), Trap> {
         if self.frames.len() >= self.limits.depth as usize {
             return Err(Trap::DepthExceeded);
         }
-        let sig = self
-            .program
-            .fn_sig(def)
-            .ok_or_else(|| self.internal_panic("missing function signature"))?
-            .clone();
         if sig.kind == FnKind::Host {
-            return self.call_host(def, args);
+            return Ok((self.call_host(def, args)?, Vec::new()));
         }
-        let body = self
-            .program
+        let program = self.program;
+        let body = program
             .function_block(def)
-            .ok_or_else(|| self.internal_panic(format!("function `{}` has no body", sig.name)))?
-            .clone();
+            .ok_or_else(|| self.internal_panic(format!("function `{}` has no body", sig.name)))?;
         if args.len() != sig.params.len() {
             return Err(self.internal_panic(format!(
                 "`{}` expected {} arguments, got {}",
@@ -353,15 +365,15 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 args.len()
             )));
         }
-        let source = self.program.resolved.module(sig.module).source;
-        let mut locals = captures.unwrap_or_default();
-        for (param, value) in sig.params.iter().zip(args.iter()) {
-            locals.insert(param.binding, value.clone());
+        let source = program.resolved.module(sig.module).source;
+        let mut locals = HashMap::new();
+        for (param, value) in sig.params.iter().zip(args) {
+            locals.insert(param.binding, value);
         }
         self.frames.push(Frame {
             locals,
             source,
-            name: sig.name.clone(),
+            name: sig.name.as_str(),
         });
         if let Err(trap) = self.check_memory() {
             self.frames.pop();
@@ -370,7 +382,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 _ => Trap::OutOfMemory,
             });
         }
-        let result = match self.eval_block(&body) {
+        let result = match self.eval_block(body) {
             Ok(value) => Ok(value),
             Err(EvalError::Return(value)) => Ok(value),
             Err(EvalError::Trap(trap)) => Err(trap),
@@ -378,12 +390,21 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 Err(self.internal_panic("`break`/`continue` escaped a loop"))
             }
         };
-        let updated = {
-            let frame = self.frames.last().unwrap();
+        let updated = if result.is_ok() {
+            let frame = self.frames.last_mut().expect("frame");
             sig.params
                 .iter()
-                .map(|p| frame.locals.get(&p.binding).cloned().unwrap_or(Value::Unit))
-                .collect::<Vec<_>>()
+                .enumerate()
+                .filter(|(_, param)| param.mutable)
+                .map(|(index, param)| {
+                    (
+                        index,
+                        frame.locals.remove(&param.binding).unwrap_or(Value::Unit),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
         };
         self.frames.pop();
         let value = result?;
@@ -398,7 +419,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         Ok((value, updated))
     }
 
-    fn call_host(&mut self, def: DefId, args: Vec<Value>) -> Result<(Value, Vec<Value>), Trap> {
+    fn call_host(&mut self, def: DefId, args: Vec<Value>) -> Result<Value, Trap> {
         if self.deadline_due() {
             return Err(Trap::Deadline);
         }
@@ -429,7 +450,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                         EvalError::Trap(trap) => trap,
                         _ => Trap::OutOfMemory,
                     })?;
-                Ok((value, args))
+                Ok(value)
             }
             Err(fault) => Err(Trap::HostFault(fault.message)),
         }
@@ -437,9 +458,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
 
     fn call_closure(&mut self, closure: &Closure, args: Vec<Value>) -> Result<Value, Trap> {
         match &closure.target {
-            ClosureTarget::Def(def) => self
-                .call_def(*def, args, Some(closure.captures.clone()))
-                .map(|(value, _)| value),
+            ClosureTarget::Def(def) => self.call_def(*def, args).map(|(value, _)| value),
             ClosureTarget::Lambda { params, body } => {
                 if params.len() != args.len() {
                     return Err(self.internal_panic("lambda argument count mismatch"));
@@ -451,7 +470,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 self.frames.push(Frame {
                     locals: closure.captures.clone(),
                     source,
-                    name: "<lambda>".into(),
+                    name: "<lambda>",
                 });
                 for (param, value) in params.iter().zip(args.iter()) {
                     self.bind_pattern(&param.pattern, value);
@@ -1107,10 +1126,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
         def: DefId,
         args: &[martite_syntax::Arg],
     ) -> EvalResult<Value> {
-        let sig = self
-            .program
+        let program = self.program;
+        let sig = program
             .fn_sig(def)
-            .cloned()
             .ok_or_else(|| EvalError::Trap(self.internal_panic("missing function")))?;
         if sig.params.len() != args.len() {
             return self.trap(self.internal_panic("argument count mismatch"));
@@ -1127,9 +1145,11 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 values.push(self.eval_expr(&arg.expr)?);
             }
         }
-        let (value, params) = self.call_def(def, values, None).map_err(EvalError::Trap)?;
+        let (value, mut updated) = self
+            .call_def_sig(def, sig, values)
+            .map_err(EvalError::Trap)?;
         for (place, index) in writebacks {
-            if let Some(value) = params.get(index).cloned() {
+            if let Some(value) = take_writeback(&mut updated, index) {
                 self.write_place(place, value)?;
             }
         }
@@ -1144,10 +1164,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
         receiver: &Expr,
         args: &[martite_syntax::Arg],
     ) -> EvalResult<Value> {
-        let sig = self
-            .program
+        let program = self.program;
+        let sig = program
             .fn_sig(def)
-            .cloned()
             .ok_or_else(|| EvalError::Trap(self.internal_panic("missing method")))?;
         if sig.params.len() != args.len() + 1 {
             return self.trap(self.internal_panic("method argument count mismatch"));
@@ -1171,14 +1190,18 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 values.push(self.eval_expr(&arg.expr)?);
             }
         }
-        let (value, params) = self.call_def(def, values, None).map_err(EvalError::Trap)?;
+        let (value, mut updated) = self
+            .call_def_sig(def, sig, values)
+            .map_err(EvalError::Trap)?;
         if sig.self_mutable() {
-            if let (Some(place), Some(new_value)) = (receiver_place, params.first().cloned()) {
+            if let (Some(place), Some(new_value)) =
+                (receiver_place, take_writeback(&mut updated, 0))
+            {
                 self.write_place(place, new_value)?;
             }
         }
         for (place, index) in writebacks {
-            if let Some(value) = params.get(index).cloned() {
+            if let Some(value) = take_writeback(&mut updated, index) {
                 self.write_place(place, value)?;
             }
         }
@@ -1911,6 +1934,11 @@ impl<'p, 'h> Runtime<'p, 'h> {
 }
 
 include!("builtins.rs");
+
+fn take_writeback(updated: &mut Vec<(usize, Value)>, index: usize) -> Option<Value> {
+    let position = updated.iter().position(|(slot, _)| *slot == index)?;
+    Some(updated.swap_remove(position).1)
+}
 
 fn value_cost(value: &Value) -> u64 {
     match value {
