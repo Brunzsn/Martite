@@ -313,7 +313,8 @@ fn golden_fixtures() {
         let source = std::fs::read_to_string(&before).expect("read fixture");
         let expected = martite_base::normalize_source(
             &std::fs::read_to_string(&after).expect("read expected fixture"),
-        );
+        )
+        .into_owned();
         let actual = format_ok(&source, interface);
         assert_eq!(actual, expected, "fixture {}", before.display());
         assert_eq!(format_ok(&actual, interface), actual);

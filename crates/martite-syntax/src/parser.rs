@@ -33,12 +33,42 @@ pub struct ParseOutput {
 
 pub fn parse_source(source: &str, limits: LoadLimits) -> ParseOutput {
     let source = normalize_source(source);
-    Parser::new(&source, limits, false).parse_program()
+    parse_source_normalized(&source, limits)
+}
+
+/// Parse source that has already been normalized with
+/// [`normalize_source`](martite_base::normalize_source).
+pub fn parse_source_normalized(source: &str, limits: LoadLimits) -> ParseOutput {
+    Parser::new(source, limits, false).parse_program()
 }
 
 pub fn parse_interface(source: &str, limits: LoadLimits) -> ParseOutput {
     let source = normalize_source(source);
-    Parser::new(&source, limits, true).parse_program()
+    parse_interface_normalized(&source, limits)
+}
+
+/// Parse an interface that has already been normalized with
+/// [`normalize_source`](martite_base::normalize_source).
+pub fn parse_interface_normalized(source: &str, limits: LoadLimits) -> ParseOutput {
+    Parser::new(source, limits, true).parse_program()
+}
+
+/// Parse already-normalized source and return the token stream for the
+/// formatter. Normal checking uses [`parse_source`] and does not retain tokens.
+pub fn parse_source_normalized_with_tokens(
+    source: &str,
+    limits: LoadLimits,
+) -> (ParseOutput, Vec<Token>) {
+    Parser::new(source, limits, false).parse_program_with_tokens()
+}
+
+/// Parse an already-normalized interface and return the token stream for the
+/// formatter.
+pub fn parse_interface_normalized_with_tokens(
+    source: &str,
+    limits: LoadLimits,
+) -> (ParseOutput, Vec<Token>) {
+    Parser::new(source, limits, true).parse_program_with_tokens()
 }
 
 type PResult<T> = Result<T, ()>;
@@ -91,7 +121,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_program(mut self) -> ParseOutput {
+    fn parse_program(self) -> ParseOutput {
+        self.parse_program_with_tokens().0
+    }
+
+    fn parse_program_with_tokens(mut self) -> (ParseOutput, Vec<Token>) {
         let start = self.span();
         let mut items = Vec::new();
         loop {
@@ -111,19 +145,24 @@ impl<'a> Parser<'a> {
             }
         }
         let end = self.span();
-        ParseOutput {
-            program: Program {
-                items,
-                is_interface: self.interface,
-                span: start.merge(end),
-                comments: self.comments,
-                parenthesized: self.parenthesized,
-                expression_parens: self.expression_parens,
-                type_parens: self.type_parens,
-                pattern_parens: self.pattern_parens,
+        let tokens = self.tokens;
+        let program = Program {
+            items,
+            is_interface: self.interface,
+            span: start.merge(end),
+            comments: self.comments,
+            parenthesized: self.parenthesized,
+            expression_parens: self.expression_parens,
+            type_parens: self.type_parens,
+            pattern_parens: self.pattern_parens,
+        };
+        (
+            ParseOutput {
+                program,
+                diagnostics: self.diagnostics,
             },
-            diagnostics: self.diagnostics,
-        }
+            tokens,
+        )
     }
 
     // ----- token helpers -------------------------------------------------

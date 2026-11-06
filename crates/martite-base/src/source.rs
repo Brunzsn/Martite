@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -50,12 +51,12 @@ impl Span {
 /// A leading BOM is removed and CRLF is normalized to LF, as required by the
 /// language rules. Keeping this in one place means token spans always refer to
 /// the same bytes that a [`SourceMap`] serves to diagnostics.
-pub fn normalize_source(text: &str) -> String {
+pub fn normalize_source(text: &str) -> Cow<'_, str> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     if text.contains("\r\n") {
-        text.replace("\r\n", "\n")
+        Cow::Owned(text.replace("\r\n", "\n"))
     } else {
-        text.to_string()
+        Cow::Borrowed(text)
     }
 }
 
@@ -69,7 +70,11 @@ pub struct SourceFile {
 
 impl SourceFile {
     fn new(name: String, text: String) -> Self {
-        let text = normalize_source(&text);
+        let text = if text.starts_with('\u{feff}') || text.contains("\r\n") {
+            normalize_source(&text).into_owned()
+        } else {
+            text
+        };
         let mut line_starts = vec![0];
         for (i, b) in text.bytes().enumerate() {
             if b == b'\n' {
@@ -396,6 +401,21 @@ mod tests {
         let file = SourceFile::new("x.mt".into(), "\u{feff}a\r\nb".into());
         assert_eq!(file.text(), "a\nb");
         assert_eq!(file.line_col(2), (2, 1));
+    }
+
+    #[test]
+    fn normalization_borrows_when_the_text_is_unchanged() {
+        let clean = normalize_source("a\nb");
+        assert!(matches!(clean, Cow::Borrowed(_)));
+        assert_eq!(clean, "a\nb");
+
+        let bom = normalize_source("\u{feff}a\nb");
+        assert!(matches!(bom, Cow::Borrowed(_)));
+        assert_eq!(bom, "a\nb");
+
+        let crlf = normalize_source("a\r\nb");
+        assert!(matches!(crlf, Cow::Owned(_)));
+        assert_eq!(crlf, "a\nb");
     }
 
     #[test]
