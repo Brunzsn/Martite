@@ -8,13 +8,13 @@ use martite_check::{
     FnSig, PatResolution, PreludeVariant, Resolution,
 };
 use martite_syntax::{
-    AssignOp, BinaryOp, Block, Expr, ExprKind, LambdaBody, MatchBody, PatKind, Pattern, Stmt,
-    StmtKind, StrExprPart, UnaryOp,
+    AssignOp, BinaryOp, Block, Expr, ExprKind, LambdaBody, MatchBody, NodeId, PatKind, Pattern,
+    Stmt, StmtKind, StrExprPart, UnaryOp,
 };
 use smallvec::{SmallVec, smallvec};
 
 use crate::cost::{comparison_cost, show_slots};
-use crate::ops::{show, value_eq, value_ord};
+use crate::ops::{show, value_eq, value_ord, write_show};
 use crate::value::{
     Closure, ClosureTarget, EnumValue, FnValue, MAX_VALUE_DEPTH, MapValue, OrderedMap, SeqValue,
     StructValue, Value, key_from_value, key_to_value, key_value_size, value_depth_exceeds,
@@ -128,6 +128,14 @@ pub struct Runtime<'p, 'h> {
     /// Allocation bytes recorded since the last exact scan. This is a
     /// conservative upper bound: freed values are only subtracted by a scan.
     pending_bytes: u64,
+    /// Immutable values materialized from `program.consts`. Program data is not
+    /// part of the per-call memory census, but the first materialization is
+    /// charged to `pending_bytes`.
+    const_values: HashMap<DefId, Value>,
+    /// Values of immutable string literals, keyed by expression node. Program
+    /// data is not part of the per-call memory census, but the first evaluation
+    /// is charged to `pending_bytes`.
+    literal_values: HashMap<NodeId, Value>,
 }
 
 struct Frame<'p> {
@@ -211,6 +219,8 @@ impl<'p, 'h> Runtime<'p, 'h> {
             host: None,
             census_bytes: 0,
             pending_bytes: 0,
+            const_values: HashMap::new(),
+            literal_values: HashMap::new(),
         }
     }
 
@@ -814,7 +824,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             ExprKind::Float(v) => Ok(Value::Float(*v)),
             ExprKind::Bool(v) => Ok(Value::Bool(*v)),
             ExprKind::Unit => Ok(Value::Unit),
-            ExprKind::Str(parts) => self.eval_string(parts, expr.span),
+            ExprKind::Str(parts) => self.eval_string(expr, parts),
             ExprKind::Var(_) => self.eval_var(expr),
             ExprKind::Tuple(items) => {
                 let mut values = Vec::with_capacity(items.len());
@@ -988,7 +998,8 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     (martite_syntax::PrimTy::Float, Value::Int(v)) => Ok(Value::Float(v as f64)),
                     (martite_syntax::PrimTy::Str, value) => {
                         self.charge(show_slots(&value))?;
-                        let text = show(&value, &self.program.types, true);
+                        let mut text = String::new();
+                        write_show(&mut text, &value, &self.program.types, true);
                         self.note_alloc(16 + text.len() as u64);
                         Ok(Value::str(text))
                     }
@@ -998,7 +1009,13 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
     }
 
-    fn eval_string(&mut self, parts: &[StrExprPart], span: Span) -> EvalResult<Value> {
+    fn eval_string(&mut self, expr: &Expr, parts: &[StrExprPart]) -> EvalResult<Value> {
+        if parts
+            .iter()
+            .all(|part| matches!(part, StrExprPart::Text(_)))
+        {
+            return self.eval_static_string(expr.id, parts);
+        }
         let mut out = String::new();
         let mut slot_cost = 0;
         for part in parts {
@@ -1007,15 +1024,42 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 StrExprPart::Expr(expr) => {
                     let value = self.eval_expr(expr)?;
                     slot_cost += show_slots(&value);
-                    out.push_str(&show(&value, &self.program.types, true));
+                    write_show(&mut out, &value, &self.program.types, true);
                 }
             }
         }
-        let _ = span;
         self.charge(slot_cost)?;
         self.charge((out.len() as u64).div_ceil(8))?;
         self.note_alloc(16 + out.len() as u64);
         Ok(Value::str(out))
+    }
+
+    /// A string literal without interpolation is immutable and can be shared
+    /// between evaluations. Fuel still charges its bytes on every use, keeping
+    /// the edition fuel table unchanged.
+    fn eval_static_string(&mut self, node: NodeId, parts: &[StrExprPart]) -> EvalResult<Value> {
+        let len: usize = parts
+            .iter()
+            .map(|part| match part {
+                StrExprPart::Text(text) => text.len(),
+                StrExprPart::Expr(_) => 0,
+            })
+            .sum();
+        if let Some(value) = self.literal_values.get(&node).cloned() {
+            self.charge((len as u64).div_ceil(8))?;
+            return Ok(value);
+        }
+        let mut out = String::with_capacity(len);
+        for part in parts {
+            if let StrExprPart::Text(text) = part {
+                out.push_str(text);
+            }
+        }
+        self.charge((out.len() as u64).div_ceil(8))?;
+        self.note_alloc(16 + out.len() as u64);
+        let value = Value::str(out);
+        self.literal_values.insert(node, value.clone());
+        Ok(value)
     }
 
     fn eval_var(&mut self, expr: &Expr) -> EvalResult<Value> {
@@ -1027,7 +1071,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 .local_value(id)
                 .cloned()
                 .ok_or_else(|| EvalError::Trap(self.internal_panic("unbound local"))),
-            Some(Resolution::Const(def)) => self.materialize_const(def, expr.span),
+            Some(Resolution::Const(def)) => self.materialize_const(def),
             Some(Resolution::Fn(def))
             | Some(Resolution::Handler(def))
             | Some(Resolution::Test(def)) => Ok(Value::Fn(FnValue::Def(def))),
@@ -1041,7 +1085,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 }))
             }
             Some(Resolution::BuiltinFn(function)) => Ok(Value::Builtin(function)),
-            Some(Resolution::ModuleItem(def)) => self.value_of_def(def, expr.span),
+            Some(Resolution::ModuleItem(def)) => self.value_of_def(def),
             Some(Resolution::BuiltinItem(item)) => self.value_of_builtin_item(&item),
             Some(Resolution::Variant(id, index)) => {
                 let payload = self
@@ -1064,12 +1108,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
     }
 
-    fn value_of_def(&mut self, def: DefId, span: Span) -> EvalResult<Value> {
-        if let Some(info) = self.program.consts.get(&def) {
-            let value = info.value.clone();
-            let value = self.const_to_value(&value, span);
-            self.note_value(&value);
-            return Ok(value);
+    fn value_of_def(&mut self, def: DefId) -> EvalResult<Value> {
+        if self.program.consts.contains_key(&def) {
+            return self.materialize_const(def);
         }
         Ok(Value::Fn(FnValue::Def(def)))
     }
@@ -1112,7 +1153,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 self.note_alloc(16);
                 Ok(Value::Enum(Rc::new(EnumValue::new(id, index, Vec::new()))))
             }
-            Some(Resolution::ModuleItem(def)) => self.value_of_def(def, expr.span),
+            Some(Resolution::ModuleItem(def)) => self.value_of_def(def),
             Some(Resolution::BuiltinItem(item)) => self.value_of_builtin_item(&item),
             Some(Resolution::Method(_)) | Some(Resolution::BuiltinMethod { .. }) => {
                 self.trap(self.internal_panic("method used as a value"))
@@ -1770,7 +1811,8 @@ impl<'p, 'h> Runtime<'p, 'h> {
             BuiltinFn::Print => {
                 let value = values.into_iter().next().unwrap_or(Value::Unit);
                 self.charge(show_slots(&value))?;
-                let text = show(&value, &self.program.types, true);
+                let mut text = String::new();
+                write_show(&mut text, &value, &self.program.types, true);
                 self.charge((text.len() as u64).div_ceil(8))?;
                 self.log.push(text);
                 self.maybe_check_memory()?;
@@ -2276,51 +2318,59 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
     }
 
-    fn materialize_const(&mut self, def: DefId, span: Span) -> EvalResult<Value> {
-        let value = self
-            .program
+    fn materialize_const(&mut self, def: DefId) -> EvalResult<Value> {
+        if let Some(value) = self.const_values.get(&def) {
+            return Ok(value.clone());
+        }
+        let program = self.program;
+        let info = program
             .consts
             .get(&def)
-            .map(|c| c.value.clone())
             .ok_or_else(|| EvalError::Trap(self.internal_panic("unknown constant")))?;
-        let value = self.const_to_value(&value, span);
+        let value = Self::const_to_value(program, &info.value);
         self.note_value(&value);
+        self.const_values.insert(def, value.clone());
         Ok(value)
     }
 
-    fn const_to_value(&self, value: &ConstValue, span: Span) -> Value {
-        let _ = span;
+    fn const_to_value(program: &CheckedProgram, value: &ConstValue) -> Value {
         match value {
             ConstValue::Unit => Value::Unit,
             ConstValue::Int(v) => Value::Int(*v),
             ConstValue::Float(v) => Value::Float(*v),
             ConstValue::Bool(v) => Value::Bool(*v),
             ConstValue::Str(v) => Value::str(v.clone()),
-            ConstValue::Tuple(items) => {
-                Value::tuple(items.iter().map(|v| self.const_to_value(v, span)).collect())
-            }
-            ConstValue::List(items) => {
-                Value::list(items.iter().map(|v| self.const_to_value(v, span)).collect())
-            }
+            ConstValue::Tuple(items) => Value::tuple(
+                items
+                    .iter()
+                    .map(|v| Self::const_to_value(program, v))
+                    .collect(),
+            ),
+            ConstValue::List(items) => Value::list(
+                items
+                    .iter()
+                    .map(|v| Self::const_to_value(program, v))
+                    .collect(),
+            ),
             ConstValue::Map(entries) => {
                 let mut map = OrderedMap::new();
                 for (k, v) in entries {
-                    let key_value = self.const_to_value(k, span);
+                    let key_value = Self::const_to_value(program, k);
                     if let Ok(key) = key_from_value(&key_value) {
-                        map.insert(key, self.const_to_value(v, span));
+                        map.insert(key, Self::const_to_value(program, v));
                     }
                 }
                 Value::map(map)
             }
             ConstValue::Struct(type_id, fields) => {
                 let mut values = Vec::new();
-                if let Some(def) = self.program.types.get(*type_id) {
+                if let Some(def) = program.types.get(*type_id) {
                     if let martite_check::TypeDefKind::Struct { fields: def_fields } = &def.kind {
                         for field in def_fields {
                             let value = fields
                                 .iter()
                                 .find(|(name, _)| name == &field.name)
-                                .map(|(_, v)| self.const_to_value(v, span))
+                                .map(|(_, v)| Self::const_to_value(program, v))
                                 .unwrap_or(Value::Unit);
                             values.push(value);
                         }
@@ -2333,13 +2383,13 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 *variant,
                 payload
                     .iter()
-                    .map(|v| self.const_to_value(v, span))
+                    .map(|v| Self::const_to_value(program, v))
                     .collect(),
             ))),
             ConstValue::Prelude(variant, payload) => {
                 let value = payload
                     .first()
-                    .map(|v| self.const_to_value(v, span))
+                    .map(|v| Self::const_to_value(program, v))
                     .unwrap_or(Value::Unit);
                 match variant {
                     PreludeVariant::None => Value::Option(None),

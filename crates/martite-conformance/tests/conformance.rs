@@ -163,6 +163,66 @@ fn show_format_golden() {
 }
 
 #[test]
+fn const_values_are_shared_but_stay_immutable() {
+    let logs = run(r#"
+        struct Point { x: int, y: int }
+
+        const VALUES: list[int] = [1, 2, 3]
+        const TABLE: map[str, int] = {"a": 1, "b": 2}
+        const ORIGIN: Point = Point { x: 4, y: 5 }
+        const NESTED: map[str, list[int]] = {"a": [1]}
+
+        fn main() {
+            var copy = VALUES
+            copy.push(4)
+            var table = TABLE
+            table["c"] = 3
+            var nested = NESTED
+            nested["a"].push(2)
+            print("{VALUES}")
+            print("{copy}")
+            print("{TABLE}")
+            print("{table}")
+            print("{NESTED}")
+            print("{nested}")
+            print("{ORIGIN.x + ORIGIN.y}")
+        }
+        "#);
+    assert_eq!(
+        logs,
+        vec![
+            "[1, 2, 3]",
+            "[1, 2, 3, 4]",
+            "{\"a\": 1, \"b\": 2}",
+            "{\"a\": 1, \"b\": 2, \"c\": 3}",
+            "{\"a\": [1]}",
+            "{\"a\": [1, 2]}",
+            "9",
+        ]
+    );
+}
+
+#[test]
+fn const_containers_are_reused_in_loops() {
+    let logs = run(r#"
+        const VALUES: list[int] = [1, 2, 3, 4]
+        const TABLE: map[str, int] = {"a": 1, "b": 2}
+
+        fn main() {
+            var total = 0
+            var index = 0
+            while index < 3 {
+                total += VALUES[0] + VALUES[3]
+                total += TABLE["a"] + TABLE["b"]
+                index += 1
+            }
+            print("{total}")
+        }
+        "#);
+    assert_eq!(logs, ["24"]);
+}
+
+#[test]
 fn std_math_surface_uses_euler() {
     let logs = run(r#"
         use std.math

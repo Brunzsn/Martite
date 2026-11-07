@@ -170,7 +170,8 @@ pub fn show(value: &Value, types: &TypeTable, top: bool) -> String {
     out
 }
 
-fn write_show(out: &mut String, value: &Value, types: &TypeTable, top: bool) {
+/// Appends the normative `Show` format to `out`.
+pub(crate) fn write_show(out: &mut String, value: &Value, types: &TypeTable, top: bool) {
     use std::fmt::Write;
     match value {
         Value::Unit => out.push_str("()"),

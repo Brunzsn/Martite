@@ -293,14 +293,11 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 Ok(Value::list(keyed.into_iter().map(|(_, v)| v).collect()))
             }
             "join" => {
-                let sep = args
-                    .first()
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_default();
+                let sep = args.first().and_then(|v| v.as_str()).unwrap_or_default();
                 let mut out = String::new();
                 for (i, item) in items.iter().enumerate() {
                     if i > 0 {
-                        out.push_str(&sep);
+                        out.push_str(sep);
                     }
                     if let Some(s) = item.as_str() {
                         out.push_str(s);
@@ -488,72 +485,51 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 ))
             }
             "split" => {
-                let sep = args
-                    .first()
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_default();
+                let sep = args.first().and_then(|v| v.as_str()).unwrap_or_default();
                 let parts: Vec<Value> = if sep.is_empty() {
                     text.chars().map(|c| Value::str(c.to_string())).collect()
                 } else {
-                    text.split(&sep).map(Value::str).collect()
+                    text.split(sep).map(|part| Value::Str(Rc::from(part))).collect()
                 };
                 self.charge((text.len() as u64).div_ceil(8))?;
                 Ok(Value::list(parts))
             }
             "trim" => {
-                let out = text.trim().to_string();
+                let out = text.trim();
                 self.charge((out.len() as u64).div_ceil(8))?;
-                Ok(Value::str(out))
+                Ok(Value::Str(Rc::from(out)))
             }
             "contains" => {
-                let needle = args
-                    .first()
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_default();
+                let needle = args.first().and_then(|v| v.as_str()).unwrap_or_default();
                 self.charge((text.len() as u64).div_ceil(8))?;
-                Ok(Value::Bool(text.contains(&needle)))
+                Ok(Value::Bool(text.contains(needle)))
             }
             "find" => {
-                let needle = args
-                    .first()
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_default();
+                let needle = args.first().and_then(|v| v.as_str()).unwrap_or_default();
                 self.charge((text.len() as u64).div_ceil(8))?;
                 Ok(text
-                    .find(&needle)
+                    .find(needle)
                     .map(|byte| Value::Int(text[..byte].chars().count() as i64))
                     .map(|v| Value::Option(Some(Box::new(v))))
                     .unwrap_or(Value::Option(None)))
             }
             "starts_with" => {
-                let needle = args
-                    .first()
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_default();
+                let needle = args.first().and_then(|v| v.as_str()).unwrap_or_default();
                 self.charge((text.len() as u64).div_ceil(8))?;
-                Ok(Value::Bool(text.starts_with(&needle)))
+                Ok(Value::Bool(text.starts_with(needle)))
             }
             "ends_with" => {
-                let needle = args
-                    .first()
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_default();
+                let needle = args.first().and_then(|v| v.as_str()).unwrap_or_default();
                 self.charge((text.len() as u64).div_ceil(8))?;
-                Ok(Value::Bool(text.ends_with(&needle)))
+                Ok(Value::Bool(text.ends_with(needle)))
             }
             "replace" => {
-                let from = args
-                    .first()
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_default();
-                let to = args
-                    .get(1)
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_default();
+                let from = args.first().and_then(|v| v.as_str()).unwrap_or_default();
+                let to = args.get(1).and_then(|v| v.as_str()).unwrap_or_default();
                 if from.is_empty() {
                     return self.trap(self.panic("replace with an empty `from`", span));
                 }
-                let out = text.replace(&from, &to);
+                let out = text.replace(from, to);
                 self.charge((out.len() as u64).div_ceil(8))?;
                 Ok(Value::str(out))
             }
