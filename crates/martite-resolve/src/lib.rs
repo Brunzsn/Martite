@@ -35,6 +35,8 @@ pub struct DefInfo {
     pub is_pub: bool,
     pub node: NodeId,
     pub item_index: usize,
+    /// Position inside the `impl` block for `DefKind::Method` definitions.
+    pub method_index: Option<usize>,
     pub container: Option<String>,
 }
 
@@ -537,6 +539,7 @@ impl<'a> Loader<'a> {
             is_pub,
             node,
             item_index,
+            method_index: None,
             container,
         });
         self.node_to_def.insert(node, id);
@@ -833,7 +836,7 @@ impl<'a> Loader<'a> {
                     _ => HashSet::new(),
                 };
                 let methods = methods_by_type.entry(imp.type_name.clone()).or_default();
-                for method in &imp.methods {
+                for (method_index, method) in imp.methods.iter().enumerate() {
                     self.check_params(module_id, &method.params);
                     self.check_type_params(module_id, &method.generics);
                     if field_names.contains(&method.name) {
@@ -864,6 +867,7 @@ impl<'a> Loader<'a> {
                         index,
                         Some(imp.type_name.clone()),
                     );
+                    self.defs[def.0 as usize].method_index = Some(method_index);
                     self.node_to_def.insert(method.id, def);
                 }
             }

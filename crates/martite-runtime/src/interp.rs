@@ -11,6 +11,7 @@ use martite_syntax::{
     AssignOp, BinaryOp, Block, Expr, ExprKind, LambdaBody, MatchBody, PatKind, Pattern, Stmt,
     StmtKind, StrExprPart, UnaryOp,
 };
+use smallvec::{SmallVec, smallvec};
 
 use crate::cost::{comparison_cost, show_slots};
 use crate::ops::{show, value_eq, value_ord};
@@ -130,7 +131,7 @@ pub struct Runtime<'p, 'h> {
 }
 
 struct Frame<'p> {
-    locals: HashMap<BindingId, Value>,
+    locals: Locals,
     /// Undo log for bindings introduced by an attempted match pattern. Each
     /// entry restores the previous value, or removes the binding when it was
     /// absent.
@@ -139,6 +140,43 @@ struct Frame<'p> {
     source: SourceId,
     name: &'p str,
 }
+
+/// Per-frame local bindings. `BindingId`s are dense, but not contiguous per
+/// function, so this uses a small inline list instead of a hash map. Lookups
+/// are linear over the (typically tiny) set of live bindings.
+#[derive(Default)]
+struct Locals {
+    slots: SmallVec<[(BindingId, Value); 8]>,
+}
+
+impl Locals {
+    fn get(&self, id: BindingId) -> Option<&Value> {
+        self.slots
+            .iter()
+            .find(|(binding, _)| *binding == id)
+            .map(|(_, value)| value)
+    }
+
+    fn insert(&mut self, id: BindingId, value: Value) -> Option<Value> {
+        if let Some((_, existing)) = self.slots.iter_mut().find(|(binding, _)| *binding == id) {
+            return Some(std::mem::replace(existing, value));
+        }
+        self.slots.push((id, value));
+        None
+    }
+
+    fn remove(&mut self, id: BindingId) -> Option<Value> {
+        let index = self.slots.iter().position(|(binding, _)| *binding == id)?;
+        Some(self.slots.swap_remove(index).1)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Value> {
+        self.slots.iter().map(|(_, value)| value)
+    }
+}
+
+type CallArgs = SmallVec<[Value; 4]>;
+type Writebacks = SmallVec<[(usize, Value); 2]>;
 
 enum EvalError {
     Trap(Trap),
@@ -205,7 +243,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
     pub fn invoke(&mut self, def: DefId, args: Vec<Value>) -> Result<CallResult, Trap> {
         self.reset();
         self.note_values(&args);
-        let (value, updated) = self.call_def(def, args)?;
+        let (value, updated) = self.call_def(def, CallArgs::from_vec(args))?;
         Ok(CallResult {
             value,
             params: updated.into_iter().map(|(_, value)| value).collect(),
@@ -232,7 +270,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             .ok_or_else(|| self.internal_panic("missing handler signature"))?;
         let has_self = sig.has_self();
         let self_mutable = sig.self_mutable();
-        let mut call_args = Vec::new();
+        let mut call_args = CallArgs::new();
         if has_self {
             call_args.push(state.clone().unwrap_or(Value::Unit));
         }
@@ -252,7 +290,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             trace: Vec::new(),
         })?;
         self.reset();
-        let (value, _) = self.call_def(main, Vec::new())?;
+        let (value, _) = self.call_def(main, CallArgs::new())?;
         Ok(MainResult {
             value,
             log: self.take_log(),
@@ -383,11 +421,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
     }
 
-    fn call_def(
-        &mut self,
-        def: DefId,
-        args: Vec<Value>,
-    ) -> Result<(Value, Vec<(usize, Value)>), Trap> {
+    fn call_def(&mut self, def: DefId, args: CallArgs) -> Result<(Value, Writebacks), Trap> {
         let program = self.program;
         let sig = program
             .fn_sig(def)
@@ -399,13 +433,13 @@ impl<'p, 'h> Runtime<'p, 'h> {
         &mut self,
         def: DefId,
         sig: &'p FnSig,
-        args: Vec<Value>,
-    ) -> Result<(Value, Vec<(usize, Value)>), Trap> {
+        args: CallArgs,
+    ) -> Result<(Value, Writebacks), Trap> {
         if self.frames.len() >= self.limits.depth as usize {
             return Err(Trap::DepthExceeded);
         }
         if sig.kind == FnKind::Host {
-            return Ok((self.call_host(def, args)?, Vec::new()));
+            return Ok((self.call_host(def, args)?, Writebacks::new()));
         }
         let program = self.program;
         let body = program
@@ -420,7 +454,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             )));
         }
         let source = program.resolved.module(sig.module).source;
-        let mut locals = HashMap::new();
+        let mut locals = Locals::default();
         for (param, value) in sig.params.iter().zip(args) {
             locals.insert(param.binding, value);
         }
@@ -455,12 +489,12 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 .map(|(index, param)| {
                     (
                         index,
-                        frame.locals.remove(&param.binding).unwrap_or(Value::Unit),
+                        frame.locals.remove(param.binding).unwrap_or(Value::Unit),
                     )
                 })
                 .collect()
         } else {
-            Vec::new()
+            Writebacks::new()
         };
         self.frames.pop();
         let value = result?;
@@ -475,7 +509,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         Ok((value, updated))
     }
 
-    fn call_host(&mut self, def: DefId, args: Vec<Value>) -> Result<Value, Trap> {
+    fn call_host(&mut self, def: DefId, args: CallArgs) -> Result<Value, Trap> {
         if self.deadline_due() {
             return Err(Trap::Deadline);
         }
@@ -508,7 +542,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
     }
 
-    fn call_closure(&mut self, closure: &Closure, args: Vec<Value>) -> Result<Value, Trap> {
+    fn call_closure(&mut self, closure: &Closure, args: CallArgs) -> Result<Value, Trap> {
         match &closure.target {
             ClosureTarget::Def(def) => self.call_def(*def, args).map(|(value, _)| value),
             ClosureTarget::Lambda { node } => {
@@ -526,14 +560,19 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 }
                 let source = self.frames.last().map(|f| f.source).unwrap_or(SourceId(0));
                 self.frames.push(Frame {
-                    locals: HashMap::new(),
+                    locals: Locals::default(),
                     undo: Vec::new(),
                     captures: closure.captures.clone(),
                     source,
                     name: "<lambda>",
                 });
-                for (param, value) in params.iter().zip(args.iter()) {
-                    self.bind_pattern(&param.pattern, value);
+                for (index, (param, value)) in params.iter().zip(args.iter()).enumerate() {
+                    match lambda.param_bindings.get(index).copied().flatten() {
+                        Some(id) => {
+                            self.current_locals_mut().insert(id, value.clone());
+                        }
+                        None => self.bind_pattern(&param.pattern, value),
+                    }
                 }
                 if let Err(trap) = self.maybe_check_memory() {
                     self.frames.pop();
@@ -1207,7 +1246,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
         }
         let callee_value = self.eval_expr(callee)?;
-        let mut values = Vec::with_capacity(args.len());
+        let mut values = CallArgs::with_capacity(args.len());
         for arg in args {
             if arg.mutable {
                 return self.trap(self.internal_panic("function values have no mut parameters"));
@@ -1237,8 +1276,8 @@ impl<'p, 'h> Runtime<'p, 'h> {
         if sig.params.len() != args.len() {
             return self.trap(self.internal_panic("argument count mismatch"));
         }
-        let mut values = Vec::with_capacity(args.len());
-        let mut writebacks: Vec<(Place, usize)> = Vec::new();
+        let mut values = CallArgs::with_capacity(args.len());
+        let mut writebacks: SmallVec<[(Place, usize); 2]> = SmallVec::new();
         for (i, arg) in args.iter().enumerate() {
             if arg.mutable {
                 let place = self.eval_place(&arg.expr)?;
@@ -1275,7 +1314,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         if sig.params.len() != args.len() + 1 {
             return self.trap(self.internal_panic("method argument count mismatch"));
         }
-        let mut values = Vec::with_capacity(args.len() + 1);
+        let mut values = CallArgs::with_capacity(args.len() + 1);
         let mut receiver_place = None;
         if sig.self_mutable() {
             let place = self.eval_place(receiver)?;
@@ -1284,7 +1323,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         } else {
             values.push(self.eval_expr(receiver)?);
         }
-        let mut writebacks: Vec<(Place, usize)> = Vec::new();
+        let mut writebacks: SmallVec<[(Place, usize); 2]> = SmallVec::new();
         for (i, arg) in args.iter().enumerate() {
             if arg.mutable {
                 let place = self.eval_place(&arg.expr)?;
@@ -1344,7 +1383,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         args: &[martite_syntax::Arg],
         span: Span,
     ) -> EvalResult<Value> {
-        let mut values = Vec::new();
+        let mut values = CallArgs::with_capacity(args.len());
         for arg in args {
             values.push(self.eval_expr(&arg.expr)?);
         }
@@ -1457,7 +1496,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
     }
 
     fn take_place_root(&mut self, place: &Place) -> EvalResult<Value> {
-        if let Some(value) = self.current_locals_mut().remove(&place.root) {
+        if let Some(value) = self.current_locals_mut().remove(place.root) {
             Ok(value)
         } else {
             self.local_value(place.root)
@@ -1680,7 +1719,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         args: &[martite_syntax::Arg],
         span: Span,
     ) -> EvalResult<Value> {
-        let mut values = Vec::new();
+        let mut values = CallArgs::with_capacity(args.len());
         for arg in args {
             values.push(self.eval_expr(&arg.expr)?);
         }
@@ -1690,7 +1729,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
     fn call_builtin_values(
         &mut self,
         function: BuiltinFn,
-        values: Vec<Value>,
+        values: CallArgs,
         span: Span,
     ) -> EvalResult<Value> {
         match function {
@@ -1733,7 +1772,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         args: &[martite_syntax::Arg],
         span: Span,
     ) -> EvalResult<Value> {
-        let mut values = Vec::new();
+        let mut values = CallArgs::with_capacity(args.len());
         for arg in args {
             values.push(self.eval_expr(&arg.expr)?);
         }
@@ -1744,7 +1783,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         &mut self,
         module: &str,
         name: &str,
-        values: Vec<Value>,
+        values: CallArgs,
         span: Span,
     ) -> EvalResult<Value> {
         match (module, name) {
@@ -1979,7 +2018,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
 
     fn local_value(&self, id: BindingId) -> Option<&Value> {
         let frame = self.frames.last()?;
-        frame.locals.get(&id).or_else(|| {
+        frame.locals.get(id).or_else(|| {
             frame
                 .captures
                 .as_ref()
@@ -1987,7 +2026,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         })
     }
 
-    fn current_locals_mut(&mut self) -> &mut HashMap<BindingId, Value> {
+    fn current_locals_mut(&mut self) -> &mut Locals {
         &mut self.frames.last_mut().expect("frame").locals
     }
 
@@ -2010,7 +2049,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     frame.locals.insert(id, value);
                 }
                 None => {
-                    frame.locals.remove(&id);
+                    frame.locals.remove(id);
                 }
             }
         }
@@ -2299,7 +2338,7 @@ fn variant_payload(value: &Value) -> Option<&[Value]> {
     }
 }
 
-fn take_writeback(updated: &mut Vec<(usize, Value)>, index: usize) -> Option<Value> {
+fn take_writeback(updated: &mut Writebacks, index: usize) -> Option<Value> {
     let position = updated.iter().position(|(slot, _)| *slot == index)?;
     Some(updated.swap_remove(position).1)
 }

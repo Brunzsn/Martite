@@ -13,6 +13,7 @@ martite-check.workspace = true
 libm.workspace = true
 serde_json.workspace = true
 indexmap.workspace = true
+smallvec.workspace = true
 
 [lints]
 workspace = true
