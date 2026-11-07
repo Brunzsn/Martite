@@ -724,7 +724,6 @@ impl<'p, 'h> Runtime<'p, 'h> {
     fn eval_for(&mut self, pattern: &Pattern, iterable: &Value, body: &Block) -> EvalResult<()> {
         match iterable {
             Value::List(items) => {
-                let items = items.clone();
                 for item in items.iter() {
                     self.charge(1)?;
                     self.bind_pattern(pattern, item);
@@ -736,14 +735,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 }
             }
             Value::Map(map) => {
-                let entries: Vec<(crate::value::KeyValue, Value)> = map
-                    .entries()
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect();
-                for (key, value) in entries {
+                for (key, value) in map.iter() {
                     self.charge(1)?;
-                    let pair = Value::tuple(vec![key_to_value(&key), value]);
+                    let pair = Value::tuple(vec![key_to_value(key), value.clone()]);
                     self.note_alloc(16 + 8 * 2);
                     self.bind_pattern(pattern, &pair);
                     match self.eval_block(body) {
@@ -754,8 +748,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 }
             }
             Value::Str(text) => {
-                let chars: Vec<char> = text.chars().collect();
-                for ch in chars {
+                for ch in text.chars() {
                     self.charge(1)?;
                     self.note_alloc(16 + ch.len_utf8() as u64);
                     let value = Value::Str(Rc::from(ch.to_string()));
