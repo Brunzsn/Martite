@@ -11,12 +11,13 @@ use martite_syntax::{
     AssignOp, BinaryOp, Block, Expr, ExprKind, LambdaBody, MatchBody, NodeId, PatKind, Pattern,
     Stmt, StmtKind, StrExprPart, UnaryOp,
 };
+use smallvec::{SmallVec, smallvec};
 
-use crate::cost::comparison_cost;
+use crate::cost::{comparison_cost, show_slots};
 use crate::ops::{show, value_eq, value_ord, write_show};
 use crate::value::{
-    Closure, ClosureTarget, EnumValue, MAX_VALUE_DEPTH, OrderedMap, StructValue, Value,
-    key_from_value, key_to_value, key_value_size, value_depth_exceeds,
+    Closure, ClosureTarget, EnumValue, FnValue, MAX_VALUE_DEPTH, MapValue, OrderedMap, SeqValue,
+    StructValue, Value, key_from_value, key_to_value, key_value_size, value_depth_exceeds,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -138,7 +139,7 @@ pub struct Runtime<'p, 'h> {
 }
 
 struct Frame<'p> {
-    locals: HashMap<BindingId, Value>,
+    locals: Locals,
     /// Undo log for bindings introduced by an attempted match pattern. Each
     /// entry restores the previous value, or removes the binding when it was
     /// absent.
@@ -147,6 +148,43 @@ struct Frame<'p> {
     source: SourceId,
     name: &'p str,
 }
+
+/// Per-frame local bindings. `BindingId`s are dense, but not contiguous per
+/// function, so this uses a small inline list instead of a hash map. Lookups
+/// are linear over the (typically tiny) set of live bindings.
+#[derive(Default)]
+struct Locals {
+    slots: SmallVec<[(BindingId, Value); 8]>,
+}
+
+impl Locals {
+    fn get(&self, id: BindingId) -> Option<&Value> {
+        self.slots
+            .iter()
+            .find(|(binding, _)| *binding == id)
+            .map(|(_, value)| value)
+    }
+
+    fn insert(&mut self, id: BindingId, value: Value) -> Option<Value> {
+        if let Some((_, existing)) = self.slots.iter_mut().find(|(binding, _)| *binding == id) {
+            return Some(std::mem::replace(existing, value));
+        }
+        self.slots.push((id, value));
+        None
+    }
+
+    fn remove(&mut self, id: BindingId) -> Option<Value> {
+        let index = self.slots.iter().position(|(binding, _)| *binding == id)?;
+        Some(self.slots.swap_remove(index).1)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Value> {
+        self.slots.iter().map(|(_, value)| value)
+    }
+}
+
+type CallArgs = SmallVec<[Value; 4]>;
+type Writebacks = SmallVec<[(usize, Value); 2]>;
 
 enum EvalError {
     Trap(Trap),
@@ -159,7 +197,7 @@ type EvalResult<T> = Result<T, EvalError>;
 
 struct Place {
     root: BindingId,
-    accessors: Vec<Accessor>,
+    accessors: SmallVec<[Accessor; 4]>,
 }
 
 enum Accessor {
@@ -215,7 +253,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
     pub fn invoke(&mut self, def: DefId, args: Vec<Value>) -> Result<CallResult, Trap> {
         self.reset();
         self.note_values(&args);
-        let (value, updated) = self.call_def(def, args)?;
+        let (value, updated) = self.call_def(def, CallArgs::from_vec(args))?;
         Ok(CallResult {
             value,
             params: updated.into_iter().map(|(_, value)| value).collect(),
@@ -242,7 +280,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             .ok_or_else(|| self.internal_panic("missing handler signature"))?;
         let has_self = sig.has_self();
         let self_mutable = sig.self_mutable();
-        let mut call_args = Vec::new();
+        let mut call_args = CallArgs::new();
         if has_self {
             call_args.push(state.clone().unwrap_or(Value::Unit));
         }
@@ -262,7 +300,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             trace: Vec::new(),
         })?;
         self.reset();
-        let (value, _) = self.call_def(main, Vec::new())?;
+        let (value, _) = self.call_def(main, CallArgs::new())?;
         Ok(MainResult {
             value,
             log: self.take_log(),
@@ -300,20 +338,17 @@ impl<'p, 'h> Runtime<'p, 'h> {
         Err(EvalError::Trap(trap))
     }
 
+    #[inline]
     fn charge(&mut self, units: u64) -> EvalResult<()> {
         self.fuel = self.fuel.saturating_sub(units);
         if self.fuel == 0 {
             return self.trap(Trap::OutOfFuel);
         }
         self.ticks += 1;
-        if self.ticks % 1024 == 0 {
-            if let Some(deadline) = self.limits.deadline {
-                if self.start.elapsed() >= deadline {
-                    return self.trap(Trap::Deadline);
-                }
+        if self.ticks & 255 == 0 {
+            if self.ticks & 1023 == 0 && self.deadline_due() {
+                return self.trap(Trap::Deadline);
             }
-        }
-        if self.ticks % 256 == 0 {
             self.maybe_check_memory()?;
         }
         Ok(())
@@ -326,8 +361,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
     }
 
     fn note_value(&mut self, value: &Value) {
-        let bytes = value.size_bytes(&mut HashSet::new());
-        self.note_alloc(bytes);
+        self.note_alloc(value.meta().bytes);
     }
 
     fn note_values(&mut self, values: &[Value]) {
@@ -393,11 +427,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
     }
 
-    fn call_def(
-        &mut self,
-        def: DefId,
-        args: Vec<Value>,
-    ) -> Result<(Value, Vec<(usize, Value)>), Trap> {
+    fn call_def(&mut self, def: DefId, args: CallArgs) -> Result<(Value, Writebacks), Trap> {
         let program = self.program;
         let sig = program
             .fn_sig(def)
@@ -409,13 +439,13 @@ impl<'p, 'h> Runtime<'p, 'h> {
         &mut self,
         def: DefId,
         sig: &'p FnSig,
-        args: Vec<Value>,
-    ) -> Result<(Value, Vec<(usize, Value)>), Trap> {
+        args: CallArgs,
+    ) -> Result<(Value, Writebacks), Trap> {
         if self.frames.len() >= self.limits.depth as usize {
             return Err(Trap::DepthExceeded);
         }
         if sig.kind == FnKind::Host {
-            return Ok((self.call_host(def, args)?, Vec::new()));
+            return Ok((self.call_host(def, args)?, Writebacks::new()));
         }
         let program = self.program;
         let body = program
@@ -430,7 +460,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             )));
         }
         let source = program.resolved.module(sig.module).source;
-        let mut locals = HashMap::new();
+        let mut locals = Locals::default();
         for (param, value) in sig.params.iter().zip(args) {
             locals.insert(param.binding, value);
         }
@@ -465,12 +495,12 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 .map(|(index, param)| {
                     (
                         index,
-                        frame.locals.remove(&param.binding).unwrap_or(Value::Unit),
+                        frame.locals.remove(param.binding).unwrap_or(Value::Unit),
                     )
                 })
                 .collect()
         } else {
-            Vec::new()
+            Writebacks::new()
         };
         self.frames.pop();
         let value = result?;
@@ -485,7 +515,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         Ok((value, updated))
     }
 
-    fn call_host(&mut self, def: DefId, args: Vec<Value>) -> Result<Value, Trap> {
+    fn call_host(&mut self, def: DefId, args: CallArgs) -> Result<Value, Trap> {
         if self.deadline_due() {
             return Err(Trap::Deadline);
         }
@@ -518,7 +548,11 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
     }
 
-    fn call_closure(&mut self, closure: &Closure, args: Vec<Value>) -> Result<Value, Trap> {
+    fn call_closure(&mut self, function: &FnValue, args: CallArgs) -> Result<Value, Trap> {
+        let closure = match function {
+            FnValue::Def(def) => return self.call_def(*def, args).map(|(value, _)| value),
+            FnValue::Closure(closure) => closure,
+        };
         match &closure.target {
             ClosureTarget::Def(def) => self.call_def(*def, args).map(|(value, _)| value),
             ClosureTarget::Lambda { node } => {
@@ -536,14 +570,19 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 }
                 let source = self.frames.last().map(|f| f.source).unwrap_or(SourceId(0));
                 self.frames.push(Frame {
-                    locals: HashMap::new(),
+                    locals: Locals::default(),
                     undo: Vec::new(),
                     captures: closure.captures.clone(),
                     source,
                     name: "<lambda>",
                 });
-                for (param, value) in params.iter().zip(args.iter()) {
-                    self.bind_pattern(&param.pattern, value);
+                for (index, (param, value)) in params.iter().zip(args.iter()).enumerate() {
+                    match lambda.param_bindings.get(index).copied().flatten() {
+                        Some(id) => {
+                            self.current_locals_mut().insert(id, value.clone());
+                        }
+                        None => self.bind_pattern(&param.pattern, value),
+                    }
                 }
                 if let Err(trap) = self.maybe_check_memory() {
                     self.frames.pop();
@@ -692,7 +731,6 @@ impl<'p, 'h> Runtime<'p, 'h> {
     fn eval_for(&mut self, pattern: &Pattern, iterable: &Value, body: &Block) -> EvalResult<()> {
         match iterable {
             Value::List(items) => {
-                let items = items.clone();
                 for item in items.iter() {
                     self.charge(1)?;
                     self.bind_pattern(pattern, item);
@@ -704,14 +742,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 }
             }
             Value::Map(map) => {
-                let entries: Vec<(crate::value::KeyValue, Value)> = map
-                    .entries()
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect();
-                for (key, value) in entries {
+                for (key, value) in map.iter() {
                     self.charge(1)?;
-                    let pair = Value::tuple(vec![key_to_value(&key), value]);
+                    let pair = Value::tuple(vec![key_to_value(key), value.clone()]);
                     self.note_alloc(16 + 8 * 2);
                     self.bind_pattern(pattern, &pair);
                     match self.eval_block(body) {
@@ -722,8 +755,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 }
             }
             Value::Str(text) => {
-                let chars: Vec<char> = text.chars().collect();
-                for ch in chars {
+                for ch in text.chars() {
                     self.charge(1)?;
                     self.note_alloc(16 + ch.len_utf8() as u64);
                     let value = Value::Str(Rc::from(ch.to_string()));
@@ -921,10 +953,10 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     Some(Rc::new(values))
                 };
                 self.note_alloc(16);
-                Ok(Value::Fn(Rc::new(Closure {
-                    target: ClosureTarget::Lambda { node: expr.id },
+                Ok(Value::Fn(FnValue::Closure(Rc::new(Closure::new(
+                    ClosureTarget::Lambda { node: expr.id },
                     captures,
-                })))
+                )))))
             }
             ExprKind::Block(block) => self.eval_block(block),
             ExprKind::Field { .. } => self.eval_field(expr),
@@ -965,9 +997,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     }
                     (martite_syntax::PrimTy::Float, Value::Int(v)) => Ok(Value::Float(v as f64)),
                     (martite_syntax::PrimTy::Str, value) => {
+                        self.charge(show_slots(&value))?;
                         let mut text = String::new();
-                        let slots = write_show(&mut text, &value, &self.program.types, true);
-                        self.charge(slots)?;
+                        write_show(&mut text, &value, &self.program.types, true);
                         self.note_alloc(16 + text.len() as u64);
                         Ok(Value::str(text))
                     }
@@ -991,7 +1023,8 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 StrExprPart::Text(text) => out.push_str(text),
                 StrExprPart::Expr(expr) => {
                     let value = self.eval_expr(expr)?;
-                    slot_cost += write_show(&mut out, &value, &self.program.types, true);
+                    slot_cost += show_slots(&value);
+                    write_show(&mut out, &value, &self.program.types, true);
                 }
             }
         }
@@ -1041,13 +1074,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             Some(Resolution::Const(def)) => self.materialize_const(def),
             Some(Resolution::Fn(def))
             | Some(Resolution::Handler(def))
-            | Some(Resolution::Test(def)) => {
-                self.note_alloc(16);
-                Ok(Value::Fn(Rc::new(Closure {
-                    target: ClosureTarget::Def(def),
-                    captures: None,
-                })))
-            }
+            | Some(Resolution::Test(def)) => Ok(Value::Fn(FnValue::Def(def))),
             Some(Resolution::PreludeVariant(PreludeVariant::None)) => Ok(Value::Option(None)),
             Some(Resolution::PreludeVariant(variant)) => {
                 self.note_alloc(16);
@@ -1069,11 +1096,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     .unwrap_or(0);
                 if payload == 0 {
                     self.note_alloc(16);
-                    Ok(Value::Enum(Rc::new(EnumValue {
-                        type_id: id,
-                        variant: index,
-                        payload: Vec::new(),
-                    })))
+                    Ok(Value::Enum(Rc::new(EnumValue::new(id, index, Vec::new()))))
                 } else {
                     self.trap(self.internal_panic("variant constructor used as a value"))
                 }
@@ -1089,11 +1112,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         if self.program.consts.contains_key(&def) {
             return self.materialize_const(def);
         }
-        self.note_alloc(16);
-        Ok(Value::Fn(Rc::new(Closure {
-            target: ClosureTarget::Def(def),
-            captures: None,
-        })))
+        Ok(Value::Fn(FnValue::Def(def)))
     }
 
     fn value_of_builtin_item(&self, item: &BuiltinItem) -> EvalResult<Value> {
@@ -1101,10 +1120,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             ("std.math", "PI") => Ok(Value::Float(std::f64::consts::PI)),
             ("std.math", "EULER") => Ok(Value::Float(std::f64::consts::E)),
             ("std.json", "Json") => self.trap(self.internal_panic("type used as a value")),
-            (module, name) => Ok(Value::BuiltinModuleFn {
-                module: module.to_string(),
-                name: name.to_string(),
-            }),
+            _ => Ok(Value::BuiltinModuleFn(item.id)),
         }
     }
 
@@ -1135,11 +1151,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             Some(Resolution::Variant(id, index)) => {
                 self.note_alloc(16);
-                Ok(Value::Enum(Rc::new(EnumValue {
-                    type_id: id,
-                    variant: index,
-                    payload: Vec::new(),
-                })))
+                Ok(Value::Enum(Rc::new(EnumValue::new(id, index, Vec::new()))))
             }
             Some(Resolution::ModuleItem(def)) => self.value_of_def(def),
             Some(Resolution::BuiltinItem(item)) => self.value_of_builtin_item(&item),
@@ -1190,10 +1202,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
         self.charge(out.len() as u64)?;
         self.note_alloc(16 + 8 * out.len() as u64);
-        Ok(Value::Struct(Rc::new(StructValue {
-            type_id,
-            fields: out,
-        })))
+        Ok(Value::Struct(Rc::new(StructValue::new(type_id, out))))
     }
 
     // ------------------------------------------------------------------
@@ -1247,7 +1256,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
         }
         let callee_value = self.eval_expr(callee)?;
-        let mut values = Vec::with_capacity(args.len());
+        let mut values = CallArgs::with_capacity(args.len());
         for arg in args {
             if arg.mutable {
                 return self.trap(self.internal_panic("function values have no mut parameters"));
@@ -1257,8 +1266,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
         match callee_value {
             Value::Fn(closure) => self.call_closure(&closure, values).map_err(EvalError::Trap),
             Value::Builtin(function) => self.call_builtin_values(function, values, expr.span),
-            Value::BuiltinModuleFn { module, name } => {
-                self.call_builtin_module_values(&module, &name, values, expr.span)
+            Value::BuiltinModuleFn(id) => {
+                let item = id.item();
+                self.call_builtin_module_values(item.module, item.name, values, expr.span)
             }
             _ => self.trap(self.internal_panic("callee is not callable")),
         }
@@ -1277,8 +1287,8 @@ impl<'p, 'h> Runtime<'p, 'h> {
         if sig.params.len() != args.len() {
             return self.trap(self.internal_panic("argument count mismatch"));
         }
-        let mut values = Vec::with_capacity(args.len());
-        let mut writebacks: Vec<(Place, usize)> = Vec::new();
+        let mut values = CallArgs::with_capacity(args.len());
+        let mut writebacks: SmallVec<[(Place, usize); 2]> = SmallVec::new();
         for (i, arg) in args.iter().enumerate() {
             if arg.mutable {
                 let place = self.eval_place(&arg.expr)?;
@@ -1315,7 +1325,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         if sig.params.len() != args.len() + 1 {
             return self.trap(self.internal_panic("method argument count mismatch"));
         }
-        let mut values = Vec::with_capacity(args.len() + 1);
+        let mut values = CallArgs::with_capacity(args.len() + 1);
         let mut receiver_place = None;
         if sig.self_mutable() {
             let place = self.eval_place(receiver)?;
@@ -1324,7 +1334,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         } else {
             values.push(self.eval_expr(receiver)?);
         }
-        let mut writebacks: Vec<(Place, usize)> = Vec::new();
+        let mut writebacks: SmallVec<[(Place, usize); 2]> = SmallVec::new();
         for (i, arg) in args.iter().enumerate() {
             if arg.mutable {
                 let place = self.eval_place(&arg.expr)?;
@@ -1369,11 +1379,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
         self.charge(payload.len() as u64)?;
         self.note_alloc(16 + 8 * payload.len() as u64);
-        let value = Value::Enum(Rc::new(EnumValue {
-            type_id,
-            variant: index,
-            payload,
-        }));
+        let value = Value::Enum(Rc::new(EnumValue::new(type_id, index, payload)));
         self.check_value_depth(&value, span)?;
         Ok(value)
     }
@@ -1384,7 +1390,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         args: &[martite_syntax::Arg],
         span: Span,
     ) -> EvalResult<Value> {
-        let mut values = Vec::new();
+        let mut values = CallArgs::with_capacity(args.len());
         for arg in args {
             values.push(self.eval_expr(&arg.expr)?);
         }
@@ -1426,7 +1432,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 };
                 Ok(Place {
                     root,
-                    accessors: Vec::new(),
+                    accessors: SmallVec::new(),
                 })
             }
             ExprKind::Field { base, name } => {
@@ -1497,7 +1503,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
     }
 
     fn take_place_root(&mut self, place: &Place) -> EvalResult<Value> {
-        if let Some(value) = self.current_locals_mut().remove(&place.root) {
+        if let Some(value) = self.current_locals_mut().remove(place.root) {
             Ok(value)
         } else {
             self.local_value(place.root)
@@ -1508,9 +1514,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
 
     fn cow_vec_mut<'a>(
         &mut self,
-        items: &'a mut Rc<Vec<Value>>,
+        items: &'a mut Rc<SeqValue>,
         slots: usize,
-    ) -> EvalResult<&'a mut Vec<Value>> {
+    ) -> EvalResult<&'a mut SeqValue> {
         if Rc::strong_count(items) != 1 {
             self.charge(slots as u64)?;
             self.note_alloc(16 + 8 * slots as u64);
@@ -1520,9 +1526,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
 
     fn cow_map_mut<'a>(
         &mut self,
-        map: &'a mut Rc<OrderedMap>,
+        map: &'a mut Rc<MapValue>,
         slots: usize,
-    ) -> EvalResult<&'a mut OrderedMap> {
+    ) -> EvalResult<&'a mut MapValue> {
         if Rc::strong_count(map) != 1 {
             self.charge(slots as u64)?;
             self.note_alloc(16 + 8 * slots as u64);
@@ -1542,53 +1548,94 @@ impl<'p, 'h> Runtime<'p, 'h> {
         Ok(Rc::make_mut(value))
     }
 
-    fn place_child_mut<'a>(
-        &mut self,
-        value: &'a mut Value,
-        accessor: &Accessor,
-    ) -> EvalResult<&'a mut Value> {
-        match (value, accessor) {
-            (Value::Struct(struct_value), Accessor::Field(index)) => {
-                let slots = struct_value.fields.len();
-                let struct_value = self.cow_struct_mut(struct_value, slots)?;
-                struct_value.fields.get_mut(*index).ok_or_else(|| {
-                    EvalError::Trap(self.internal_panic("struct field out of range"))
-                })
-            }
-            (Value::Tuple(items), Accessor::Tuple(index)) => {
-                let slots = items.len();
-                let items = self.cow_vec_mut(items, slots)?;
-                items
-                    .get_mut(*index as usize)
-                    .ok_or_else(|| EvalError::Trap(self.internal_panic("tuple field out of range")))
-            }
-            (Value::List(items), Accessor::Index(Value::Int(index))) => {
-                let slots = items.len();
-                let items = self.cow_vec_mut(items, slots)?;
-                let index = *index;
-                if index < 0 || index as usize >= items.len() {
-                    return Err(EvalError::Trap(self.internal_panic("index out of bounds")));
-                }
-                Ok(&mut items[index as usize])
-            }
-            (Value::Map(map), Accessor::Index(key)) => {
-                let key =
-                    key_from_value(key).map_err(|msg| EvalError::Trap(self.internal_panic(msg)))?;
-                let slots = map.len().saturating_mul(2);
-                let map = self.cow_map_mut(map, slots)?;
-                map.get_mut(&key)
-                    .ok_or_else(|| EvalError::Trap(self.internal_panic("missing map key")))
-            }
-            _ => Err(EvalError::Trap(self.internal_panic("invalid place access"))),
-        }
-    }
-
     fn take_path_value(&mut self, value: &mut Value, accessors: &[Accessor]) -> EvalResult<Value> {
         let Some((first, rest)) = accessors.split_first() else {
             return Ok(std::mem::replace(value, Value::Unit));
         };
-        let slot = self.place_child_mut(value, first)?;
-        self.take_path_value(slot, rest)
+        match first {
+            Accessor::Field(index) => {
+                let Value::Struct(struct_value) = value else {
+                    return Err(EvalError::Trap(self.internal_panic("invalid place access")));
+                };
+                let slots = struct_value.fields.len();
+                let struct_value = self.cow_struct_mut(struct_value, slots)?;
+                let old = struct_value
+                    .fields
+                    .get(*index)
+                    .ok_or_else(|| {
+                        EvalError::Trap(self.internal_panic("struct field out of range"))
+                    })?
+                    .meta();
+                let taken = {
+                    let slot = struct_value.field_mut(*index).expect("field was checked");
+                    self.take_path_value(slot, rest)?
+                };
+                let new = struct_value.fields[*index].meta();
+                struct_value.note_field_replaced(old, new);
+                Ok(taken)
+            }
+            Accessor::Tuple(index) => {
+                let Value::Tuple(items) = value else {
+                    return Err(EvalError::Trap(self.internal_panic("invalid place access")));
+                };
+                let slots = items.len();
+                let items = self.cow_vec_mut(items, slots)?;
+                let index = *index as usize;
+                let old = items
+                    .get(index)
+                    .ok_or_else(|| {
+                        EvalError::Trap(self.internal_panic("tuple field out of range"))
+                    })?
+                    .meta();
+                let taken = {
+                    let slot = items.slot_mut(index).expect("field was checked");
+                    self.take_path_value(slot, rest)?
+                };
+                let new = items[index].meta();
+                items.note_child_replaced(old, new);
+                Ok(taken)
+            }
+            Accessor::Index(index_value) => match value {
+                Value::List(items) => {
+                    let Value::Int(index) = index_value else {
+                        return Err(EvalError::Trap(self.internal_panic("invalid place access")));
+                    };
+                    let slots = items.len();
+                    let items = self.cow_vec_mut(items, slots)?;
+                    let index = *index;
+                    if index < 0 || index as usize >= items.len() {
+                        return Err(EvalError::Trap(self.internal_panic("index out of bounds")));
+                    }
+                    let index = index as usize;
+                    let old = items[index].meta();
+                    let taken = {
+                        let slot = items.slot_mut(index).expect("index was checked");
+                        self.take_path_value(slot, rest)?
+                    };
+                    let new = items[index].meta();
+                    items.note_child_replaced(old, new);
+                    Ok(taken)
+                }
+                Value::Map(map) => {
+                    let key = key_from_value(index_value)
+                        .map_err(|msg| EvalError::Trap(self.internal_panic(msg)))?;
+                    let slots = map.len().saturating_mul(2);
+                    let map = self.cow_map_mut(map, slots)?;
+                    let old = map
+                        .get(&key)
+                        .ok_or_else(|| EvalError::Trap(self.internal_panic("missing map key")))?
+                        .meta();
+                    let taken = {
+                        let slot = map.value_mut(&key).expect("key was checked");
+                        self.take_path_value(slot, rest)?
+                    };
+                    let new = map.get(&key).expect("key was checked").meta();
+                    map.note_value_replaced(&key, old, new);
+                    Ok(taken)
+                }
+                _ => Err(EvalError::Trap(self.internal_panic("invalid place access"))),
+            },
+        }
     }
 
     fn set_path(
@@ -1616,10 +1663,18 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 };
                 let slots = struct_value.fields.len();
                 let struct_value = self.cow_struct_mut(struct_value, slots)?;
-                let slot = struct_value.fields.get_mut(*index).ok_or_else(|| {
-                    EvalError::Trap(self.internal_panic("struct field out of range"))
-                })?;
-                self.set_path(slot, rest, new_value, child_remaining)
+                let old = struct_value
+                    .fields
+                    .get(*index)
+                    .ok_or_else(|| {
+                        EvalError::Trap(self.internal_panic("struct field out of range"))
+                    })?
+                    .meta();
+                let slot = struct_value.field_mut(*index).expect("field was checked");
+                let result = self.set_path(slot, rest, new_value, child_remaining);
+                let new = slot.meta();
+                struct_value.note_field_replaced(old, new);
+                result
             }
             Accessor::Tuple(index) => {
                 let Value::Tuple(items) = value else {
@@ -1627,10 +1682,18 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 };
                 let slots = items.len();
                 let items = self.cow_vec_mut(items, slots)?;
-                let slot = items.get_mut(*index as usize).ok_or_else(|| {
-                    EvalError::Trap(self.internal_panic("tuple field out of range"))
-                })?;
-                self.set_path(slot, rest, new_value, child_remaining)
+                let index = *index as usize;
+                let old = items
+                    .get(index)
+                    .ok_or_else(|| {
+                        EvalError::Trap(self.internal_panic("tuple field out of range"))
+                    })?
+                    .meta();
+                let slot = items.slot_mut(index).expect("field was checked");
+                let result = self.set_path(slot, rest, new_value, child_remaining);
+                let new = slot.meta();
+                items.note_child_replaced(old, new);
+                result
             }
             Accessor::Index(index_value) => match value {
                 Value::List(items) => {
@@ -1643,7 +1706,13 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     if index < 0 || index as usize >= items.len() {
                         return Err(EvalError::Trap(self.internal_panic("index out of bounds")));
                     }
-                    self.set_path(&mut items[index as usize], rest, new_value, child_remaining)
+                    let index = index as usize;
+                    let old = items[index].meta();
+                    let slot = items.slot_mut(index).expect("index was checked");
+                    let result = self.set_path(slot, rest, new_value, child_remaining);
+                    let new = slot.meta();
+                    items.note_child_replaced(old, new);
+                    result
                 }
                 Value::Map(map) => {
                     if value_depth_exceeds(index_value, child_remaining) {
@@ -1663,10 +1732,15 @@ impl<'p, 'h> Runtime<'p, 'h> {
                         map.insert(key, new_value);
                         Ok(())
                     } else {
-                        let slot = map.get_mut(&key).ok_or_else(|| {
-                            EvalError::Trap(self.internal_panic("missing map key"))
-                        })?;
-                        self.set_path(slot, rest, new_value, child_remaining)
+                        let old = map
+                            .get(&key)
+                            .ok_or_else(|| EvalError::Trap(self.internal_panic("missing map key")))?
+                            .meta();
+                        let slot = map.value_mut(&key).expect("key was checked");
+                        let result = self.set_path(slot, rest, new_value, child_remaining);
+                        let new = slot.meta();
+                        map.note_value_replaced(&key, old, new);
+                        result
                     }
                 }
                 _ => Err(EvalError::Trap(self.internal_panic("invalid place access"))),
@@ -1720,7 +1794,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         args: &[martite_syntax::Arg],
         span: Span,
     ) -> EvalResult<Value> {
-        let mut values = Vec::new();
+        let mut values = CallArgs::with_capacity(args.len());
         for arg in args {
             values.push(self.eval_expr(&arg.expr)?);
         }
@@ -1730,15 +1804,15 @@ impl<'p, 'h> Runtime<'p, 'h> {
     fn call_builtin_values(
         &mut self,
         function: BuiltinFn,
-        values: Vec<Value>,
+        values: CallArgs,
         span: Span,
     ) -> EvalResult<Value> {
         match function {
             BuiltinFn::Print => {
                 let value = values.into_iter().next().unwrap_or(Value::Unit);
+                self.charge(show_slots(&value))?;
                 let mut text = String::new();
-                let slots = write_show(&mut text, &value, &self.program.types, true);
-                self.charge(slots)?;
+                write_show(&mut text, &value, &self.program.types, true);
                 self.charge((text.len() as u64).div_ceil(8))?;
                 self.log.push(text);
                 self.maybe_check_memory()?;
@@ -1774,7 +1848,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         args: &[martite_syntax::Arg],
         span: Span,
     ) -> EvalResult<Value> {
-        let mut values = Vec::new();
+        let mut values = CallArgs::with_capacity(args.len());
         for arg in args {
             values.push(self.eval_expr(&arg.expr)?);
         }
@@ -1785,7 +1859,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         &mut self,
         module: &str,
         name: &str,
-        values: Vec<Value>,
+        values: CallArgs,
         span: Span,
     ) -> EvalResult<Value> {
         match (module, name) {
@@ -2020,7 +2094,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
 
     fn local_value(&self, id: BindingId) -> Option<&Value> {
         let frame = self.frames.last()?;
-        frame.locals.get(&id).or_else(|| {
+        frame.locals.get(id).or_else(|| {
             frame
                 .captures
                 .as_ref()
@@ -2028,7 +2102,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         })
     }
 
-    fn current_locals_mut(&mut self) -> &mut HashMap<BindingId, Value> {
+    fn current_locals_mut(&mut self) -> &mut Locals {
         &mut self.frames.last_mut().expect("frame").locals
     }
 
@@ -2051,7 +2125,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     frame.locals.insert(id, value);
                 }
                 None => {
-                    frame.locals.remove(&id);
+                    frame.locals.remove(id);
                 }
             }
         }
@@ -2302,19 +2376,16 @@ impl<'p, 'h> Runtime<'p, 'h> {
                         }
                     }
                 }
-                Value::Struct(Rc::new(StructValue {
-                    type_id: *type_id,
-                    fields: values,
-                }))
+                Value::Struct(Rc::new(StructValue::new(*type_id, values)))
             }
-            ConstValue::Enum(type_id, variant, payload) => Value::Enum(Rc::new(EnumValue {
-                type_id: *type_id,
-                variant: *variant,
-                payload: payload
+            ConstValue::Enum(type_id, variant, payload) => Value::Enum(Rc::new(EnumValue::new(
+                *type_id,
+                *variant,
+                payload
                     .iter()
                     .map(|v| Self::const_to_value(program, v))
                     .collect(),
-            })),
+            ))),
             ConstValue::Prelude(variant, payload) => {
                 let value = payload
                     .first()
@@ -2348,7 +2419,7 @@ fn variant_payload(value: &Value) -> Option<&[Value]> {
     }
 }
 
-fn take_writeback(updated: &mut Vec<(usize, Value)>, index: usize) -> Option<Value> {
+fn take_writeback(updated: &mut Writebacks, index: usize) -> Option<Value> {
     let position = updated.iter().position(|(slot, _)| *slot == index)?;
     Some(updated.swap_remove(position).1)
 }

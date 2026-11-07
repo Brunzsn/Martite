@@ -6,6 +6,7 @@ use martite_resolve::{
     BuiltinItem, DefId, DefKind, ModuleId, ModuleTarget, ResolvedProgram, builtin_item,
 };
 use martite_syntax::*;
+use rustc_hash::FxHashMap;
 
 use crate::exhaustive::is_exhaustive;
 use crate::program::*;
@@ -49,7 +50,7 @@ pub fn check(resolved: ResolvedProgram) -> crate::CheckOutput {
         types,
         functions: functions
             .into_iter()
-            .map(|(def, sig)| (def, Rc::unwrap_or_clone(sig)))
+            .map(|sig| sig.map(Rc::unwrap_or_clone))
             .collect(),
         methods,
         consts,
@@ -103,20 +104,20 @@ struct Checker<'a> {
     diagnostics: Vec<Diagnostic>,
     types: TypeTable,
     json_type: Option<TypeId>,
-    def_to_type: HashMap<DefId, TypeId>,
-    functions: HashMap<DefId, Rc<FnSig>>,
+    def_to_type: FxHashMap<DefId, TypeId>,
+    functions: Vec<Option<Rc<FnSig>>>,
     methods: HashMap<(TypeId, String), DefId>,
-    const_types: HashMap<DefId, Ty>,
-    consts: HashMap<DefId, ConstInfo>,
-    expr_types: HashMap<NodeId, Ty>,
-    resolutions: HashMap<NodeId, Resolution>,
-    pattern_resolutions: HashMap<NodeId, PatResolution>,
-    struct_lit_fields: HashMap<NodeId, Vec<(usize, usize)>>,
-    struct_pattern_fields: HashMap<NodeId, Vec<(usize, usize)>>,
-    bindings: HashMap<BindingId, BindingInfo>,
-    pattern_bindings: HashMap<NodeId, BindingId>,
-    param_bindings: HashMap<NodeId, BindingId>,
-    lambdas: HashMap<NodeId, LambdaInfo>,
+    const_types: FxHashMap<DefId, Ty>,
+    consts: FxHashMap<DefId, ConstInfo>,
+    expr_types: NodeTable<Ty>,
+    resolutions: NodeTable<Resolution>,
+    pattern_resolutions: NodeTable<PatResolution>,
+    struct_lit_fields: FxHashMap<NodeId, Vec<(usize, usize)>>,
+    struct_pattern_fields: FxHashMap<NodeId, Vec<(usize, usize)>>,
+    bindings: FxHashMap<BindingId, BindingInfo>,
+    pattern_bindings: NodeTable<BindingId>,
+    param_bindings: FxHashMap<NodeId, BindingId>,
+    lambdas: FxHashMap<NodeId, LambdaInfo>,
     handlers: HashMap<String, DefId>,
     hooks: HashMap<String, HookSig>,
     tests: Vec<DefId>,
@@ -133,25 +134,26 @@ struct Checker<'a> {
 
 impl<'a> Checker<'a> {
     fn new(resolved: &'a ResolvedProgram) -> Self {
+        let node_capacity = resolved.next_node_id as usize;
         Self {
             resolved,
             diagnostics: Vec::new(),
             types: TypeTable::default(),
             json_type: None,
-            def_to_type: HashMap::new(),
-            functions: HashMap::new(),
+            def_to_type: FxHashMap::default(),
+            functions: vec![None; resolved.defs.len()],
             methods: HashMap::new(),
-            const_types: HashMap::new(),
-            consts: HashMap::new(),
-            expr_types: HashMap::new(),
-            resolutions: HashMap::new(),
-            pattern_resolutions: HashMap::new(),
-            struct_lit_fields: HashMap::new(),
-            struct_pattern_fields: HashMap::new(),
-            bindings: HashMap::new(),
-            pattern_bindings: HashMap::new(),
-            param_bindings: HashMap::new(),
-            lambdas: HashMap::new(),
+            const_types: FxHashMap::default(),
+            consts: FxHashMap::default(),
+            expr_types: NodeTable::with_capacity(node_capacity),
+            resolutions: NodeTable::with_capacity(node_capacity),
+            pattern_resolutions: NodeTable::with_capacity(node_capacity),
+            struct_lit_fields: FxHashMap::default(),
+            struct_pattern_fields: FxHashMap::default(),
+            bindings: FxHashMap::default(),
+            pattern_bindings: NodeTable::with_capacity(node_capacity),
+            param_bindings: FxHashMap::default(),
+            lambdas: FxHashMap::default(),
             handlers: HashMap::new(),
             hooks: HashMap::new(),
             tests: Vec::new(),
@@ -175,6 +177,14 @@ impl<'a> Checker<'a> {
         self.collect_handlers();
         self.check_consts();
         self.check_bodies();
+    }
+
+    fn fn_sig(&self, def: DefId) -> Option<&Rc<FnSig>> {
+        self.functions.get(def.0 as usize).and_then(Option::as_ref)
+    }
+
+    fn set_fn_sig(&mut self, def: DefId, sig: FnSig) {
+        self.functions[def.0 as usize] = Some(Rc::new(sig));
     }
 
     // ------------------------------------------------------------------
@@ -469,9 +479,9 @@ impl<'a> Checker<'a> {
                             },
                             None => Ty::Unit,
                         };
-                        self.functions.insert(
+                        self.set_fn_sig(
                             def,
-                            Rc::new(FnSig {
+                            FnSig {
                                 def,
                                 node: f.id,
                                 module: module_id,
@@ -487,16 +497,16 @@ impl<'a> Checker<'a> {
                                 },
                                 span: f.span,
                                 is_pub: f.is_pub || is_interface,
-                            }),
+                            },
                         );
                     }
                     Item::Test(t) => {
                         let Some(def) = resolved.node_to_def.get(&t.id).copied() else {
                             continue;
                         };
-                        self.functions.insert(
+                        self.set_fn_sig(
                             def,
-                            Rc::new(FnSig {
+                            FnSig {
                                 def,
                                 node: t.id,
                                 module: module_id,
@@ -508,7 +518,7 @@ impl<'a> Checker<'a> {
                                 kind: FnKind::Test,
                                 span: t.span,
                                 is_pub: false,
-                            }),
+                            },
                         );
                         self.tests.push(def);
                     }
@@ -629,9 +639,9 @@ impl<'a> Checker<'a> {
                 },
                 None => Ty::Unit,
             };
-            self.functions.insert(
+            self.set_fn_sig(
                 def,
-                Rc::new(FnSig {
+                FnSig {
                     def,
                     node: method.id,
                     module: module_id,
@@ -643,7 +653,7 @@ impl<'a> Checker<'a> {
                     kind: FnKind::Method(type_id),
                     span: method.span,
                     is_pub: method.is_pub,
-                }),
+                },
             );
             self.methods.insert((type_id, method.name.clone()), def);
         }
@@ -661,7 +671,7 @@ impl<'a> Checker<'a> {
         {
             self.main = Some(def);
             self.entry_kind = EntryKind::Script;
-            let sig = self.functions.get(&def).cloned();
+            let sig = self.fn_sig(def).cloned();
             if let Some(sig) = sig {
                 let ok_ret = sig.ret == Ty::Unit
                     || matches!(&sig.ret, Ty::Result(t, e) if **t == Ty::Unit && is_show(e, &self.types));
@@ -764,9 +774,9 @@ impl<'a> Checker<'a> {
                 );
             }
             state = Some(ret.clone());
-            self.functions.insert(
+            self.set_fn_sig(
                 def,
-                Rc::new(FnSig {
+                FnSig {
                     def,
                     node: init.id,
                     module: root,
@@ -778,7 +788,7 @@ impl<'a> Checker<'a> {
                     kind: FnKind::Handler,
                     span: init.span,
                     is_pub: false,
-                }),
+                },
             );
             self.handlers.insert("init".into(), def);
         }
@@ -921,9 +931,9 @@ impl<'a> Checker<'a> {
             if self_seen && state.is_none() {
                 // Already reported above; keep the signature for checking.
             }
-            self.functions.insert(
+            self.set_fn_sig(
                 def,
-                Rc::new(FnSig {
+                FnSig {
                     def,
                     node: handler.id,
                     module: root,
@@ -935,7 +945,7 @@ impl<'a> Checker<'a> {
                     kind: FnKind::Handler,
                     span: handler.span,
                     is_pub: false,
-                }),
+                },
             );
         }
     }
@@ -1238,17 +1248,15 @@ impl<'a> Checker<'a> {
     // ------------------------------------------------------------------
 
     fn check_bodies(&mut self) {
-        let mut defs: Vec<DefId> = self.functions.keys().copied().collect();
-        defs.sort_by_key(|d| d.0);
-        for def in defs {
-            let sig = match self.functions.get(&def) {
+        for def in 0..self.functions.len() {
+            let sig = match self.functions.get(def).and_then(Option::as_ref) {
                 Some(s) => Rc::clone(s),
                 None => continue,
             };
             if sig.kind == FnKind::Host {
                 continue;
             }
-            let Some(body) = self.function_block(def) else {
+            let Some(body) = self.function_block(sig.def) else {
                 continue;
             };
             self.check_function_body(&sig, body);
@@ -1266,8 +1274,7 @@ impl<'a> Checker<'a> {
             Item::Test(t) if t.id == info.node => Some(&t.body),
             Item::Impl(i) => i
                 .methods
-                .iter()
-                .find(|m| m.id == info.node)
+                .get(info.method_index?)
                 .and_then(|m| m.body.as_ref()),
             _ => None,
         }

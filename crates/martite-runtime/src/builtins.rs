@@ -1,3 +1,43 @@
+/// True when evaluating `expr` can call user or host code. Calls are the only
+/// way an argument can mutate the receiver binding, so call-free arguments let
+/// a mutable builtin use the direct root path without changing evaluation
+/// order.
+fn expr_may_call(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Unit
+        | ExprKind::Var(_)
+        | ExprKind::Lambda { .. } => false,
+        ExprKind::Str(parts) => parts.iter().any(|part| match part {
+            StrExprPart::Text(_) => false,
+            StrExprPart::Expr(expr) => expr_may_call(expr),
+        }),
+        ExprKind::Tuple(items) | ExprKind::List(items) => items.iter().any(expr_may_call),
+        ExprKind::Map(entries) => entries
+            .iter()
+            .any(|(key, value)| expr_may_call(key) || expr_may_call(value)),
+        ExprKind::StructLit { fields, base, .. } => {
+            base.as_deref().is_some_and(expr_may_call)
+                || fields
+                    .iter()
+                    .any(|field| field.value.as_ref().is_some_and(expr_may_call))
+        }
+        ExprKind::Unary { expr, .. } | ExprKind::Try(expr) | ExprKind::Convert { expr, .. } => {
+            expr_may_call(expr)
+        }
+        ExprKind::Binary { lhs, rhs, .. } => expr_may_call(lhs) || expr_may_call(rhs),
+        ExprKind::Range { start, end, .. } => expr_may_call(start) || expr_may_call(end),
+        ExprKind::Field { base, .. } => expr_may_call(base),
+        ExprKind::Index { base, index } => expr_may_call(base) || expr_may_call(index),
+        ExprKind::If { .. }
+        | ExprKind::Match { .. }
+        | ExprKind::Block(_)
+        | ExprKind::Call { .. } => true,
+    }
+}
+
 impl<'p, 'h> Runtime<'p, 'h> {
     fn call_builtin_method(
         &mut self,
@@ -17,7 +57,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         };
         if !mut_self {
             let mut value = self.eval_expr(base)?;
-            let mut values = Vec::with_capacity(args.len());
+            let mut values = CallArgs::with_capacity(args.len());
             for arg in args {
                 if arg.mutable {
                     return self.trap(self.internal_panic("unexpected mut argument"));
@@ -32,8 +72,19 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
 
         let place = self.eval_place(base)?;
-        let snapshot = self.read_place(&place)?;
-        let mut values = Vec::with_capacity(args.len());
+        let direct_root = place.accessors.is_empty()
+            && args
+                .iter()
+                .all(|arg| !arg.mutable && !expr_may_call(&arg.expr));
+        let snapshot = if direct_root {
+            if self.local_value(place.root).is_none() {
+                return self.trap(self.internal_panic("unbound place root"));
+            }
+            None
+        } else {
+            Some(self.read_place(&place)?)
+        };
+        let mut values = CallArgs::with_capacity(args.len());
         for arg in args {
             if arg.mutable {
                 return self.trap(self.internal_panic("unexpected mut argument"));
@@ -43,20 +94,27 @@ impl<'p, 'h> Runtime<'p, 'h> {
         self.check_builtin_mutation_depth(name, &values, place.accessors.len())?;
 
         let mut root = self.take_place_root(&place)?;
-        let mut value = snapshot;
-        let result = if place.accessors.is_empty() {
-            drop(root);
+        let result = if let Some(mut value) = snapshot {
+            if place.accessors.is_empty() {
+                drop(root);
+                let result =
+                    self.apply_builtin_method(receiver, name, &mut value, values, expr.span)?;
+                self.current_locals_mut().insert(place.root, value);
+                result
+            } else {
+                let replaced = self.take_path_value(&mut root, &place.accessors)?;
+                drop(replaced);
+                let result =
+                    self.apply_builtin_method(receiver, name, &mut value, values, expr.span)?;
+                self.set_path(&mut root, &place.accessors, value, MAX_VALUE_DEPTH)?;
+                self.current_locals_mut().insert(place.root, root);
+                result
+            }
+        } else {
+            let mut value = root;
             let result =
                 self.apply_builtin_method(receiver, name, &mut value, values, expr.span)?;
             self.current_locals_mut().insert(place.root, value);
-            result
-        } else {
-            let replaced = self.take_path_value(&mut root, &place.accessors)?;
-            drop(replaced);
-            let result =
-                self.apply_builtin_method(receiver, name, &mut value, values, expr.span)?;
-            self.set_path(&mut root, &place.accessors, value, MAX_VALUE_DEPTH)?;
-            self.current_locals_mut().insert(place.root, root);
             result
         };
         self.check_value_depth(&result, expr.span)?;
@@ -69,7 +127,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         receiver: BuiltinReceiver,
         name: &str,
         receiver_value: &mut Value,
-        args: Vec<Value>,
+        args: CallArgs,
         span: Span,
     ) -> EvalResult<Value> {
         match receiver {
@@ -88,7 +146,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         &mut self,
         name: &str,
         receiver: &mut Value,
-        args: Vec<Value>,
+        args: CallArgs,
         span: Span,
     ) -> EvalResult<Value> {
         let Value::List(items) = receiver else {
@@ -129,7 +187,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let mut out = Vec::with_capacity(snapshot.len());
                 for item in snapshot.iter() {
                     out.push(
-                        self.call_closure(closure, vec![item.clone()])
+                        self.call_closure(closure, smallvec![item.clone()])
                             .map_err(EvalError::Trap)?,
                     );
                 }
@@ -142,7 +200,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let mut out = Vec::new();
                 for item in snapshot.iter() {
                     let keep = self
-                        .call_closure(closure, vec![item.clone()])
+                        .call_closure(closure, smallvec![item.clone()])
                         .map_err(EvalError::Trap)?;
                     if matches!(keep, Value::Bool(true)) {
                         out.push(item.clone());
@@ -162,7 +220,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 self.charge(snapshot.len() as u64)?;
                 for item in snapshot.iter() {
                     init = self
-                        .call_closure(closure, vec![init, item.clone()])
+                        .call_closure(closure, smallvec![init, item.clone()])
                         .map_err(EvalError::Trap)?;
                 }
                 Ok(init)
@@ -173,7 +231,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 for item in snapshot.iter() {
                     self.charge(1)?;
                     if matches!(
-                        self.call_closure(closure, vec![item.clone()])
+                        self.call_closure(closure, smallvec![item.clone()])
                             .map_err(EvalError::Trap)?,
                         Value::Bool(true)
                     ) {
@@ -188,7 +246,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 for item in snapshot.iter() {
                     self.charge(1)?;
                     if !matches!(
-                        self.call_closure(closure, vec![item.clone()])
+                        self.call_closure(closure, smallvec![item.clone()])
                             .map_err(EvalError::Trap)?,
                         Value::Bool(true)
                     ) {
@@ -226,7 +284,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let mut keyed = Vec::with_capacity(snapshot.len());
                 for item in snapshot.iter() {
                     let key = self
-                        .call_closure(closure, vec![item.clone()])
+                        .call_closure(closure, smallvec![item.clone()])
                         .map_err(EvalError::Trap)?;
                     keyed.push((key, item.clone()));
                 }
@@ -307,7 +365,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     self.charge(other.len() as u64)?;
                     self.note_alloc(8 * other.len() as u64);
                     let list = self.cow_vec_mut(items, n)?;
-                    list.extend(other.iter().cloned());
+                    list.extend_values(other.iter().cloned());
                 }
                 Ok(Value::Unit)
             }
@@ -317,7 +375,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     Rc::make_mut(items).clear();
                 } else {
                     self.note_alloc(16);
-                    *items = Rc::new(Vec::new());
+                    *items = Rc::new(SeqValue::new(Vec::new()));
                 }
                 Ok(Value::Unit)
             }
@@ -329,7 +387,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         &mut self,
         name: &str,
         receiver: &mut Value,
-        args: Vec<Value>,
+        args: CallArgs,
         span: Span,
     ) -> EvalResult<Value> {
         let Value::Map(map) = receiver else {
@@ -395,7 +453,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     Rc::make_mut(map).clear();
                 } else {
                     self.note_alloc(16);
-                    *map = Rc::new(OrderedMap::new());
+                    *map = Rc::new(MapValue::new(OrderedMap::new()));
                 }
                 Ok(Value::Unit)
             }
@@ -407,7 +465,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         &mut self,
         name: &str,
         receiver: &mut Value,
-        args: Vec<Value>,
+        args: CallArgs,
         span: Span,
     ) -> EvalResult<Value> {
         let Value::Str(text) = receiver else {
@@ -507,7 +565,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         &mut self,
         name: &str,
         receiver: &mut Value,
-        args: Vec<Value>,
+        args: CallArgs,
         span: Span,
     ) -> EvalResult<Value> {
         let Value::Int(value) = receiver else {
@@ -550,7 +608,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         &mut self,
         name: &str,
         receiver: &mut Value,
-        args: Vec<Value>,
+        args: CallArgs,
         span: Span,
     ) -> EvalResult<Value> {
         let Value::Float(value) = receiver else {
@@ -595,7 +653,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         &mut self,
         name: &str,
         receiver: &mut Value,
-        args: Vec<Value>,
+        args: CallArgs,
         _span: Span,
     ) -> EvalResult<Value> {
         let Value::Range {
@@ -639,7 +697,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         &mut self,
         name: &str,
         receiver: &mut Value,
-        args: Vec<Value>,
+        args: CallArgs,
         span: Span,
     ) -> EvalResult<Value> {
         let Value::Option(option) = receiver else {
@@ -652,7 +710,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let closure = self.closure_arg(&args, 0)?;
                 match option.clone() {
                     Some(value) => Ok(Value::Option(Some(Box::new(
-                        self.call_closure(closure, vec![*value])
+                        self.call_closure(closure, smallvec![*value])
                             .map_err(EvalError::Trap)?,
                     )))),
                     None => Ok(Value::Option(None)),
@@ -662,7 +720,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let closure = self.closure_arg(&args, 0)?;
                 match option.clone() {
                     Some(value) => self
-                        .call_closure(closure, vec![*value])
+                        .call_closure(closure, smallvec![*value])
                         .map_err(EvalError::Trap),
                     None => Ok(Value::Option(None)),
                 }
@@ -695,7 +753,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         &mut self,
         name: &str,
         receiver: &mut Value,
-        args: Vec<Value>,
+        args: CallArgs,
         span: Span,
     ) -> EvalResult<Value> {
         let Value::Result(result) = receiver else {
@@ -708,7 +766,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let closure = self.closure_arg(&args, 0)?;
                 match result.clone() {
                     Ok(value) => Ok(Value::Result(Ok(Box::new(
-                        self.call_closure(closure, vec![*value])
+                        self.call_closure(closure, smallvec![*value])
                             .map_err(EvalError::Trap)?,
                     )))),
                     Err(error) => Ok(Value::Result(Err(error))),
@@ -719,7 +777,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 match result.clone() {
                     Ok(value) => Ok(Value::Result(Ok(value))),
                     Err(error) => Ok(Value::Result(Err(Box::new(
-                        self.call_closure(closure, vec![*error])
+                        self.call_closure(closure, smallvec![*error])
                             .map_err(EvalError::Trap)?,
                     )))),
                 }
@@ -728,7 +786,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let closure = self.closure_arg(&args, 0)?;
                 match result.clone() {
                     Ok(value) => self
-                        .call_closure(closure, vec![*value])
+                        .call_closure(closure, smallvec![*value])
                         .map_err(EvalError::Trap),
                     Err(error) => Ok(Value::Result(Err(error))),
                 }
@@ -755,9 +813,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
     }
 
-    fn closure_arg<'a>(&self, args: &'a [Value], index: usize) -> EvalResult<&'a Closure> {
+    fn closure_arg<'a>(&self, args: &'a [Value], index: usize) -> EvalResult<&'a FnValue> {
         match args.get(index) {
-            Some(Value::Fn(closure)) => Ok(closure.as_ref()),
+            Some(Value::Fn(function)) => Ok(function),
             _ => self.trap(self.internal_panic("expected a function argument")),
         }
     }

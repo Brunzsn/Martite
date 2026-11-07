@@ -85,6 +85,62 @@ fn lists_and_loops() {
 }
 
 #[test]
+fn loops_iterate_a_snapshot() {
+    assert_eq!(
+        run_source(
+            r#"
+            fn main() {
+                var xs = [1, 2, 3]
+                var total = 0
+                for x in xs {
+                    total += x
+                    xs.push(x)
+                }
+                print("{total}:{xs.len()}")
+
+                var table = {"a": 1, "b": 2}
+                var keys = ""
+                for (key, value) in table {
+                    keys += key
+                    table["c"] = value
+                }
+                print("{keys}:{table.len()}")
+
+                var text = "ab"
+                var seen = ""
+                for ch in text {
+                    seen += ch
+                    text = text + "c"
+                }
+                print("{seen}:{text.len()}")
+            }
+            "#
+        ),
+        ["6:6", "ab:3", "ab:4"]
+    );
+}
+
+#[test]
+fn mut_receiver_is_copied_in_before_arguments() {
+    assert_eq!(
+        run_source(
+            r#"
+            fn add_marker(mut xs: list[int]) -> int {
+                xs.push(9)
+                0
+            }
+            fn main() {
+                var xs = [1, 2, 3]
+                xs.push(add_marker(mut xs))
+                print("{xs}")
+            }
+            "#
+        ),
+        ["[1, 2, 3, 0]"]
+    );
+}
+
+#[test]
 fn option_match() {
     assert_eq!(
         run_source(

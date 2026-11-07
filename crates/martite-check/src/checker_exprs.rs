@@ -588,6 +588,7 @@ impl<'a> Checker<'a> {
         }
         self.scopes.push(HashMap::new());
         let mut param_tys = Vec::new();
+        let mut param_bindings = Vec::with_capacity(params.len());
         for (i, param) in params.iter().enumerate() {
             let ty = match &param.ty {
                 Some(t) => match self.resolve_current_ty(t) {
@@ -614,6 +615,11 @@ impl<'a> Checker<'a> {
             for (name, (id, _)) in &bindings {
                 self.bind_existing(name, *id, param.span);
             }
+            param_bindings.push(if matches!(param.pattern.kind, PatKind::Bind(_)) {
+                self.pattern_bindings.get(&param.pattern.id).copied()
+            } else {
+                None
+            });
             param_tys.push(ty);
         }
         let inferred_ret = match body {
@@ -631,6 +637,7 @@ impl<'a> Checker<'a> {
                 params: params.to_vec(),
                 body: body.clone(),
                 captures,
+                param_bindings,
             },
         );
         self.ctx = saved_ctx;
@@ -954,7 +961,7 @@ impl<'a> Checker<'a> {
         let symbols = &resolved.module(module).symbols;
         if let Some(def) = symbols.values.get(name).copied() {
             let info = resolved.def(def);
-            if let Some(sig) = self.functions.get(&def).cloned() {
+            if let Some(sig) = self.fn_sig(def).cloned() {
                 let ty = Ty::Fn(
                     sig.params.iter().map(|p| p.ty.clone()).collect(),
                     Box::new(sig.ret.clone()),
@@ -1178,7 +1185,7 @@ impl<'a> Checker<'a> {
                             kind: FieldKind::Value,
                         };
                     }
-                    if let Some(sig) = self.functions.get(&def).cloned() {
+                    if let Some(sig) = self.fn_sig(def).cloned() {
                         let ty = Ty::Fn(
                             sig.params.iter().map(|p| p.ty.clone()).collect(),
                             Box::new(sig.ret.clone()),
@@ -1304,7 +1311,7 @@ impl<'a> Checker<'a> {
             }
         }
         if let Some(def_id) = self.methods.get(&(type_id, name.to_string())).copied() {
-            if let Some(sig) = self.functions.get(&def_id).cloned() {
+            if let Some(sig) = self.fn_sig(def_id).cloned() {
                 if sig.has_self() {
                     let module = self.current_module();
                     self.err_at(
@@ -1381,7 +1388,7 @@ impl<'a> Checker<'a> {
                     };
                 };
                 if let Some(def_id) = self.methods.get(&(*type_id, name.clone())).copied() {
-                    if let Some(sig) = self.functions.get(&def_id).cloned() {
+                    if let Some(sig) = self.fn_sig(def_id).cloned() {
                         let ty = Ty::Fn(
                             sig.call_params().iter().map(|p| p.ty.clone()).collect(),
                             Box::new(sig.ret.clone()),
@@ -1858,7 +1865,7 @@ impl<'a> Checker<'a> {
         receiver: Option<(&Expr, Ty)>,
         infer: &mut Infer,
     ) -> Ty {
-        let Some(sig) = self.functions.get(&def).cloned() else {
+        let Some(sig) = self.fn_sig(def).cloned() else {
             return Ty::Error;
         };
         if sig.kind == FnKind::Handler && !self.ctx.as_ref().is_some_and(|c| c.is_test) {
