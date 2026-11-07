@@ -179,18 +179,27 @@ pub fn show(value: &Value, types: &TypeTable, top: bool) -> String {
     out
 }
 
-fn write_show(out: &mut String, value: &Value, types: &TypeTable, top: bool) {
+/// Appends the normative `Show` format and returns the number of container
+/// slots traversed. Callers that charge `Show` fuel use the count directly
+/// instead of walking the value twice.
+pub(crate) fn write_show(out: &mut String, value: &Value, types: &TypeTable, top: bool) -> u64 {
     use std::fmt::Write;
     match value {
-        Value::Unit => out.push_str("()"),
+        Value::Unit => {
+            out.push_str("()");
+            0
+        }
         Value::Int(v) => {
             let _ = write!(out, "{v}");
+            0
         }
         Value::Float(v) => {
             let _ = write!(out, "{v:?}");
+            0
         }
         Value::Bool(v) => {
             let _ = write!(out, "{v}");
+            0
         }
         Value::Str(s) => {
             if top {
@@ -209,41 +218,48 @@ fn write_show(out: &mut String, value: &Value, types: &TypeTable, top: bool) {
                 }
                 out.push('"');
             }
+            0
         }
         Value::List(items) => {
             out.push('[');
+            let mut slots = items.len() as u64;
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                write_show(out, item, types, false);
+                slots += write_show(out, item, types, false);
             }
             out.push(']');
+            slots
         }
         Value::Tuple(items) => {
             out.push('(');
+            let mut slots = items.len() as u64;
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                write_show(out, item, types, false);
+                slots += write_show(out, item, types, false);
             }
             if items.len() == 1 {
                 out.push(',');
             }
             out.push(')');
+            slots
         }
         Value::Map(map) => {
             out.push('{');
+            let mut slots = map.len() as u64 * 2;
             for (i, (key, value)) in map.entries().iter().enumerate() {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                write_show(out, &crate::value::key_to_value(key), types, false);
+                slots += write_show(out, &crate::value::key_to_value(key), types, false);
                 out.push_str(": ");
-                write_show(out, value, types, false);
+                slots += write_show(out, value, types, false);
             }
             out.push('}');
+            slots
         }
         Value::Range {
             start,
@@ -251,11 +267,13 @@ fn write_show(out: &mut String, value: &Value, types: &TypeTable, top: bool) {
             inclusive,
         } => {
             let _ = write!(out, "{start}..{}{end}", if *inclusive { "=" } else { "" });
+            0
         }
         Value::Struct(value) => {
             let def = types.get(value.type_id);
             let name = def.map(|d| d.name.as_str()).unwrap_or("<struct>");
             let _ = write!(out, "{name} {{ ");
+            let mut slots = value.fields.len() as u64;
             if let Some(TypeDefKind::Struct { fields }) = def.map(|d| &d.kind) {
                 for (i, (field, field_value)) in fields.iter().zip(value.fields.iter()).enumerate()
                 {
@@ -263,10 +281,11 @@ fn write_show(out: &mut String, value: &Value, types: &TypeTable, top: bool) {
                         out.push_str(", ");
                     }
                     let _ = write!(out, "{}: ", field.name);
-                    write_show(out, field_value, types, false);
+                    slots += write_show(out, field_value, types, false);
                 }
             }
             out.push_str(" }");
+            slots
         }
         Value::Enum(value) => {
             let def = types.get(value.type_id);
@@ -279,35 +298,43 @@ fn write_show(out: &mut String, value: &Value, types: &TypeTable, top: bool) {
                 .map(|v| v.name.as_str())
                 .unwrap_or("<variant>");
             let _ = write!(out, "{name}.{variant}");
+            let mut slots = value.payload.len() as u64;
             if !value.payload.is_empty() {
                 out.push('(');
                 for (i, item) in value.payload.iter().enumerate() {
                     if i > 0 {
                         out.push_str(", ");
                     }
-                    write_show(out, item, types, false);
+                    slots += write_show(out, item, types, false);
                 }
                 out.push(')');
             }
+            slots
         }
         Value::Option(inner) => match inner {
-            None => out.push_str("None"),
+            None => {
+                out.push_str("None");
+                0
+            }
             Some(v) => {
                 out.push_str("Some(");
-                write_show(out, v, types, false);
+                let slots = 1 + write_show(out, v, types, false);
                 out.push(')');
+                slots
             }
         },
         Value::Result(result) => match result {
             Ok(v) => {
                 out.push_str("Ok(");
-                write_show(out, v, types, false);
+                let slots = 1 + write_show(out, v, types, false);
                 out.push(')');
+                slots
             }
             Err(v) => {
                 out.push_str("Err(");
-                write_show(out, v, types, false);
+                let slots = 1 + write_show(out, v, types, false);
                 out.push(')');
+                slots
             }
         },
         Value::Handle(handle) => {
@@ -316,13 +343,42 @@ fn write_show(out: &mut String, value: &Value, types: &TypeTable, top: bool) {
                 .map(|d| d.name.as_str())
                 .unwrap_or("Handle");
             let _ = write!(out, "<{name}>");
+            0
         }
         Value::Fn(_) | Value::Builtin(_) | Value::BuiltinModuleFn { .. } => {
             out.push_str("<fn>");
+            0
         }
     }
 }
 
 pub fn map_key(value: &Value) -> Result<crate::value::KeyValue, String> {
     key_from_value(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cost::slots;
+    use crate::value::{KeyValue, OrderedMap, Value};
+
+    #[test]
+    fn write_show_reports_the_slots_it_traverses() {
+        let types = TypeTable::default();
+        let mut map = OrderedMap::new();
+        map.insert(
+            KeyValue::Str("a".into()),
+            Value::list(vec![Value::Int(1), Value::Int(2)]),
+        );
+        let value = Value::list(vec![
+            Value::Int(1),
+            Value::map(map),
+            Value::Option(Some(Box::new(Value::list(vec![Value::Int(3)])))),
+            Value::Result(Ok(Box::new(Value::Int(4)))),
+        ]);
+        let mut out = String::new();
+        let counted = write_show(&mut out, &value, &types, true);
+        assert_eq!(counted, slots(&value));
+        assert_eq!(out, "[1, {\"a\": [1, 2]}, Some([3]), Ok(4)]");
+    }
 }

@@ -164,6 +164,11 @@ const FUEL_ROWS: &[FuelRow] = &[
         source: "fn main() { let a = [[1, 2], [3]]\nlet b = [[1, 2], [3]]\nlet same = a == b\nprint(\"{same}\") }",
         expected: 36,
     },
+    FuelRow {
+        name: "repeated string literal bytes",
+        source: "fn main() { var i = 0\nwhile i < 3 { let text = \"abcd\"\ni += 1 } }",
+        expected: 27,
+    },
 ];
 
 #[test]
@@ -213,6 +218,34 @@ fn repeated_small_allocations_do_not_inflate_memory() {
     ));
     assert_eq!(long, short);
     assert_eq!(long, 32);
+}
+
+#[test]
+fn shared_const_values_are_counted_once() {
+    let shared = min_memory(&Case::single(
+        "const VALUES: list[int] = [1, 2, 3]\nfn main() { var all: list[list[int]] = []\nvar i = 0\nwhile i < 10 { all.push(VALUES)\ni += 1 } }",
+    ));
+    let rebuilt = min_memory(&Case::single(
+        "fn main() { var all: list[list[int]] = []\nvar i = 0\nwhile i < 10 { all.push([1, 2, 3])\ni += 1 } }",
+    ));
+    assert!(
+        shared < rebuilt,
+        "cached constants must share one payload: shared {shared}, rebuilt {rebuilt}"
+    );
+}
+
+#[test]
+fn shared_string_literals_are_counted_once() {
+    let shared = min_memory(&Case::single(
+        "fn main() { var all: list[str] = []\nvar i = 0\nwhile i < 10 { all.push(\"abc\")\ni += 1 } }",
+    ));
+    let rebuilt = min_memory(&Case::single(
+        "fn main() { var all: list[str] = []\nvar i = 0\nwhile i < 10 { all.push(\"a\" + \"bc\")\ni += 1 } }",
+    ));
+    assert!(
+        shared < rebuilt,
+        "cached literals must share one payload: shared {shared}, rebuilt {rebuilt}"
+    );
 }
 
 #[test]

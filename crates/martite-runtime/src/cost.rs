@@ -49,11 +49,6 @@ pub(crate) fn comparison_cost(value: &Value) -> u64 {
     slots(value).saturating_add(string_cost(value))
 }
 
-/// Number of slots traversed by `Show`.
-pub(crate) fn show_slots(value: &Value) -> u64 {
-    slots(value)
-}
-
 fn key_slots(key: &KeyValue) -> u64 {
     match key {
         KeyValue::Tuple(items) => items.len() as u64 + items.iter().map(key_slots).sum::<u64>(),
