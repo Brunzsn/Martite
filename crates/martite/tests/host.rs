@@ -1,6 +1,9 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use martite::{Engine, HostSignature, HostType, Instance, Outcome};
 use martite_base::MemoryProvider;
-use martite_runtime::Value;
+use martite_runtime::{HostFault, Trap, Value};
 
 const INTERFACE: &str = r#"struct Doc
 fn text(doc: Doc) -> str
@@ -294,4 +297,264 @@ fn ungranted_host_module_is_e501() {
         Err(error) => error,
     };
     assert!(error.iter().any(|d| d.code == martite_base::Code::E501));
+}
+
+const HANDLE_INTERFACE: &str = r#"struct Doc
+fn new_doc(name: str) -> Doc
+fn find_doc(name: str) -> Doc?
+fn try_new_doc(name: str) -> Result[Doc, str]
+fn text(doc: Doc) -> str
+fn bad() -> str
+on created() -> Result[(), str]
+on found() -> Result[(), str]
+on try_new() -> Result[(), str]
+on broken() -> Result[(), str]
+"#;
+
+const HANDLE_MANIFEST: &str = r#"
+[plugin]
+name = "handle-constructor"
+version = "0.1.0"
+lang = "1"
+api = "1.0"
+entry = "main.mt"
+
+[permissions]
+grant = ["app.docs"]
+"#;
+
+const HANDLE_PLUGIN: &str = r#"
+use app.docs
+
+struct State { text: str, count: int }
+
+on init() -> State { State { text: "", count: 0 } }
+
+on created(mut self) -> Result[(), str] {
+    let doc = docs.new_doc("new")
+    self.text = docs.text(doc)
+    self.count += 1
+    Ok(())
+}
+
+on found(mut self) -> Result[(), str] {
+    match docs.find_doc("found") {
+        Some(doc) => {
+            self.text = docs.text(doc)
+            self.count += 1
+            Ok(())
+        }
+        None => Err("missing"),
+    }
+}
+
+on try_new(mut self) -> Result[(), str] {
+    match docs.try_new_doc("tried") {
+        Ok(doc) => {
+            self.text = docs.text(doc)
+            self.count += 1
+            Ok(())
+        }
+        Err(message) => Err(message),
+    }
+}
+
+on broken() -> Result[(), str] {
+    let _ = docs.bad()
+    Ok(())
+}
+"#;
+
+const HANDLE_TEST_PLUGIN: &str = r#"
+use app.docs
+
+test "test double constructs a handle" {
+    let doc = docs.new_doc("offline")
+    assert(docs.text(doc) == "offline", "wrong token")
+}
+"#;
+
+fn handle_engine() -> (Engine, Rc<RefCell<Vec<u32>>>) {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let seen_text = seen.clone();
+    let mut engine = Engine::new();
+    engine.interface("app.docs", HANDLE_INTERFACE);
+    engine.host_fn(
+        "app.docs.new_doc",
+        HostSignature::new(vec![HostType::Str], HostType::Handle("Doc".into())),
+        |cx, args| {
+            let name = args.first().and_then(Value::as_str).unwrap_or_default();
+            cx.make_handle(name)
+        },
+    );
+    engine.host_fn(
+        "app.docs.find_doc",
+        HostSignature::new(
+            vec![HostType::Str],
+            HostType::Option(Box::new(HostType::Handle("Doc".into()))),
+        ),
+        |cx, args| {
+            let name = args.first().and_then(Value::as_str).unwrap_or_default();
+            Ok(Value::Option(Some(Box::new(cx.make_handle(name)?))))
+        },
+    );
+    engine.host_fn(
+        "app.docs.try_new_doc",
+        HostSignature::new(
+            vec![HostType::Str],
+            HostType::Result(
+                Box::new(HostType::Handle("Doc".into())),
+                Box::new(HostType::Str),
+            ),
+        ),
+        |cx, args| {
+            let name = args.first().and_then(Value::as_str).unwrap_or_default();
+            Ok(Value::Result(Ok(Box::new(cx.make_handle(name)?))))
+        },
+    );
+    engine.host_fn(
+        "app.docs.text",
+        HostSignature::new(vec![HostType::Handle("Doc".into())], HostType::Str),
+        move |_cx, args| match args.first() {
+            Some(Value::Handle(handle)) => {
+                seen_text.borrow_mut().push(handle.type_id.0);
+                Ok(Value::str(handle.token.clone()))
+            }
+            _ => Err(HostFault::new("expected a Doc handle")),
+        },
+    );
+    engine.host_fn(
+        "app.docs.bad",
+        HostSignature::new(vec![], HostType::Str),
+        |cx, _args| cx.make_handle("bad"),
+    );
+    (engine, seen)
+}
+
+fn load_handle_plugin(source: &str) -> (martite::Plugin, Rc<RefCell<Vec<u32>>>) {
+    let (engine, seen) = handle_engine();
+    let mut provider = MemoryProvider::new();
+    provider.insert("main.mt", source);
+    let plugin = engine
+        .load(HANDLE_MANIFEST, &provider)
+        .unwrap_or_else(|diagnostics| {
+            let sources = martite_base::SourceMap::new();
+            panic!(
+                "{}",
+                diagnostics
+                    .iter()
+                    .map(|d| d.render(&sources))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        });
+    (plugin, seen)
+}
+
+fn doc_type_id(plugin: &martite::Plugin) -> u32 {
+    plugin
+        .program()
+        .types
+        .defs
+        .iter()
+        .find(|def| def.name == "Doc" && def.is_interface)
+        .map(|def| def.id.0)
+        .expect("Doc interface type")
+}
+
+fn handle_state_text<'a>(instance: &'a Instance<'_>) -> &'a str {
+    let Some(Value::Struct(state)) = instance.state() else {
+        panic!("expected struct state");
+    };
+    let Value::Str(text) = &state.fields[0] else {
+        panic!("expected text field");
+    };
+    text
+}
+
+fn handle_state_count(instance: &Instance<'_>) -> i64 {
+    let Some(Value::Struct(state)) = instance.state() else {
+        panic!("expected struct state");
+    };
+    let Value::Int(count) = &state.fields[1] else {
+        panic!("expected count field");
+    };
+    *count
+}
+
+#[test]
+fn host_functions_can_construct_handles() {
+    let (plugin, seen) = load_handle_plugin(HANDLE_PLUGIN);
+    let expected = doc_type_id(&plugin);
+    let mut instance = plugin.instantiate().expect("init");
+    let Outcome::Handled(value) = instance.call("created", vec![]).expect("call") else {
+        panic!("handler missing");
+    };
+    assert!(matches!(value, Value::Result(Ok(_))), "{value:?}");
+    assert_eq!(handle_state_text(&instance), "new");
+    assert_eq!(handle_state_count(&instance), 1);
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0], expected);
+}
+
+#[test]
+fn host_functions_can_construct_option_handles() {
+    let (plugin, seen) = load_handle_plugin(HANDLE_PLUGIN);
+    let expected = doc_type_id(&plugin);
+    let mut instance = plugin.instantiate().expect("init");
+    let Outcome::Handled(value) = instance.call("found", vec![]).expect("call") else {
+        panic!("handler missing");
+    };
+    assert!(matches!(value, Value::Result(Ok(_))), "{value:?}");
+    assert_eq!(handle_state_text(&instance), "found");
+    assert_eq!(handle_state_count(&instance), 1);
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0], expected);
+}
+
+#[test]
+fn host_functions_can_construct_result_handles() {
+    let (plugin, seen) = load_handle_plugin(HANDLE_PLUGIN);
+    let expected = doc_type_id(&plugin);
+    let mut instance = plugin.instantiate().expect("init");
+    let Outcome::Handled(value) = instance.call("try_new", vec![]).expect("call") else {
+        panic!("handler missing");
+    };
+    assert!(matches!(value, Value::Result(Ok(_))), "{value:?}");
+    assert_eq!(handle_state_text(&instance), "tried");
+    assert_eq!(handle_state_count(&instance), 1);
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0], expected);
+}
+
+#[test]
+fn make_handle_without_an_opaque_return_is_a_host_fault() {
+    let (plugin, _seen) = load_handle_plugin(HANDLE_PLUGIN);
+    let mut instance = plugin.instantiate().expect("init");
+    let error = instance
+        .call("broken", vec![])
+        .expect_err("expected a host fault");
+    match error {
+        Trap::HostFault(message) => {
+            assert!(
+                message.contains("opaque handle"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("unexpected trap: {other:?}"),
+    }
+}
+
+#[test]
+fn test_doubles_can_construct_handles() {
+    let (engine, _seen) = handle_engine();
+    let mut provider = MemoryProvider::new();
+    provider.insert("main.mt", HANDLE_TEST_PLUGIN);
+    let plugin = engine.load(HANDLE_MANIFEST, &provider).expect("load");
+    let reports = plugin.run_tests();
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].passed(), "test failed: {:?}", reports[0].outcome);
 }

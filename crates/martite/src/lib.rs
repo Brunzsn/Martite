@@ -503,6 +503,11 @@ impl Plugin {
     }
 
     /// Create an opaque handle value for a host type declared in an interface.
+    ///
+    /// This is for handles created outside a plugin call, such as test
+    /// fixtures. A host function that creates a handle during a call uses
+    /// `HostContext::make_handle`, which derives the type from the function's
+    /// declared return type.
     pub fn make_handle(&self, type_name: &str, token: impl Into<String>) -> Option<Value> {
         let type_id = self
             .program

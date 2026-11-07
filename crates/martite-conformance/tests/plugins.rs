@@ -4,10 +4,12 @@ use martite_runtime::{HostContext, HostFault, Value};
 
 const INTERFACE: &str = r#"struct Doc
 fn text(doc: Doc) -> str
+fn new_doc(name: str) -> Doc
 fn maybe() -> str?
 fn stale_text(doc: Doc) -> str?
 on saved(doc: Doc) -> Result[(), str]
 on lookup(doc: Doc) -> Result[(), str]
+on create() -> Result[(), str]
 on tick()
 on fail() -> Result[(), str]
 on boom()
@@ -56,6 +58,13 @@ on lookup(mut self, doc: Doc) -> Result[(), str] {
     }
 }
 
+on create(mut self) -> Result[(), str] {
+    let doc = editor.new_doc("ok")
+    self.text = editor.text(doc)
+    self.saves += 1
+    Ok(())
+}
+
 on tick(mut self) { self.saves += 1 }
 
 on fail(mut self) -> Result[(), str] {
@@ -86,6 +95,14 @@ fn editor_engine() -> Engine {
             Some(Value::Handle(handle)) if handle.token == "ok" => Ok(Value::str("hello")),
             Some(Value::Handle(_)) => Err(HostFault::new("stale handle")),
             _ => Err(HostFault::new("expected a Doc handle")),
+        },
+    );
+    engine.host_fn(
+        "app.editor.new_doc",
+        HostSignature::new(vec![HostType::Str], HostType::Handle("Doc".into())),
+        |cx, args| {
+            let name = args.first().and_then(Value::as_str).unwrap_or_default();
+            cx.make_handle(name)
         },
     );
     engine.host_fn(
@@ -149,6 +166,18 @@ fn init_state_and_handler_copy_out_work() {
     assert_eq!(state_str(&instance, 1), "");
 
     let Outcome::Handled(value) = instance.call("saved", vec![doc]).expect("call") else {
+        panic!("handler missing");
+    };
+    assert!(matches!(value, Value::Result(Ok(_))), "{value:?}");
+    assert_eq!(state_int(&instance, 0), 1);
+    assert_eq!(state_str(&instance, 1), "hello");
+}
+
+#[test]
+fn host_functions_can_create_handles_during_a_call() {
+    let plugin = load(PLUGIN, MANIFEST).expect("load");
+    let mut instance = plugin.instantiate().expect("init");
+    let Outcome::Handled(value) = instance.call("create", vec![]).expect("call") else {
         panic!("handler missing");
     };
     assert!(matches!(value, Value::Result(Ok(_))), "{value:?}");

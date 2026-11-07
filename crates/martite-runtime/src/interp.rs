@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use martite_base::{SourceId, Span};
 use martite_check::{
     BindingId, BuiltinFn, BuiltinItem, BuiltinReceiver, CheckedProgram, ConstValue, DefId, FnKind,
-    FnSig, PatResolution, PreludeVariant, Resolution,
+    FnSig, PatResolution, PreludeVariant, Resolution, Ty, TypeDefKind, TypeId,
 };
 use martite_syntax::{
     AssignOp, BinaryOp, Block, Expr, ExprKind, LambdaBody, MatchBody, NodeId, PatKind, Pattern,
@@ -16,8 +16,9 @@ use smallvec::{SmallVec, smallvec};
 use crate::cost::{comparison_cost, show_slots};
 use crate::ops::{show, value_eq, value_ord, write_show};
 use crate::value::{
-    Closure, ClosureTarget, EnumValue, FnValue, MAX_VALUE_DEPTH, MapValue, OrderedMap, SeqValue,
-    StructValue, Value, key_from_value, key_to_value, key_value_size, value_depth_exceeds,
+    Closure, ClosureTarget, EnumValue, FnValue, HandleValue, MAX_VALUE_DEPTH, MapValue, OrderedMap,
+    SeqValue, StructValue, Value, key_from_value, key_to_value, key_value_size,
+    value_depth_exceeds,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -52,14 +53,49 @@ impl HostFault {
     }
 }
 
+/// Per-call context passed to a host function.
+///
+/// The runtime constructs this value. `handle_type` records the opaque type
+/// the host function is allowed to create, if any.
 #[derive(Debug, Clone)]
 pub struct HostContext {
     pub charged: u64,
+    handle_type: Option<TypeId>,
 }
 
 impl HostContext {
     pub fn charge(&mut self, units: u64) {
         self.charged = self.charged.saturating_add(units);
+    }
+
+    /// Create an opaque handle of the host function's declared return type.
+    ///
+    /// The runtime enables this when the host function returns a direct
+    /// opaque interface type, or an `Option` or `Result` whose success
+    /// payload is one. Calling it from any other host function is a host
+    /// bug and returns a [`HostFault`].
+    pub fn make_handle(&self, token: impl Into<String>) -> Result<Value, HostFault> {
+        let Some(type_id) = self.handle_type else {
+            return Err(HostFault::new(
+                "make_handle requires the host function to return an opaque handle type",
+            ));
+        };
+        Ok(Value::Handle(Rc::new(HandleValue {
+            type_id,
+            token: token.into(),
+        })))
+    }
+}
+
+fn opaque_handle_type(ty: &Ty, program: &CheckedProgram) -> Option<TypeId> {
+    match ty {
+        Ty::Named(id, args) if args.is_empty() => {
+            let def = program.type_def(*id)?;
+            (def.is_interface && matches!(&def.kind, TypeDefKind::Opaque)).then_some(*id)
+        }
+        Ty::Option(inner) => opaque_handle_type(inner.as_ref(), program),
+        Ty::Result(ok, _) => opaque_handle_type(ok.as_ref(), program),
+        _ => None,
     }
 }
 
@@ -445,7 +481,8 @@ impl<'p, 'h> Runtime<'p, 'h> {
             return Err(Trap::DepthExceeded);
         }
         if sig.kind == FnKind::Host {
-            return Ok((self.call_host(def, args)?, Writebacks::new()));
+            let handle_type = opaque_handle_type(&sig.ret, self.program);
+            return Ok((self.call_host(def, handle_type, args)?, Writebacks::new()));
         }
         let program = self.program;
         let body = program
@@ -515,7 +552,12 @@ impl<'p, 'h> Runtime<'p, 'h> {
         Ok((value, updated))
     }
 
-    fn call_host(&mut self, def: DefId, args: CallArgs) -> Result<Value, Trap> {
+    fn call_host(
+        &mut self,
+        def: DefId,
+        handle_type: Option<TypeId>,
+        args: CallArgs,
+    ) -> Result<Value, Trap> {
         if self.deadline_due() {
             return Err(Trap::Deadline);
         }
@@ -527,7 +569,10 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 trace: Vec::new(),
             });
         };
-        let mut cx = HostContext { charged: 0 };
+        let mut cx = HostContext {
+            charged: 0,
+            handle_type,
+        };
         let result = host.call(def, &args, &mut cx);
         self.fuel = self.fuel.saturating_sub(cx.charged.saturating_add(1));
         if self.fuel == 0 {
