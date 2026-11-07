@@ -229,7 +229,7 @@ impl<'a> Analysis<'a> {
     }
 
     fn collect_signatures(&mut self) {
-        for sig in self.program.functions.values() {
+        for sig in self.program.functions.iter().flatten() {
             let Some(module) = self.module(sig.module) else {
                 continue;
             };
@@ -333,8 +333,9 @@ impl<'a> Analysis<'a> {
         let mut defs: Vec<DefId> = self
             .program
             .functions
-            .keys()
-            .copied()
+            .iter()
+            .flatten()
+            .map(|sig| sig.def)
             .filter(|def| self.program.function_block(*def).is_some())
             .collect();
         defs.sort();

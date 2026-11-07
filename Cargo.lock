@@ -586,6 +586,7 @@ dependencies = [
  "martite-base",
  "martite-resolve",
  "martite-syntax",
+ "rustc-hash",
 ]
 
 [[package]]
@@ -669,6 +670,7 @@ version = "0.1.0"
 dependencies = [
  "martite-base",
  "martite-syntax",
+ "rustc-hash",
 ]
 
 [[package]]
@@ -681,6 +683,7 @@ dependencies = [
  "martite-check",
  "martite-syntax",
  "serde_json",
+ "smallvec",
 ]
 
 [[package]]
@@ -922,6 +925,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "rustc-hash"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
+
+[[package]]
 name = "rustix"
 version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1036,6 +1045,12 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "smallvec"
+version = "1.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 
 [[package]]
 name = "stacker"
