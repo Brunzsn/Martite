@@ -189,7 +189,7 @@ type EvalResult<T> = Result<T, EvalError>;
 
 struct Place {
     root: BindingId,
-    accessors: Vec<Accessor>,
+    accessors: SmallVec<[Accessor; 4]>,
 }
 
 enum Accessor {
@@ -1391,7 +1391,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 };
                 Ok(Place {
                     root,
-                    accessors: Vec::new(),
+                    accessors: SmallVec::new(),
                 })
             }
             ExprKind::Field { base, name } => {
