@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use martite_base::{SourceId, Span};
 use martite_resolve::{BuiltinItem, DefId, DefInfo, ModuleId, ModuleTarget, ResolvedProgram};
-use martite_syntax::{Block, FnDecl, LambdaBody, LambdaParam, NodeId};
+use martite_syntax::{Block, FnDecl, LambdaBody, LambdaParam, NodeId, NodeTable};
+use rustc_hash::FxHashMap;
 
 use crate::ty::{BindingId, Ty, TypeId, TypeTable};
 
@@ -191,20 +192,22 @@ pub struct CheckedProgram {
     /// methods, handlers, and tests; other definitions hold `None`.
     pub functions: Vec<Option<FnSig>>,
     pub methods: HashMap<(TypeId, String), DefId>,
-    pub consts: HashMap<DefId, ConstInfo>,
-    pub expr_types: HashMap<NodeId, Ty>,
-    pub resolutions: HashMap<NodeId, Resolution>,
-    pub pattern_resolutions: HashMap<NodeId, PatResolution>,
+    pub consts: FxHashMap<DefId, ConstInfo>,
+    /// Type of every expression, indexed directly by its dense `NodeId`.
+    pub expr_types: NodeTable<Ty>,
+    /// Name resolution for every resolved expression.
+    pub resolutions: NodeTable<Resolution>,
+    pub pattern_resolutions: NodeTable<PatResolution>,
     /// Declaration slots for struct literals, keyed by the literal's `NodeId`.
     /// Each pair is `(index in the literal's fields, declaration index)`.
-    pub struct_lit_fields: HashMap<NodeId, Vec<(usize, usize)>>,
+    pub struct_lit_fields: FxHashMap<NodeId, Vec<(usize, usize)>>,
     /// Declaration slots for struct patterns, keyed by the pattern's `NodeId`.
     /// Each pair is `(index in the pattern's fields, declaration index)`.
-    pub struct_pattern_fields: HashMap<NodeId, Vec<(usize, usize)>>,
-    pub bindings: HashMap<BindingId, BindingInfo>,
-    pub pattern_bindings: HashMap<NodeId, BindingId>,
-    pub param_bindings: HashMap<NodeId, BindingId>,
-    pub lambdas: HashMap<NodeId, LambdaInfo>,
+    pub struct_pattern_fields: FxHashMap<NodeId, Vec<(usize, usize)>>,
+    pub bindings: FxHashMap<BindingId, BindingInfo>,
+    pub pattern_bindings: NodeTable<BindingId>,
+    pub param_bindings: FxHashMap<NodeId, BindingId>,
+    pub lambdas: FxHashMap<NodeId, LambdaInfo>,
     pub handlers: HashMap<String, DefId>,
     pub hooks: HashMap<String, HookSig>,
     pub tests: Vec<DefId>,

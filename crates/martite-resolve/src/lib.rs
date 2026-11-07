@@ -7,6 +7,7 @@ use martite_base::{
     Code, Diagnostic, LoadLimits, Severity, SourceId, SourceMap, SourceProvider, Span,
 };
 use martite_syntax::*;
+use rustc_hash::FxHashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DefId(pub u32);
@@ -146,8 +147,11 @@ pub struct ResolvedProgram {
     pub modules: Vec<Module>,
     pub entry: ModuleId,
     pub defs: Vec<DefInfo>,
-    pub node_to_def: HashMap<NodeId, DefId>,
+    pub node_to_def: FxHashMap<NodeId, DefId>,
     pub grants: Vec<String>,
+    /// One past the highest `NodeId` allocated while loading this program.
+    /// Every node ID in the program is smaller than this bound.
+    pub next_node_id: u32,
 }
 
 impl ResolvedProgram {
@@ -238,7 +242,8 @@ struct Loader<'a> {
     modules: Vec<Module>,
     by_path: HashMap<String, ModuleId>,
     defs: Vec<DefInfo>,
-    node_to_def: HashMap<NodeId, DefId>,
+    node_to_def: FxHashMap<NodeId, DefId>,
+    node_ids: NodeIdAllocator,
     interfaces: HashMap<String, InterfaceSource>,
     file_cache: HashMap<String, Option<String>>,
     loading: HashSet<String>,
@@ -265,7 +270,8 @@ impl<'a> Loader<'a> {
             modules: Vec::new(),
             by_path: HashMap::new(),
             defs: Vec::new(),
-            node_to_def: HashMap::new(),
+            node_to_def: FxHashMap::default(),
+            node_ids: NodeIdAllocator::new(),
             interfaces,
             file_cache: HashMap::new(),
             loading: HashSet::new(),
@@ -276,7 +282,8 @@ impl<'a> Loader<'a> {
     }
 
     fn run(&mut self) {
-        let names: Vec<String> = self.interfaces.keys().cloned().collect();
+        let mut names: Vec<String> = self.interfaces.keys().cloned().collect();
+        names.sort();
         for path in names {
             let _ = self.ensure_module(&path, true);
         }
@@ -304,12 +311,14 @@ impl<'a> Loader<'a> {
 
     fn finish(self) -> Option<ResolvedProgram> {
         let entry = self.entry?;
+        let next_node_id = self.node_ids.next_id();
         Some(ResolvedProgram {
             modules: self.modules,
             entry,
             defs: self.defs,
             node_to_def: self.node_to_def,
             grants: self.options.grants.clone(),
+            next_node_id,
         })
     }
 
@@ -439,10 +448,12 @@ impl<'a> Loader<'a> {
         }
 
         let source = self.sources.add(file_name, text.clone());
+        let limits = self.options.limits;
+        let parse = self.options.parse;
         let parsed = if is_interface {
-            parse_interface_with(&text, self.options.limits, self.options.parse)
+            parse_interface_with_allocator(&text, limits, parse, &mut self.node_ids)
         } else {
-            parse_source_with(&text, self.options.limits, self.options.parse)
+            parse_source_with_allocator(&text, limits, parse, &mut self.node_ids)
         };
         self.push_syntax_diagnostics(parsed.diagnostics, source);
 
@@ -1509,6 +1520,31 @@ mod tests {
         assert!(main.symbols.modules.contains_key("shapes"));
         assert!(main.symbols.types.contains_key("Circle"));
         assert!(main.symbols.consts.contains_key("MAX_SIZE"));
+    }
+
+    #[test]
+    fn node_ids_are_unique_across_modules() {
+        let (_sources, out) = resolve_text(
+            &[
+                (
+                    "main.mt",
+                    "use util\nfn main() {\n    let value = util.one()\n}\n",
+                ),
+                ("util.mt", "pub fn one() -> int {\n    1\n}\n"),
+            ],
+            "main.mt",
+        );
+        assert!(!out.has_errors(), "unexpected errors");
+        let program = out.program.expect("program");
+        let mut seen = HashSet::new();
+        for module in &program.modules {
+            for item in &module.ast.items {
+                let id = item.id();
+                assert!(id.0 < program.next_node_id);
+                assert!(seen.insert(id), "duplicate NodeId across modules");
+            }
+        }
+        assert!(!seen.is_empty());
     }
 
     #[test]

@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::mem::discriminant;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use martite_base::{Code, Diagnostic, LoadLimits, Span, normalize_source};
 
@@ -21,6 +20,40 @@ impl ParseOptions {
     pub const TOOLING: Self = Self {
         keep_parentheses: true,
     };
+}
+
+/// Allocates `NodeId`s for one parse session.
+///
+/// IDs start at 1 and increase by one for every AST node. A load session shares
+/// one allocator across all of its modules so IDs stay unique and dense within
+/// that program. Separate sessions may reuse the same range because every
+/// `NodeId`-keyed table belongs to a single program.
+#[derive(Debug)]
+pub struct NodeIdAllocator {
+    next: u32,
+}
+
+impl Default for NodeIdAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NodeIdAllocator {
+    pub fn new() -> Self {
+        Self { next: 1 }
+    }
+
+    fn allocate(&mut self) -> NodeId {
+        let id = NodeId(self.next);
+        self.next = self.next.checked_add(1).expect("NodeId space exhausted");
+        id
+    }
+
+    /// One past the highest ID allocated by this session.
+    pub fn next_id(&self) -> u32 {
+        self.next
+    }
 }
 
 /// Parenthesis metadata recorded only when [`ParseOptions::keep_parentheses`]
@@ -93,7 +126,21 @@ pub fn parse_source(source: &str, limits: LoadLimits) -> ParseOutput {
 /// Parse a source file with explicit options.
 pub fn parse_source_with(source: &str, limits: LoadLimits, options: ParseOptions) -> ParseOutput {
     let source = normalize_source(source);
-    parse_source_normalized_with_options(&source, limits, options)
+    parse_normalized(&source, limits, false, options, &mut NodeIdAllocator::new())
+}
+
+/// Parse a source file, allocating its nodes from a shared session.
+///
+/// Pass the same allocator to every module of a load so `NodeId`s stay unique
+/// and dense across the whole program.
+pub fn parse_source_with_allocator(
+    source: &str,
+    limits: LoadLimits,
+    options: ParseOptions,
+    ids: &mut NodeIdAllocator,
+) -> ParseOutput {
+    let source = normalize_source(source);
+    parse_normalized(&source, limits, false, options, ids)
 }
 
 /// Parse source that has already been normalized with
@@ -108,7 +155,7 @@ pub fn parse_source_normalized_with_options(
     limits: LoadLimits,
     options: ParseOptions,
 ) -> ParseOutput {
-    Parser::new(source, limits, false, options).parse_program()
+    parse_normalized(source, limits, false, options, &mut NodeIdAllocator::new())
 }
 
 pub fn parse_interface(source: &str, limits: LoadLimits) -> ParseOutput {
@@ -122,7 +169,18 @@ pub fn parse_interface_with(
     options: ParseOptions,
 ) -> ParseOutput {
     let source = normalize_source(source);
-    parse_interface_normalized_with_options(&source, limits, options)
+    parse_normalized(&source, limits, true, options, &mut NodeIdAllocator::new())
+}
+
+/// Parse an interface file, allocating its nodes from a shared session.
+pub fn parse_interface_with_allocator(
+    source: &str,
+    limits: LoadLimits,
+    options: ParseOptions,
+    ids: &mut NodeIdAllocator,
+) -> ParseOutput {
+    let source = normalize_source(source);
+    parse_normalized(&source, limits, true, options, ids)
 }
 
 /// Parse an interface that has already been normalized with
@@ -137,7 +195,17 @@ pub fn parse_interface_normalized_with_options(
     limits: LoadLimits,
     options: ParseOptions,
 ) -> ParseOutput {
-    Parser::new(source, limits, true, options).parse_program()
+    parse_normalized(source, limits, true, options, &mut NodeIdAllocator::new())
+}
+
+fn parse_normalized(
+    source: &str,
+    limits: LoadLimits,
+    interface: bool,
+    options: ParseOptions,
+    ids: &mut NodeIdAllocator,
+) -> ParseOutput {
+    Parser::new(source, ids, limits, interface, options).parse_program()
 }
 
 /// Parse already-normalized source and return the token stream for the
@@ -156,7 +224,8 @@ pub fn parse_source_normalized_with_tokens_with_options(
     limits: LoadLimits,
     options: ParseOptions,
 ) -> (ParseOutput, Vec<Token>) {
-    Parser::new(source, limits, false, options).parse_program_with_tokens()
+    let mut ids = NodeIdAllocator::new();
+    Parser::new(source, &mut ids, limits, false, options).parse_program_with_tokens()
 }
 
 /// Parse an already-normalized interface and return the token stream for the
@@ -175,7 +244,8 @@ pub fn parse_interface_normalized_with_tokens_with_options(
     limits: LoadLimits,
     options: ParseOptions,
 ) -> (ParseOutput, Vec<Token>) {
-    Parser::new(source, limits, true, options).parse_program_with_tokens()
+    let mut ids = NodeIdAllocator::new();
+    Parser::new(source, &mut ids, limits, true, options).parse_program_with_tokens()
 }
 
 type PResult<T> = Result<T, ()>;
@@ -213,6 +283,7 @@ enum PatternHead {
 
 struct Parser<'a> {
     source: &'a str,
+    ids: &'a mut NodeIdAllocator,
     tokens: Vec<Token>,
     idx: usize,
     limits: LoadLimits,
@@ -227,13 +298,20 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn new(source: &'a str, limits: LoadLimits, interface: bool, options: ParseOptions) -> Self {
+    fn new(
+        source: &'a str,
+        ids: &'a mut NodeIdAllocator,
+        limits: LoadLimits,
+        interface: bool,
+        options: ParseOptions,
+    ) -> Self {
         let lexed = lex(source, limits);
-        Self::with_lexed(source, lexed, limits, interface, options)
+        Self::with_lexed(source, ids, lexed, limits, interface, options)
     }
 
     fn with_lexed(
         source: &'a str,
+        ids: &'a mut NodeIdAllocator,
         lexed: Lexed,
         limits: LoadLimits,
         interface: bool,
@@ -241,6 +319,7 @@ impl<'a> Parser<'a> {
     ) -> Self {
         Self {
             source,
+            ids,
             tokens: lexed.tokens,
             idx: 0,
             limits,
@@ -478,8 +557,7 @@ impl<'a> Parser<'a> {
     }
 
     fn id(&mut self) -> NodeId {
-        static NEXT_NODE_ID: AtomicU32 = AtomicU32::new(1);
-        NodeId(NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed))
+        self.ids.allocate()
     }
 
     fn enter_depth(&mut self) -> PResult<()> {
@@ -1853,15 +1931,27 @@ impl<'a> Parser<'a> {
                     let options = ParseOptions {
                         keep_parentheses: self.parentheses.is_some(),
                     };
-                    let mut sub =
-                        Parser::with_lexed(self.source, lexed, self.limits, false, options);
-                    let expr = sub.parse_expr().map_err(|_| {
-                        self.error(
-                            Code::E003,
-                            expr_span,
-                            "malformed expression inside interpolation",
-                        )
-                    })?;
+                    let mut sub = Parser::with_lexed(
+                        self.source,
+                        &mut *self.ids,
+                        lexed,
+                        self.limits,
+                        false,
+                        options,
+                    );
+                    let expr = match sub.parse_expr() {
+                        Ok(expr) => expr,
+                        Err(()) => {
+                            let span = expr_span;
+                            drop(sub);
+                            self.error(
+                                Code::E003,
+                                span,
+                                "malformed expression inside interpolation",
+                            );
+                            return Err(());
+                        }
+                    };
                     sub.peek_token();
                     if !sub.at(&TokenKind::Eof) {
                         let err_span = sub.span();
@@ -2536,5 +2626,30 @@ mod tests {
         assert!(!tables.type_parens(ty.id).is_empty());
         assert!(!tables.pattern_parens(pattern.id).is_empty());
         assert!(tooling.program.is_parenthesized(value.id));
+    }
+
+    #[test]
+    fn node_ids_are_dense_and_repeatable() {
+        let source = "fn main() { let x = \"{1 + 2}\" }";
+        let limits = LoadLimits::default();
+        let first = parse_source(source, limits);
+        let second = parse_source(source, limits);
+        assert!(first.diagnostics.is_empty(), "{:?}", first.diagnostics);
+        assert_eq!(first.program, second.program);
+
+        let mut ids = NodeIdAllocator::new();
+        let parsed = parse_source_with_allocator(source, limits, ParseOptions::default(), &mut ids);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert!(ids.next_id() > 1);
+        assert_eq!(first.program, parsed.program);
+    }
+
+    #[test]
+    fn allocator_hands_out_consecutive_ids() {
+        let mut ids = NodeIdAllocator::new();
+        assert_eq!(ids.next_id(), 1);
+        assert_eq!(ids.allocate(), NodeId(1));
+        assert_eq!(ids.allocate(), NodeId(2));
+        assert_eq!(ids.next_id(), 3);
     }
 }
