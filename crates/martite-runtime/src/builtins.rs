@@ -1,3 +1,43 @@
+/// True when evaluating `expr` can call user or host code. Calls are the only
+/// way an argument can mutate the receiver binding, so call-free arguments let
+/// a mutable builtin use the direct root path without changing evaluation
+/// order.
+fn expr_may_call(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Unit
+        | ExprKind::Var(_)
+        | ExprKind::Lambda { .. } => false,
+        ExprKind::Str(parts) => parts.iter().any(|part| match part {
+            StrExprPart::Text(_) => false,
+            StrExprPart::Expr(expr) => expr_may_call(expr),
+        }),
+        ExprKind::Tuple(items) | ExprKind::List(items) => items.iter().any(expr_may_call),
+        ExprKind::Map(entries) => entries
+            .iter()
+            .any(|(key, value)| expr_may_call(key) || expr_may_call(value)),
+        ExprKind::StructLit { fields, base, .. } => {
+            base.as_deref().is_some_and(expr_may_call)
+                || fields
+                    .iter()
+                    .any(|field| field.value.as_ref().is_some_and(expr_may_call))
+        }
+        ExprKind::Unary { expr, .. } | ExprKind::Try(expr) | ExprKind::Convert { expr, .. } => {
+            expr_may_call(expr)
+        }
+        ExprKind::Binary { lhs, rhs, .. } => expr_may_call(lhs) || expr_may_call(rhs),
+        ExprKind::Range { start, end, .. } => expr_may_call(start) || expr_may_call(end),
+        ExprKind::Field { base, .. } => expr_may_call(base),
+        ExprKind::Index { base, index } => expr_may_call(base) || expr_may_call(index),
+        ExprKind::If { .. }
+        | ExprKind::Match { .. }
+        | ExprKind::Block(_)
+        | ExprKind::Call { .. } => true,
+    }
+}
+
 impl<'p, 'h> Runtime<'p, 'h> {
     fn call_builtin_method(
         &mut self,
@@ -32,7 +72,18 @@ impl<'p, 'h> Runtime<'p, 'h> {
         }
 
         let place = self.eval_place(base)?;
-        let snapshot = self.read_place(&place)?;
+        let direct_root = place.accessors.is_empty()
+            && args
+                .iter()
+                .all(|arg| !arg.mutable && !expr_may_call(&arg.expr));
+        let snapshot = if direct_root {
+            if self.local_value(place.root).is_none() {
+                return self.trap(self.internal_panic("unbound place root"));
+            }
+            None
+        } else {
+            Some(self.read_place(&place)?)
+        };
         let mut values = CallArgs::with_capacity(args.len());
         for arg in args {
             if arg.mutable {
@@ -43,20 +94,27 @@ impl<'p, 'h> Runtime<'p, 'h> {
         self.check_builtin_mutation_depth(name, &values, place.accessors.len())?;
 
         let mut root = self.take_place_root(&place)?;
-        let mut value = snapshot;
-        let result = if place.accessors.is_empty() {
-            drop(root);
+        let result = if let Some(mut value) = snapshot {
+            if place.accessors.is_empty() {
+                drop(root);
+                let result =
+                    self.apply_builtin_method(receiver, name, &mut value, values, expr.span)?;
+                self.current_locals_mut().insert(place.root, value);
+                result
+            } else {
+                let replaced = self.take_path_value(&mut root, &place.accessors)?;
+                drop(replaced);
+                let result =
+                    self.apply_builtin_method(receiver, name, &mut value, values, expr.span)?;
+                self.set_path(&mut root, &place.accessors, value, MAX_VALUE_DEPTH)?;
+                self.current_locals_mut().insert(place.root, root);
+                result
+            }
+        } else {
+            let mut value = root;
             let result =
                 self.apply_builtin_method(receiver, name, &mut value, values, expr.span)?;
             self.current_locals_mut().insert(place.root, value);
-            result
-        } else {
-            let replaced = self.take_path_value(&mut root, &place.accessors)?;
-            drop(replaced);
-            let result =
-                self.apply_builtin_method(receiver, name, &mut value, values, expr.span)?;
-            self.set_path(&mut root, &place.accessors, value, MAX_VALUE_DEPTH)?;
-            self.current_locals_mut().insert(place.root, root);
             result
         };
         self.check_value_depth(&result, expr.span)?;
