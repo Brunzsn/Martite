@@ -3,6 +3,69 @@ use martite_base::Span;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u32);
 
+/// Dense side table indexed by [`NodeId`].
+///
+/// Slots live in a `Vec`, so lookups are a bounds check instead of a hash
+/// lookup. IDs must come from the same parse session as the program that owns
+/// the table; that keeps the indexed range dense.
+#[derive(Clone, PartialEq)]
+pub struct NodeTable<T> {
+    slots: Vec<Option<T>>,
+}
+
+impl<T> Default for NodeTable<T> {
+    fn default() -> Self {
+        Self { slots: Vec::new() }
+    }
+}
+
+impl<T> NodeTable<T> {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            slots: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn insert(&mut self, id: NodeId, value: T) -> Option<T> {
+        let index = id.0 as usize;
+        if self.slots.len() <= index {
+            self.slots.resize_with(index + 1, || None);
+        }
+        self.slots[index].replace(value)
+    }
+
+    #[inline]
+    pub fn get(&self, id: &NodeId) -> Option<&T> {
+        self.slots.get(id.0 as usize).and_then(Option::as_ref)
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, id: &NodeId) -> Option<&mut T> {
+        self.slots.get_mut(id.0 as usize).and_then(Option::as_mut)
+    }
+
+    pub fn contains_key(&self, id: &NodeId) -> bool {
+        self.get(id).is_some()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.slots.iter().filter_map(Option::as_ref)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (NodeId, &T)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| value.as_ref().map(|value| (NodeId(index as u32), value)))
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for NodeTable<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
 /// One pair of source parentheses around a node. Nested pairs are recorded
 /// innermost first, so the formatter can reproduce redundant `((x))` too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -504,4 +567,23 @@ pub struct FieldPat {
     pub span: Span,
     pub name: String,
     pub pattern: Pattern,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_table_indexes_by_dense_id() {
+        let mut table = NodeTable::default();
+        assert_eq!(table.get(&NodeId(2)), None);
+        assert_eq!(table.insert(NodeId(2), "two"), None);
+        assert_eq!(table.insert(NodeId(1), "one"), None);
+        assert_eq!(table.get(&NodeId(1)), Some(&"one"));
+        assert_eq!(table.get(&NodeId(2)), Some(&"two"));
+        assert_eq!(table.get(&NodeId(3)), None);
+        assert_eq!(table.values().copied().collect::<Vec<_>>(), ["one", "two"]);
+        assert_eq!(table.insert(NodeId(2), "second"), Some("two"));
+        assert_eq!(table.get(&NodeId(2)), Some(&"second"));
+    }
 }

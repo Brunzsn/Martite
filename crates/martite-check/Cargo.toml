@@ -10,6 +10,7 @@ publish = false
 martite-base.workspace = true
 martite-syntax.workspace = true
 martite-resolve.workspace = true
+rustc-hash.workspace = true
 
 [lints]
 workspace = true
