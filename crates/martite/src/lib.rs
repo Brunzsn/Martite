@@ -717,11 +717,9 @@ impl HostDispatcher for Dispatch<'_> {
 fn toml_to_json(value: &toml::Value, json_type: TypeId, program: &CheckedProgram) -> Value {
     let variant = |name: &str| program.types.variant_index(json_type, name).unwrap_or(0);
     let make = |variant: usize, payload: Vec<Value>| {
-        Value::Enum(Rc::new(martite_runtime::EnumValue {
-            type_id: json_type,
-            variant,
-            payload,
-        }))
+        Value::Enum(Rc::new(martite_runtime::EnumValue::new(
+            json_type, variant, payload,
+        )))
     };
     match value {
         toml::Value::String(s) => make(variant("Str"), vec![Value::str(s.clone())]),
@@ -979,7 +977,7 @@ fn encode_into(out: &mut Vec<u8>, value: &Value, program: &CheckedProgram) {
             write_len(out, value.type_id.0 as usize);
             write_bytes(out, value.token.as_bytes());
         }
-        Fn(_) | Builtin(_) | BuiltinModuleFn { .. } => out.push(14),
+        Fn(_) | Builtin(_) | BuiltinModuleFn(_) => out.push(14),
     }
 }
 
@@ -1121,7 +1119,7 @@ fn decode_value(
             for _ in 0..len {
                 fields.push(decode_value(bytes, pos, program, depth + 1)?);
             }
-            Value::Struct(Rc::new(martite_runtime::StructValue { type_id, fields }))
+            Value::Struct(Rc::new(martite_runtime::StructValue::new(type_id, fields)))
         }
         10 => {
             let type_id = TypeId(read_u32(bytes, pos)?);
@@ -1131,11 +1129,9 @@ fn decode_value(
             for _ in 0..len {
                 payload.push(decode_value(bytes, pos, program, depth + 1)?);
             }
-            Value::Enum(Rc::new(martite_runtime::EnumValue {
-                type_id,
-                variant,
-                payload,
-            }))
+            Value::Enum(Rc::new(martite_runtime::EnumValue::new(
+                type_id, variant, payload,
+            )))
         }
         11 => match read_u8(bytes, pos)? {
             0 => Value::Option(None),
@@ -1350,7 +1346,7 @@ fn validate_snapshot_value(
                 Err("snapshot handle type is not opaque".into())
             }
         }
-        Value::Fn(_) | Value::Builtin(_) | Value::BuiltinModuleFn { .. } => {
+        Value::Fn(_) | Value::Builtin(_) | Value::BuiltinModuleFn(_) => {
             Err("snapshot contains a function value".into())
         }
     }

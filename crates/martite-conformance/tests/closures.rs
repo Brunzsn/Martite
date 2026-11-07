@@ -62,6 +62,20 @@ fn free_function_values_work_in_higher_order_builtins() {
 }
 
 #[test]
+fn builtin_module_function_values_are_callable() {
+    assert_eq!(
+        run(r#"
+            use std.math.sin
+            fn main() {
+                let function = sin
+                print("{function(0.0)}")
+            }
+            "#),
+        ["0.0"]
+    );
+}
+
+#[test]
 fn higher_order_builtins_accept_borrowed_closures() {
     assert_eq!(
         run(r#"

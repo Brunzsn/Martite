@@ -59,35 +59,130 @@ pub enum ModuleTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinItem {
+    pub id: BuiltinItemId,
     pub module: &'static str,
     pub name: &'static str,
     pub kind: DefKind,
 }
+
+/// Compact identity for a canonical builtin module item.
+///
+/// Runtime values store this instead of the module/name strings so using a
+/// builtin function as a value never allocates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct BuiltinItemId(u8);
+
+impl BuiltinItemId {
+    pub fn item(self) -> &'static BuiltinItem {
+        BUILTIN_ITEMS
+            .get(self.0 as usize)
+            .expect("builtin item id is in range")
+    }
+}
+
+static BUILTIN_ITEMS: [BuiltinItem; 15] = [
+    BuiltinItem {
+        id: BuiltinItemId(0),
+        module: "std.math",
+        name: "PI",
+        kind: DefKind::Const,
+    },
+    BuiltinItem {
+        id: BuiltinItemId(1),
+        module: "std.math",
+        name: "EULER",
+        kind: DefKind::Const,
+    },
+    BuiltinItem {
+        id: BuiltinItemId(2),
+        module: "std.math",
+        name: "min",
+        kind: DefKind::Fn,
+    },
+    BuiltinItem {
+        id: BuiltinItemId(3),
+        module: "std.math",
+        name: "max",
+        kind: DefKind::Fn,
+    },
+    BuiltinItem {
+        id: BuiltinItemId(4),
+        module: "std.math",
+        name: "clamp",
+        kind: DefKind::Fn,
+    },
+    BuiltinItem {
+        id: BuiltinItemId(5),
+        module: "std.math",
+        name: "sin",
+        kind: DefKind::Fn,
+    },
+    BuiltinItem {
+        id: BuiltinItemId(6),
+        module: "std.math",
+        name: "cos",
+        kind: DefKind::Fn,
+    },
+    BuiltinItem {
+        id: BuiltinItemId(7),
+        module: "std.math",
+        name: "tan",
+        kind: DefKind::Fn,
+    },
+    BuiltinItem {
+        id: BuiltinItemId(8),
+        module: "std.math",
+        name: "atan2",
+        kind: DefKind::Fn,
+    },
+    BuiltinItem {
+        id: BuiltinItemId(9),
+        module: "std.math",
+        name: "exp",
+        kind: DefKind::Fn,
+    },
+    BuiltinItem {
+        id: BuiltinItemId(10),
+        module: "std.math",
+        name: "ln",
+        kind: DefKind::Fn,
+    },
+    BuiltinItem {
+        id: BuiltinItemId(11),
+        module: "std.math",
+        name: "log10",
+        kind: DefKind::Fn,
+    },
+    BuiltinItem {
+        id: BuiltinItemId(12),
+        module: "std.json",
+        name: "Json",
+        kind: DefKind::Enum,
+    },
+    BuiltinItem {
+        id: BuiltinItemId(13),
+        module: "std.json",
+        name: "parse",
+        kind: DefKind::Fn,
+    },
+    BuiltinItem {
+        id: BuiltinItemId(14),
+        module: "std.json",
+        name: "stringify",
+        kind: DefKind::Fn,
+    },
+];
 
 /// Look up a builtin module item by its canonical name.
 ///
 /// The returned names are always `'static`, so `BuiltinItem` stays `Copy` and
 /// resolution never allocates when recording a builtin lookup.
 pub fn builtin_item(module: &str, name: &str) -> Option<BuiltinItem> {
-    let (module, name, kind) = match (module, name) {
-        ("std.math", "PI") => ("std.math", "PI", DefKind::Const),
-        ("std.math", "EULER") => ("std.math", "EULER", DefKind::Const),
-        ("std.math", "min") => ("std.math", "min", DefKind::Fn),
-        ("std.math", "max") => ("std.math", "max", DefKind::Fn),
-        ("std.math", "clamp") => ("std.math", "clamp", DefKind::Fn),
-        ("std.math", "sin") => ("std.math", "sin", DefKind::Fn),
-        ("std.math", "cos") => ("std.math", "cos", DefKind::Fn),
-        ("std.math", "tan") => ("std.math", "tan", DefKind::Fn),
-        ("std.math", "atan2") => ("std.math", "atan2", DefKind::Fn),
-        ("std.math", "exp") => ("std.math", "exp", DefKind::Fn),
-        ("std.math", "ln") => ("std.math", "ln", DefKind::Fn),
-        ("std.math", "log10") => ("std.math", "log10", DefKind::Fn),
-        ("std.json", "Json") => ("std.json", "Json", DefKind::Enum),
-        ("std.json", "parse") => ("std.json", "parse", DefKind::Fn),
-        ("std.json", "stringify") => ("std.json", "stringify", DefKind::Fn),
-        _ => return None,
-    };
-    Some(BuiltinItem { module, name, kind })
+    BUILTIN_ITEMS
+        .iter()
+        .find(|item| item.module == module && item.name == name)
+        .copied()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1564,11 +1659,13 @@ mod tests {
         assert_eq!(euler.module, "std.math");
         assert_eq!(euler.name, "EULER");
         assert_eq!(euler.kind, DefKind::Const);
+        assert_eq!(euler.id.item(), &euler);
 
         let parse = symbols.builtin_items.get("parse").copied().expect("parse");
         assert_eq!(parse.module, "std.json");
         assert_eq!(parse.name, "parse");
         assert_eq!(parse.kind, DefKind::Fn);
+        assert_eq!(parse.id.item(), &parse);
     }
 
     #[test]
