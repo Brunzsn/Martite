@@ -274,7 +274,7 @@ impl Engine {
         let program = loaded
             .program
             .ok_or_else(|| vec![Diagnostic::error(Code::E508, "program failed to load")])?;
-        let mut host_by_def = HashMap::new();
+        let mut host_by_def = vec![None; program.resolved.defs.len()];
         let mut missing = Vec::new();
         for module in &program.resolved.modules {
             if !module.is_interface {
@@ -308,7 +308,7 @@ impl Engine {
                             ));
                         }
                     }
-                    host_by_def.insert(def, registered.clone());
+                    host_by_def[def.0 as usize] = Some(registered.clone());
                 }
             }
         }
@@ -364,7 +364,7 @@ impl Engine {
         let program = loaded
             .program
             .ok_or_else(|| vec![Diagnostic::error(Code::E508, "program failed to load")])?;
-        let mut host_by_def = HashMap::new();
+        let mut host_by_def = vec![None; program.resolved.defs.len()];
         let mut diagnostics = Vec::new();
         for module in &program.resolved.modules {
             if !module.is_interface {
@@ -395,7 +395,7 @@ impl Engine {
                                     ));
                                 }
                             }
-                            host_by_def.insert(def, registered.clone());
+                            host_by_def[def.0 as usize] = Some(registered.clone());
                         }
                     }
                 }
@@ -452,7 +452,9 @@ fn parse_api(api: &str) -> Result<(u32, u32), ()> {
 pub struct Plugin {
     program: CheckedProgram,
     sources: SourceMap,
-    host_by_def: HashMap<DefId, RegisteredFn>,
+    /// Dense table indexed by `DefId`. Entries are present for interface
+    /// functions registered with the engine; other definitions hold `None`.
+    host_by_def: Vec<Option<RegisteredFn>>,
     settings: toml::Value,
     limits: ExecLimits,
     manifest: Manifest,
@@ -700,7 +702,7 @@ pub struct Snapshot {
 }
 
 struct Dispatch<'a> {
-    fns: &'a HashMap<DefId, RegisteredFn>,
+    fns: &'a [Option<RegisteredFn>],
 }
 
 impl HostDispatcher for Dispatch<'_> {
@@ -710,12 +712,12 @@ impl HostDispatcher for Dispatch<'_> {
         args: &[Value],
         cx: &mut HostContext,
     ) -> Result<Value, HostFault> {
-        let function = self
+        let registered = self
             .fns
-            .get(&def)
-            .map(|r| r.function.clone())
+            .get(def.0 as usize)
+            .and_then(Option::as_ref)
             .ok_or_else(|| HostFault::new("host function is not registered"))?;
-        function(cx, args)
+        (registered.function)(cx, args)
     }
 }
 
