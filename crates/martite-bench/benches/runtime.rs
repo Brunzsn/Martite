@@ -1,7 +1,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use martite_bench::{BENCH_LIMITS, fixture};
+use martite_bench::{BENCH_LIMITS, HOST_CALLS_COUNT, fixture, host_calls_plugin};
 use martite_runtime::{Runtime, Value};
 
 fn runtime_benches(c: &mut Criterion) {
@@ -18,6 +18,9 @@ fn runtime_benches(c: &mut Criterion) {
         "closures",
         "captures",
         "mut_params",
+        "field_index_ops",
+        "option_ops",
+        "map_iteration",
     ] {
         let (program, _) = fixture(&format!("runtime/{name}.mt")).checked();
         let mut runtime = Runtime::new(&program, BENCH_LIMITS);
@@ -39,6 +42,14 @@ fn runtime_benches(c: &mut Criterion) {
     let mut restored = plugin.instantiate().expect("init");
     group.bench_function("plugin_restore", |b| {
         b.iter(|| black_box(restored.restore(&snapshot)))
+    });
+
+    let host_plugin = host_calls_plugin();
+    let mut host_instance = host_plugin.instantiate().expect("init");
+    group.bench_function("host_calls", |b| {
+        b.iter(|| {
+            black_box(host_instance.call("run", vec![Value::Int(HOST_CALLS_COUNT), Value::Int(7)]))
+        })
     });
     group.finish();
 }

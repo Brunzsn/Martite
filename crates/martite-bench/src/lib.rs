@@ -8,13 +8,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use martite::{Engine, Plugin};
+use martite::{Engine, HostSignature, HostType, Plugin};
 use martite_base::{LoadLimits, MemoryProvider, SourceMap};
 use martite_check::CheckedProgram;
 use martite_config::{Manifest, parse_manifest};
 use martite_driver::{LoadOptions, LoadedProgram, load};
 use martite_resolve::InterfaceSource;
-use martite_runtime::ExecLimits;
+use martite_runtime::{ExecLimits, Value};
 use martite_syntax::ParseOptions;
 
 /// Generous execution limits so benchmark fixtures never trap.
@@ -24,6 +24,9 @@ pub const BENCH_LIMITS: ExecLimits = ExecLimits {
     depth: 200,
     deadline: None,
 };
+
+/// Number of host calls the `runtime/host_calls` fixture performs per run.
+pub const HOST_CALLS_COUNT: i64 = 1000;
 
 /// Root of the deterministic benchmark corpus owned by the conformance suite.
 pub fn corpus_root() -> PathBuf {
@@ -281,6 +284,36 @@ pub fn fixture(name: &str) -> Fixture {
         manifest_text,
         manifest,
     }
+}
+
+/// Load the `runtime/host_calls` fixture with deterministic host functions.
+///
+/// The fixture loops over `app.bench.mix`, passing an opaque `Token` handle
+/// created by `app.bench.mint`, so the benchmark covers both host-call dispatch
+/// and handle copies.
+pub fn host_calls_plugin() -> Plugin {
+    let fixture = fixture("runtime/host_calls");
+    let mut engine = fixture.engine();
+    engine.host_fn(
+        "app.bench.mint",
+        HostSignature::new(vec![HostType::Int], HostType::Handle("Token".into())),
+        |cx, args| {
+            let seed = args.first().and_then(Value::as_int).unwrap_or(0);
+            cx.make_handle(seed.to_string())
+        },
+    );
+    engine.host_fn(
+        "app.bench.mix",
+        HostSignature::new(
+            vec![HostType::Handle("Token".into()), HostType::Int],
+            HostType::Int,
+        ),
+        |_cx, args| {
+            let value = args.get(1).and_then(Value::as_int).unwrap_or(0);
+            Ok(Value::Int(value.wrapping_mul(31).wrapping_add(7) & 0xffff))
+        },
+    );
+    fixture.load_plugin_with(&engine)
 }
 
 /// Locate the `martite` CLI binary used by the startup benchmarks.

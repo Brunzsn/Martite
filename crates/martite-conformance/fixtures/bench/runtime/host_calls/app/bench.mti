@@ -1,0 +1,4 @@
+struct Token
+fn mint(seed: int) -> Token
+fn mix(token: Token, value: int) -> int
+on run(count: int, seed: int) -> int

@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use martite::{HostSignature, HostType, Outcome};
 use martite_base::{LoadLimits, MemoryProvider};
 use martite_config::{FmtConfig, ToolConfig, parse_manifest};
 use martite_driver::{LoadOptions, LoadedProgram, load};
@@ -39,6 +40,20 @@ fn relative(root: &Path, path: &Path) -> String {
         .expect("fixture path")
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+fn is_plugin_fixture(root: &Path, path: &Path) -> bool {
+    let mut directory = path.parent();
+    while let Some(candidate) = directory {
+        if candidate.join("plugin.toml").is_file() {
+            return true;
+        }
+        if candidate == root {
+            break;
+        }
+        directory = candidate.parent();
+    }
+    false
 }
 
 fn provider_for(root: &Path) -> (MemoryProvider, Vec<InterfaceSource>, Vec<String>, String) {
@@ -244,7 +259,7 @@ fn runtime_fixtures_run_and_plugins_round_trip_state() {
         if path.extension().and_then(|ext| ext.to_str()) != Some("mt") {
             continue;
         }
-        if path.components().any(|part| part.as_os_str() == "plugin") {
+        if is_plugin_fixture(&root, &path) {
             continue;
         }
         let loaded = load_single(&path);
@@ -286,4 +301,45 @@ fn runtime_plugin_fixture_handles_calls_and_snapshots() {
     let mut restored = plugin.instantiate().expect("init");
     restored.restore(&snapshot).expect("restore");
     restored.call("tick", vec![]).expect("tick after restore");
+}
+
+#[test]
+fn runtime_host_calls_fixture_calls_host_functions() {
+    let root = bench_root().join("runtime/host_calls");
+    let (provider, interfaces, _, _) = provider_for(&root);
+    let manifest = std::fs::read_to_string(root.join("plugin.toml")).expect("manifest");
+    let mut engine = martite::Engine::new();
+    for interface in &interfaces {
+        engine.interface(interface.path.clone(), interface.text.clone());
+    }
+    engine.host_fn(
+        "app.bench.mint",
+        HostSignature::new(vec![HostType::Int], HostType::Handle("Token".into())),
+        |cx, args| {
+            let seed = args.first().and_then(Value::as_int).unwrap_or(0);
+            cx.make_handle(seed.to_string())
+        },
+    );
+    engine.host_fn(
+        "app.bench.mix",
+        HostSignature::new(
+            vec![HostType::Handle("Token".into()), HostType::Int],
+            HostType::Int,
+        ),
+        |_cx, args| {
+            let value = args.get(1).and_then(Value::as_int).unwrap_or(0);
+            Ok(Value::Int(value.wrapping_mul(31).wrapping_add(7) & 0xffff))
+        },
+    );
+    let plugin = engine
+        .load(&manifest, &provider)
+        .expect("host-call plugin loads");
+    let mut instance = plugin.instantiate().expect("init");
+    let outcome = instance
+        .call("run", vec![Value::Int(10), Value::Int(3)])
+        .expect("run handler");
+    assert!(
+        matches!(outcome, Outcome::Handled(Value::Int(_))),
+        "expected an int result, got {outcome:?}"
+    );
 }
