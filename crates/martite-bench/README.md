@@ -90,80 +90,84 @@ them as absolute counters to compare across commits, not as pass/fail limits.
 
 ## Results
 
-No thresholds are enforced. These numbers are one local Windows run and are
-only useful for comparing against a baseline on the same machine. Record a
-fresh row when landing performance work.
+No thresholds are enforced. These numbers are one GitHub Actions
+`windows-latest` run and are only useful for comparing against a baseline on
+the same runner class. Record a fresh row when landing performance work.
 
-> The timing and allocation rows below predate the `field_index_ops`,
-> `option_ops`, `map_iteration`, and `host_calls` fixtures. Run
-> `cargo bench -p martite-bench` to include them in the next refresh.
-
-- Machine: Intel Core i3-1005G1, 8 GB RAM, Windows 11 Home
-- Rust: `rustc 1.97.1 (8bab26f4f 2026-07-14)`
-- Date: 2026-11-06
-- Commit: `2111ef3` (working tree with this suite)
-- Command: `cargo bench -p martite-bench`
+- Machine: GitHub Actions `windows-latest` (Windows Server 2025)
+- Rust: `rustc 1.99.1 (58cf8f9c3 2026-10-13)`
+- Date: 2026-11-08
+- Commit: `cf1c1e9`
+- Command: `cargo bench -p martite-bench` (Benchmarks workflow)
 
 | Benchmark | Median |
 | --- | ---: |
-| `cli/check_small` | 64.619 ms |
-| `cli/lint_small` | 56.186 ms |
-| `cli/run_small` | 49.669 ms |
-| `cli/fmt_check` | 53.087 ms |
-| `fmt/medium` | 544.83 µs |
-| `fmt/large` | 174.34 ms |
-| `fmt/interface` | 45.363 µs |
-| `fmt/corpus` | 1.8681 ms |
-| `fmt/idempotent` | 457.32 µs |
-| `fmt/check` | 579.08 µs |
-| `lexer/small` | 6.4482 µs |
-| `lexer/medium` | 37.579 µs |
-| `lexer/large` | 3.0592 ms |
-| `lexer/strings_interpolation` | 6.9832 µs |
-| `lexer/comments` | 3.6999 µs |
-| `lint/full_clean` | 5.9781 µs |
-| `lint/syntax_only_clean` | 947.64 ns |
-| `lint/full_noisy` | 13.868 µs |
-| `lint/syntax_only_noisy` | 2.7218 µs |
-| `load/single` | 69.050 µs |
-| `load/multi_module` | 244.66 µs |
-| `load/plugin_interface` | 190.50 µs |
-| `parser/small` | 13.114 µs |
-| `parser/medium` | 65.461 µs |
-| `parser/large` | 4.5515 ms |
-| `parser/interface` | 7.2030 µs |
-| `parser/deep_expression` | 38.868 µs |
-| `parser/error_recovery` | 4.0405 µs |
-| `runtime/arithmetic_loop` | 828.73 µs |
-| `runtime/fib` | 11.376 ms |
-| `runtime/function_calls` | 6.6572 ms |
-| `runtime/list_ops` | 4.1214 ms |
-| `runtime/map_ops` | 546.53 µs |
-| `runtime/string_ops` | 3.3526 ms |
-| `runtime/method_dispatch` | 1.5521 ms |
-| `runtime/pattern_match` | 7.4639 ms |
-| `runtime/closures` | 7.4725 ms |
-| `runtime/captures` | 4.6429 ms |
-| `runtime/mut_params` | 11.707 ms |
-| `runtime/plugin_handler` | 6.7795 µs |
-| `runtime/plugin_snapshot` | 998.22 ns |
-| `runtime/plugin_restore` | 1.0297 µs |
+| `cli/check_small` | 6.549 ms |
+| `cli/lint_small` | 6.806 ms |
+| `cli/run_small` | 6.633 ms |
+| `cli/fmt_check` | 6.756 ms |
+| `fmt/medium` | 129.781 µs |
+| `fmt/large` | 17.205 ms |
+| `fmt/interface` | 16.918 µs |
+| `fmt/corpus` | 741.087 µs |
+| `fmt/idempotent` | 122.679 µs |
+| `fmt/check` | 125.030 µs |
+| `lexer/small` | 1.308 µs |
+| `lexer/medium` | 7.740 µs |
+| `lexer/large` | 787.607 µs |
+| `lexer/strings_interpolation` | 2.784 µs |
+| `lexer/comments` | 1.054 µs |
+| `lint/full_clean` | 4.820 µs |
+| `lint/syntax_only_clean` | 723.84 ns |
+| `lint/full_noisy` | 8.657 µs |
+| `lint/syntax_only_noisy` | 1.426 µs |
+| `load/single` | 16.129 µs |
+| `load/multi_module` | 51.620 µs |
+| `load/plugin_interface` | 37.109 µs |
+| `parser/small` | 6.321 µs |
+| `parser/medium` | 28.961 µs |
+| `parser/large` | 2.349 ms |
+| `parser/interface` | 3.333 µs |
+| `parser/deep_expression` | 25.870 µs |
+| `parser/error_recovery` | 1.616 µs |
+| `runtime/arithmetic_loop` | 440.471 µs |
+| `runtime/fib` | 635.592 µs |
+| `runtime/function_calls` | 1.146 ms |
+| `runtime/list_ops` | 180.442 µs |
+| `runtime/map_ops` | 143.571 µs |
+| `runtime/string_ops` | 103.634 µs |
+| `runtime/method_dispatch` | 447.691 µs |
+| `runtime/pattern_match` | 803.603 µs |
+| `runtime/closures` | 809.807 µs |
+| `runtime/captures` | 587.687 µs |
+| `runtime/mut_params` | 1.851 ms |
+| `runtime/field_index_ops` | 11.134 ms |
+| `runtime/option_ops` | 2.304 ms |
+| `runtime/map_iteration` | 11.684 ms |
+| `runtime/host_calls` | 487.549 µs |
+| `runtime/plugin_handler` | 1.039 µs |
+| `runtime/plugin_snapshot` | 600.04 ns |
+| `runtime/plugin_restore` | 605.99 ns |
 
 The allocation report from the same run:
 
 | Benchmark | allocations | bytes | reallocations | deallocations |
 | --- | ---: | ---: | ---: | ---: |
-| `runtime/arithmetic_loop` | 19 | 3087 | 0 | 19 |
-| `runtime/fib` | 67089 | 7026504 | 0 | 67089 |
-| `runtime/function_calls` | 36019 | 2916984 | 0 | 36019 |
-| `runtime/list_ops` | 5768 | 2449780 | 219 | 5768 |
-| `runtime/map_ops` | 3878 | 220506 | 6 | 3878 |
-| `runtime/string_ops` | 6340 | 1779695 | 34 | 6340 |
-| `runtime/method_dispatch` | 13077 | 938433 | 0 | 13077 |
-| `runtime/pattern_match` | 60164 | 5857851 | 1 | 60164 |
-| `runtime/closures` | 40389 | 4569479 | 602 | 40389 |
-| `runtime/captures` | 24098 | 3555621 | 402 | 24098 |
-| `runtime/mut_params` | 51172 | 4510715 | 1 | 51172 |
-| `runtime/plugin_handler` | 43 | 4170 | 0 | 43 |
+| `runtime/arithmetic_loop` | 0 | 0 | 0 | 0 |
+| `runtime/fib` | 0 | 0 | 0 | 0 |
+| `runtime/function_calls` | 0 | 0 | 0 | 0 |
+| `runtime/list_ops` | 12 | 31920 | 12 | 12 |
+| `runtime/map_ops` | 642 | 12282 | 1 | 642 |
+| `runtime/string_ops` | 419 | 65774 | 16 | 419 |
+| `runtime/method_dispatch` | 1002 | 52104 | 0 | 1002 |
+| `runtime/pattern_match` | 1008 | 128680 | 0 | 1008 |
+| `runtime/closures` | 1803 | 176464 | 0 | 1803 |
+| `runtime/captures` | 1403 | 132320 | 0 | 1403 |
+| `runtime/mut_params` | 1003 | 88272 | 0 | 1003 |
+| `runtime/field_index_ops` | 45 | 4320 | 1 | 45 |
+| `runtime/option_ops` | 3204 | 77776 | 0 | 3204 |
+| `runtime/map_iteration` | 98313 | 5788108 | 6 | 98313 |
+| `runtime/host_calls` | 4 | 1427 | 0 | 4 |
+| `runtime/plugin_handler` | 5 | 1488 | 0 | 5 |
 | `runtime/plugin_snapshot` | 2 | 80 | 3 | 2 |
-| `runtime/plugin_restore` | 5 | 297 | 0 | 5 |
+| `runtime/plugin_restore` | 5 | 233 | 0 | 5 |
