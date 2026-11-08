@@ -313,6 +313,80 @@ fn result_and_options_work() {
 }
 
 #[test]
+fn option_and_result_methods_move_payloads() {
+    assert_eq!(
+        run(r#"
+        fn main() {
+            let values = [10, 20]
+            let some: list[int]? = Some([1, 2, 3])
+            let none: list[int]? = None
+            print("{some.is_some()}")
+            print("{none.is_none()}")
+            print("{some.map(fn(items) => items.len())}")
+            print("{none.map(fn(items) => items.len())}")
+            print("{some.and_then(fn(items) => Some(items.len() * 2))}")
+            print("{none.and_then(fn(items) => Some(items.len()))}")
+            print("{some.ok_or("missing")}")
+            print("{none.ok_or("missing")}")
+            print("{some.unwrap_or([9])}")
+            print("{none.unwrap_or([9])}")
+            print("{some.expect("some")}")
+            print("{some}")
+            print("{values.get(0).map(fn(value) => value + 1)}")
+            print("{values.get(7).and_then(fn(value) => Some(value + 1))}")
+
+            let ok: Result[list[int], str] = Ok([1, 2])
+            let err: Result[list[int], str] = Err("bad")
+            print("{ok.is_ok()}")
+            print("{err.is_err()}")
+            print("{ok.map(fn(items) => items.len())}")
+            print("{err.map(fn(items) => items.len())}")
+            print("{ok.map_err(fn(message) => message.len())}")
+            print("{err.map_err(fn(message) => message.len())}")
+            print("{ok.and_then(fn(items) => Ok(items.len()))}")
+            print("{err.and_then(fn(items) => Ok(items.len()))}")
+            print("{ok.ok()}")
+            print("{err.ok()}")
+            print("{ok.unwrap_or([9])}")
+            print("{err.unwrap_or([9])}")
+            print("{ok.expect("ok")}")
+            print("{err}")
+        }
+        "#),
+        [
+            "true",
+            "true",
+            "Some(3)",
+            "None",
+            "Some(6)",
+            "None",
+            "Ok([1, 2, 3])",
+            "Err(\"missing\")",
+            "[1, 2, 3]",
+            "[9]",
+            "[1, 2, 3]",
+            "Some([1, 2, 3])",
+            "Some(11)",
+            "None",
+            "true",
+            "true",
+            "Ok(2)",
+            "Err(\"bad\")",
+            "Ok([1, 2])",
+            "Err(3)",
+            "Ok(2)",
+            "Err(\"bad\")",
+            "Some([1, 2])",
+            "None",
+            "[1, 2]",
+            "[9]",
+            "[1, 2]",
+            "Err(\"bad\")",
+        ]
+    );
+}
+
+#[test]
 fn host_value_helpers_are_stable() {
     // A tiny sanity check that Value equality follows the specified rules.
     assert!(Value::Int(1) != Value::Float(1.0));
