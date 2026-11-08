@@ -37,7 +37,7 @@ pub enum Value {
 /// `slots` and `string_slots` mirror the fuel table. `bytes` is nominal and
 /// counts shared payloads at each occurrence; the authoritative memory census
 /// still uses `Value::size_bytes` with its de-duplicating set.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValueMeta {
     pub depth: u16,
     pub slots: u64,
@@ -161,6 +161,9 @@ impl SeqValue {
     }
 
     pub(crate) fn note_child_replaced(&mut self, old: ValueMeta, new: ValueMeta) {
+        if old == new {
+            return;
+        }
         self.meta.slots = self
             .meta
             .slots
@@ -345,6 +348,9 @@ impl MapValue {
     }
 
     pub(crate) fn note_value_replaced(&mut self, key: &Key, old: ValueMeta, new: ValueMeta) {
+        if old == new {
+            return;
+        }
         let stats = KeyStats::new(key);
         self.meta.slots = self
             .meta
@@ -503,6 +509,9 @@ impl StructValue {
     }
 
     pub(crate) fn note_field_replaced(&mut self, old: ValueMeta, new: ValueMeta) {
+        if old == new {
+            return;
+        }
         self.meta.slots = self
             .meta
             .slots
@@ -1533,6 +1542,45 @@ mod tests {
         *value.field_mut(1).expect("field") = Value::Int(9);
         let new = value.fields[1].meta();
         value.note_field_replaced(old, new);
+        assert_meta(&Value::Struct(Rc::new(value)));
+    }
+
+    #[test]
+    fn equal_metadata_replacement_leaves_bookkeeping_untouched() {
+        let mut seq = SeqValue::new(vec![Value::Int(1), Value::list(vec![Value::Int(2)])]);
+        let before = seq.meta;
+        let before_deep_count = seq.deep_count;
+        let old = seq[0].meta();
+        *seq.slot_mut(0).expect("slot") = Value::Int(9);
+        let new = seq[0].meta();
+        assert_eq!(old, new);
+        seq.note_child_replaced(old, new);
+        assert_eq!(seq.meta, before);
+        assert_eq!(seq.deep_count, before_deep_count);
+        assert_seq(&seq);
+
+        let mut map = MapValue::new(OrderedMap::new());
+        let key = KeyValue::Str("key".into());
+        map.insert(key.clone(), Value::Int(1));
+        let before = map.meta;
+        let old = map.get(&key).expect("value").meta();
+        *map.value_mut(&key).expect("value") = Value::Int(2);
+        let new = map.get(&key).expect("value").meta();
+        assert_eq!(old, new);
+        map.note_value_replaced(&key, old, new);
+        assert_eq!(map.meta, before);
+        assert_map(&map);
+
+        let mut value = StructValue::new(TypeId(1), vec![Value::Int(1), Value::Int(2)]);
+        let before = value.meta;
+        let before_deep_count = value.deep_count;
+        let old = value.fields[0].meta();
+        *value.field_mut(0).expect("field") = Value::Int(9);
+        let new = value.fields[0].meta();
+        assert_eq!(old, new);
+        value.note_field_replaced(old, new);
+        assert_eq!(value.meta, before);
+        assert_eq!(value.deep_count, before_deep_count);
         assert_meta(&Value::Struct(Rc::new(value)));
     }
 }

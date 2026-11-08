@@ -201,6 +201,13 @@ impl Locals {
             .map(|(_, value)| value)
     }
 
+    fn get_mut(&mut self, id: BindingId) -> Option<&mut Value> {
+        self.slots
+            .iter_mut()
+            .find(|(binding, _)| *binding == id)
+            .map(|(_, value)| value)
+    }
+
     fn insert(&mut self, id: BindingId, value: Value) -> Option<Value> {
         if let Some((_, existing)) = self.slots.iter_mut().find(|(binding, _)| *binding == id) {
             return Some(std::mem::replace(existing, value));
@@ -1541,6 +1548,17 @@ impl<'p, 'h> Runtime<'p, 'h> {
     }
 
     fn write_place(&mut self, place: Place, value: Value) -> EvalResult<()> {
+        // A plain variable assignment writes its local slot in place.
+        if place.accessors.is_empty() {
+            let slot = self.current_locals_mut().get_mut(place.root);
+            if let Some(slot) = slot {
+                if value_depth_exceeds(&value, MAX_VALUE_DEPTH) {
+                    return Err(EvalError::Trap(Trap::DepthExceeded));
+                }
+                *slot = value;
+                return Ok(());
+            }
+        }
         let mut root = self.take_place_root(&place)?;
         self.set_path(&mut root, &place.accessors, value, MAX_VALUE_DEPTH)?;
         self.current_locals_mut().insert(place.root, root);
