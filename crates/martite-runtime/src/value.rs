@@ -74,6 +74,22 @@ fn wrapped_meta(inner: ValueMeta) -> ValueMeta {
     }
 }
 
+fn add_slot_meta(meta: &mut ValueMeta, deep_count: &mut u32, child: ValueMeta) {
+    meta.slots = meta.slots.saturating_add(1).saturating_add(child.slots);
+    meta.string_slots = meta.string_slots.saturating_add(child.string_slots);
+    meta.bytes = meta.bytes.saturating_add(8).saturating_add(child.bytes);
+    add_depth_meta(meta, deep_count, 1 + child.depth);
+}
+
+fn add_depth_meta(meta: &mut ValueMeta, deep_count: &mut u32, depth: u16) {
+    if depth > meta.depth {
+        meta.depth = depth;
+        *deep_count = 1;
+    } else if depth == meta.depth {
+        *deep_count = deep_count.saturating_add(1);
+    }
+}
+
 /// A list or tuple payload with cached metadata.
 #[derive(Debug, Clone)]
 pub struct SeqValue {
@@ -83,16 +99,18 @@ pub struct SeqValue {
 }
 
 impl SeqValue {
+    /// Build a sequence that adopts `items` and computes its metadata in place.
     pub fn new(items: Vec<Value>) -> Self {
-        let mut value = Self {
-            items: Vec::with_capacity(items.len()),
-            meta: ValueMeta::empty_container(),
-            deep_count: 0,
-        };
-        for item in items {
-            value.push(item);
+        let mut meta = ValueMeta::empty_container();
+        let mut deep_count = 0;
+        for item in &items {
+            add_slot_meta(&mut meta, &mut deep_count, item.meta());
         }
-        value
+        Self {
+            items,
+            meta,
+            deep_count,
+        }
     }
 
     pub(crate) fn push(&mut self, value: Value) {
@@ -162,18 +180,7 @@ impl SeqValue {
     }
 
     fn add_slot(&mut self, child: ValueMeta) {
-        self.meta.slots = self
-            .meta
-            .slots
-            .saturating_add(1)
-            .saturating_add(child.slots);
-        self.meta.string_slots = self.meta.string_slots.saturating_add(child.string_slots);
-        self.meta.bytes = self
-            .meta
-            .bytes
-            .saturating_add(8)
-            .saturating_add(child.bytes);
-        self.add_depth(1 + child.depth);
+        add_slot_meta(&mut self.meta, &mut self.deep_count, child);
     }
 
     fn remove_slot(&mut self, child: ValueMeta) {
@@ -192,12 +199,7 @@ impl SeqValue {
     }
 
     fn add_depth(&mut self, depth: u16) {
-        if depth > self.meta.depth {
-            self.meta.depth = depth;
-            self.deep_count = 1;
-        } else if depth == self.meta.depth {
-            self.deep_count = self.deep_count.saturating_add(1);
-        }
+        add_depth_meta(&mut self.meta, &mut self.deep_count, depth);
     }
 
     fn remove_depth(&mut self, depth: u16) {
@@ -1452,6 +1454,15 @@ mod tests {
         seq.sort_by(|a, b| b.meta().depth.cmp(&a.meta().depth));
         assert_seq(&seq);
         seq.clear();
+        assert_seq(&seq);
+    }
+
+    #[test]
+    fn sequence_construction_adopts_input_allocation() {
+        let items = vec![Value::Int(1), Value::Int(2), Value::Int(3)];
+        let allocation = items.as_ptr();
+        let seq = SeqValue::new(items);
+        assert_eq!(seq.items.as_ptr(), allocation);
         assert_seq(&seq);
     }
 
