@@ -1,0 +1,14 @@
+[plugin]
+name = "bench-runtime-host-calls"
+version = "0.1.0"
+lang = "1"
+api = "1.0"
+entry = "main.mt"
+
+[permissions]
+grant = ["app.bench"]
+
+[limits]
+fuel = 10000000
+memory = 67108864
+depth = 200

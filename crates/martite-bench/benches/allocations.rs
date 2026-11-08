@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::hint::black_box;
 
-use martite_bench::{BENCH_LIMITS, criterion_dir, fixture};
+use martite_bench::{BENCH_LIMITS, HOST_CALLS_COUNT, criterion_dir, fixture, host_calls_plugin};
 use martite_runtime::{Runtime, Value};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 
@@ -46,6 +46,14 @@ fn runtime_alloc(table: &mut String, name: &str, fixture_name: &str, iterations:
     });
 }
 
+fn host_call_allocs(table: &mut String) {
+    let plugin = host_calls_plugin();
+    let mut instance = plugin.instantiate().expect("init");
+    measure(table, "runtime/host_calls", 20, || {
+        let _ = black_box(instance.call("run", vec![Value::Int(HOST_CALLS_COUNT), Value::Int(7)]));
+    });
+}
+
 fn plugin_allocs(table: &mut String) {
     let plugin = fixture("runtime/plugin").load_plugin();
     let mut instance = plugin.instantiate().expect("init");
@@ -80,9 +88,13 @@ fn main() {
         ("runtime/closures", "runtime/closures.mt", 20),
         ("runtime/captures", "runtime/captures.mt", 20),
         ("runtime/mut_params", "runtime/mut_params.mt", 20),
+        ("runtime/field_index_ops", "runtime/field_index_ops.mt", 20),
+        ("runtime/option_ops", "runtime/option_ops.mt", 20),
+        ("runtime/map_iteration", "runtime/map_iteration.mt", 20),
     ] {
         runtime_alloc(&mut table, name, fixture_name, iterations);
     }
+    host_call_allocs(&mut table);
     plugin_allocs(&mut table);
 
     println!();

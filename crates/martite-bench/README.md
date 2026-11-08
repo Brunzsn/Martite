@@ -66,10 +66,10 @@ allocation deltas in the job summary.
 | `parser` | source small/medium/large, `.mti` interface, deeply nested expression, malformed error recovery | `syntax/*`, `parser/*` |
 | `load` | single module, multi-module, plugin with an interface | `load/*` |
 | `lint` | full recommended and syntax-only, clean and noisy | `lint/*` |
-| `runtime` | arithmetic loop, `fib`, function calls, list/map/string ops, method dispatch, pattern matching, closures, captures, `mut` params, plugin handler, snapshot, restore | `runtime/*` |
+| `runtime` | arithmetic loop, `fib`, function calls, list/map/string ops, method dispatch, pattern matching, closures, captures, `mut` params, field/index assignment, `Option` lookups, map iteration, host calls, plugin handler, snapshot, restore | `runtime/*` |
 | `fmt` | medium, large, interface, whole golden corpus, idempotent reformat, check | `syntax/*`, `crates/martite-fmt/tests/fixtures` |
 | `cli` | cold `check`, `lint`, `run`, and `fmt --check` | `syntax/small.mt`, `lint/clean.mt`, formatter fixture |
-| allocation report | the runtime fixtures plus plugin handler/snapshot/restore, reported as allocations and bytes per iteration | `runtime/*` |
+| allocation report | the runtime fixtures plus host calls and plugin handler/snapshot/restore, reported as allocations and bytes per iteration | `runtime/*` |
 
 Every timed function uses `std::hint::black_box` for its input and output. File
 I/O and program loading happen in setup unless the group is specifically
@@ -93,6 +93,10 @@ them as absolute counters to compare across commits, not as pass/fail limits.
 No thresholds are enforced. These numbers are one local Windows run and are
 only useful for comparing against a baseline on the same machine. Record a
 fresh row when landing performance work.
+
+> The timing and allocation rows below predate the `field_index_ops`,
+> `option_ops`, `map_iteration`, and `host_calls` fixtures. Run
+> `cargo bench -p martite-bench` to include them in the next refresh.
 
 - Machine: Intel Core i3-1005G1, 8 GB RAM, Windows 11 Home
 - Rust: `rustc 1.97.1 (8bab26f4f 2026-07-14)`
