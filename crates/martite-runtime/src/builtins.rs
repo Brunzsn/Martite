@@ -700,7 +700,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
         args: CallArgs,
         span: Span,
     ) -> EvalResult<Value> {
-        let Value::Option(option) = receiver else {
+        // The receiver is an owned temporary for every non-mut builtin method,
+        // so take it instead of deep-cloning the payload.
+        let Value::Option(option) = std::mem::replace(receiver, Value::Unit) else {
             return self.trap(self.internal_panic("receiver is not an Option"));
         };
         match name {
@@ -708,7 +710,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             "is_none" => Ok(Value::Bool(option.is_none())),
             "map" => {
                 let closure = self.closure_arg(&args, 0)?;
-                match option.clone() {
+                match option {
                     Some(value) => Ok(Value::Option(Some(Box::new(
                         self.call_closure(closure, smallvec![*value])
                             .map_err(EvalError::Trap)?,
@@ -718,7 +720,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             "and_then" => {
                 let closure = self.closure_arg(&args, 0)?;
-                match option.clone() {
+                match option {
                     Some(value) => self
                         .call_closure(closure, smallvec![*value])
                         .map_err(EvalError::Trap),
@@ -726,17 +728,17 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 }
             }
             "unwrap_or" => Ok(match option {
-                Some(value) => (**value).clone(),
+                Some(value) => *value,
                 None => args.into_iter().next().unwrap_or(Value::Unit),
             }),
-            "ok_or" => Ok(match option.clone() {
+            "ok_or" => Ok(match option {
                 Some(value) => Value::Result(Ok(value)),
                 None => Value::Result(Err(Box::new(
                     args.into_iter().next().unwrap_or(Value::Unit),
                 ))),
             }),
             "expect" => match option {
-                Some(value) => Ok((**value).clone()),
+                Some(value) => Ok(*value),
                 None => {
                     let message = args
                         .first()
@@ -756,7 +758,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
         args: CallArgs,
         span: Span,
     ) -> EvalResult<Value> {
-        let Value::Result(result) = receiver else {
+        // The receiver is an owned temporary for every non-mut builtin method,
+        // so take it instead of deep-cloning the payload.
+        let Value::Result(result) = std::mem::replace(receiver, Value::Unit) else {
             return self.trap(self.internal_panic("receiver is not a Result"));
         };
         match name {
@@ -764,7 +768,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             "is_err" => Ok(Value::Bool(result.is_err())),
             "map" => {
                 let closure = self.closure_arg(&args, 0)?;
-                match result.clone() {
+                match result {
                     Ok(value) => Ok(Value::Result(Ok(Box::new(
                         self.call_closure(closure, smallvec![*value])
                             .map_err(EvalError::Trap)?,
@@ -774,7 +778,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             "map_err" => {
                 let closure = self.closure_arg(&args, 0)?;
-                match result.clone() {
+                match result {
                     Ok(value) => Ok(Value::Result(Ok(value))),
                     Err(error) => Ok(Value::Result(Err(Box::new(
                         self.call_closure(closure, smallvec![*error])
@@ -784,7 +788,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             "and_then" => {
                 let closure = self.closure_arg(&args, 0)?;
-                match result.clone() {
+                match result {
                     Ok(value) => self
                         .call_closure(closure, smallvec![*value])
                         .map_err(EvalError::Trap),
@@ -792,15 +796,15 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 }
             }
             "unwrap_or" => Ok(match result {
-                Ok(value) => (**value).clone(),
+                Ok(value) => *value,
                 Err(_) => args.into_iter().next().unwrap_or(Value::Unit),
             }),
-            "ok" => Ok(match result.clone() {
+            "ok" => Ok(match result {
                 Ok(value) => Value::Option(Some(value)),
                 Err(_) => Value::Option(None),
             }),
             "expect" => match result {
-                Ok(value) => Ok((**value).clone()),
+                Ok(value) => Ok(*value),
                 Err(_) => {
                     let message = args
                         .first()
