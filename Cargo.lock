@@ -654,6 +654,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "martite-fuel"
+version = "0.1.0"
+
+[[package]]
 name = "martite-lint"
 version = "0.1.0"
 dependencies = [
@@ -683,6 +687,7 @@ dependencies = [
  "libm",
  "martite-base",
  "martite-check",
+ "martite-fuel",
  "martite-syntax",
  "serde_json",
  "smallvec",

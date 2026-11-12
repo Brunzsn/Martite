@@ -49,10 +49,10 @@ sources -> parse -> resolve -> check -> lower -> [optimize] -> runtime
 
 | Crate | Role | Depends on |
 | --- | --- | --- |
-| `martite-base` (or a small new `martite-fuel` module in it) | **Single fuel table**: static charge constants and dynamic cost functions (`sort_cost`, string bytes `div_ceil(8)`, comparison cost, ...). Today ~60 charge sites are spread over `interp.rs`, `builtins.rs`, `cost.rs`; they all move here | none |
-| `martite-ir` | IR types, printer, verifier, lowering from `CheckedProgram` | base, syntax, check |
+| `martite-fuel` | **Single fuel table**: static charge constants and dynamic cost functions (`sort_cost`, string bytes `div_ceil(8)`, comparison cost, ...). Every charge site in `interp.rs` and `builtins.rs` calls it. Helpers take counts, not `Value`, so the IR can use the table without the runtime | none |
+| `martite-ir` | IR types, printer, verifier, lowering from `CheckedProgram` | base, fuel, syntax, check |
 | `martite-opt` | passes, pass manager (created with the first pass, section 11) | ir |
-| `martite-runtime` | executes `IrProgram` | base, ir |
+| `martite-runtime` | executes `IrProgram` | base, fuel, ir |
 | `martite-driver` | `load` (unchanged) plus `lower` | base, syntax, resolve, check, ir (not runtime) |
 | `martite` (embedding facade) | wires driver and runtime | as today plus ir |
 
@@ -226,7 +226,7 @@ pub struct Charge {
 }
 ```
 
-plus the effect flag `DYN_COST` for charges computed at run time from values (string bytes, `show` slots, comparison cost, sort cost, copy-on-write slots, most builtins). Dynamic formulas live in the shared fuel module, never inline in the evaluator.
+plus the effect flag `DYN_COST` for charges computed at run time from values (string bytes, `show` slots, comparison cost, sort cost, copy-on-write slots, most builtins). Dynamic formulas live in `martite-fuel`, never inline in the evaluator.
 
 Rules that lowering must follow, all derived from the interpreter:
 

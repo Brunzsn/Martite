@@ -3,6 +3,7 @@ use std::path::Path;
 
 const CRATES: &[&str] = &[
     "martite-base",
+    "martite-fuel",
     "martite-syntax",
     "martite-config",
     "martite-resolve",

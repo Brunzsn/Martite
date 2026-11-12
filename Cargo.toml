@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 martite = { path = "crates/martite", version = "0.1.0" }
 martite-base = { path = "crates/martite-base", version = "0.1.0" }
+martite-fuel = { path = "crates/martite-fuel", version = "0.1.0" }
 martite-syntax = { path = "crates/martite-syntax", version = "0.1.0" }
 martite-config = { path = "crates/martite-config", version = "0.1.0" }
 martite-resolve = { path = "crates/martite-resolve", version = "0.1.0" }

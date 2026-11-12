@@ -177,13 +177,13 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 .unwrap_or(Value::Option(None))),
             "contains" => {
                 let needle = args.into_iter().next().unwrap_or(Value::Unit);
-                self.charge(items.len() as u64)?;
+                self.charge(fuel::slot_cost(items.len() as u64))?;
                 Ok(Value::Bool(items.iter().any(|v| value_eq(v, &needle))))
             }
             "map" => {
                 let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
-                self.charge(snapshot.len() as u64)?;
+                self.charge(fuel::slot_cost(snapshot.len() as u64))?;
                 let mut out = Vec::with_capacity(snapshot.len());
                 for item in snapshot.iter() {
                     out.push(
@@ -196,7 +196,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             "filter" => {
                 let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
-                self.charge(snapshot.len() as u64)?;
+                self.charge(fuel::slot_cost(snapshot.len() as u64))?;
                 let mut out = Vec::new();
                 for item in snapshot.iter() {
                     let keep = self
@@ -217,7 +217,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 };
                 let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
-                self.charge(snapshot.len() as u64)?;
+                self.charge(fuel::slot_cost(snapshot.len() as u64))?;
                 for item in snapshot.iter() {
                     init = self
                         .call_closure(closure, smallvec![init, item.clone()])
@@ -229,7 +229,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
                 for item in snapshot.iter() {
-                    self.charge(1)?;
+                    self.charge(fuel::ITERATION_COST)?;
                     if matches!(
                         self.call_closure(closure, smallvec![item.clone()])
                             .map_err(EvalError::Trap)?,
@@ -244,7 +244,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
                 for item in snapshot.iter() {
-                    self.charge(1)?;
+                    self.charge(fuel::ITERATION_COST)?;
                     if !matches!(
                         self.call_closure(closure, smallvec![item.clone()])
                             .map_err(EvalError::Trap)?,
@@ -261,18 +261,18 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     .enumerate()
                     .map(|(i, v)| Value::tuple(vec![Value::Int(i as i64), v.clone()]))
                     .collect();
-                self.charge(out.len() as u64)?;
+                self.charge(fuel::slot_cost(out.len() as u64))?;
                 Ok(Value::list(out))
             }
             "reversed" => {
                 let mut out: Vec<Value> = items.iter().cloned().collect();
                 out.reverse();
-                self.charge(out.len() as u64)?;
+                self.charge(fuel::slot_cost(out.len() as u64))?;
                 Ok(Value::list(out))
             }
             "sorted" => {
                 let mut out: Vec<Value> = items.iter().cloned().collect();
-                self.charge(crate::cost::sort_cost(out.len() as u64))?;
+                self.charge(fuel::sort_cost(out.len() as u64))?;
                 out.sort_by(value_ord);
                 self.ensure_deadline()?;
                 Ok(Value::list(out))
@@ -280,7 +280,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             "sorted_by" => {
                 let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
-                self.charge(crate::cost::sort_cost(snapshot.len() as u64))?;
+                self.charge(fuel::sort_cost(snapshot.len() as u64))?;
                 let mut keyed = Vec::with_capacity(snapshot.len());
                 for item in snapshot.iter() {
                     let key = self
@@ -303,14 +303,14 @@ impl<'p, 'h> Runtime<'p, 'h> {
                         out.push_str(s);
                     }
                 }
-                self.charge(items.len() as u64)?;
-                self.charge((out.len() as u64).div_ceil(8))?;
+                self.charge(fuel::slot_cost(items.len() as u64))?;
+                self.charge(fuel::string_cost(out.len() as u64))?;
                 Ok(Value::str(out))
             }
             "push" => {
                 let value = args.into_iter().next().unwrap_or(Value::Unit);
                 let n = items.len();
-                self.charge(1)?;
+                self.charge(fuel::SLOT_COST)?;
                 self.note_alloc(8);
                 let list = self.cow_vec_mut(items, n)?;
                 list.push(value);
@@ -318,7 +318,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             "pop" => {
                 let n = items.len();
-                self.charge(1)?;
+                self.charge(fuel::SLOT_COST)?;
                 let list = self.cow_vec_mut(items, n)?;
                 Ok(list
                     .pop()
@@ -327,7 +327,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             "sort" => {
                 let n = items.len();
-                self.charge(crate::cost::sort_cost(n as u64))?;
+                self.charge(fuel::sort_cost(n as u64))?;
                 let list = self.cow_vec_mut(items, n)?;
                 list.sort_by(value_ord);
                 self.ensure_deadline()?;
@@ -341,7 +341,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     return self.trap(self.panic("list insert index out of bounds", span));
                 }
                 let index = index as usize;
-                self.charge((n - index + 1) as u64)?;
+                self.charge(fuel::list_insert_cost(n as u64, index as u64))?;
                 self.note_alloc(8);
                 let list = self.cow_vec_mut(items, n)?;
                 list.insert(index, value);
@@ -354,7 +354,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     return self.trap(self.panic("list index out of bounds", span));
                 }
                 let index = index as usize;
-                self.charge((n - index) as u64)?;
+                self.charge(fuel::list_remove_cost(n as u64, index as u64))?;
                 let list = self.cow_vec_mut(items, n)?;
                 Ok(list.remove(index))
             }
@@ -362,7 +362,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let other = args.into_iter().next().unwrap_or(Value::Unit);
                 if let Value::List(other) = other {
                     let n = items.len();
-                    self.charge(other.len() as u64)?;
+                    self.charge(fuel::slot_cost(other.len() as u64))?;
                     self.note_alloc(8 * other.len() as u64);
                     let list = self.cow_vec_mut(items, n)?;
                     list.extend_values(other.iter().cloned());
@@ -370,7 +370,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 Ok(Value::Unit)
             }
             "clear" => {
-                self.charge(items.len() as u64)?;
+                self.charge(fuel::slot_cost(items.len() as u64))?;
                 if Rc::strong_count(items) == 1 {
                     Rc::make_mut(items).clear();
                 } else {
@@ -412,17 +412,17 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 Ok(Value::Bool(map.get(&key).is_some()))
             }
             "keys" => {
-                self.charge(map.len() as u64)?;
+                self.charge(fuel::slot_cost(map.len() as u64))?;
                 Ok(Value::list(
                     map.keys().iter().map(key_to_value).collect(),
                 ))
             }
             "values" => {
-                self.charge(map.len() as u64)?;
+                self.charge(fuel::slot_cost(map.len() as u64))?;
                 Ok(Value::list(map.values()))
             }
             "entries" => {
-                self.charge(map.len().saturating_mul(2) as u64)?;
+                self.charge(fuel::map_cost(map.len() as u64))?;
                 Ok(Value::list(
                     map.entries()
                         .iter()
@@ -443,12 +443,12 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let (index, removed) = map
                     .remove_with_index(&key)
                     .expect("key was checked before mutation");
-                self.charge(((n - index) * 2) as u64)?;
+                self.charge(fuel::map_remove_cost(n as u64, index as u64))?;
                 Ok(Value::Option(Some(Box::new(removed))))
             }
             "clear" => {
                 let n = map.len();
-                self.charge(n.saturating_mul(2) as u64)?;
+                self.charge(fuel::map_cost(n as u64))?;
                 if Rc::strong_count(map) == 1 {
                     Rc::make_mut(map).clear();
                 } else {
@@ -473,11 +473,11 @@ impl<'p, 'h> Runtime<'p, 'h> {
         };
         match name {
             "len" => {
-                self.charge((text.len() as u64).div_ceil(8))?;
+                self.charge(fuel::string_cost(text.len() as u64))?;
                 Ok(Value::Int(text.chars().count() as i64))
             }
             "chars" => {
-                self.charge((text.len() as u64).div_ceil(8))?;
+                self.charge(fuel::string_cost(text.len() as u64))?;
                 Ok(Value::list(
                     text.chars()
                         .map(|c| Value::str(c.to_string()))
@@ -491,22 +491,22 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 } else {
                     text.split(sep).map(|part| Value::Str(Rc::from(part))).collect()
                 };
-                self.charge((text.len() as u64).div_ceil(8))?;
+                self.charge(fuel::string_cost(text.len() as u64))?;
                 Ok(Value::list(parts))
             }
             "trim" => {
                 let out = text.trim();
-                self.charge((out.len() as u64).div_ceil(8))?;
+                self.charge(fuel::string_cost(out.len() as u64))?;
                 Ok(Value::Str(Rc::from(out)))
             }
             "contains" => {
                 let needle = args.first().and_then(|v| v.as_str()).unwrap_or_default();
-                self.charge((text.len() as u64).div_ceil(8))?;
+                self.charge(fuel::string_cost(text.len() as u64))?;
                 Ok(Value::Bool(text.contains(needle)))
             }
             "find" => {
                 let needle = args.first().and_then(|v| v.as_str()).unwrap_or_default();
-                self.charge((text.len() as u64).div_ceil(8))?;
+                self.charge(fuel::string_cost(text.len() as u64))?;
                 Ok(text
                     .find(needle)
                     .map(|byte| Value::Int(text[..byte].chars().count() as i64))
@@ -515,12 +515,12 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             "starts_with" => {
                 let needle = args.first().and_then(|v| v.as_str()).unwrap_or_default();
-                self.charge((text.len() as u64).div_ceil(8))?;
+                self.charge(fuel::string_cost(text.len() as u64))?;
                 Ok(Value::Bool(text.starts_with(needle)))
             }
             "ends_with" => {
                 let needle = args.first().and_then(|v| v.as_str()).unwrap_or_default();
-                self.charge((text.len() as u64).div_ceil(8))?;
+                self.charge(fuel::string_cost(text.len() as u64))?;
                 Ok(Value::Bool(text.ends_with(needle)))
             }
             "replace" => {
@@ -530,28 +530,28 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     return self.trap(self.panic("replace with an empty `from`", span));
                 }
                 let out = text.replace(from, to);
-                self.charge((out.len() as u64).div_ceil(8))?;
+                self.charge(fuel::string_cost(out.len() as u64))?;
                 Ok(Value::str(out))
             }
             "to_upper" => {
                 let out = text.to_uppercase();
-                self.charge((out.len() as u64).div_ceil(8))?;
+                self.charge(fuel::string_cost(out.len() as u64))?;
                 Ok(Value::str(out))
             }
             "to_lower" => {
                 let out = text.to_lowercase();
-                self.charge((out.len() as u64).div_ceil(8))?;
+                self.charge(fuel::string_cost(out.len() as u64))?;
                 Ok(Value::str(out))
             }
             "parse_int" => {
-                self.charge((text.len() as u64).div_ceil(8))?;
+                self.charge(fuel::string_cost(text.len() as u64))?;
                 Ok(match parse_int(&text) {
                     Some(v) => Value::Option(Some(Box::new(Value::Int(v)))),
                     None => Value::Option(None),
                 })
             }
             "parse_float" => {
-                self.charge((text.len() as u64).div_ceil(8))?;
+                self.charge(fuel::string_cost(text.len() as u64))?;
                 Ok(match parse_float(&text) {
                     Some(v) => Value::Option(Some(Box::new(Value::Float(v)))),
                     None => Value::Option(None),
@@ -674,7 +674,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 Ok(Value::Bool(inside))
             }
             "to_list" => {
-                self.charge(len.max(0) as u64)?;
+                self.charge(fuel::slot_cost(len.max(0) as u64))?;
                 let mut out = Vec::new();
                 let last = if *inclusive { Some(*end) } else { end.checked_sub(1) };
                 if let Some(last) = last {

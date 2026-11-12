@@ -7,13 +7,13 @@ use martite_check::{
     BindingId, BuiltinFn, BuiltinItem, BuiltinReceiver, CheckedProgram, ConstValue, DefId, FnKind,
     FnSig, PatResolution, PreludeVariant, Resolution, Ty, TypeDefKind, TypeId,
 };
+use martite_fuel as fuel;
 use martite_syntax::{
     AssignOp, BinaryOp, Block, Expr, ExprKind, LambdaBody, MatchBody, NodeId, PatKind, Pattern,
     Stmt, StmtKind, StrExprPart, UnaryOp,
 };
 use smallvec::{SmallVec, smallvec};
 
-use crate::cost::{comparison_cost, show_slots};
 use crate::ops::{show, value_eq, value_ord, write_show};
 use crate::value::{
     Closure, ClosureTarget, EnumValue, FnValue, HandleValue, MAX_VALUE_DEPTH, MapValue, OrderedMap,
@@ -579,7 +579,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             handle_type,
         };
         let result = host.call(def, &args, &mut cx);
-        self.fuel = self.fuel.saturating_sub(cx.charged.saturating_add(1));
+        self.fuel = self.fuel.saturating_sub(fuel::host_call_cost(cx.charged));
         if self.fuel == 0 {
             return Err(Trap::OutOfFuel);
         }
@@ -708,7 +708,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             StmtKind::While { cond, body } => {
                 loop {
-                    self.charge(1)?;
+                    self.charge(fuel::ITERATION_COST)?;
                     let condition = self.eval_expr(cond)?;
                     if !matches!(condition, Value::Bool(true)) {
                         break;
@@ -782,7 +782,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         match iterable {
             Value::List(items) => {
                 for item in items.iter() {
-                    self.charge(1)?;
+                    self.charge(fuel::ITERATION_COST)?;
                     self.bind_pattern(pattern, item);
                     match self.eval_block(body) {
                         Ok(_) | Err(EvalError::Continue) => {}
@@ -793,7 +793,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             Value::Map(map) => {
                 for (key, value) in map.iter() {
-                    self.charge(1)?;
+                    self.charge(fuel::ITERATION_COST)?;
                     let pair = Value::tuple(vec![key_to_value(key), value.clone()]);
                     self.note_alloc(16 + 8 * 2);
                     self.bind_pattern(pattern, &pair);
@@ -806,7 +806,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             Value::Str(text) => {
                 for ch in text.chars() {
-                    self.charge(1)?;
+                    self.charge(fuel::ITERATION_COST)?;
                     self.note_alloc(16 + ch.len_utf8() as u64);
                     let value = Value::Str(Rc::from(ch.to_string()));
                     self.bind_pattern(pattern, &value);
@@ -830,7 +830,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 if let Some(last) = last {
                     let mut i = *start;
                     while i <= last {
-                        self.charge(1)?;
+                        self.charge(fuel::ITERATION_COST)?;
                         self.bind_pattern(pattern, &Value::Int(i));
                         match self.eval_block(body) {
                             Ok(_) | Err(EvalError::Continue) => {}
@@ -868,7 +868,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
     }
 
     fn eval_expr_inner(&mut self, expr: &Expr) -> EvalResult<Value> {
-        self.charge(1)?;
+        self.charge(fuel::EXPRESSION_COST)?;
         match &expr.kind {
             ExprKind::Int(v) => Ok(Value::Int(*v)),
             ExprKind::Float(v) => Ok(Value::Float(*v)),
@@ -881,7 +881,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 for item in items {
                     values.push(self.eval_expr(item)?);
                 }
-                self.charge(values.len() as u64)?;
+                self.charge(fuel::slot_cost(values.len() as u64))?;
                 self.note_alloc(16 + 8 * values.len() as u64);
                 let value = Value::tuple(values);
                 self.check_value_depth(&value, expr.span)?;
@@ -892,7 +892,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 for item in items {
                     values.push(self.eval_expr(item)?);
                 }
-                self.charge(values.len() as u64)?;
+                self.charge(fuel::slot_cost(values.len() as u64))?;
                 self.note_alloc(16 + 8 * values.len() as u64);
                 let value = Value::list(values);
                 self.check_value_depth(&value, expr.span)?;
@@ -907,7 +907,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                         .map_err(|msg| EvalError::Trap(self.panic(msg, k.span)))?;
                     map.insert(key, value);
                 }
-                self.charge(map.len() as u64 * 2)?;
+                self.charge(fuel::map_cost(map.len() as u64))?;
                 let key_bytes: u64 = map.iter().map(|(key, _)| key_value_size(key)).sum();
                 self.note_alloc(16 + 16 * map.len() as u64 + key_bytes);
                 let value = Value::map(map);
@@ -1047,7 +1047,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     }
                     (martite_syntax::PrimTy::Float, Value::Int(v)) => Ok(Value::Float(v as f64)),
                     (martite_syntax::PrimTy::Str, value) => {
-                        self.charge(show_slots(&value))?;
+                        self.charge(fuel::show_cost(value.meta().slots))?;
                         let mut text = String::new();
                         write_show(&mut text, &value, &self.program.types, true);
                         self.note_alloc(16 + text.len() as u64);
@@ -1067,19 +1067,19 @@ impl<'p, 'h> Runtime<'p, 'h> {
             return self.eval_static_string(expr.id, parts);
         }
         let mut out = String::new();
-        let mut slot_cost = 0;
+        let mut show_slots = 0;
         for part in parts {
             match part {
                 StrExprPart::Text(text) => out.push_str(text),
                 StrExprPart::Expr(expr) => {
                     let value = self.eval_expr(expr)?;
-                    slot_cost += show_slots(&value);
+                    show_slots += fuel::show_cost(value.meta().slots);
                     write_show(&mut out, &value, &self.program.types, true);
                 }
             }
         }
-        self.charge(slot_cost)?;
-        self.charge((out.len() as u64).div_ceil(8))?;
+        self.charge(show_slots)?;
+        self.charge(fuel::string_cost(out.len() as u64))?;
         self.note_alloc(16 + out.len() as u64);
         Ok(Value::str(out))
     }
@@ -1096,7 +1096,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             })
             .sum();
         if let Some(value) = self.literal_values.get(&node).cloned() {
-            self.charge((len as u64).div_ceil(8))?;
+            self.charge(fuel::string_cost(len as u64))?;
             return Ok(value);
         }
         let mut out = String::with_capacity(len);
@@ -1105,7 +1105,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 out.push_str(text);
             }
         }
-        self.charge((out.len() as u64).div_ceil(8))?;
+        self.charge(fuel::string_cost(out.len() as u64))?;
         self.note_alloc(16 + out.len() as u64);
         let value = Value::str(out);
         self.literal_values.insert(node, value.clone());
@@ -1250,7 +1250,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 }
             }
         }
-        self.charge(out.len() as u64)?;
+        self.charge(fuel::slot_cost(out.len() as u64))?;
         self.note_alloc(16 + 8 * out.len() as u64);
         Ok(Value::Struct(Rc::new(StructValue::new(type_id, out))))
     }
@@ -1427,7 +1427,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             payload.push(self.eval_expr(&arg.expr)?);
         }
-        self.charge(payload.len() as u64)?;
+        self.charge(fuel::slot_cost(payload.len() as u64))?;
         self.note_alloc(16 + 8 * payload.len() as u64);
         let value = Value::Enum(Rc::new(EnumValue::new(type_id, index, payload)));
         self.check_value_depth(&value, span)?;
@@ -1568,7 +1568,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         slots: usize,
     ) -> EvalResult<&'a mut SeqValue> {
         if Rc::strong_count(items) != 1 {
-            self.charge(slots as u64)?;
+            self.charge(fuel::slot_cost(slots as u64))?;
             self.note_alloc(16 + 8 * slots as u64);
         }
         Ok(Rc::make_mut(items))
@@ -1580,7 +1580,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         slots: usize,
     ) -> EvalResult<&'a mut MapValue> {
         if Rc::strong_count(map) != 1 {
-            self.charge(slots as u64)?;
+            self.charge(fuel::slot_cost(slots as u64))?;
             self.note_alloc(16 + 8 * slots as u64);
         }
         Ok(Rc::make_mut(map))
@@ -1592,7 +1592,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
         slots: usize,
     ) -> EvalResult<&'a mut StructValue> {
         if Rc::strong_count(value) != 1 {
-            self.charge(slots as u64)?;
+            self.charge(fuel::slot_cost(slots as u64))?;
             self.note_alloc(16 + 8 * slots as u64);
         }
         Ok(Rc::make_mut(value))
@@ -1860,10 +1860,10 @@ impl<'p, 'h> Runtime<'p, 'h> {
         match function {
             BuiltinFn::Print => {
                 let value = values.into_iter().next().unwrap_or(Value::Unit);
-                self.charge(show_slots(&value))?;
+                self.charge(fuel::show_cost(value.meta().slots))?;
                 let mut text = String::new();
                 write_show(&mut text, &value, &self.program.types, true);
-                self.charge((text.len() as u64).div_ceil(8))?;
+                self.charge(fuel::string_cost(text.len() as u64))?;
                 self.log.push(text);
                 self.maybe_check_memory()?;
                 Ok(Value::Unit)
@@ -1968,7 +1968,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                self.charge((text.len() as u64).div_ceil(8))?;
+                self.charge(fuel::string_cost(text.len() as u64))?;
                 if text.len() as u64 > self.limits.memory {
                     return Err(EvalError::Trap(Trap::OutOfMemory));
                 }
@@ -1989,7 +1989,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             ("std.json", "stringify") => {
                 let value = values.into_iter().next().unwrap_or(Value::Unit);
                 let text = crate::json::stringify(&value, &self.program.types);
-                self.charge((text.len() as u64).div_ceil(8))?;
+                self.charge(fuel::string_cost(text.len() as u64))?;
                 self.note_alloc(16 + text.len() as u64);
                 Ok(Value::str(text))
             }
@@ -2237,17 +2237,26 @@ impl<'p, 'h> Runtime<'p, 'h> {
         use BinaryOp::*;
         match op {
             Eq => {
-                let cost = comparison_cost(&lhs).max(comparison_cost(&rhs));
+                let lhs_meta = lhs.meta();
+                let rhs_meta = rhs.meta();
+                let cost = fuel::comparison_cost(lhs_meta.slots, lhs_meta.string_slots)
+                    .max(fuel::comparison_cost(rhs_meta.slots, rhs_meta.string_slots));
                 self.charge(cost)?;
                 Ok(Value::Bool(value_eq(&lhs, &rhs)))
             }
             Ne => {
-                let cost = comparison_cost(&lhs).max(comparison_cost(&rhs));
+                let lhs_meta = lhs.meta();
+                let rhs_meta = rhs.meta();
+                let cost = fuel::comparison_cost(lhs_meta.slots, lhs_meta.string_slots)
+                    .max(fuel::comparison_cost(rhs_meta.slots, rhs_meta.string_slots));
                 self.charge(cost)?;
                 Ok(Value::Bool(!value_eq(&lhs, &rhs)))
             }
             Lt | Le | Gt | Ge => {
-                let cost = comparison_cost(&lhs).max(comparison_cost(&rhs));
+                let lhs_meta = lhs.meta();
+                let rhs_meta = rhs.meta();
+                let cost = fuel::comparison_cost(lhs_meta.slots, lhs_meta.string_slots)
+                    .max(fuel::comparison_cost(rhs_meta.slots, rhs_meta.string_slots));
                 self.charge(cost)?;
                 let ord = match (&lhs, &rhs) {
                     (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
@@ -2300,7 +2309,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     let mut text = String::with_capacity(a.len() + b.len());
                     text.push_str(a);
                     text.push_str(b);
-                    self.charge((text.len() as u64).div_ceil(8))?;
+                    self.charge(fuel::string_cost(text.len() as u64))?;
                     self.note_alloc(16 + text.len() as u64);
                     Ok(Value::str(text))
                 }
@@ -2332,7 +2341,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     None => return self.trap(self.panic("invalid list slice", span)),
                 };
                 let slice = items[start..end].to_vec();
-                self.charge(slice.len() as u64)?;
+                self.charge(fuel::slot_cost(slice.len() as u64))?;
                 self.note_alloc(16 + 8 * slice.len() as u64);
                 let value = Value::list(slice);
                 self.check_value_depth(&value, span)?;
@@ -2353,7 +2362,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     None => return self.trap(self.panic("invalid string slice", span)),
                 };
                 let out: String = chars[start..end].iter().collect();
-                self.charge((out.len() as u64).div_ceil(8))?;
+                self.charge(fuel::string_cost(out.len() as u64))?;
                 self.note_alloc(16 + out.len() as u64);
                 Ok(Value::str(out))
             }

@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use indexmap::IndexMap;
 use martite_check::{BindingId, BuiltinFn, BuiltinItemId, DefId, TypeId};
+use martite_fuel as fuel;
 use martite_syntax::NodeId;
 
 #[derive(Debug, Clone)]
@@ -840,7 +841,7 @@ impl Value {
             Value::Str(text) => ValueMeta {
                 depth: 1,
                 slots: 0,
-                string_slots: (text.len() as u64).div_ceil(8),
+                string_slots: fuel::string_slots(text.len() as u64),
                 bytes: 16 + text.len() as u64,
             },
             Value::Handle(handle) => ValueMeta {
@@ -1002,7 +1003,7 @@ fn key_slots(key: &KeyValue) -> u64 {
 
 fn key_string_slots(key: &KeyValue) -> u64 {
     match key {
-        KeyValue::Str(text) => (text.len() as u64).div_ceil(8),
+        KeyValue::Str(text) => fuel::string_slots(text.len() as u64),
         KeyValue::Tuple(items) => items.iter().map(key_string_slots).sum(),
         KeyValue::Struct(_, fields) | KeyValue::Enum(_, _, fields) => {
             fields.iter().map(key_string_slots).sum()
@@ -1183,7 +1184,7 @@ mod tests {
             Value::Str(text) => RefMeta {
                 depth: 1,
                 slots: 0,
-                string_slots: (text.len() as u64).div_ceil(8),
+                string_slots: fuel::string_slots(text.len() as u64),
                 bytes: 16 + text.len() as u64,
             },
             Value::Handle(handle) => RefMeta {
@@ -1228,7 +1229,7 @@ mod tests {
 
     fn reference_key_string(key: &KeyValue) -> u64 {
         match key {
-            KeyValue::Str(text) => (text.len() as u64).div_ceil(8),
+            KeyValue::Str(text) => fuel::string_slots(text.len() as u64),
             KeyValue::Tuple(items) => items.iter().map(reference_key_string).sum(),
             KeyValue::Struct(_, fields) | KeyValue::Enum(_, _, fields) => {
                 fields.iter().map(reference_key_string).sum()
@@ -1534,5 +1535,28 @@ mod tests {
         let new = value.fields[1].meta();
         value.note_field_replaced(old, new);
         assert_meta(&Value::Struct(Rc::new(value)));
+    }
+
+    #[test]
+    fn nested_slots_count_every_container() {
+        let nested = Value::list(vec![
+            Value::list(vec![Value::Int(1), Value::Int(2)]),
+            Value::list(vec![Value::Int(3)]),
+        ]);
+        assert_eq!(nested.meta().slots, 2 + 2 + 1);
+
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Str("a".into()), Value::Int(1));
+        map.insert(KeyValue::Str("b".into()), Value::Int(2));
+        assert_eq!(Value::map(map).meta().slots, 4);
+    }
+
+    #[test]
+    fn comparison_meta_includes_nested_strings() {
+        let value = Value::list(vec![Value::str("abcd"), Value::str("efgh")]);
+        let meta = value.meta();
+        assert_eq!(meta.slots, 2);
+        assert_eq!(meta.string_slots, 2);
+        assert_eq!(fuel::comparison_cost(meta.slots, meta.string_slots), 4);
     }
 }
