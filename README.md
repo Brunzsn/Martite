@@ -20,6 +20,14 @@ The workspace is split along the compiler pipeline:
 - `martite-conformance` — cross-cutting conformance fixtures
 - `martite-bench` — Criterion benchmarks for the compiler, runtime, tools, and CLI
 
+## Architecture
+
+The compiler pipeline is `syntax → resolve → check → runtime`; tooling (`lint`,
+`fmt`, diagnostics) stays on the AST. Execution is moving from the checked-AST
+tree-walker to a resolved tree IR (`martite-ir`). The design and its semantics
+contract are in [`Martite_IR_Design_Doc.md`](Martite_IR_Design_Doc.md); the
+document stays a draft until the phase-3 performance gate is met.
+
 ## Commands
 
 ```sh
