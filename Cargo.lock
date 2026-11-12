@@ -629,6 +629,8 @@ dependencies = [
  "martite-resolve",
  "martite-runtime",
  "martite-syntax",
+ "serde",
+ "serde_json",
  "toml",
 ]
 

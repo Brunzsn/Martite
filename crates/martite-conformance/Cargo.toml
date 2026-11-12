@@ -17,6 +17,8 @@ martite-runtime.workspace = true
 martite-driver.workspace = true
 martite-lint.workspace = true
 martite-fmt.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 
 [lints]

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use martite_base::Code;
-use martite_conformance::{Case, min_fuel, min_memory, run_case, run_case_with_limits};
+use martite_conformance::{Case, min_depth, min_fuel, min_memory, run_case, run_case_with_limits};
 use martite_runtime::{
     ExecLimits, HostContext, HostDispatcher, HostFault, MAX_VALUE_DEPTH, Trap, Value,
     value_depth_exceeds,
@@ -289,6 +289,12 @@ fn memory_limits_include_locals_arguments_and_copy_on_write() {
         copied > baseline,
         "copy-on-write must add the copied payload: baseline {baseline}, copied {copied}"
     );
+}
+
+#[test]
+fn depth_cost_is_golden() {
+    let recursive = "fn down(n: int) -> int {\n    if n == 0 { 0 } else { down(n - 1) }\n}\nfn main() { print(down(10)) }";
+    assert_eq!(min_depth(&Case::single(recursive)), 12);
 }
 
 #[test]

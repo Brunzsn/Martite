@@ -502,6 +502,23 @@ impl Plugin {
         &self.manifest
     }
 
+    /// Execution limits resolved from the manifest and engine maximum.
+    pub fn limits(&self) -> ExecLimits {
+        self.limits
+    }
+
+    /// Arguments passed to `init`, including the settings JSON value when the
+    /// hook declares a parameter.
+    pub fn init_args(&self) -> Vec<Value> {
+        let Some(init) = self.program.init else {
+            return Vec::new();
+        };
+        match self.program.fn_sig(init) {
+            Some(sig) if sig.params.is_empty() => Vec::new(),
+            _ => vec![self.settings_json()],
+        }
+    }
+
     /// Create an opaque handle value for a host type declared in an interface.
     ///
     /// This is for handles created outside a plugin call, such as test
@@ -580,15 +597,7 @@ impl Plugin {
 
     pub fn instantiate(&self) -> Result<Instance<'_>, Trap> {
         let state = if let Some(init) = self.program.init {
-            let sig = self
-                .program
-                .fn_sig(init)
-                .ok_or_else(|| Trap::HostFault("missing init signature".into()))?;
-            let args = if sig.params.is_empty() {
-                Vec::new()
-            } else {
-                vec![self.settings_json()]
-            };
+            let args = self.init_args();
             let mut dispatcher = Dispatch {
                 fns: &self.host_by_def,
             };

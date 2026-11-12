@@ -1,5 +1,8 @@
 //! Shared harness for the Martite conformance suite.
 
+pub mod snapshot;
+pub mod snapshot_cases;
+
 use std::collections::HashSet;
 
 use martite_base::{
@@ -367,20 +370,29 @@ fn checked_program(case: &Case) -> martite_check::CheckedProgram {
     loaded.program.expect("program")
 }
 
-fn run_with_fuel(
-    program: &martite_check::CheckedProgram,
-    fuel: u64,
-    memory: u64,
-) -> Result<(), Trap> {
-    let mut runtime = Runtime::new(
-        program,
-        ExecLimits {
-            fuel,
-            memory,
+/// Upper bounds used when binary-searching a fixture's thresholds.
+#[derive(Debug, Clone, Copy)]
+pub struct ProbeCaps {
+    pub fuel: u64,
+    pub memory: u64,
+    pub depth: u32,
+}
+
+impl Default for ProbeCaps {
+    fn default() -> Self {
+        Self {
+            fuel: 1_000_000,
+            memory: 8 << 20,
             depth: 200,
-            deadline: None,
-        },
-    );
+        }
+    }
+}
+
+fn run_with_limits(
+    program: &martite_check::CheckedProgram,
+    limits: ExecLimits,
+) -> Result<(), Trap> {
+    let mut runtime = Runtime::new(program, limits);
     runtime.run_main().map(|_| ())
 }
 
@@ -388,16 +400,37 @@ fn run_with_fuel(
 /// when a charge drives the remaining budget to zero, so this is one more
 /// than the total specified cost.
 pub fn min_fuel(case: &Case) -> u64 {
+    min_fuel_with(case, ProbeCaps::default())
+}
+
+pub fn min_fuel_with(case: &Case, caps: ProbeCaps) -> u64 {
     let program = checked_program(case);
     let mut low = 1u64;
-    let mut high = 1_000_000u64;
+    let mut high = caps.fuel.max(1);
     assert!(
-        run_with_fuel(&program, high, 8 << 20).is_ok(),
+        run_with_limits(
+            &program,
+            ExecLimits {
+                fuel: high,
+                memory: caps.memory,
+                depth: caps.depth,
+                deadline: None,
+            },
+        )
+        .is_ok(),
         "fixture needs more than the probe cap"
     );
     while low < high {
         let mid = low + (high - low) / 2;
-        match run_with_fuel(&program, mid, 8 << 20) {
+        match run_with_limits(
+            &program,
+            ExecLimits {
+                fuel: mid,
+                memory: caps.memory,
+                depth: caps.depth,
+                deadline: None,
+            },
+        ) {
             Ok(()) => high = mid,
             Err(Trap::OutOfFuel) => low = mid + 1,
             Err(trap) => panic!("unexpected trap while probing fuel: {trap:?}"),
@@ -409,19 +442,81 @@ pub fn min_fuel(case: &Case) -> u64 {
 /// Smallest memory budget that lets the program finish, i.e. its high-water
 /// mark under the specified accounting.
 pub fn min_memory(case: &Case) -> u64 {
+    min_memory_with(case, ProbeCaps::default())
+}
+
+pub fn min_memory_with(case: &Case, caps: ProbeCaps) -> u64 {
     let program = checked_program(case);
     let mut low = 0u64;
-    let mut high = 8 << 20;
+    let mut high = caps.memory;
     assert!(
-        run_with_fuel(&program, 1_000_000, high).is_ok(),
+        run_with_limits(
+            &program,
+            ExecLimits {
+                fuel: caps.fuel,
+                memory: high,
+                depth: caps.depth,
+                deadline: None,
+            },
+        )
+        .is_ok(),
         "fixture needs more than the probe cap"
     );
     while low < high {
         let mid = low + (high - low) / 2;
-        match run_with_fuel(&program, 1_000_000, mid) {
+        match run_with_limits(
+            &program,
+            ExecLimits {
+                fuel: caps.fuel,
+                memory: mid,
+                depth: caps.depth,
+                deadline: None,
+            },
+        ) {
             Ok(()) => high = mid,
             Err(Trap::OutOfMemory) => low = mid + 1,
             Err(trap) => panic!("unexpected trap while probing memory: {trap:?}"),
+        }
+    }
+    low
+}
+
+/// Smallest call-depth budget that lets the program finish.
+pub fn min_depth(case: &Case) -> u32 {
+    min_depth_with(case, ProbeCaps::default())
+}
+
+pub fn min_depth_with(case: &Case, caps: ProbeCaps) -> u32 {
+    let program = checked_program(case);
+    let mut low = 0u32;
+    let mut high = caps.depth;
+    assert!(
+        run_with_limits(
+            &program,
+            ExecLimits {
+                fuel: caps.fuel,
+                memory: caps.memory,
+                depth: high,
+                deadline: None,
+            },
+        )
+        .is_ok(),
+        "fixture needs more than the probe cap"
+    );
+    while low < high {
+        let mid = low + (high - low) / 2;
+        match run_with_limits(
+            &program,
+            ExecLimits {
+                fuel: caps.fuel,
+                memory: caps.memory,
+                depth: mid,
+                deadline: None,
+            },
+        ) {
+            Ok(()) => high = mid,
+            Err(Trap::DepthExceeded) => low = mid + 1,
+            Err(trap) => panic!("unexpected trap while probing depth: {trap:?}"),
         }
     }
     low

@@ -278,6 +278,11 @@ impl<'p, 'h> Runtime<'p, 'h> {
         self.limits
     }
 
+    /// Fuel consumed by the current run, including host-call charges.
+    pub fn fuel_used(&self) -> u64 {
+        self.limits.fuel.saturating_sub(self.fuel)
+    }
+
     pub fn set_limits(&mut self, limits: ExecLimits) {
         self.limits = limits;
     }
