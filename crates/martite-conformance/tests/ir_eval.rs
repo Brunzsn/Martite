@@ -416,6 +416,32 @@ fn failed_guards_restore_the_previous_binding_for_copy_on_write() {
 }
 
 #[test]
+fn failed_guard_bindings_do_not_leak_a_reference_in_ir() {
+    let baseline = Case::single(
+        "fn main() {\n    var items = [1, 2, 3]\n    items.push(4)\n    print(\"{items.len()}\")\n}",
+    );
+    let with_failed_guard = Case::single(
+        "fn main() {\n    var items = [1, 2, 3]\n    match Some(items) {\n        Some(bound) if false => print(\"{bound.len()}\"),\n        _ => {}\n    }\n    items.push(4)\n    print(\"{items.len()}\")\n}",
+    );
+    let limits = ExecLimits::default();
+    let ast = observe_ast(&with_failed_guard, limits);
+    let ir = observe_ir(&with_failed_guard, limits);
+    assert_eq!(ir.outcome, ast.outcome, "outcome");
+    assert_eq!(ir.log, ast.log, "log");
+    assert_eq!(ir.fuel, ast.fuel, "fuel used");
+    assert_eq!(
+        min_memory_ir(&with_failed_guard),
+        min_memory(&with_failed_guard),
+        "IR must match the AST failed-guard memory oracle"
+    );
+    assert_eq!(
+        min_memory_ir(&with_failed_guard),
+        min_memory_ir(&baseline),
+        "a failed guard must not keep its binding slot live into later copy-on-write"
+    );
+}
+
+#[test]
 fn panic_and_assert_traps_match_the_ast_interpreter() {
     for (id, source) in [
         ("panic", r#"fn main() { panic("boom") }"#),
@@ -441,19 +467,39 @@ let part = text[1..9] }"#,
     }
 }
 
-/// Snapshot cases whose call, builtin and host surface is executable by the
-/// #109 evaluator. Closures, captures and `match` cases stay out until #110.
+/// Snapshot cases whose call, builtin, host, closure and pattern surface is
+/// executable by the #110 evaluator. Exact memory and depth thresholds remain
+/// with #111, and the full corpus harness with #112.
 const IR_READY_CASES: &[&str] = &[
     "bench/load/multi",
+    "bench/runtime/captures.mt",
+    "bench/runtime/closures.mt",
     "bench/runtime/field_index_ops.mt",
     "bench/runtime/fib.mt",
     "bench/runtime/function_calls.mt",
     "bench/runtime/host_calls",
+    "bench/runtime/list_ops.mt",
     "bench/runtime/map_ops.mt",
     "bench/runtime/method_dispatch.mt",
     "bench/runtime/mut_params.mt",
+    "bench/runtime/option_ops.mt",
+    "bench/runtime/pattern_match.mt",
     "bench/runtime/plugin",
+    "bench/runtime/string_ops.mt",
+    "closures/builtin_module_function_values_are_callable",
+    "closures/calls_copy_out_only_mutable_parameters",
+    "closures/free_function_values_work_in_higher_order_builtins",
+    "closures/higher_order_builtins_accept_borrowed_closures",
+    "closures/lambdas_capture_by_value",
+    "closures/lambdas_record_only_free_variables",
+    "closures/loop_lambdas_capture_each_iteration",
+    "closures/nested_lambdas_capture_transitively",
+    "closures/nested_lambdas_record_transitive_captures",
+    "e2e/enums_and_match",
+    "e2e/functions_and_closures",
     "e2e/generic_stack",
+    "e2e/option_match",
+    "e2e/result_and_try",
     "host/host_functions_can_construct_handles",
     "host/make_handle_without_an_opaque_return_is_a_host_fault",
     "host/plugin_init_hook_and_state",
@@ -469,6 +515,13 @@ const IR_READY_CASES: &[&str] = &[
     "limits/fuel/unique-remove-shifts-only",
     "limits/memory/arguments-and-locals",
     "limits/memory/copy-on-write",
+    "patterns/failed_guards_keep_side_effects",
+    "patterns/match_guards_and_or_patterns_fall_through_cleanly",
+    "patterns/nested_or_patterns_and_failed_guards_restore_bindings",
+    "patterns/struct_literal_fields_evaluate_after_base_in_source_order",
+    "patterns/struct_literals_preserve_declaration_order_and_updates",
+    "patterns/struct_patterns_use_declaration_slots",
+    "patterns/variant_patterns_bind_payloads",
     "plugins/a_trap_rolls_back_the_state_and_an_err_commits_it",
     "plugins/handler_parameters_are_copy_in_and_copy_out",
     "plugins/host_functions_can_create_handles_during_a_call",
