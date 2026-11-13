@@ -6,7 +6,7 @@ use crate::node::NodeKind;
 use crate::types::TyId;
 
 use super::LowerError;
-use super::context::FnLowerer;
+use super::context::{FnLowerer, PatternPosition};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockKind {
@@ -85,7 +85,7 @@ impl FnLowerer<'_, '_> {
         match &stmt.kind {
             StmtKind::Let { pattern, value, .. } => {
                 let value = self.lower_expr(value)?;
-                let pattern = self.lower_pattern(pattern)?;
+                let pattern = self.lower_pattern(pattern, PatternPosition::Binding)?;
                 Ok(self.push(
                     NodeKind::Let { pattern, value },
                     unit,
@@ -111,7 +111,7 @@ impl FnLowerer<'_, '_> {
                 body,
             } => {
                 let iterable = self.lower_expr(iter)?;
-                let pattern = self.lower_pattern(pattern)?;
+                let pattern = self.lower_pattern(pattern, PatternPosition::Binding)?;
                 let (body, _) = self.lower_block(body, BlockKind::Body, None)?;
                 let first_child = self.append_children(vec![iterable, body]).start;
                 Ok(self.push(

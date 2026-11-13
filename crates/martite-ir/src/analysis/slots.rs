@@ -11,6 +11,7 @@ use crate::id::{IrId, PatternId, Slot};
 use crate::node::NodeKind;
 use crate::pattern::Pattern;
 use crate::program::{IrFn, IrProgram};
+use crate::types::TypeDefKind;
 use crate::verify::children_of;
 
 /// A set of frame slots, indexed densely over `IrFn::locals`.
@@ -314,6 +315,60 @@ pub(crate) fn pattern_binding_set(pattern: &Pattern) -> Vec<Slot> {
     pattern_binding_slots(pattern, &mut slots);
     slots.sort_unstable();
     slots
+}
+
+/// Whether a pattern matches every value of its type.
+///
+/// This is the semantic question a `match` asks when it decides whether an arm
+/// can fall through. An or-pattern always matches when any alternative does.
+/// A variant pattern always matches when its enum has one variant and every
+/// payload pattern always matches; `Option` and `Result` have two variants.
+pub(crate) fn pattern_always_matches(program: &IrProgram, pattern: &Pattern) -> bool {
+    pattern_irrefutable(program, pattern, false)
+}
+
+/// Whether a pattern is irrefutable in a binding position (`let`, `for` and
+/// lambda parameters), matching checker rule E302.
+///
+/// Unlike [`pattern_always_matches`], every or-pattern alternative must be
+/// irrefutable because binding positions bind the first alternative.
+pub(crate) fn pattern_binds_irrefutably(program: &IrProgram, pattern: &Pattern) -> bool {
+    pattern_irrefutable(program, pattern, true)
+}
+
+fn pattern_irrefutable(program: &IrProgram, pattern: &Pattern, or_requires_all: bool) -> bool {
+    match pattern {
+        Pattern::Wild | Pattern::Bind { .. } => true,
+        Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) | Pattern::Prelude { .. } => false,
+        Pattern::Tuple(items) => items
+            .iter()
+            .all(|item| pattern_irrefutable(program, item, or_requires_all)),
+        Pattern::Struct { fields, .. } => fields
+            .iter()
+            .all(|(_, item)| pattern_irrefutable(program, item, or_requires_all)),
+        Pattern::Variant { type_id, args, .. } => {
+            let singleton = matches!(
+                program.types.get(*type_id).map(|def| &def.kind),
+                Some(TypeDefKind::Enum { variants }) if variants.len() == 1
+            );
+            singleton
+                && args
+                    .iter()
+                    .all(|item| pattern_irrefutable(program, item, or_requires_all))
+        }
+        Pattern::Or(items) => {
+            if or_requires_all {
+                !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|item| pattern_irrefutable(program, item, true))
+            } else {
+                items
+                    .iter()
+                    .any(|item| pattern_irrefutable(program, item, false))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -12,8 +12,6 @@ use martite_conformance::snapshot_cases;
 use martite_ir::{Charge, IrProgram, LowerErrorKind, NodeKind, lower, verify};
 
 const KNOWN_GAPS: &[&str] = &[
-    "pattern",
-    "match",
     "lambda",
     "method value",
     "variant value",

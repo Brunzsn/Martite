@@ -1,4 +1,4 @@
-﻿use crate::snapshot::SnapshotCase;
+use crate::snapshot::SnapshotCase;
 use crate::snapshot_cases::{default_caps, main_case};
 
 pub fn cases() -> Vec<SnapshotCase> {
@@ -141,6 +141,37 @@ pub fn cases() -> Vec<SnapshotCase> {
                 match 1 {
                     1 if bump(mut value) => print("yes"),
                     _ => print("{value}"),
+                }
+            }
+            "#,
+            None,
+            caps,
+        ),
+        main_case(
+            "patterns/nested_or_patterns_and_failed_guards_restore_bindings",
+            r#"
+            enum Shape { Pair(int, int), Single(int), Empty }
+
+            fn main() {
+                let value = Shape.Pair(2, 3)
+                match value {
+                    Pair(x, 1) | Pair(x, 2) => print("early {x}"),
+                    Pair(x, y) => print("pair {x}:{y}"),
+                    Single(x) => print("single {x}"),
+                    Empty => print("empty"),
+                }
+
+                let nested: (int?, int) = (Some(4), 5)
+                match nested {
+                    (Some(x), y) if x > 10 => print("big {x}:{y}"),
+                    (Some(x), y) => print("nested {x}:{y}"),
+                    (None, _) => print("none"),
+                }
+
+                match Some([1, 2, 3]) {
+                    Some(items) if items.len() > 5 => print("big"),
+                    Some(items) => print("{items.len()}"),
+                    None => print("none"),
                 }
             }
             "#,

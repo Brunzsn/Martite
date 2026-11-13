@@ -4,14 +4,25 @@ use martite_syntax::{Block, Expr};
 
 use crate::charge::Charge;
 use crate::effects::Effects;
-use crate::id::{ConstId, Slot, StrId};
+use crate::id::{ConstId, MatchSetId, Slot, StrId};
 use crate::node::{ChildRange, Node, NodeKind, StrPart};
-use crate::pattern::{Pattern, StructLayout};
+use crate::pattern::{MatchSet, Pattern, StructLayout};
 use crate::program::IrFn;
 use crate::types::TyId;
 use crate::{ConstValue, IrId, PatternId, StructLayoutId};
 
 use super::{LowerError, Lowerer, SlotPlan};
+
+/// Where a pattern is being lowered.
+///
+/// Match arms keep every or-pattern alternative. Binding positions (`let`,
+/// `for` and lambda parameters) require an irrefutable pattern, so lowering
+/// keeps only the first alternative as the design doc section 6.3 specifies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PatternPosition {
+    Match,
+    Binding,
+}
 
 pub(crate) struct FnLowerer<'a, 'p> {
     pub(crate) lowerer: &'a mut Lowerer<'p>,
@@ -126,6 +137,12 @@ impl<'a, 'p> FnLowerer<'a, 'p> {
     pub(crate) fn push_pattern(&mut self, pattern: Pattern) -> PatternId {
         let id = PatternId::new(self.function.patterns.len() as u32);
         self.function.patterns.push(pattern);
+        id
+    }
+
+    pub(crate) fn push_match_set(&mut self, set: MatchSet) -> MatchSetId {
+        let id = MatchSetId::new(self.function.matches.len() as u32);
+        self.function.matches.push(set);
         id
     }
 

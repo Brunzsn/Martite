@@ -22,4 +22,4 @@ pub use definite::{DefiniteAssignment, UnboundRead};
 pub use liveness::Liveness;
 pub use slots::{SlotBindingError, SlotSet, check_slot_initialization};
 
-pub(crate) use slots::pattern_binding_set;
+pub(crate) use slots::{pattern_binding_set, pattern_binds_irrefutably};

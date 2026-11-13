@@ -1,9 +1,10 @@
 //! Resolved patterns, match arm tables and struct-update layouts.
 //!
-//! Patterns charge nothing; only guards and bodies evaluate. Lowering and the
-//! two-phase binding protocol land in #105. The data model already records the
-//! binding slots so the verifier can check writes without walking checker side
-//! tables.
+//! Patterns charge nothing; only guards and bodies evaluate. The pattern tree
+//! is pure test data: the evaluator tests it without writes, then binds the
+//! arm's slots and rolls them back on guard failure. Every binding slot is
+//! recorded on the pattern so the verifier can check writes and definite
+//! assignment without walking checker side tables.
 
 use crate::id::{IrId, PatternId, Slot, StrId};
 use crate::program::PreludeVariant;

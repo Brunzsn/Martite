@@ -748,22 +748,6 @@ fn f(p: P) -> int {
         }
     ));
 
-    let pattern = lower_source_result(
-        r#"
-fn f() -> int {
-    let (a, b) = (1, 2)
-    a + b
-}
-"#,
-    )
-    .expect_err("pattern is #105");
-    assert!(matches!(
-        pattern.kind,
-        LowerErrorKind::Unsupported {
-            construct: "pattern"
-        }
-    ));
-
     let lambda = lower_source_result(
         r#"
 fn f() -> int {
@@ -822,4 +806,292 @@ fn compute(a: int) -> int {
     assert_eq!(function.slot_info[1].name.as_deref(), Some("x"));
     assert_eq!(function.slot_info[2].name.as_deref(), Some("y"));
     assert!(function.body.is_some());
+}
+
+#[test]
+fn lowers_variant_or_patterns_and_guards() {
+    let ir = lower_source(
+        r#"
+enum Value { A(int, int), B(int) }
+
+fn pick(value: Value) -> int {
+    match value {
+        A(x, 1) | A(x, 2) if x > 0 => x,
+        A(x, _) => x + 10,
+        B(x) => x,
+    }
+}
+"#,
+    );
+    let function = named_function(&ir, "pick");
+    let match_node = function
+        .nodes
+        .iter()
+        .find(|node| matches!(node.kind, martite_ir::NodeKind::Match { .. }))
+        .expect("match node");
+    let martite_ir::NodeKind::Match { match_set, .. } = match_node.kind else {
+        unreachable!()
+    };
+    assert_eq!(match_node.charge, martite_ir::Charge::expression());
+    let set = function.match_set(match_set).expect("match set");
+    assert_eq!(set.arms.len(), 3);
+    assert!(set.arms[0].guard.is_some());
+
+    let martite_ir::Pattern::Or(alternatives) =
+        function.pattern(set.arms[0].pattern).expect("or pattern")
+    else {
+        panic!("first arm must keep its or-pattern");
+    };
+    assert_eq!(alternatives.len(), 2);
+    let mut bound_slot = None;
+    for (index, alternative) in alternatives.iter().enumerate() {
+        let martite_ir::Pattern::Variant {
+            type_id,
+            variant,
+            args,
+        } = alternative
+        else {
+            panic!("alternative must be a variant pattern");
+        };
+        assert_eq!(*variant, 0);
+        assert_eq!(args.len(), 2);
+        let martite_ir::Pattern::Bind { slot, .. } = &args[0] else {
+            panic!("payload must bind");
+        };
+        if let Some(previous) = bound_slot {
+            assert_eq!(previous, *slot);
+        }
+        bound_slot = Some(*slot);
+        assert_eq!(args[1], martite_ir::Pattern::Int(index as i64 + 1));
+        assert!(ir.types.get(*type_id).is_some());
+    }
+
+    let guard = set.arms[0].guard.expect("guard");
+    assert!(matches!(
+        function.node(guard).expect("guard node").kind,
+        martite_ir::NodeKind::Gt { .. }
+    ));
+}
+
+#[test]
+fn lowers_nested_struct_patterns_in_declaration_order() {
+    let ir = lower_source(
+        r#"
+struct Point { x: int, y: int, z: int }
+struct Segment { start: Point, end: Point }
+
+fn read(segment: Segment) -> int {
+    match segment {
+        Segment { end: Point { y: end_y, .. }, .. } => end_y,
+    }
+}
+"#,
+    );
+    let function = named_function(&ir, "read");
+    let match_node = function
+        .nodes
+        .iter()
+        .find(|node| matches!(node.kind, martite_ir::NodeKind::Match { .. }))
+        .expect("match node");
+    let martite_ir::NodeKind::Match { match_set, .. } = match_node.kind else {
+        unreachable!()
+    };
+    let set = function.match_set(match_set).expect("match set");
+    let martite_ir::Pattern::Struct { fields, .. } = function
+        .pattern(set.arms[0].pattern)
+        .expect("segment pattern")
+    else {
+        panic!("top-level pattern must be a struct");
+    };
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].0, 1, "end is the second declaration field");
+    let martite_ir::Pattern::Struct {
+        fields: point_fields,
+        ..
+    } = &fields[0].1
+    else {
+        panic!("nested point pattern");
+    };
+    assert_eq!(point_fields.len(), 1);
+    assert_eq!(point_fields[0].0, 1, "y is the second declaration field");
+    assert!(matches!(
+        point_fields[0].1,
+        martite_ir::Pattern::Bind { .. }
+    ));
+}
+
+#[test]
+fn lowers_prelude_and_literal_patterns() {
+    let ir = lower_source(
+        r#"
+fn option_pick(value: int?) -> int {
+    match value {
+        Some(0) => 1,
+        Some(x) => x,
+        None => 0,
+    }
+}
+
+fn bool_pick(value: bool) -> int {
+    match value {
+        true => 1,
+        false => 0,
+    }
+}
+
+fn str_pick(value: str) -> int {
+    match value {
+        "a" => 1,
+        _ => 0,
+    }
+}
+"#,
+    );
+
+    let option = named_function(&ir, "option_pick");
+    let match_node = option
+        .nodes
+        .iter()
+        .find(|node| matches!(node.kind, martite_ir::NodeKind::Match { .. }))
+        .expect("match node");
+    let martite_ir::NodeKind::Match { match_set, .. } = match_node.kind else {
+        unreachable!()
+    };
+    let set = option.match_set(match_set).expect("match set");
+    assert!(matches!(
+        option.pattern(set.arms[0].pattern),
+        Some(martite_ir::Pattern::Prelude {
+            variant: martite_ir::PreludeVariant::Some,
+            args,
+        }) if args.len() == 1
+    ));
+    assert!(matches!(
+        option.pattern(set.arms[2].pattern),
+        Some(martite_ir::Pattern::Prelude {
+            variant: martite_ir::PreludeVariant::None,
+            args,
+        }) if args.is_empty()
+    ));
+
+    let boolean = named_function(&ir, "bool_pick");
+    assert!(
+        boolean
+            .patterns
+            .iter()
+            .any(|pattern| matches!(pattern, martite_ir::Pattern::Bool(true)))
+    );
+
+    let string = named_function(&ir, "str_pick");
+    let string_pattern = string
+        .patterns
+        .iter()
+        .find_map(|pattern| match pattern {
+            martite_ir::Pattern::Str(id) => Some(*id),
+            _ => None,
+        })
+        .expect("string pattern");
+    assert_eq!(ir.string(string_pattern), Some("a"));
+}
+
+#[test]
+fn lowers_irrefutable_destructuring_and_first_or_alternative() {
+    let ir = lower_source(
+        r#"
+struct Point { x: int, y: int, z: int }
+enum Only { A(int) }
+
+fn destructure(pair: (int, int), point: Point, only: Only) -> int {
+    let (a, b) = pair
+    let Point { y, .. } = point
+    let A(c) = only
+    let (d | d) = 1
+    a + b + y + c + d
+}
+"#,
+    );
+    let function = named_function(&ir, "destructure");
+    assert!(
+        !function
+            .patterns
+            .iter()
+            .any(|pattern| matches!(pattern, martite_ir::Pattern::Or(_))),
+        "binding positions select the first or-pattern alternative"
+    );
+    assert!(function.patterns.iter().any(|pattern| matches!(
+        pattern,
+        martite_ir::Pattern::Struct { fields, .. } if fields.len() == 1
+    )));
+    assert!(function.patterns.iter().any(|pattern| matches!(
+        pattern,
+        martite_ir::Pattern::Variant { variant: 0, args, .. } if args.len() == 1
+    )));
+}
+
+#[test]
+fn match_block_bodies_lower_as_bodies() {
+    let ir = lower_source(
+        r#"
+fn block_body(value: int) -> int {
+    match value {
+        x => {
+            let y = x + 1
+            y
+        }
+    }
+}
+"#,
+    );
+    let function = named_function(&ir, "block_body");
+    let match_node = function
+        .nodes
+        .iter()
+        .find(|node| matches!(node.kind, martite_ir::NodeKind::Match { .. }))
+        .expect("match node");
+    let martite_ir::NodeKind::Match { match_set, .. } = match_node.kind else {
+        unreachable!()
+    };
+    let set = function.match_set(match_set).expect("match set");
+    let body = function.node(set.arms[0].body).expect("arm body");
+    assert!(matches!(body.kind, martite_ir::NodeKind::Block(_)));
+    assert_eq!(body.charge, martite_ir::Charge::ZERO);
+    assert_eq!(body.ty, function.ret);
+}
+
+#[test]
+fn verifier_rejects_refutable_for_pattern() {
+    let mut ir = lower_source(
+        r#"
+fn loops() -> int {
+    for x in [1, 2] {
+        let _ = x
+    }
+    0
+}
+"#,
+    );
+    let function = &mut ir.fns[0];
+    let for_node = function
+        .nodes
+        .iter()
+        .position(|node| matches!(node.kind, martite_ir::NodeKind::For { .. }))
+        .expect("for node");
+    let pattern = martite_ir::PatternId::new(function.patterns.len() as u32);
+    function.patterns.push(martite_ir::Pattern::Int(1));
+    let martite_ir::NodeKind::For {
+        pattern: slot_pattern,
+        ..
+    } = &mut function.nodes[for_node].kind
+    else {
+        unreachable!()
+    };
+    *slot_pattern = pattern;
+
+    let error = verify(&ir).expect_err("refutable for pattern");
+    assert!(matches!(
+        error.kind,
+        martite_ir::VerifyErrorKind::PatternShape {
+            context: "`for` pattern is refutable",
+            ..
+        }
+    ));
 }

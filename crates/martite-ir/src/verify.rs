@@ -14,7 +14,9 @@ use std::fmt;
 
 use martite_base::{SourceId, Span};
 
-use crate::analysis::{DefiniteAssignment, check_slot_initialization};
+use crate::analysis::{
+    DefiniteAssignment, check_slot_initialization, pattern_binding_set, pattern_binds_irrefutably,
+};
 use crate::builtin::{BuiltinMethodDef, BuiltinReceiver};
 use crate::charge::Charge;
 use crate::effects::Effects;
@@ -1059,13 +1061,19 @@ impl<'a> Verifier<'a> {
                 context: "self is not the first parameter",
             }));
         }
-        if let Some(pattern) = param.pattern
-            && pattern.index() >= function.patterns.len()
-        {
-            return Err(error(VerifyErrorKind::Pattern {
-                pattern,
-                context: "parameter pattern",
-            }));
+        if let Some(pattern) = param.pattern {
+            let Some(pattern_value) = function.pattern(pattern) else {
+                return Err(error(VerifyErrorKind::Pattern {
+                    pattern,
+                    context: "parameter pattern",
+                }));
+            };
+            if !pattern_binds_irrefutably(self.program, pattern_value) {
+                return Err(error(VerifyErrorKind::PatternShape {
+                    pattern,
+                    context: "parameter pattern is refutable",
+                }));
+            }
         }
         Ok(())
     }
@@ -1077,6 +1085,7 @@ impl<'a> Verifier<'a> {
         set: &MatchSet,
     ) -> Result<(), VerifyError> {
         let error = |kind| verify_error(function, kind);
+        let mut arm_slots = Vec::new();
         for arm in &set.arms {
             if arm.pattern.index() >= function.patterns.len() {
                 return Err(error(VerifyErrorKind::Pattern {
@@ -1097,6 +1106,17 @@ impl<'a> Verifier<'a> {
                     arena: Arena::Node,
                     id: guard.0,
                 }));
+            }
+            if let Some(pattern) = function.pattern(arm.pattern) {
+                for slot in pattern_binding_set(pattern) {
+                    if arm_slots.contains(&slot) {
+                        return Err(error(VerifyErrorKind::PatternShape {
+                            pattern: arm.pattern,
+                            context: "match arm binding slot is shared with another arm",
+                        }));
+                    }
+                    arm_slots.push(slot);
+                }
             }
             let _ = id;
         }
@@ -1414,6 +1434,17 @@ impl<'p> FnCheck<'p> {
     }
 
     fn run(&mut self) -> Result<(), VerifyError> {
+        let patterns: Vec<_> = self
+            .function
+            .params
+            .iter()
+            .filter_map(|param| param.pattern.map(|pattern| (pattern, param.ty)))
+            .collect();
+        for (pattern, ty) in patterns {
+            let ty = self.ty(ty)?;
+            self.check_pattern_against(pattern, &ty)?;
+        }
+
         let body = self.function.body.expect("shape check requires a body");
         if !matches!(self.function.kind, FnKind::Lambda)
             && !matches!(
@@ -2405,6 +2436,7 @@ impl<'p> FnCheck<'p> {
                 let value_ty = self.check_node(value, NodeRole::Value)?;
                 let value_ty = self.ty(value_ty)?;
                 self.check_pattern_against(pattern, &value_ty)?;
+                self.check_irrefutable_binding_pattern(pattern, "`let` pattern is refutable")?;
                 Ok(Ty::Unit)
             }
             NodeKind::Assign { place, value } => {
@@ -2468,6 +2500,7 @@ impl<'p> FnCheck<'p> {
                 let iterable_ty = self.check_node(iterable, NodeRole::Value)?;
                 let element_ty = self.for_element_type(iterable_ty)?;
                 self.check_pattern_against(pattern, &element_ty)?;
+                self.check_irrefutable_binding_pattern(pattern, "`for` pattern is refutable")?;
                 self.loop_depth += 1;
                 let body_ty = self.check_node(body, NodeRole::Body);
                 self.loop_depth -= 1;
@@ -2714,6 +2747,27 @@ impl<'p> FnCheck<'p> {
             }
             _ => false,
         })
+    }
+
+    fn check_irrefutable_binding_pattern(
+        &self,
+        pattern: PatternId,
+        context: &'static str,
+    ) -> Result<(), VerifyError> {
+        let Some(value) = self.function.pattern(pattern) else {
+            return Err(self.error(
+                None,
+                VerifyErrorKind::Pattern {
+                    pattern,
+                    context: "irrefutable binding",
+                },
+            ));
+        };
+        if pattern_binds_irrefutably(self.program, value) {
+            Ok(())
+        } else {
+            Err(self.error(None, VerifyErrorKind::PatternShape { pattern, context }))
+        }
     }
 
     fn check_pattern_against(
@@ -5600,8 +5654,13 @@ impl<'a> EffectsCheck<'a> {
             }
             NodeKind::Return(_) => effects |= E::NONLOCAL_EXIT,
             NodeKind::Try(_) => effects |= E::NONLOCAL_EXIT | E::MAY_TRAP | E::ALLOCATES,
-            NodeKind::Match { .. } => {
+            NodeKind::Match { match_set, .. } => {
                 effects |= E::MAY_TRAP | E::READS_HEAP | E::WRITES_LOCAL;
+                if let Some(set) = function.match_set(match_set) {
+                    for arm in &set.arms {
+                        effects |= self.pattern_effects(function, arm.pattern);
+                    }
+                }
             }
             NodeKind::ConvertInt(_) => effects |= E::MAY_TRAP,
             NodeKind::ConvertFloat(_) => {}
