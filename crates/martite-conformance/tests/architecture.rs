@@ -85,3 +85,16 @@ fn ir_stays_above_the_runtime() {
         "martite-ir must not depend on the benchmark crate"
     );
 }
+
+#[test]
+fn ir_evaluator_reads_only_the_ir_program() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = fs::read_to_string(root.join("crates/martite-runtime/src/ir_eval.rs"))
+        .expect("read IR evaluator source");
+    for forbidden in ["martite_check", "CheckedProgram", "BindingId", "HashMap"] {
+        assert!(
+            !source.contains(forbidden),
+            "the IR evaluator must not use {forbidden}"
+        );
+    }
+}

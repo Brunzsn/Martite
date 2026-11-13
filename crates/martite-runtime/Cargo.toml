@@ -6,6 +6,12 @@ license.workspace = true
 description = "Tree-walking interpreter and standard library for Martite"
 publish = false
 
+[features]
+default = []
+# Opt-in IR evaluator (#108). The AST interpreter stays the default path until
+# the differential and threshold suites are green (#112, #111, #115).
+ir-eval = []
+
 [dependencies]
 martite-base.workspace = true
 martite-fuel.workspace = true
