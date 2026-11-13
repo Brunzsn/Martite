@@ -1,24 +1,22 @@
 //! Lowering gate for the conformance corpus.
 //!
-//! #103 only lowers the first-half constructs. This test walks every snapshot
-//! case, verifies every program that lowers, and fails if lowering reports an
-//! internal error or an unexpected unsupported construct. When #104–#106 land,
-//! the allowed gap set shrinks to empty and the corpus-wide gate moves to #106.
+//! Calls are lowered by #104. The remaining gap set belongs to #105 (patterns
+//! and match) and #106 (lambdas and capture-dependent values). This test walks
+//! every snapshot case, verifies every program that lowers, and fails if
+//! lowering reports an internal error or an unexpected unsupported construct.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use martite_conformance::snapshot_cases;
-use martite_ir::{LowerErrorKind, lower, verify};
+use martite_ir::{Charge, IrProgram, LowerErrorKind, NodeKind, lower, verify};
 
 const KNOWN_GAPS: &[&str] = &[
-    "call",
     "pattern",
     "match",
     "lambda",
     "method value",
     "variant value",
-    "mut argument",
     "builtin item value",
     "function value kind",
 ];
@@ -53,6 +51,66 @@ fn checkable_fixtures_lower_or_report_a_known_gap() {
     }
     assert!(lowered > 0, "no conformance fixture lowered");
     eprintln!("ir lowering gate: lowered {lowered}, skipped {skipped}");
+}
+
+#[test]
+fn call_fixtures_use_exact_call_and_place_charges() {
+    for id in [
+        "bench/runtime/mut_params.mt",
+        "bench/runtime/field_index_ops.mt",
+        "plugins/settings_are_delivered_to_init_as_json",
+    ] {
+        let case = snapshot_cases::all_cases()
+            .into_iter()
+            .find(|case| case.id() == id)
+            .unwrap_or_else(|| panic!("missing case {id}"));
+        let (program, sources) = case
+            .checked_program()
+            .unwrap_or_else(|| panic!("{id} must check"));
+        let ir: IrProgram =
+            lower(&program, &sources).unwrap_or_else(|error| panic!("{id}: {error}"));
+        verify(&ir).unwrap_or_else(|error| panic!("{id}: {error}"));
+        for function in &ir.fns {
+            for node in &function.nodes {
+                if node.kind.is_call() {
+                    assert_eq!(
+                        node.charge,
+                        Charge::expression(),
+                        "{}: call charge",
+                        function.name
+                    );
+                }
+                match node.kind {
+                    NodeKind::SlotPlace(_) => {
+                        assert_eq!(node.charge, Charge::ZERO, "{}: place charge", function.name)
+                    }
+                    NodeKind::MutArg(place) => {
+                        assert_eq!(
+                            node.charge,
+                            Charge::ZERO,
+                            "{}: mut argument wrapper charge",
+                            function.name
+                        );
+                        assert_place_charges(function, place);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn assert_place_charges(function: &martite_ir::IrFn, id: martite_ir::IrId) {
+    let node = function.node(id).expect("place node");
+    assert_eq!(node.charge, Charge::ZERO, "place chain charge");
+    match node.kind {
+        NodeKind::SlotPlace(_) => {}
+        NodeKind::Field { base, .. } | NodeKind::TupleField { base, .. } => {
+            assert_place_charges(function, base);
+        }
+        NodeKind::Index { base, .. } => assert_place_charges(function, base),
+        other => panic!("expected a place node, found {other:?}"),
+    }
 }
 
 #[test]

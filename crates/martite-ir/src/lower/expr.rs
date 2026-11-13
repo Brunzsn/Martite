@@ -1,12 +1,15 @@
 use martite_base::Span;
-use martite_check::{BuiltinFn, BuiltinItem, DefId, DefKind, Resolution};
+use martite_check::{
+    BuiltinFn, BuiltinItem, BuiltinReceiver as CheckBuiltinReceiver, DefId, DefKind, Resolution,
+};
 use martite_syntax::{
     Arg, BinaryOp as SyntaxBinaryOp, Expr, ExprKind, FieldInit, PatKind, Pattern as SyntaxPattern,
     PrimTy, StrExprPart, UnaryOp as SyntaxUnaryOp,
 };
 
+use crate::builtin::BuiltinReceiver as IrBuiltinReceiver;
 use crate::charge::Charge;
-use crate::id::{BuiltinFnId, BuiltinItemId, IrId};
+use crate::id::{BuiltinFnId, BuiltinItemId, BuiltinMethodId, IrId};
 use crate::node::{AccessMode, NodeKind, StrPart};
 use crate::pattern::Pattern;
 use crate::program::{ConstValue, FnKind, PreludeVariant};
@@ -330,6 +333,13 @@ impl FnLowerer<'_, '_> {
         Ok(self.push(node, ty, Charge::expression(), expr.span, false))
     }
 
+    /// Lower a call by mirroring the interpreter's `eval_call` dispatch.
+    ///
+    /// A syntactic `Var` or `Field` callee that resolves to a function, method
+    /// or builtin is not evaluated as a value; every other callee is. Mutable
+    /// arguments lower to [`NodeKind::MutArg`] around their place chain, in
+    /// source order (receiver first). Writeback is part of call semantics, so
+    /// no separate writeback nodes are emitted.
     fn lower_call(
         &mut self,
         expr: &Expr,
@@ -337,95 +347,382 @@ impl FnLowerer<'_, '_> {
         args: &[Arg],
         ty: TyId,
     ) -> Result<IrId, LowerError> {
-        let resolution = self.resolution(callee)?;
-        match resolution {
-            Resolution::BuiltinFn(BuiltinFn::Assert) => {
+        if let ExprKind::Field { base, .. } = &callee.kind {
+            match self.resolution_opt(callee) {
+                Some(Resolution::Method(def)) => {
+                    return self.lower_method_call(base, def, args, ty, expr.span);
+                }
+                Some(Resolution::BuiltinMethod { receiver, name }) => {
+                    return self
+                        .lower_builtin_method_call(base, receiver, name, args, ty, expr.span);
+                }
+                Some(Resolution::Variant(type_id, index)) => {
+                    return self.lower_variant_call(type_id, index, args, ty, expr.span);
+                }
+                Some(Resolution::ModuleItem(def)) => {
+                    return self.lower_named_call(def, args, ty, expr.span);
+                }
+                Some(Resolution::BuiltinItem(item)) => {
+                    return self.lower_builtin_module_call(&item, args, ty, expr.span);
+                }
+                _ => {}
+            }
+        }
+        if let ExprKind::Var(_) = &callee.kind {
+            match self.resolution_opt(callee) {
+                Some(Resolution::Fn(def))
+                | Some(Resolution::Handler(def))
+                | Some(Resolution::Test(def))
+                | Some(Resolution::ModuleItem(def)) => {
+                    return self.lower_named_call(def, args, ty, expr.span);
+                }
+                Some(Resolution::BuiltinFn(function)) => {
+                    return self.lower_builtin_fn_call(function, args, ty, expr.span);
+                }
+                Some(Resolution::PreludeVariant(variant)) => {
+                    return self.lower_prelude_call(variant, args, ty, expr.span);
+                }
+                Some(Resolution::Variant(type_id, index)) => {
+                    return self.lower_variant_call(type_id, index, args, ty, expr.span);
+                }
+                Some(Resolution::BuiltinItem(item)) => {
+                    return self.lower_builtin_module_call(&item, args, ty, expr.span);
+                }
+                _ => {}
+            }
+        }
+        self.lower_value_call(callee, args, ty, expr.span)
+    }
+
+    /// Lower a callee that is not evaluated: functions, associated functions,
+    /// handlers and tests.
+    ///
+    /// Handlers with `self` receive their state as the first argument, so they
+    /// lower to [`NodeKind::CallMethod`] and write the state back on success.
+    fn lower_named_call(
+        &mut self,
+        def: DefId,
+        args: &[Arg],
+        ty: TyId,
+        span: Span,
+    ) -> Result<IrId, LowerError> {
+        let Some(target) = self.fn_id(def) else {
+            return Err(self.internal(span, "called function has no IR id"));
+        };
+        let (kind, self_first) = {
+            let function = &self.lowerer.fns[target.index()];
+            (
+                function.kind,
+                function.params.first().is_some_and(|param| param.is_self),
+            )
+        };
+        if let FnKind::Host(host) = kind {
+            if args.iter().any(|arg| arg.mutable) {
+                return Err(self.internal(span, "host functions have no `mut` parameters"));
+            }
+            let children = self.lower_plain_args(args)?;
+            let first_arg = self.append_children(children).start;
+            return Ok(self.push(
+                NodeKind::CallHost { host, first_arg },
+                ty,
+                Charge::expression(),
+                span,
+                false,
+            ));
+        }
+        if self_first && args.is_empty() {
+            return Err(self.internal(span, "self call without a receiver argument"));
+        }
+        let children = self.lower_call_args(args)?;
+        let range = self.append_children(children);
+        let kind = if self_first {
+            NodeKind::CallMethod {
+                target,
+                first_child: range.start,
+            }
+        } else {
+            NodeKind::CallDirect {
+                target,
+                first_arg: range.start,
+            }
+        };
+        Ok(self.push(kind, ty, Charge::expression(), span, false))
+    }
+
+    fn lower_method_call(
+        &mut self,
+        receiver: &Expr,
+        def: DefId,
+        args: &[Arg],
+        ty: TyId,
+        span: Span,
+    ) -> Result<IrId, LowerError> {
+        let Some(target) = self.fn_id(def) else {
+            return Err(self.internal(span, "called method has no IR id"));
+        };
+        let (is_self, self_mutable) = self.lowerer.fns[target.index()]
+            .params
+            .first()
+            .map(|param| (param.is_self, param.mutable))
+            .unwrap_or((false, false));
+        if !is_self {
+            return Err(self.internal(span, "method call to a function without self"));
+        }
+        let receiver = if self_mutable {
+            self.lower_mut_arg(receiver, receiver.span)?
+        } else {
+            self.lower_expr(receiver)?
+        };
+        let mut children = Vec::with_capacity(args.len() + 1);
+        children.push(receiver);
+        children.extend(self.lower_call_args(args)?);
+        let first_child = self.append_children(children).start;
+        Ok(self.push(
+            NodeKind::CallMethod {
+                target,
+                first_child,
+            },
+            ty,
+            Charge::expression(),
+            span,
+            false,
+        ))
+    }
+
+    fn lower_builtin_method_call(
+        &mut self,
+        receiver: &Expr,
+        receiver_kind: CheckBuiltinReceiver,
+        name: &str,
+        args: &[Arg],
+        ty: TyId,
+        span: Span,
+    ) -> Result<IrId, LowerError> {
+        let receiver_kind = convert_builtin_receiver(receiver_kind);
+        let Some(method) = BuiltinMethodId::lookup(receiver_kind, name) else {
+            return Err(self.internal(span, "unknown builtin method"));
+        };
+        let Some(def) = method.def() else {
+            return Err(self.internal(span, "builtin method has no definition"));
+        };
+        let receiver = if def.mut_self {
+            self.lower_mut_arg(receiver, receiver.span)?
+        } else {
+            self.lower_expr(receiver)?
+        };
+        let mut children = Vec::with_capacity(args.len() + 1);
+        children.push(receiver);
+        children.extend(self.lower_plain_args(args)?);
+        let first_child = self.append_children(children).start;
+        Ok(self.push(
+            NodeKind::CallBuiltinMethod {
+                method,
+                first_child,
+            },
+            ty,
+            Charge::expression(),
+            span,
+            false,
+        ))
+    }
+
+    fn lower_builtin_fn_call(
+        &mut self,
+        function: BuiltinFn,
+        args: &[Arg],
+        ty: TyId,
+        span: Span,
+    ) -> Result<IrId, LowerError> {
+        match function {
+            BuiltinFn::Assert => {
                 let children = self.lower_plain_args(args)?;
                 if children.len() != 2 {
-                    return Err(self.internal(expr.span, "assert arity mismatch"));
+                    return Err(self.internal(span, "assert arity mismatch"));
                 }
                 let range = self.append_children(children);
                 Ok(self.push(
                     NodeKind::Assert(range),
                     ty,
                     Charge::expression(),
-                    expr.span,
+                    span,
                     false,
                 ))
             }
-            Resolution::BuiltinFn(BuiltinFn::Panic) => {
+            BuiltinFn::Panic => {
                 let children = self.lower_plain_args(args)?;
                 if children.len() != 1 {
-                    return Err(self.internal(expr.span, "panic arity mismatch"));
+                    return Err(self.internal(span, "panic arity mismatch"));
                 }
                 let range = self.append_children(children);
                 Ok(self.push(
                     NodeKind::Panic(range),
                     ty,
                     Charge::expression(),
-                    expr.span,
+                    span,
                     false,
                 ))
             }
-            Resolution::BuiltinFn(_) => Err(self.unsupported(expr.span, "call")),
-            Resolution::PreludeVariant(variant) => {
+            BuiltinFn::Print => {
                 let children = self.lower_plain_args(args)?;
-                let expected = if matches!(variant, martite_check::PreludeVariant::None) {
-                    0
-                } else {
-                    1
-                };
-                if children.len() != expected {
-                    return Err(self.internal(expr.span, "prelude constructor arity mismatch"));
+                if children.len() != 1 {
+                    return Err(self.internal(span, "print arity mismatch"));
                 }
-                let variant = convert_prelude(variant);
-                let has_payload = !children.is_empty();
-                let first_payload = if has_payload {
-                    self.append_children(children).start
-                } else {
-                    0
-                };
-                let post = if has_payload { 1 } else { 0 };
+                let first_arg = self.append_children(children).start;
                 Ok(self.push(
-                    NodeKind::PreludeVariant {
-                        variant,
-                        first_payload,
+                    NodeKind::CallBuiltinFn {
+                        builtin: BuiltinFnId::PRINT,
+                        first_arg,
                     },
                     ty,
-                    Charge::new(1, post, 0),
-                    expr.span,
+                    Charge::expression(),
+                    span,
                     false,
                 ))
             }
-            Resolution::Variant(type_id, index) => {
-                let type_id = TypeId::new(type_id.0);
-                let payload = self.variant_payload_count(type_id, index)?;
-                let children = self.lower_plain_args(args)?;
-                if children.len() != payload {
-                    return Err(self.internal(expr.span, "variant constructor arity mismatch"));
-                }
-                let first_payload = self.append_children(children).start;
-                Ok(self.push(
-                    NodeKind::EnumVariant {
-                        variant: u32::try_from(index)
-                            .map_err(|_| self.internal(expr.span, "variant index exceeds u32"))?,
-                        first_payload,
-                    },
-                    ty,
-                    Charge::new(1, payload as u32, 0),
-                    expr.span,
-                    false,
-                ))
-            }
-            _ => Err(self.unsupported(expr.span, "call")),
         }
+    }
+
+    fn lower_builtin_module_call(
+        &mut self,
+        item: &BuiltinItem,
+        args: &[Arg],
+        ty: TyId,
+        span: Span,
+    ) -> Result<IrId, LowerError> {
+        if item.kind != DefKind::Fn {
+            return Err(self.unsupported(span, "builtin item value"));
+        }
+        let Some(id) = BuiltinItemId::lookup(item.module, item.name) else {
+            return Err(self.internal(span, "unknown builtin module item"));
+        };
+        let children = self.lower_plain_args(args)?;
+        let first_arg = self.append_children(children).start;
+        Ok(self.push(
+            NodeKind::CallBuiltinModule {
+                item: id,
+                first_arg,
+            },
+            ty,
+            Charge::expression(),
+            span,
+            false,
+        ))
+    }
+
+    fn lower_prelude_call(
+        &mut self,
+        variant: martite_check::PreludeVariant,
+        args: &[Arg],
+        ty: TyId,
+        span: Span,
+    ) -> Result<IrId, LowerError> {
+        let children = self.lower_plain_args(args)?;
+        let expected = if matches!(variant, martite_check::PreludeVariant::None) {
+            0
+        } else {
+            1
+        };
+        if children.len() != expected {
+            return Err(self.internal(span, "prelude constructor arity mismatch"));
+        }
+        let variant = convert_prelude(variant);
+        let has_payload = !children.is_empty();
+        let first_payload = if has_payload {
+            self.append_children(children).start
+        } else {
+            0
+        };
+        let post = if has_payload { 1 } else { 0 };
+        Ok(self.push(
+            NodeKind::PreludeVariant {
+                variant,
+                first_payload,
+            },
+            ty,
+            Charge::new(1, post, 0),
+            span,
+            false,
+        ))
+    }
+
+    fn lower_variant_call(
+        &mut self,
+        type_id: martite_check::TypeId,
+        index: usize,
+        args: &[Arg],
+        ty: TyId,
+        span: Span,
+    ) -> Result<IrId, LowerError> {
+        let type_id = TypeId::new(type_id.0);
+        let payload = self.variant_payload_count(type_id, index)?;
+        let children = self.lower_plain_args(args)?;
+        if children.len() != payload {
+            return Err(self.internal(span, "variant constructor arity mismatch"));
+        }
+        let first_payload = self.append_children(children).start;
+        Ok(self.push(
+            NodeKind::EnumVariant {
+                variant: u32::try_from(index)
+                    .map_err(|_| self.internal(span, "variant index exceeds u32"))?,
+                first_payload,
+            },
+            ty,
+            Charge::new(1, payload as u32, 0),
+            span,
+            false,
+        ))
+    }
+
+    fn lower_value_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Arg],
+        ty: TyId,
+        span: Span,
+    ) -> Result<IrId, LowerError> {
+        let callee = self.lower_expr(callee)?;
+        let mut children = Vec::with_capacity(args.len() + 1);
+        children.push(callee);
+        children.extend(self.lower_plain_args(args)?);
+        let first_child = self.append_children(children).start;
+        Ok(self.push(
+            NodeKind::CallValue {
+                first_child,
+                argc: args.len() as u32,
+            },
+            ty,
+            Charge::expression(),
+            span,
+            false,
+        ))
+    }
+
+    fn lower_call_args(&mut self, args: &[Arg]) -> Result<Vec<IrId>, LowerError> {
+        let mut children = Vec::with_capacity(args.len());
+        for arg in args {
+            if arg.mutable {
+                children.push(self.lower_mut_arg(&arg.expr, arg.span)?);
+            } else {
+                children.push(self.lower_expr(&arg.expr)?);
+            }
+        }
+        Ok(children)
+    }
+
+    fn lower_mut_arg(&mut self, expr: &Expr, span: Span) -> Result<IrId, LowerError> {
+        let place = self.lower_place(expr)?;
+        let ty = self.node_ty(place);
+        Ok(self.push(NodeKind::MutArg(place), ty, Charge::ZERO, span, false))
     }
 
     fn lower_plain_args(&mut self, args: &[Arg]) -> Result<Vec<IrId>, LowerError> {
         let mut children = Vec::with_capacity(args.len());
         for arg in args {
             if arg.mutable {
-                return Err(self.unsupported(arg.span, "mut argument"));
+                return Err(self.internal(
+                    arg.span,
+                    "`mut` argument on a call form without mutable parameters",
+                ));
             }
             children.push(self.lower_expr(&arg.expr)?);
         }
@@ -705,6 +1002,19 @@ fn builtin_fn_id(function: BuiltinFn) -> BuiltinFnId {
         BuiltinFn::Print => BuiltinFnId::PRINT,
         BuiltinFn::Panic => BuiltinFnId::PANIC,
         BuiltinFn::Assert => BuiltinFnId::ASSERT,
+    }
+}
+
+fn convert_builtin_receiver(receiver: CheckBuiltinReceiver) -> IrBuiltinReceiver {
+    match receiver {
+        CheckBuiltinReceiver::List => IrBuiltinReceiver::List,
+        CheckBuiltinReceiver::Map => IrBuiltinReceiver::Map,
+        CheckBuiltinReceiver::Str => IrBuiltinReceiver::Str,
+        CheckBuiltinReceiver::Int => IrBuiltinReceiver::Int,
+        CheckBuiltinReceiver::Float => IrBuiltinReceiver::Float,
+        CheckBuiltinReceiver::Range => IrBuiltinReceiver::Range,
+        CheckBuiltinReceiver::Option => IrBuiltinReceiver::Option,
+        CheckBuiltinReceiver::Result => IrBuiltinReceiver::Result,
     }
 }
 
