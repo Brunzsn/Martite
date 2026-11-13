@@ -162,6 +162,41 @@ fn loops(xs: list[int]) {
 }
 
 #[test]
+fn expression_blocks_charge_once_and_body_blocks_do_not() {
+    let ir = lower_source(
+        r#"
+fn main() {
+    let value = if true { 1 } else { 2 }
+    let _ = value
+}
+"#,
+    );
+    let function = named_function(&ir, "main");
+    let (_, if_node) = find_node(function, |kind| matches!(kind, NodeKind::If(_)));
+    let (_, expr_block) = find_node(function, |kind| matches!(kind, NodeKind::ExprBlock(_)));
+    let (_, body_block) = find_node(function, |kind| matches!(kind, NodeKind::Block(_)));
+
+    assert_charge(if_node, 1, 0, 0);
+    assert_charge(expr_block, 1, 0, 0);
+    assert_charge(body_block, 0, 0, 0);
+    assert!(
+        function.is_safepoint(function.body.expect("body")),
+        "the function body is the entry/fallthrough safepoint"
+    );
+    assert!(
+        !function.is_safepoint(
+            function
+                .nodes
+                .iter()
+                .position(|node| matches!(node.kind, NodeKind::ExprBlock(_)))
+                .map(|index| IrId::new(index as u32))
+                .expect("expression block")
+        ),
+        "an expression block is not a body safepoint"
+    );
+}
+
+#[test]
 fn struct_and_map_literals_keep_source_order_and_dynamic_post() {
     let ir = lower_source(
         r#"
