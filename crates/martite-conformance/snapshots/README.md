@@ -49,6 +49,21 @@ cargo test -p martite-conformance --test snapshots
 
 Do not edit the JSONL files by hand.
 
+## Differential harness
+
+`tests/ir_differential.rs` enumerates every snapshot case automatically. It
+compares the full observable record (result or trap, log, host calls, exact
+fuel, plugin steps and state), then runs the IR at the AST record's fuel,
+memory and depth thresholds and one unit below each.
+
+- `LiveAst` also runs the AST interpreter and requires it to reproduce the
+  recorded oracle before comparing the IR.
+- `Snapshots` compares the IR directly with the checked-in records. This is the
+  mode that stays valid after the AST interpreter is retired.
+
+There is no fixture allowlist: a new case in `snapshot_cases` is covered as soon
+as its snapshot record exists.
+
 ## Thresholds
 
 - A successful case records the smallest budget at which it still completes.

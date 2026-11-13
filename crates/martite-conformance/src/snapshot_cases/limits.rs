@@ -111,6 +111,18 @@ const FUEL_CASES: &[(&str, &str)] = &[
         "repeated-string-literal-bytes",
         "fn main() { var i = 0\nwhile i < 3 { let text = \"abcd\"\ni += 1 } }",
     ),
+    (
+        "mut-parameter-writeback",
+        "fn bump(mut value: int) -> int {\n    value += 1\n    value\n}\nfn main() {\n    var value = 1\n    value = bump(mut value)\n    print(\"{value}\")\n}",
+    ),
+    (
+        "compound-assignment",
+        "fn main() { var value = 1\nvalue += 2\nprint(\"{value}\") }",
+    ),
+    (
+        "expanded-assignment",
+        "fn main() { var value = 1\nvalue = value + 2\nprint(\"{value}\") }",
+    ),
 ];
 
 const MEMORY_CASES: &[(&str, &str)] = &[

@@ -1,5 +1,6 @@
 //! Shared harness for the Martite conformance suite.
 
+pub mod differential;
 pub mod snapshot;
 pub mod snapshot_cases;
 

@@ -122,6 +122,8 @@ cargo test --workspace
   syntax-only behavior, documented exemptions, primary spans, and suppression;
 - golden preset/group/severity/threshold/option/override and glob tests;
 - golden `Show`, fuel, memory, depth, deadline, panic, and trap tests;
+- the full AST-vs-IR differential over every snapshot case, including exact
+  fuel and the minimum fuel, memory and depth thresholds;
 - grammar fixtures for the section 10 parser notes;
 - plugin state, snapshots, handles, grants, settings, and test doubles;
 - formatter idempotence, AST equality, comment survival, and suppression

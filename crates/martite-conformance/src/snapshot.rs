@@ -5,7 +5,7 @@
 //! memory and depth budgets at which the AST interpreter produces that result.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use martite::{Engine, HostSignature, Plugin};
@@ -109,6 +109,14 @@ pub struct ThresholdsRecord {
     pub depth: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+/// One IR threshold that differs from the AST oracle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThresholdMismatch {
+    pub field: &'static str,
+    pub expected: String,
+    pub actual: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -647,95 +655,110 @@ impl SnapshotCase {
     /// The AST record already proves that each threshold is minimal. The IR
     /// must complete at the threshold and differ one unit below it, which
     /// makes its minimum equal to the oracle's without a second binary search.
-    pub fn verify_ir_thresholds(&self, expected: &SnapshotRecord) {
+    pub fn verify_ir_thresholds(
+        &self,
+        expected: &SnapshotRecord,
+    ) -> Result<(), Vec<ThresholdMismatch>> {
         if expected.thresholds.note.is_some() {
-            return;
+            return Ok(());
         }
         let caps = self.caps();
         let outcomes = expected_outcomes(expected);
-        let fuel = expected
-            .thresholds
-            .fuel
-            .unwrap_or_else(|| panic!("{}: missing fuel threshold", expected.id));
-        let memory = expected
-            .thresholds
-            .memory
-            .unwrap_or_else(|| panic!("{}: missing memory threshold", expected.id));
-        let depth = expected
-            .thresholds
-            .depth
-            .unwrap_or_else(|| panic!("{}: missing depth threshold", expected.id));
-        assert_eq!(
-            self.outcomes_at_ir(ExecLimits {
+        let Some(fuel) = expected.thresholds.fuel else {
+            return Err(vec![missing_threshold(expected, "thresholds.fuel")]);
+        };
+        let Some(memory) = expected.thresholds.memory else {
+            return Err(vec![missing_threshold(expected, "thresholds.memory")]);
+        };
+        let Some(depth) = expected.thresholds.depth else {
+            return Err(vec![missing_threshold(expected, "thresholds.depth")]);
+        };
+
+        let mut mismatches = Vec::new();
+        self.check_ir_boundary(
+            "thresholds.fuel",
+            &outcomes,
+            ExecLimits {
                 fuel,
                 memory: caps.memory,
                 depth: caps.depth,
                 deadline: None,
+            },
+            (fuel > 1).then(|| ExecLimits {
+                fuel: fuel - 1,
+                memory: caps.memory,
+                depth: caps.depth,
+                deadline: None,
             }),
-            outcomes,
-            "{}: IR fuel threshold",
-            expected.id
+            &mut mismatches,
         );
-        if fuel > 1 {
-            assert_ne!(
-                self.outcomes_at_ir(ExecLimits {
-                    fuel: fuel - 1,
-                    memory: caps.memory,
-                    depth: caps.depth,
-                    deadline: None,
-                }),
-                outcomes,
-                "{}: IR fuel threshold is not minimal",
-                expected.id
-            );
-        }
-        assert_eq!(
-            self.outcomes_at_ir(ExecLimits {
+        self.check_ir_boundary(
+            "thresholds.memory",
+            &outcomes,
+            ExecLimits {
                 fuel: caps.fuel,
                 memory,
                 depth: caps.depth,
                 deadline: None,
+            },
+            (memory > 0).then(|| ExecLimits {
+                fuel: caps.fuel,
+                memory: memory - 1,
+                depth: caps.depth,
+                deadline: None,
             }),
-            outcomes,
-            "{}: IR memory threshold",
-            expected.id
+            &mut mismatches,
         );
-        if memory > 0 {
-            assert_ne!(
-                self.outcomes_at_ir(ExecLimits {
-                    fuel: caps.fuel,
-                    memory: memory - 1,
-                    depth: caps.depth,
-                    deadline: None,
-                }),
-                outcomes,
-                "{}: IR memory threshold is not minimal",
-                expected.id
-            );
-        }
-        assert_eq!(
-            self.outcomes_at_ir(ExecLimits {
+        self.check_ir_boundary(
+            "thresholds.depth",
+            &outcomes,
+            ExecLimits {
                 fuel: caps.fuel,
                 memory: caps.memory,
                 depth,
                 deadline: None,
+            },
+            (depth > 0).then(|| ExecLimits {
+                fuel: caps.fuel,
+                memory: caps.memory,
+                depth: depth - 1,
+                deadline: None,
             }),
-            outcomes,
-            "{}: IR depth threshold",
-            expected.id
+            &mut mismatches,
         );
-        if depth > 0 {
-            assert_ne!(
-                self.outcomes_at_ir(ExecLimits {
-                    fuel: caps.fuel,
-                    memory: caps.memory,
-                    depth: depth - 1,
-                    deadline: None,
-                }),
-                outcomes,
-                "{}: IR depth threshold is not minimal",
-                expected.id
-            );
+
+        if mismatches.is_empty() {
+            Ok(())
+        } else {
+            Err(mismatches)
+        }
+    }
+
+    fn check_ir_boundary(
+        &self,
+        field: &'static str,
+        outcomes: &[OutcomeRecord],
+        at: ExecLimits,
+        below: Option<ExecLimits>,
+        mismatches: &mut Vec<ThresholdMismatch>,
+    ) {
+        let actual = self.outcomes_at_ir(at);
+        if actual != outcomes {
+            mismatches.push(ThresholdMismatch {
+                field,
+                expected: format!("{outcomes:?}"),
+                actual: format!("{actual:?}"),
+            });
+        }
+        if let Some(below) = below {
+            let actual_below = self.outcomes_at_ir(below);
+            if actual_below == outcomes {
+                mismatches.push(ThresholdMismatch {
+                    field,
+                    expected: "a different outcome one unit below the threshold".into(),
+                    actual: format!("same outcome: {actual_below:?}"),
+                });
+            }
         }
     }
 
@@ -833,6 +856,14 @@ fn expected_outcomes(record: &SnapshotRecord) -> Vec<OutcomeRecord> {
             .collect()
     } else {
         record.outcome.iter().cloned().collect()
+    }
+}
+
+fn missing_threshold(record: &SnapshotRecord, field: &'static str) -> ThresholdMismatch {
+    ThresholdMismatch {
+        field,
+        expected: "a recorded threshold".into(),
+        actual: format!("missing from {}", record.id),
     }
 }
 
@@ -1428,4 +1459,27 @@ pub fn read_records(path: &std::path::Path) -> Vec<SnapshotRecord> {
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("parse snapshot line"))
         .collect()
+}
+
+/// Load every JSONL snapshot in `root`, keyed by fixture id.
+pub fn read_snapshot_dir(root: &std::path::Path) -> BTreeMap<String, SnapshotRecord> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        panic!(
+            "missing snapshot directory {}; run:\n  cargo test -p martite-conformance --test snapshots -- --ignored update_snapshots",
+            root.display()
+        );
+    };
+    let mut entries: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
+    entries.sort();
+    let mut snapshots = BTreeMap::new();
+    for path in entries {
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        for record in read_records(&path) {
+            let previous = snapshots.insert(record.id.clone(), record);
+            assert!(previous.is_none(), "duplicate snapshot id in {path:?}");
+        }
+    }
+    snapshots
 }

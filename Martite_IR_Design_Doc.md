@@ -358,7 +358,7 @@ Runs after lowering and, in tests and debug builds, after each pass. Checks:
 ## 13. Testing strategy
 
 - **Behavior snapshots first.** Before any IR code runs, record from the current interpreter, for every conformance, e2e, host, plugin, limits, traps and bench fixture: result or trap (kind, message, source, span, trace), log, host call trace, **fuel used**, and **minimum fuel, memory and depth** at which it completes (binary search, as `limits.rs` already does for memory). Check these in. They outlive the AST interpreter.
-- **Differential, migration:** AST interpreter versus IR evaluator on all of the above while both exist; afterwards IR versus snapshots.
+- **Differential, migration:** `crates/martite-conformance/tests/ir_differential.rs` enumerates every snapshot case automatically and compares the full observable record plus the IR at the AST fuel, memory and depth thresholds (and one unit below each). `LiveAst` runs both evaluators; `Snapshots` is the IR-vs-recorded-oracle mode that remains after the AST interpreter is retired.
 - **Golden fuel table:** the existing `FuelRow` cases run against the IR evaluator unchanged, including the copy-on-write rows.
 - **Add missing cases** found in the code review: `mut`-parameter and handler-state fuel; lambda traps across modules (to pin the source-file behavior); `for` over a list the body mutates; `Try` in lambdas; compound assignment versus the written-out form; fuel exactly at the limit.
 - **Verifier tests:** hand-built invalid IR per invariant, including read-before-write, loop first-iteration reads, guard-failed arm bindings, empty capture lists and slot reuse.

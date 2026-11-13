@@ -1,7 +1,9 @@
-//! AST-vs-IR differential for the evaluator slices (#108, #109, #110).
+//! Focused AST-vs-IR regression tests for the evaluator (#108, #109, #110,
+//! #111). The full-corpus gate lives in `tests/ir_differential.rs`.
 //!
-//! The cases compare result, log, exact fuel used and, for the match
-//! rollback regression, the minimum memory budget.
+//! The cases here cover invariants that are not represented by a snapshot
+//! fixture: tick cadence, per-site literal accounting, trailing expression
+//! statements, value depth and host dispatch ordering.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -370,6 +372,17 @@ fn fuel_limit_edge_matches_the_ast_interpreter() {
 }
 
 #[test]
+fn compound_and_written_out_assignment_match_their_ast_costs() {
+    for source in [
+        "fn main() { var value = 1\nvalue += 2 }",
+        "fn main() { var value = 1\nvalue = value + 2 }",
+    ] {
+        let case = Case::single(source);
+        assert_eq!(min_fuel_ir(&case), min_fuel(&case));
+    }
+}
+
+#[test]
 fn match_patterns_and_guards_match_the_ast_interpreter() {
     for (id, source) in [
         (
@@ -541,98 +554,6 @@ let part = text[1..9] }"#,
         ),
     ] {
         assert_matches(id, source);
-    }
-}
-
-/// Snapshot cases whose call, builtin, host, closure and pattern surface is
-/// executable by the #110 evaluator. #111 compares their exact fuel, memory and
-/// depth thresholds; #112 widens this to the full corpus.
-const IR_READY_CASES: &[&str] = &[
-    "bench/load/multi",
-    "bench/runtime/captures.mt",
-    "bench/runtime/closures.mt",
-    "bench/runtime/field_index_ops.mt",
-    "bench/runtime/fib.mt",
-    "bench/runtime/function_calls.mt",
-    "bench/runtime/host_calls",
-    "bench/runtime/list_ops.mt",
-    "bench/runtime/map_ops.mt",
-    "bench/runtime/method_dispatch.mt",
-    "bench/runtime/mut_params.mt",
-    "bench/runtime/option_ops.mt",
-    "bench/runtime/pattern_match.mt",
-    "bench/runtime/plugin",
-    "bench/runtime/string_ops.mt",
-    "closures/builtin_module_function_values_are_callable",
-    "closures/calls_copy_out_only_mutable_parameters",
-    "closures/free_function_values_work_in_higher_order_builtins",
-    "closures/higher_order_builtins_accept_borrowed_closures",
-    "closures/lambdas_capture_by_value",
-    "closures/lambdas_record_only_free_variables",
-    "closures/loop_lambdas_capture_each_iteration",
-    "closures/nested_lambdas_capture_transitively",
-    "closures/nested_lambdas_record_transitive_captures",
-    "e2e/enums_and_match",
-    "e2e/functions_and_closures",
-    "e2e/generic_stack",
-    "e2e/option_match",
-    "e2e/result_and_try",
-    "host/host_functions_can_construct_handles",
-    "host/make_handle_without_an_opaque_return_is_a_host_fault",
-    "host/plugin_init_hook_and_state",
-    "limits/depth/recursive-down",
-    "limits/fuel/join-slots-and-bytes",
-    "limits/fuel/list-extend-slots",
-    "limits/fuel/shared-insert-copies-and-shifts",
-    "limits/fuel/shared-push-copies-the-list",
-    "limits/fuel/shared-remove-copies-and-shifts",
-    "limits/fuel/sorting",
-    "limits/fuel/unique-insert-shifts-only",
-    "limits/fuel/unique-push-has-no-copy",
-    "limits/fuel/unique-remove-shifts-only",
-    "limits/memory/arguments-and-locals",
-    "limits/memory/copy-on-write",
-    "patterns/failed_guards_keep_side_effects",
-    "patterns/match_guards_and_or_patterns_fall_through_cleanly",
-    "patterns/nested_or_patterns_and_failed_guards_restore_bindings",
-    "patterns/struct_literal_fields_evaluate_after_base_in_source_order",
-    "patterns/struct_literals_preserve_declaration_order_and_updates",
-    "patterns/struct_patterns_use_declaration_slots",
-    "patterns/variant_patterns_bind_payloads",
-    "plugins/a_trap_rolls_back_the_state_and_an_err_commits_it",
-    "plugins/handler_parameters_are_copy_in_and_copy_out",
-    "plugins/host_functions_can_create_handles_during_a_call",
-    "plugins/init_state_and_handler_copy_out_work",
-    "plugins/settings_are_delivered_to_init_as_json",
-    "plugins/shutdown_and_stateless_plugins_work",
-    "plugins/stateless_plugin_handlers",
-    "traps/panic/abs-overflow",
-    "traps/panic/call-trace",
-    "traps/panic/insert-bounds",
-    "traps/panic/option-expect",
-    "traps/panic/pow-negative",
-    "traps/panic/pow-overflow",
-    "traps/panic/remove-bounds",
-    "traps/panic/replace-empty",
-    "traps/panic/result-expect",
-    "traps/panic/round-negative",
-];
-
-#[test]
-fn call_and_host_fixtures_match_the_ast_interpreter() {
-    let cases = martite_conformance::snapshot_cases::all_cases();
-    for id in IR_READY_CASES {
-        let case = cases
-            .iter()
-            .find(|case| case.id() == *id)
-            .unwrap_or_else(|| panic!("missing snapshot case {id}"));
-        let expected = case.record();
-        let mut ir = case.observe_ir();
-        // Outcomes, logs, host calls, steps and exact fuel are compared here;
-        // the thresholds are checked separately against the AST oracle.
-        ir.thresholds = expected.thresholds.clone();
-        assert_eq!(ir, expected, "{id}");
-        case.verify_ir_thresholds(&expected);
     }
 }
 

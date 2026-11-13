@@ -1,5 +1,5 @@
 ﻿use crate::snapshot::SnapshotCase;
-use crate::snapshot_cases::{default_caps, main_case};
+use crate::snapshot_cases::{default_caps, main_case, main_case_files};
 
 const PANIC_CASES: &[(&str, &str)] = &[
     (
@@ -79,6 +79,22 @@ pub fn cases() -> Vec<SnapshotCase> {
     cases.push(main_case(
         "traps/panic/call-trace",
         "fn inner() {\n    panic(\"boom\")\n}\nfn outer() {\n    inner()\n}\nfn main() {\n    outer()\n}\n",
+        None,
+        caps,
+    ));
+    cases.push(main_case_files(
+        "traps/panic/lambda-across-modules",
+        vec![
+            (
+                "main.mt".into(),
+                "use util\nfn main() {\n    let fail = util.make()\n    let _ = fail()\n}\n".into(),
+            ),
+            (
+                "util.mt".into(),
+                "pub fn make() -> fn() -> int {\n    fn() { panic(\"boom\") }\n}\n".into(),
+            ),
+        ],
+        "main.mt",
         None,
         caps,
     ));

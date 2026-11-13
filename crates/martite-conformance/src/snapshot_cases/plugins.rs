@@ -190,6 +190,27 @@ pub fn cases() -> Vec<SnapshotCase> {
             ],
         ),
         scenario(
+            "mut_parameter_and_handler_state_fuel",
+            PLUGIN,
+            Some(editor_hosts()),
+            vec![
+                PluginStep::Init,
+                PluginStep::Call {
+                    hook: "tick",
+                    args: Vec::new(),
+                },
+                PluginStep::Call {
+                    hook: "mutate",
+                    args: vec![ArgSpec::int(1)],
+                },
+                PluginStep::Call {
+                    hook: "tick",
+                    args: Vec::new(),
+                },
+                PluginStep::Shutdown,
+            ],
+        ),
+        scenario(
             "a_trap_rolls_back_the_state_and_an_err_commits_it",
             PLUGIN,
             Some(editor_hosts()),

@@ -224,6 +224,28 @@ pub fn cases() -> Vec<SnapshotCase> {
             None,
             caps,
         ),
+        main_case(
+            "e2e/try_inside_lambda",
+            r#"
+            fn parse(text: str) -> Result[int, str] {
+                match text.parse_int() {
+                    Some(value) => Ok(value),
+                    None => Err("bad"),
+                }
+            }
+            fn main() {
+                let checked_add = fn(text: str, amount: int) -> Result[int, str] {
+                    let value = parse(text)?
+                    Ok(value + amount)
+                }
+                let good = checked_add("3", 4)
+                let bad = checked_add("x", 4)
+                print("{good}:{bad}")
+            }
+            "#,
+            None,
+            caps,
+        ),
     ];
     cases.push(main_case_files(
         "e2e/modules_and_consts",
