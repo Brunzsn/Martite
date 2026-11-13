@@ -658,6 +658,13 @@ name = "martite-fuel"
 version = "0.1.0"
 
 [[package]]
+name = "martite-ir"
+version = "0.1.0"
+dependencies = [
+ "martite-base",
+]
+
+[[package]]
 name = "martite-lint"
 version = "0.1.0"
 dependencies = [

@@ -15,6 +15,7 @@ martite-syntax = { path = "crates/martite-syntax", version = "0.1.0" }
 martite-config = { path = "crates/martite-config", version = "0.1.0" }
 martite-resolve = { path = "crates/martite-resolve", version = "0.1.0" }
 martite-check = { path = "crates/martite-check", version = "0.1.0" }
+martite-ir = { path = "crates/martite-ir", version = "0.1.0" }
 martite-runtime = { path = "crates/martite-runtime", version = "0.1.0" }
 martite-driver = { path = "crates/martite-driver", version = "0.1.0" }
 martite-lint = { path = "crates/martite-lint", version = "0.1.0" }

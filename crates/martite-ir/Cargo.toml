@@ -1,0 +1,13 @@
+[package]
+name = "martite-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Resolved, self-contained tree IR for Martite"
+publish = false
+
+[dependencies]
+martite-base.workspace = true
+
+[lints]
+workspace = true
