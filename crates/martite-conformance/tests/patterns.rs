@@ -149,3 +149,34 @@ fn failed_guards_keep_side_effects() {
         "#);
     assert_eq!(logs, ["1"]);
 }
+
+#[test]
+fn nested_or_patterns_and_failed_guards_restore_bindings() {
+    let logs = run(r#"
+        enum Shape { Pair(int, int), Single(int), Empty }
+
+        fn main() {
+            let value = Shape.Pair(2, 3)
+            match value {
+                Pair(x, 1) | Pair(x, 2) => print("early {x}"),
+                Pair(x, y) => print("pair {x}:{y}"),
+                Single(x) => print("single {x}"),
+                Empty => print("empty"),
+            }
+
+            let nested: (int?, int) = (Some(4), 5)
+            match nested {
+                (Some(x), y) if x > 10 => print("big {x}:{y}"),
+                (Some(x), y) => print("nested {x}:{y}"),
+                (None, _) => print("none"),
+            }
+
+            match Some([1, 2, 3]) {
+                Some(items) if items.len() > 5 => print("big"),
+                Some(items) => print("{items.len()}"),
+                None => print("none"),
+            }
+        }
+        "#);
+    assert_eq!(logs, ["pair 2:3", "nested 4:5", "3"]);
+}

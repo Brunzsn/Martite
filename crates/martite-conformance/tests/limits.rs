@@ -292,6 +292,20 @@ fn memory_limits_include_locals_arguments_and_copy_on_write() {
 }
 
 #[test]
+fn failed_guard_bindings_do_not_leak_a_reference() {
+    let baseline = min_memory(&Case::single(
+        "fn main() {\n    var items = [1, 2, 3]\n    items.push(4)\n    print(\"{items.len()}\")\n}",
+    ));
+    let with_failed_guard = min_memory(&Case::single(
+        "fn main() {\n    var items = [1, 2, 3]\n    match Some(items) {\n        Some(bound) if false => print(\"{bound.len()}\"),\n        _ => {}\n    }\n    items.push(4)\n    print(\"{items.len()}\")\n}",
+    ));
+    assert_eq!(
+        with_failed_guard, baseline,
+        "a failed guard must not keep its binding slot live into later copy-on-write"
+    );
+}
+
+#[test]
 fn depth_cost_is_golden() {
     let recursive = "fn down(n: int) -> int {\n    if n == 0 { 0 } else { down(n - 1) }\n}\nfn main() { print(down(10)) }";
     assert_eq!(min_depth(&Case::single(recursive)), 12);

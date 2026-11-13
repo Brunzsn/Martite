@@ -2051,3 +2051,56 @@ fn rejects_or_pattern_alternatives_that_bind_different_slots() {
         VerifyErrorKind::PatternShape { .. }
     ));
 }
+
+#[test]
+fn rejects_refutable_let_pattern() {
+    let mut program = valid_program();
+    program.fns[0].patterns[0] = Pattern::Int(1);
+    assert!(matches!(
+        error_kind(program),
+        VerifyErrorKind::PatternShape {
+            context: "`let` pattern is refutable",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn rejects_refutable_parameter_pattern() {
+    let mut program = valid_match_program();
+    program.fns[0].params[0].pattern = Some(PatternId::new(0));
+    assert!(matches!(
+        error_kind(program),
+        VerifyErrorKind::PatternShape {
+            context: "parameter pattern is refutable",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn rejects_match_arm_binding_shared_with_another_arm() {
+    let mut program = valid_match_program();
+    let int = program.fns[0].slot_info[0].ty;
+    program.fns[0].locals = 2;
+    program.fns[0].slot_info.push(SlotInfo {
+        ty: int,
+        mutable: false,
+        name: None,
+    });
+    program.fns[0].patterns[0] = Pattern::Bind {
+        slot: Slot::new(1),
+        ty: int,
+    };
+    program.fns[0].patterns[1] = Pattern::Bind {
+        slot: Slot::new(1),
+        ty: int,
+    };
+    assert!(matches!(
+        error_kind(program),
+        VerifyErrorKind::PatternShape {
+            context: "match arm binding slot is shared with another arm",
+            ..
+        }
+    ));
+}

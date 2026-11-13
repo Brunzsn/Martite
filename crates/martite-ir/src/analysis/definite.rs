@@ -6,10 +6,9 @@
 //! slot. Unreachable code is vacuously assigned, matching the usual dominance
 //! definition: no path from entry reaches the read.
 
-use crate::analysis::slots::{SlotSet, pattern_binding_slots};
+use crate::analysis::slots::{SlotSet, pattern_always_matches, pattern_binding_slots};
 use crate::id::{IrId, MatchSetId, PatternId, Slot};
 use crate::node::{AccessMode, Node, NodeKind};
-use crate::pattern::Pattern;
 use crate::program::{IrFn, IrProgram};
 use crate::verify::children_of;
 
@@ -462,7 +461,7 @@ impl<'a> Analyzer<'a> {
     fn pattern_is_irrefutable(&self, pattern: PatternId) -> bool {
         self.function
             .pattern(pattern)
-            .is_some_and(pattern_is_irrefutable)
+            .is_some_and(|pattern| pattern_always_matches(self.program, pattern))
     }
 
     fn analyze_assign(
@@ -524,22 +523,6 @@ impl<'a> Analyzer<'a> {
 
         self.after[id.index()] = after.clone();
         Ok(after)
-    }
-}
-
-fn pattern_is_irrefutable(pattern: &Pattern) -> bool {
-    match pattern {
-        Pattern::Wild | Pattern::Bind { .. } => true,
-        Pattern::Tuple(items) => items.iter().all(pattern_is_irrefutable),
-        Pattern::Struct { fields, .. } => fields
-            .iter()
-            .all(|(_, pattern)| pattern_is_irrefutable(pattern)),
-        Pattern::Or(items) => items.iter().any(pattern_is_irrefutable),
-        Pattern::Int(_)
-        | Pattern::Bool(_)
-        | Pattern::Str(_)
-        | Pattern::Variant { .. }
-        | Pattern::Prelude { .. } => false,
     }
 }
 

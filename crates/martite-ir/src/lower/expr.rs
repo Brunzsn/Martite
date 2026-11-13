@@ -1,23 +1,25 @@
 use martite_base::Span;
 use martite_check::{
-    BuiltinFn, BuiltinItem, BuiltinReceiver as CheckBuiltinReceiver, DefId, DefKind, Resolution,
+    BuiltinFn, BuiltinItem, BuiltinReceiver as CheckBuiltinReceiver, DefId, DefKind, PatResolution,
+    Resolution,
 };
 use martite_syntax::{
-    Arg, BinaryOp as SyntaxBinaryOp, Expr, ExprKind, FieldInit, PatKind, Pattern as SyntaxPattern,
-    PrimTy, StrExprPart, UnaryOp as SyntaxUnaryOp,
+    Arg, BinaryOp as SyntaxBinaryOp, Expr, ExprKind, FieldInit, FieldPat,
+    MatchArm as SyntaxMatchArm, MatchBody, PatKind, Pattern as SyntaxPattern, PrimTy, StrExprPart,
+    UnaryOp as SyntaxUnaryOp,
 };
 
 use crate::builtin::BuiltinReceiver as IrBuiltinReceiver;
 use crate::charge::Charge;
 use crate::id::{BuiltinFnId, BuiltinItemId, BuiltinMethodId, IrId};
 use crate::node::{AccessMode, NodeKind, StrPart};
-use crate::pattern::Pattern;
+use crate::pattern::{MatchArm, MatchSet, Pattern};
 use crate::program::{ConstValue, FnKind, PreludeVariant};
 use crate::types::{TyId, TypeDefKind, TypeId};
 use crate::{PatternId, StructLayout};
 
 use super::LowerError;
-use super::context::FnLowerer;
+use super::context::{FnLowerer, PatternPosition};
 use super::stmt::BlockKind;
 
 impl FnLowerer<'_, '_> {
@@ -119,7 +121,7 @@ impl FnLowerer<'_, '_> {
                     false,
                 ))
             }
-            ExprKind::Match { .. } => Err(self.unsupported(expr.span, "match")),
+            ExprKind::Match { scrutinee, arms } => self.lower_match(expr, scrutinee, arms, ty),
             ExprKind::Lambda { .. } => Err(self.unsupported(expr.span, "lambda")),
             ExprKind::Block(block) => {
                 let (id, _) = self.lower_block(block, BlockKind::Expr, Some(ty))?;
@@ -839,6 +841,45 @@ impl FnLowerer<'_, '_> {
         }
     }
 
+    fn lower_match(
+        &mut self,
+        expr: &Expr,
+        scrutinee: &Expr,
+        arms: &[SyntaxMatchArm],
+        ty: TyId,
+    ) -> Result<IrId, LowerError> {
+        let scrutinee = self.lower_expr(scrutinee)?;
+        let mut lowered = Vec::with_capacity(arms.len());
+        for arm in arms {
+            let pattern = self.lower_pattern(&arm.pattern, PatternPosition::Match)?;
+            let guard = arm
+                .guard
+                .as_ref()
+                .map(|guard| self.lower_expr(guard))
+                .transpose()?;
+            let body = match &arm.body {
+                MatchBody::Block(block) => self.lower_block(block, BlockKind::Body, None)?.0,
+                MatchBody::Expr(body) => self.lower_expr(body)?,
+            };
+            lowered.push(MatchArm {
+                pattern,
+                guard,
+                body,
+            });
+        }
+        let match_set = self.push_match_set(MatchSet { arms: lowered });
+        Ok(self.push(
+            NodeKind::Match {
+                match_set,
+                scrutinee,
+            },
+            ty,
+            Charge::expression(),
+            expr.span,
+            false,
+        ))
+    }
+
     pub(crate) fn lower_place(&mut self, expr: &Expr) -> Result<IrId, LowerError> {
         stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || self.lower_place_inner(expr))
     }
@@ -882,13 +923,19 @@ impl FnLowerer<'_, '_> {
     pub(crate) fn lower_pattern(
         &mut self,
         pattern: &SyntaxPattern,
+        position: PatternPosition,
     ) -> Result<PatternId, LowerError> {
         stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
-            self.lower_pattern_inner(pattern)
+            let lowered = self.lower_pattern_value(pattern, position)?;
+            Ok(self.push_pattern(lowered))
         })
     }
 
-    fn lower_pattern_inner(&mut self, pattern: &SyntaxPattern) -> Result<PatternId, LowerError> {
+    fn lower_pattern_value(
+        &mut self,
+        pattern: &SyntaxPattern,
+        position: PatternPosition,
+    ) -> Result<Pattern, LowerError> {
         self.enter(pattern.span)?;
         let lowered = match &pattern.kind {
             PatKind::Wild => Pattern::Wild,
@@ -904,11 +951,120 @@ impl FnLowerer<'_, '_> {
                     ty: self.slot_ty(slot),
                 }
             }
-            _ => return Err(self.unsupported(pattern.span, "pattern")),
+            PatKind::Int(value) => Pattern::Int(*value),
+            PatKind::Bool(value) => Pattern::Bool(*value),
+            PatKind::Str(text) => Pattern::Str(self.intern_str(text)),
+            PatKind::Tuple(items) => Pattern::Tuple(
+                items
+                    .iter()
+                    .map(|item| self.lower_pattern_value(item, position))
+                    .collect::<Result<_, _>>()?,
+            ),
+            PatKind::Variant { args, .. } => self.lower_variant_pattern(pattern, args, position)?,
+            PatKind::Struct { fields, .. } => {
+                self.lower_struct_pattern(pattern, fields, position)?
+            }
+            PatKind::Or(items) => match position {
+                PatternPosition::Binding => {
+                    let first = items.first().ok_or_else(|| {
+                        self.internal(pattern.span, "or-pattern has no alternatives")
+                    })?;
+                    self.lower_pattern_value(first, position)?
+                }
+                PatternPosition::Match => Pattern::Or(
+                    items
+                        .iter()
+                        .map(|item| self.lower_pattern_value(item, position))
+                        .collect::<Result<_, _>>()?,
+                ),
+            },
         };
-        let id = self.push_pattern(lowered);
         self.leave();
-        Ok(id)
+        Ok(lowered)
+    }
+
+    fn lower_variant_pattern(
+        &mut self,
+        pattern: &SyntaxPattern,
+        args: &[SyntaxPattern],
+        position: PatternPosition,
+    ) -> Result<Pattern, LowerError> {
+        let resolution = self
+            .lowerer
+            .program
+            .pattern_resolutions
+            .get(&pattern.id)
+            .copied()
+            .ok_or_else(|| self.internal(pattern.span, "variant pattern has no resolution"))?;
+        let args = args
+            .iter()
+            .map(|arg| self.lower_pattern_value(arg, position))
+            .collect::<Result<Vec<_>, _>>()?;
+        match resolution {
+            PatResolution::Prelude(variant) => Ok(Pattern::Prelude {
+                variant: convert_prelude(variant),
+                args,
+            }),
+            PatResolution::Variant(type_id, index) => Ok(Pattern::Variant {
+                type_id: TypeId::new(type_id.0),
+                variant: u32::try_from(index)
+                    .map_err(|_| self.internal(pattern.span, "variant index exceeds u32"))?,
+                args,
+            }),
+            PatResolution::Struct(_) => {
+                Err(self.internal(pattern.span, "variant pattern resolved as a struct pattern"))
+            }
+        }
+    }
+
+    fn lower_struct_pattern(
+        &mut self,
+        pattern: &SyntaxPattern,
+        fields: &[FieldPat],
+        position: PatternPosition,
+    ) -> Result<Pattern, LowerError> {
+        let resolution = self
+            .lowerer
+            .program
+            .pattern_resolutions
+            .get(&pattern.id)
+            .copied()
+            .ok_or_else(|| self.internal(pattern.span, "struct pattern has no resolution"))?;
+        let PatResolution::Struct(check_type_id) = resolution else {
+            return Err(self.internal(pattern.span, "struct pattern has a variant resolution"));
+        };
+        let slots = self
+            .lowerer
+            .program
+            .struct_pattern_fields
+            .get(&pattern.id)
+            .cloned()
+            .ok_or_else(|| {
+                self.internal(pattern.span, "struct pattern has no declaration slots")
+            })?;
+        if slots.len() != fields.len() {
+            return Err(self.internal(
+                pattern.span,
+                "struct pattern field mapping does not cover its fields",
+            ));
+        }
+        let mut lowered = Vec::with_capacity(fields.len());
+        for (source, declaration) in slots {
+            let field = fields.get(source).ok_or_else(|| {
+                self.internal(pattern.span, "struct pattern field index is out of range")
+            })?;
+            let field = self.lower_pattern_value(&field.pattern, position)?;
+            lowered.push((
+                u32::try_from(declaration)
+                    .map_err(|_| self.internal(pattern.span, "struct field index exceeds u32"))?,
+                field,
+            ));
+        }
+        lowered.sort_by_key(|(declaration, _)| *declaration);
+        Ok(Pattern::Struct {
+            type_id: TypeId::new(check_type_id.0),
+            fields: lowered,
+        })
     }
 
     fn const_ref(&mut self, def: DefId, span: Span) -> Result<crate::ConstId, LowerError> {

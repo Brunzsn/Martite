@@ -4,15 +4,16 @@
 //!
 //! This module lowers the checked AST into the resolved IR: function and slot
 //! allocation, the constant and static-string pools, expressions, statements,
-//! calls and mutable-argument places. Match patterns (#105) and lambdas,
-//! captures and `Entries` (#106) are deliberately not lowered yet. A checked
+//! calls, mutable-argument places and patterns. Lambdas, captures and `Entries`
+//! (#106) are deliberately not lowered yet. A checked
 //! program that uses one of those constructs receives
 //! [`LowerErrorKind::Unsupported`]; any other failure is an internal compiler
 //! error.
 //!
-//! The checker's `expr_types`, `resolutions`, `struct_lit_fields` and
-//! `pattern_bindings` side tables are read only here. After [`lower`] returns,
-//! the `IrProgram` is self-contained.
+//! The checker's `expr_types`, `resolutions`, `struct_lit_fields`,
+//! `pattern_resolutions`, `struct_pattern_fields` and `pattern_bindings` side
+//! tables are read only here. After [`lower`] returns, the `IrProgram` is
+//! self-contained.
 
 mod context;
 mod effects;
@@ -55,9 +56,8 @@ pub fn lower(program: &CheckedProgram, sources: &SourceMap) -> Result<IrProgram,
 
 /// One lowering failure.
 ///
-/// [`LowerErrorKind::Unsupported`] is expected until #104–#106 land. Every
-/// other kind on a program that passed the checker is an internal compiler
-/// error.
+/// [`LowerErrorKind::Unsupported`] is expected until #106 lands. Every other
+/// kind on a program that passed the checker is an internal compiler error.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LowerError {
     pub fn_id: Option<FnId>,
@@ -69,7 +69,7 @@ pub struct LowerError {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum LowerErrorKind {
-    /// A construct owned by #105 or #106.
+    /// A construct owned by #106.
     Unsupported { construct: &'static str },
     /// A lowering invariant failed.
     Internal { message: String },
