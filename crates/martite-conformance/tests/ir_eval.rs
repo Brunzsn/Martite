@@ -5,9 +5,9 @@
 //! surface. The cases compare result, log and exact fuel used.
 
 use martite_base::Severity;
-use martite_conformance::Case;
-use martite_ir::{TypeTable, lower, verify};
-use martite_runtime::{ExecLimits, IrRuntime, Runtime, show};
+use martite_conformance::{Case, min_memory};
+use martite_ir::{IrProgram, TypeTable, lower, verify};
+use martite_runtime::{ExecLimits, IrRuntime, Runtime, Trap, show};
 
 #[derive(Debug, PartialEq, Eq)]
 struct Observation {
@@ -68,6 +68,43 @@ fn observe_ir(case: &Case, limits: ExecLimits) -> Observation {
         Err(trap) => Err(format!("{trap:?}")),
     };
     Observation { outcome, log, fuel }
+}
+
+fn lowered(case: &Case) -> IrProgram {
+    let (program, sources) = checked(case);
+    let ir = lower(&program, &sources).expect("fixture lowers");
+    verify(&ir).expect("fixture verifies");
+    ir
+}
+
+fn run_ir(ir: &IrProgram, limits: ExecLimits) -> Result<(), Trap> {
+    let mut runtime = IrRuntime::new(ir, limits);
+    runtime.run_main().map(|_| ())
+}
+
+fn min_memory_ir(case: &Case) -> u64 {
+    let ir = lowered(case);
+    let mut low = 0u64;
+    let mut high = 8 << 20;
+    let limits = |memory| ExecLimits {
+        fuel: 1_000_000,
+        memory,
+        depth: 200,
+        deadline: None,
+    };
+    assert!(
+        run_ir(&ir, limits(high)).is_ok(),
+        "fixture needs more than the probe cap"
+    );
+    while low < high {
+        let mid = low + (high - low) / 2;
+        match run_ir(&ir, limits(mid)) {
+            Ok(()) => high = mid,
+            Err(Trap::OutOfMemory) => low = mid + 1,
+            Err(trap) => panic!("unexpected trap while probing memory: {trap:?}"),
+        }
+    }
+    low
 }
 
 fn assert_matches(id: &str, source: &str) {
@@ -248,6 +285,129 @@ fn core_fixtures_match_the_ast_interpreter() {
     ] {
         assert_matches(id, source);
     }
+}
+
+#[test]
+fn match_patterns_and_guards_match_the_ast_interpreter() {
+    for (id, source) in [
+        (
+            "enum_or_patterns",
+            r#"
+            enum Shape { Pair(int, int), Single(int), Empty }
+            fn main() {
+                let value = Shape.Pair(2, 3)
+                match value {
+                    Pair(x, 1) | Pair(x, 2) => print("early {x}"),
+                    Pair(x, y) => print("pair {x}:{y}"),
+                    Single(x) => print("single {x}"),
+                    Empty => print("empty"),
+                }
+                match Shape.Pair(2, 2) {
+                    Pair(x, 1) | Pair(x, 2) => print("or {x}"),
+                    _ => print("other"),
+                }
+            }
+            "#,
+        ),
+        (
+            "nested_prelude_and_failed_guard",
+            r#"
+            fn main() {
+                let nested: (int?, int) = (Some(4), 5)
+                match nested {
+                    (Some(x), y) if x > 10 => print("big {x}:{y}"),
+                    (Some(x), y) => print("nested {x}:{y}"),
+                    (None, _) => print("none"),
+                }
+            }
+            "#,
+        ),
+        (
+            "struct_patterns",
+            r#"
+            struct Point { x: int, y: int }
+            fn main() {
+                let point = Point { x: 1, y: 2 }
+                match point {
+                    Point { x, y } => print("{x}:{y}"),
+                }
+            }
+            "#,
+        ),
+        (
+            "literal_patterns_and_wildcards",
+            r#"
+            fn main() {
+                match "b" {
+                    "a" => print("a"),
+                    "b" => print("b"),
+                    _ => print("other"),
+                }
+                match true {
+                    true => print("yes"),
+                    false => print("no"),
+                }
+                match 3 {
+                    1 | 2 => print("small"),
+                    n if n > 2 => print("big {n}"),
+                    _ => print("other"),
+                }
+                let none: int? = None
+                match none {
+                    None => print("none"),
+                    Some(value) => print("{value}"),
+                }
+            }
+            "#,
+        ),
+        (
+            "match_block_arms",
+            r#"
+            fn main() {
+                match 1 {
+                    1 => { print("one") },
+                    _ => {},
+                }
+                match 2 {
+                    value if value > 1 => { print("{value}") },
+                    _ => {},
+                }
+            }
+            "#,
+        ),
+    ] {
+        assert_matches(id, source);
+    }
+}
+
+#[test]
+fn failed_guards_restore_the_previous_binding_for_copy_on_write() {
+    let case = Case::single(
+        r#"
+        fn main() {
+            var items = [1, 2, 3]
+            for i in 0..2 {
+                match Some(items) {
+                    Some(bound) if i == 0 => print("{bound[0]}"),
+                    _ => {}
+                }
+            }
+            items[0] = 9
+            print("{items[0]}")
+        }
+        "#,
+    );
+    let limits = ExecLimits::default();
+    let ast = observe_ast(&case, limits);
+    let ir = observe_ir(&case, limits);
+    assert_eq!(ir.outcome, ast.outcome, "outcome");
+    assert_eq!(ir.log, ast.log, "log");
+    assert_eq!(ir.fuel, ast.fuel, "fuel used");
+    assert_eq!(
+        min_memory_ir(&case),
+        min_memory(&case),
+        "a failed guard must restore the previous binding, not clear the slot"
+    );
 }
 
 #[test]
