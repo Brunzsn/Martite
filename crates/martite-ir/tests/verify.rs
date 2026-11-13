@@ -3,8 +3,8 @@
 use martite_ir::{
     AccessMode, BuiltinFnId, CaptureInfo, Charge, ChildRange, ConstId, ConstValue, Effects,
     Entries, EntryKind, FieldDef, FnId, FnKind, HostFnInfo, IrFn, IrId, IrProgram, MatchArm,
-    MatchSet, MatchSetId, Node, NodeKind, Pattern, PatternId, Slot, SlotInfo, SourceId, Span, Ty,
-    TyId, TypeDef, TypeDefKind, TypeTable, VerifyErrorKind,
+    MatchSet, MatchSetId, Node, NodeKind, Pattern, PatternId, Slot, SlotInfo, SourceId, Span,
+    StructLayout, StructLayoutId, Ty, TyId, TypeDef, TypeDefKind, TypeTable, VerifyErrorKind,
 };
 
 fn types() -> (TypeTable, TyId, TyId, TyId, TyId) {
@@ -1164,7 +1164,7 @@ fn valid_struct_literal_verifies() {
         node(
             NodeKind::Struct {
                 type_id,
-                first_field: 0,
+                layout: StructLayoutId::new(0),
             },
             point,
             Charge::new(1, 2, 0),
@@ -1198,7 +1198,10 @@ fn valid_struct_literal_verifies() {
         captures: Vec::new(),
         patterns: Vec::new(),
         matches: Vec::new(),
-        struct_layouts: Vec::new(),
+        struct_layouts: vec![StructLayout {
+            first_child: 0,
+            fields: vec![0, 1],
+        }],
         str_parts: Vec::new(),
         nodes,
         spans: vec![Span::empty(0); 5],

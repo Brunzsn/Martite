@@ -86,6 +86,10 @@ impl<'a> Analyzer<'a> {
     /// Compute liveness before `id` given the live set after it. Returns the
     /// live-before set and stores both states on the node.
     fn live(&mut self, id: IrId, after: &SlotSet) -> SlotSet {
+        stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || self.live_inner(id, after))
+    }
+
+    fn live_inner(&mut self, id: IrId, after: &SlotSet) -> SlotSet {
         let node = self.node(id);
         let (before, effective_after) = match node.kind {
             NodeKind::Block(_) | NodeKind::ExprBlock(_) => {
@@ -345,6 +349,12 @@ impl<'a> Analyzer<'a> {
     }
 
     fn live_place(&mut self, id: IrId, after: &SlotSet, read: bool) -> SlotSet {
+        stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
+            self.live_place_inner(id, after, read)
+        })
+    }
+
+    fn live_place_inner(&mut self, id: IrId, after: &SlotSet, read: bool) -> SlotSet {
         let node = self.node(id);
         let before = match node.kind {
             NodeKind::SlotPlace(slot) => {

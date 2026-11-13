@@ -197,6 +197,17 @@ fn collect_node_sites(
     sites: &mut [Option<InitSite>],
     id: IrId,
 ) -> Result<(), SlotBindingError> {
+    stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
+        collect_node_sites_inner(program, function, sites, id)
+    })
+}
+
+fn collect_node_sites_inner(
+    program: &IrProgram,
+    function: &IrFn,
+    sites: &mut [Option<InitSite>],
+    id: IrId,
+) -> Result<(), SlotBindingError> {
     let Some(node) = function.node(id).copied() else {
         return Ok(());
     };

@@ -9,6 +9,12 @@ publish = false
 [dependencies]
 martite-base.workspace = true
 martite-check.workspace = true
+martite-syntax.workspace = true
+stacker.workspace = true
+
+[dev-dependencies]
+martite-driver.workspace = true
+martite-resolve.workspace = true
 
 [lints]
 workspace = true

@@ -11,6 +11,7 @@ martite-base.workspace = true
 martite-syntax.workspace = true
 martite-resolve.workspace = true
 rustc-hash.workspace = true
+stacker.workspace = true
 
 [lints]
 workspace = true

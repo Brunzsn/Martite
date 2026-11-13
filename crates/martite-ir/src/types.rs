@@ -226,7 +226,7 @@ impl TypeTable {
         table
     }
 
-    fn ty_from_checker(&mut self, ty: &CheckTy) -> TyId {
+    pub(crate) fn ty_from_checker(&mut self, ty: &CheckTy) -> TyId {
         let converted = match ty {
             CheckTy::Int => Ty::Int,
             CheckTy::Float => Ty::Float,

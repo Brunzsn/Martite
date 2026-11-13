@@ -1385,8 +1385,6 @@ fn type_error(id: TyId) -> VerifyError {
 
 // The type/tree/charge and effects checks are below.
 
-const MAX_VERIFY_DEPTH: u32 = 1024;
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VisitState {
     Unvisited,
@@ -1522,6 +1520,12 @@ impl<'p> FnCheck<'p> {
     }
 
     fn check_node(&mut self, id: IrId, role: NodeRole) -> Result<TyId, VerifyError> {
+        stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
+            self.check_node_impl(id, role)
+        })
+    }
+
+    fn check_node_impl(&mut self, id: IrId, role: NodeRole) -> Result<TyId, VerifyError> {
         let node = self.node(id)?;
         let index = id.index();
         match self.states[index] {
@@ -1551,7 +1555,7 @@ impl<'p> FnCheck<'p> {
         self.states[index] = VisitState::OnStack;
         self.stack.push(id);
         self.depth += 1;
-        if self.depth > MAX_VERIFY_DEPTH {
+        if self.depth > crate::MAX_NODE_DEPTH {
             return Err(self.error(
                 Some(id),
                 VerifyErrorKind::ControlFlow {
@@ -2204,10 +2208,9 @@ impl<'p> FnCheck<'p> {
             NodeKind::CallHost { host, first_arg } => {
                 self.check_host_call(host, first_arg, node.ty)
             }
-            NodeKind::Struct {
-                type_id,
-                first_field,
-            } => self.check_struct_value(type_id, first_field, node.ty, id),
+            NodeKind::Struct { type_id, layout } => {
+                self.check_struct_value(type_id, layout, node.ty, id)
+            }
             NodeKind::StructUpdate { type_id, layout } => {
                 self.check_struct_update(type_id, layout, node.ty, id)
             }
@@ -3402,7 +3405,7 @@ impl<'p> FnCheck<'p> {
     fn check_struct_value(
         &mut self,
         type_id: TypeId,
-        first_field: u32,
+        layout_id: StructLayoutId,
         node_ty: TyId,
         id: IrId,
     ) -> Result<Ty, VerifyError> {
@@ -3447,12 +3450,37 @@ impl<'p> FnCheck<'p> {
                 },
             ));
         };
+        let Some(layout) = self.function.struct_layout(layout_id) else {
+            return Err(self.error(
+                Some(id),
+                VerifyErrorKind::StructLayout { layout: layout_id },
+            ));
+        };
         let field_types: Vec<TyId> = fields.iter().map(|field| field.ty).collect();
         let args = args.clone();
-        self.check_child_count(first_field, field_types.len() as u32, "struct literal")?;
-        for (index, field_ty) in field_types.iter().enumerate() {
-            let child = self.function.children[first_field as usize + index];
-            let expected = self.substitute(*field_ty, &args);
+        let first_child = layout.first_child;
+        let layout_fields = layout.fields.clone();
+        if layout_fields.len() != field_types.len() {
+            return Err(self.error(
+                Some(id),
+                VerifyErrorKind::StructLayout { layout: layout_id },
+            ));
+        }
+        self.check_child_count(first_child, layout_fields.len() as u32, "struct literal")?;
+        let mut seen = Vec::new();
+        for (index, field) in layout_fields.iter().enumerate() {
+            if *field as usize >= field_types.len() || seen.contains(field) {
+                return Err(self.error(
+                    Some(id),
+                    VerifyErrorKind::Path {
+                        index: *field,
+                        context: "struct literal field",
+                    },
+                ));
+            }
+            seen.push(*field);
+            let child = self.function.children[first_child as usize + index];
+            let expected = self.substitute(field_types[*field as usize], &args);
             self.expect_child_type(child, &expected, "struct field")?;
         }
         Ok(ty)
@@ -5295,7 +5323,7 @@ fn builtin_method_arity(receiver: BuiltinReceiver, name: &str) -> Option<u32> {
     })
 }
 
-struct EffectsCheck<'a> {
+pub(crate) struct EffectsCheck<'a> {
     program: &'a IrProgram,
     summaries: Vec<Effects>,
 }
@@ -5306,6 +5334,18 @@ impl<'a> EffectsCheck<'a> {
             program,
             summaries: vec![Effects::NONE; program.fns.len()],
         }
+    }
+
+    /// Build a checker over an explicit callee-summary snapshot. Lowering uses
+    /// this to fill stored effects without duplicating the leaf-effect rules.
+    pub(crate) fn with_summaries(program: &'a IrProgram, summaries: Vec<Effects>) -> Self {
+        Self { program, summaries }
+    }
+
+    /// Leaf effects of one node, using the summaries supplied to
+    /// [`Self::with_summaries`]. Children are not included.
+    pub(crate) fn leaf_effects(&self, function: &IrFn, node: Node) -> Effects {
+        self.own_effects(function, node, &self.summaries)
     }
 
     fn run(&mut self) -> Result<(), VerifyError> {
@@ -5334,17 +5374,19 @@ impl<'a> EffectsCheck<'a> {
     }
 
     fn summarize_node(&self, function: &IrFn, id: IrId, summaries: &[Effects]) -> Effects {
-        let Some(node) = function.node(id).copied() else {
-            return Effects::NONE;
-        };
-        let mut effects = self.own_effects(function, node, summaries);
-        for child in children_of(self.program, function, node) {
-            effects |= self.summarize_node(function, child, summaries);
-        }
-        if function.is_safepoint(id) {
-            effects |= Effects::SAFEPOINT;
-        }
-        effects
+        stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
+            let Some(node) = function.node(id).copied() else {
+                return Effects::NONE;
+            };
+            let mut effects = self.own_effects(function, node, summaries);
+            for child in children_of(self.program, function, node) {
+                effects |= self.summarize_node(function, child, summaries);
+            }
+            if function.is_safepoint(id) {
+                effects |= Effects::SAFEPOINT;
+            }
+            effects
+        })
     }
 
     fn verify_function(&self, function: &IrFn, body: IrId) -> Result<(), VerifyError> {
@@ -5352,25 +5394,27 @@ impl<'a> EffectsCheck<'a> {
     }
 
     fn verify_node(&self, function: &IrFn, id: IrId) -> Result<Effects, VerifyError> {
-        let node = *function.node(id).expect("shape checked");
-        let mut computed = self.own_effects(function, node, &self.summaries);
-        for child in children_of(self.program, function, node) {
-            computed |= self.verify_node(function, child)?;
-        }
-        if function.is_safepoint(id) {
-            computed |= Effects::SAFEPOINT;
-        }
-        if !node.effects.contains(computed) {
-            let missing = Effects::from_bits_truncate(computed.bits() & !node.effects.bits());
-            return Err(VerifyError {
-                function: Some(function.id),
-                source: Some(function.source),
-                node: Some(id),
-                span: function.span(id),
-                kind: VerifyErrorKind::Effects { missing },
-            });
-        }
-        Ok(computed)
+        stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
+            let node = *function.node(id).expect("shape checked");
+            let mut computed = self.own_effects(function, node, &self.summaries);
+            for child in children_of(self.program, function, node) {
+                computed |= self.verify_node(function, child)?;
+            }
+            if function.is_safepoint(id) {
+                computed |= Effects::SAFEPOINT;
+            }
+            if !node.effects.contains(computed) {
+                let missing = Effects::from_bits_truncate(computed.bits() & !node.effects.bits());
+                return Err(VerifyError {
+                    function: Some(function.id),
+                    source: Some(function.source),
+                    node: Some(id),
+                    span: function.span(id),
+                    kind: VerifyErrorKind::Effects { missing },
+                });
+            }
+            Ok(computed)
+        })
     }
 
     fn own_effects(&self, function: &IrFn, node: Node, summaries: &[Effects]) -> Effects {
@@ -5850,17 +5894,13 @@ pub(crate) fn children_of(program: &IrProgram, function: &IrFn, node: Node) -> V
                 }
             }
         }
-        NodeKind::Struct {
-            type_id,
-            first_field,
-        } => {
-            if let Some(def) = program.types.get(type_id)
-                && let TypeDefKind::Struct { fields } = &def.kind
-            {
-                for index in 0..fields.len() {
-                    if let Some(child) = function.children.get(first_field as usize + index) {
-                        children.push(*child);
-                    }
+        NodeKind::Struct { layout, .. } => {
+            let layout = function.struct_layout(layout);
+            let first_child = layout.map(|layout| layout.first_child).unwrap_or(0);
+            let fields = layout.map(|layout| layout.fields.len()).unwrap_or(0);
+            for index in 0..fields {
+                if let Some(child) = function.children.get(first_child as usize + index) {
+                    children.push(*child);
                 }
             }
         }

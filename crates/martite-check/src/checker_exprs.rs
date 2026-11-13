@@ -54,6 +54,15 @@ impl<'a> Checker<'a> {
     // ------------------------------------------------------------------
 
     fn check_expr(&mut self, expr: &Expr, expected: Option<&Ty>, infer: &mut Infer) -> Ty {
+        // Operator chains build left-deep trees without increasing the parser's
+        // nesting depth. Grow the stack for the recursive walk, as the parser
+        // does, so the IR depth limit is reachable on checked programs.
+        stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
+            self.check_expr_inner(expr, expected, infer)
+        })
+    }
+
+    fn check_expr_inner(&mut self, expr: &Expr, expected: Option<&Ty>, infer: &mut Infer) -> Ty {
         let ty = match &expr.kind {
             ExprKind::Var(name) => {
                 if name == "None" {

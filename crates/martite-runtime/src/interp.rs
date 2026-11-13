@@ -44,8 +44,8 @@ impl Default for ExecLimits {
 ///
 /// The AST evaluator is the only remaining `martite-check` consumer. It maps
 /// definitions and resolved names into the IR vocabulary so runtime values
-/// never carry checker ids. Real lowering replaces this bridge in #103 and the
-/// whole AST path is removed in #115/#116.
+/// never carry checker ids. The IR lowering that replaces this bridge lands
+/// across #103–#106; the whole AST path is removed in #115/#116.
 #[derive(Debug, Clone)]
 struct ProgramIds {
     types: TypeTable,

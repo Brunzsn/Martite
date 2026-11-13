@@ -55,10 +55,12 @@ pub struct MatchSet {
     pub arms: Vec<MatchArm>,
 }
 
-/// Field offsets for a struct literal with a base expression.
+/// Field offsets for a struct literal.
 ///
-/// The `StructUpdate` node's children start at `first_child` with `[base,
-/// values...]`; `fields[i]` is the declaration slot of `values[i]`.
+/// For `Struct`, the children start at `first_child` and are the values in
+/// source order; every declaration slot must appear exactly once in `fields`.
+/// For `StructUpdate`, the children start with the base followed by the values
+/// in source order; `fields[i]` is the declaration slot of `values[i]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct StructLayout {
     pub first_child: u32,

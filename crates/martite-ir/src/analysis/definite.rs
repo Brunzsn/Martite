@@ -143,6 +143,12 @@ impl<'a> Analyzer<'a> {
     }
 
     fn analyze(&mut self, id: IrId, state: &SlotSet) -> Result<Option<SlotSet>, UnboundRead> {
+        stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
+            self.analyze_inner(id, state)
+        })
+    }
+
+    fn analyze_inner(&mut self, id: IrId, state: &SlotSet) -> Result<Option<SlotSet>, UnboundRead> {
         let node = self.node(id);
         self.before[id.index()] = Some(state.clone());
 

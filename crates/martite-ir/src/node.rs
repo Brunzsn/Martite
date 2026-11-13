@@ -313,14 +313,16 @@ pub enum NodeKind {
     },
 
     // Aggregates.
-    /// Fields are `children[first_field..]` in declaration order.
+    /// Children start at the layout's `first_child`, in source order.
+    /// [`crate::StructLayout`] maps each child to its declaration slot. Every
+    /// field must be present because there is no base.
     Struct {
         type_id: TypeId,
-        first_field: u32,
+        layout: StructLayoutId,
     },
     /// Children start at the layout's `first_child` with the base first,
-    /// followed by the values. [`crate::StructLayout`] maps each value to its
-    /// declaration slot.
+    /// followed by the values in source order. [`crate::StructLayout`] maps
+    /// each value to its declaration slot.
     StructUpdate {
         type_id: TypeId,
         layout: StructLayoutId,

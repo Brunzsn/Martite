@@ -1,12 +1,12 @@
 //! Resolved, self-contained tree IR for Martite.
 //!
-//! This crate is the data model between the checker and the runtime. Lowering
-//! from `CheckedProgram` starts in #103; the crate currently owns the type,
-//! builtin and id vocabulary that lowering and the runtime share, a
-//! deterministic text printer ([`Printer`]) for dumps and golden tests, the
-//! verifier ([`verify`]) that enforces the contract between lowering and
-//! every pass, and the on-demand slot analyses in [`analysis`]. There is no
-//! evaluator, lowering or optimizer here yet.
+//! This crate is the data model between the checker and the runtime. It owns
+//! the type, builtin and id vocabulary, the deterministic text printer
+//! ([`Printer`]) for dumps and golden tests, the verifier ([`verify`]) that
+//! enforces the contract between lowering and every pass, the on-demand slot
+//! analyses in [`analysis`], and the first half of lowering ([`lower`]). Calls,
+//! match patterns and lambdas are lowered in #104–#106; there is no evaluator
+//! or optimizer here yet.
 //!
 //! Dependency direction: `martite-ir` may depend on `martite-base`,
 //! `martite-fuel`, `martite-syntax` and `martite-check` for lowering inputs,
@@ -38,12 +38,19 @@ pub mod builtin;
 pub mod charge;
 pub mod effects;
 pub mod id;
+pub mod lower;
 pub mod node;
 pub mod pattern;
 pub mod print;
 pub mod program;
 pub mod types;
 pub mod verify;
+
+/// Maximum IR tree depth per function, enforced by lowering and the verifier.
+///
+/// The parser's `nesting_depth` limit does not bound operator, postfix or
+/// `else if` chains, so the IR owns this limit.
+pub const MAX_NODE_DEPTH: u32 = 1024;
 
 pub use builtin::{
     BuiltinFnDef, BuiltinItemDef, BuiltinItemKind, BuiltinMethodDef, BuiltinReceiver,
@@ -54,6 +61,7 @@ pub use id::{
     BuiltinFnId, BuiltinItemId, BuiltinMethodId, CaptureIndex, ConstId, FnId, HostId, IrId,
     MatchSetId, PatternId, Slot, StrId, StructLayoutId,
 };
+pub use lower::{LowerError, LowerErrorKind, lower};
 pub use martite_base::{SourceId, Span};
 pub use node::{
     AccessMode, BinaryOp, ChildRange, CompoundOp, Node, NodeKind, OperandClass, StrPart, UnaryOp,

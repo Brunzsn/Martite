@@ -545,14 +545,22 @@ impl<'a> Printer<'a> {
                     None => write!(out, "first_arg={first_arg}"),
                 }
             }
-            NodeKind::Struct {
-                type_id,
-                first_field,
-            } => write!(
-                out,
-                "struct type=type#{} first_field={first_field}",
-                type_id.0
-            ),
+            NodeKind::Struct { type_id, layout } => {
+                write!(out, "struct type=type#{} layout=#{}", type_id.0, layout.0)?;
+                match function.struct_layout(*layout) {
+                    Some(layout) => {
+                        out.write_str(" fields=")?;
+                        write_u32_list(out, &layout.fields)?;
+                        out.write_str(" children=")?;
+                        write_ir_range(
+                            out,
+                            function,
+                            ChildRange::new(layout.first_child, layout.fields.len() as u32),
+                        )
+                    }
+                    None => Ok(()),
+                }
+            }
             NodeKind::StructUpdate { type_id, layout } => {
                 write!(
                     out,

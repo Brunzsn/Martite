@@ -20,6 +20,7 @@ table, not writing another one-off test.
 | `tests/fuzz_corpus.rs` | deterministic replay of `fuzz/corpus/checker` |
 | `tests/formatter.rs` | section 14 golden fixtures and cross-tool checks |
 | `tests/bench_fixtures.rs` | deterministic benchmark corpus: parse, check, run, plugin, formatter |
+| `tests/ir_lowering.rs` | lowering gate over the snapshot corpus, with the current #104–#106 gaps |
 | `tests/snapshots.rs` | AST-interpreter behavior snapshots and threshold oracle |
 
 The CLI-level fix and JSON checks live in `crates/martite-cli/tests/` because

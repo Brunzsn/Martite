@@ -123,7 +123,7 @@ Complete for the current language (each kind has fixed arity and child roles):
 - **Places:** root slot plus accessors (`Field(i)`, `Tuple(i)`, `Index(expr)`); used by assignment, compound assignment and mutable arguments. Place chains are not evaluated as values, which is why they charge only their index expressions.
 - **Operators:** `Unary`, `Binary { op, class }` where `class` is `Int | Float | Str | Dyn` (`Dyn` covers generic `Eq`/`Ord` and any operand whose type is a type parameter); `And`, `Or`, `Coalesce` as short-circuit nodes.
 - **Calls:** `CallDirect { fn, args }`, `CallMethod { fn, receiver, args }`, `CallValue { callee, args }` (dynamic dispatch over user fn / closure / builtin / builtin-module fn), `CallBuiltinFn`, `CallBuiltinMethod { receiver_kind, name }`, `CallBuiltinModule`, `CallHost { host, args }`. Each argument is `ArgMode::Value(expr)` or `ArgMode::MutPlace(place)` (6.4).
-- **Aggregates:** `Struct { type, fields-in-decl-order, base? }`, `EnumVariant`, `PreludeVariant(None|Some|Ok|Err)`, `Tuple`, `List`, `Map`, `Range`.
+- **Aggregates:** `Struct { type, layout }`, `StructUpdate { type, layout }`, `EnumVariant`, `PreludeVariant(None|Some|Ok|Err)`, `Tuple`, `List`, `Map`, `Range`. `StructLayout` stores the child range in source order and maps each child to its declaration slot; `StructUpdate` additionally stores the base before the values.
 - **Control flow:** `Block { stmts, tail }`, `If`, `While`, `For { iter_kind: List|Map|Str|Range }`, `Break`, `Continue`, `Return`, `Match`, `Try` (an early return from the enclosing function or lambda).
 - **Statements:** `Let`, `Assign`, `CompoundAssign(op)`, `ExprStmt` (safepoint-bearing, section 8.3).
 - **Conversions:** `ConvertInt`, `ConvertFloat`, `ConvertStr`.
@@ -190,7 +190,7 @@ Constants and static string literals live in pools. First use in a run allocates
 
 `martite-ir` pins `size_of::<Node>() == 32`: a 12-byte `NodeKind`, the 4-byte `TyId`, the 12-byte `Charge` and the 4-byte `Effects`. `NodeKind`'s variant is the operator or kind discriminator. Fixed-arity children are inline (at most two `IrId`s or one `ChildRange`); variable-arity children live in a per-function `Vec<IrId>`. The binary operand class is derived from the node and child types instead of being stored, and `Int`/`Float` literal payloads live in the const pool; both decisions keep `NodeKind` 4-byte aligned and within 12 bytes.
 
-Spans, synthetic origins and safepoints are parallel side vectors on `IrFn`. Pattern, match-arm, string-interpolation and struct-update payloads use per-function side arenas so they do not enlarge a node; `StructLayout` carries the `StructUpdate` child offset. The size budget is pinned by `crates/martite-ir/tests/layout.rs`.
+Spans, synthetic origins and safepoints are parallel side vectors on `IrFn`. Pattern, match-arm, string-interpolation and struct-literal/update payloads use per-function side arenas so they do not enlarge a node; `StructLayout` carries the child offset and source-order-to-declaration-slot mapping for both `Struct` and `StructUpdate`. The size budget is pinned by `crates/martite-ir/tests/layout.rs`.
 
 ## 7. Semantics contract
 
@@ -294,7 +294,7 @@ Rules:
 
 ## 10. Lowering from `CheckedProgram`
 
-Inputs: `CheckedProgram` (resolved program, `expr_types`, `resolutions`, `pattern_resolutions`, `struct_lit_fields`, `struct_pattern_fields`, `pattern_bindings`, `LambdaInfo`, `FnSig`, `ConstInfo`, entries).
+Inputs: `CheckedProgram` (resolved program, `expr_types`, `resolutions`, `pattern_resolutions`, `struct_lit_fields`, `struct_pattern_fields`, `pattern_bindings`, `LambdaInfo`, `FnSig`, `ConstInfo`, entries) and the `SourceMap` that names its `SourceId`s.
 
 1. Allocate an `FnId` for every function, method, handler, test, hook, host function and lambda; record `source` per function.
 2. Assign one slot to every `BindingId` a function declares; parameters first. No reuse. Every slot has exactly one initialization site: a parameter (plus its destructuring pattern), a `Let`/`For`/match-arm pattern binding, or a `SlotInit` node.
@@ -308,6 +308,7 @@ Rules:
 - **Lowering never optimizes** and never desugars across a charge boundary (principle 6).
 - After lowering nothing reads the AST `NodeTable`s. Spans and source ids come from the IR.
 - Lowering must be total on programs that passed the checker; a failure is an internal compiler error.
+- Lowering refuses trees deeper than `MAX_NODE_DEPTH` before the verifier would reject them. The parser and checker grow their stacks for deep operator chains, so the IR limit is the authoritative bound.
 - Irrefutable destructuring (`let`, `for`, lambda parameters) is validated here or by the verifier. The interpreter's silent skipping of shape mismatches does not carry over.
 
 ## 11. Optimizer interface (built with the first pass)

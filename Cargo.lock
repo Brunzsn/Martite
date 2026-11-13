@@ -588,6 +588,7 @@ dependencies = [
  "martite-resolve",
  "martite-syntax",
  "rustc-hash",
+ "stacker",
 ]
 
 [[package]]
@@ -665,6 +666,10 @@ version = "0.1.0"
 dependencies = [
  "martite-base",
  "martite-check",
+ "martite-driver",
+ "martite-resolve",
+ "martite-syntax",
+ "stacker",
 ]
 
 [[package]]

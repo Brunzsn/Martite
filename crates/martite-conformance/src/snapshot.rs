@@ -354,6 +354,23 @@ impl SnapshotCase {
         self.id().split('/').next().unwrap_or("misc")
     }
 
+    /// The checked program and its source names, when the case produces one.
+    ///
+    /// Used by the IR lowering gate. Plugin error cases that never reach the
+    /// checker return `None`.
+    pub fn checked_program(&self) -> Option<(CheckedProgram, SourceMap)> {
+        match self {
+            Self::Main { case, .. } => {
+                let loaded = case.load();
+                loaded.program.map(|program| (program, loaded.sources))
+            }
+            Self::Plugin { scenario, .. } => {
+                let plugin = load_plugin(scenario);
+                Some((plugin.program().clone(), plugin.sources().clone()))
+            }
+        }
+    }
+
     pub fn observe(&self) -> SnapshotRecord {
         match self {
             Self::Main {
