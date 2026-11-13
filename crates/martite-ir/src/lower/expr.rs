@@ -226,7 +226,8 @@ impl FnLowerer<'_, '_> {
         for item in items {
             children.push(self.lower_expr(item)?);
         }
-        let post = children.len() as u32;
+        let post = u32::try_from(children.len())
+            .map_err(|_| self.internal(expr.span, "aggregate element count exceeds u32"))?;
         let range = self.append_children(children);
         let kind = if tuple {
             NodeKind::Tuple(range)
@@ -247,12 +248,14 @@ impl FnLowerer<'_, '_> {
             children.push(self.lower_expr(key)?);
             children.push(self.lower_expr(value)?);
         }
-        let post = children.len() as u32;
         let range = self.append_children(children);
+        // The interpreter charges `map_cost(map.len())` after inserting the
+        // entries, so duplicate keys reduce the post-charge. The static
+        // schedule carries no post; the evaluator computes the dynamic cost.
         Ok(self.push(
             NodeKind::Map(range),
             ty,
-            Charge::new(1, post, 0),
+            Charge::expression(),
             expr.span,
             false,
         ))
@@ -553,7 +556,7 @@ impl FnLowerer<'_, '_> {
                 ty,
                 Charge::expression(),
                 span,
-                false,
+                true,
             ));
         }
         if self_first && args.is_empty() {
@@ -640,6 +643,10 @@ impl FnLowerer<'_, '_> {
         children.push(receiver);
         children.extend(self.lower_plain_args(args)?);
         let first_child = self.append_children(children).start;
+        // The sort family checks the deadline after sorting.
+        let safepoint = method
+            .def()
+            .is_some_and(|def| matches!(def.name, "sorted" | "sorted_by" | "sort"));
         Ok(self.push(
             NodeKind::CallBuiltinMethod {
                 method,
@@ -648,7 +655,7 @@ impl FnLowerer<'_, '_> {
             ty,
             Charge::expression(),
             span,
-            false,
+            safepoint,
         ))
     }
 
@@ -702,7 +709,7 @@ impl FnLowerer<'_, '_> {
                     ty,
                     Charge::expression(),
                     span,
-                    false,
+                    true,
                 ))
             }
         }
@@ -723,6 +730,8 @@ impl FnLowerer<'_, '_> {
         };
         let children = self.lower_plain_args(args)?;
         let first_arg = self.append_children(children).start;
+        // `std.json.parse` checks the input size against the memory cap.
+        let safepoint = id == BuiltinItemId::JSON_PARSE;
         Ok(self.push(
             NodeKind::CallBuiltinModule {
                 item: id,
@@ -731,7 +740,7 @@ impl FnLowerer<'_, '_> {
             ty,
             Charge::expression(),
             span,
-            false,
+            safepoint,
         ))
     }
 
@@ -758,14 +767,15 @@ impl FnLowerer<'_, '_> {
         } else {
             0
         };
-        let post = if has_payload { 1 } else { 0 };
+        // The interpreter boxes Option/Result payloads but charges no slot
+        // cost for them.
         Ok(self.push(
             NodeKind::PreludeVariant {
                 variant,
                 first_payload,
             },
             ty,
-            Charge::new(1, post, 0),
+            Charge::expression(),
             span,
             false,
         ))
@@ -786,6 +796,8 @@ impl FnLowerer<'_, '_> {
             return Err(self.internal(span, "variant constructor arity mismatch"));
         }
         let first_payload = self.append_children(children).start;
+        let post = u32::try_from(payload)
+            .map_err(|_| self.internal(span, "variant payload count exceeds u32"))?;
         Ok(self.push(
             NodeKind::EnumVariant {
                 variant: u32::try_from(index)
@@ -793,7 +805,7 @@ impl FnLowerer<'_, '_> {
                 first_payload,
             },
             ty,
-            Charge::new(1, payload as u32, 0),
+            Charge::new(1, post, 0),
             span,
             false,
         ))

@@ -65,7 +65,7 @@ fn valid_program() -> IrProgram {
             },
             int,
             Charge::expression(),
-            Effects::MAY_TRAP | Effects::READS_LOCAL,
+            Effects::MAY_TRAP | Effects::PANICS | Effects::READS_LOCAL,
         ),
         // 5: place value
         node(
@@ -87,6 +87,7 @@ fn valid_program() -> IrProgram {
                 | Effects::ALLOCATES
                 | Effects::DYN_COST
                 | Effects::MAY_TRAP
+                | Effects::PANICS
                 | Effects::READS_LOCAL
                 | Effects::SAFEPOINT,
         ),
@@ -108,7 +109,11 @@ fn valid_program() -> IrProgram {
             },
             unit,
             Charge::expression(),
-            Effects::LOGS | Effects::DYN_COST | Effects::ALLOCATES | Effects::READS_LOCAL,
+            Effects::LOGS
+                | Effects::DYN_COST
+                | Effects::ALLOCATES
+                | Effects::READS_LOCAL
+                | Effects::SAFEPOINT,
         ),
         // 9: expression statement
         node(
@@ -139,6 +144,7 @@ fn valid_program() -> IrProgram {
                 | Effects::ALLOCATES
                 | Effects::DYN_COST
                 | Effects::MAY_TRAP
+                | Effects::PANICS
                 | Effects::LOGS
                 | Effects::NONLOCAL_EXIT
                 | Effects::SAFEPOINT,
@@ -146,7 +152,7 @@ fn valid_program() -> IrProgram {
     ];
 
     let mut safepoints = vec![false; nodes.len()];
-    for id in [1, 6, 9, 10, 11] {
+    for id in [1, 6, 8, 9, 10, 11] {
         safepoints[id] = true;
     }
 
@@ -422,7 +428,7 @@ fn valid_call_and_mut_program() -> IrProgram {
             },
             int,
             Charge::expression(),
-            Effects::MAY_TRAP | Effects::READS_LOCAL,
+            Effects::MAY_TRAP | Effects::PANICS | Effects::READS_LOCAL,
         ),
         node(
             NodeKind::SlotWrite {
@@ -431,7 +437,7 @@ fn valid_call_and_mut_program() -> IrProgram {
             },
             unit,
             Charge::ZERO,
-            Effects::WRITES_LOCAL | Effects::MAY_TRAP | Effects::READS_LOCAL,
+            Effects::WRITES_LOCAL | Effects::MAY_TRAP | Effects::PANICS | Effects::READS_LOCAL,
         ),
         node(
             NodeKind::SlotRead {
@@ -452,7 +458,11 @@ fn valid_call_and_mut_program() -> IrProgram {
             NodeKind::Block(ChildRange::new(0, 2)),
             int,
             Charge::ZERO,
-            Effects::WRITES_LOCAL | Effects::MAY_TRAP | Effects::READS_LOCAL | Effects::SAFEPOINT,
+            Effects::WRITES_LOCAL
+                | Effects::MAY_TRAP
+                | Effects::PANICS
+                | Effects::READS_LOCAL
+                | Effects::SAFEPOINT,
         ),
     ];
     let mut inc_safepoints = vec![false; inc_nodes.len()];
@@ -517,7 +527,7 @@ fn valid_call_and_mut_program() -> IrProgram {
             NodeKind::MutArg(IrId::new(2)),
             int,
             Charge::ZERO,
-            Effects::NONE,
+            Effects::READS_LOCAL | Effects::WRITES_LOCAL,
         ),
         node(
             NodeKind::CallDirect {
@@ -526,13 +536,23 @@ fn valid_call_and_mut_program() -> IrProgram {
             },
             int,
             Charge::expression(),
-            Effects::CALLS | Effects::MAY_TRAP | Effects::SAFEPOINT,
+            Effects::CALLS
+                | Effects::MAY_TRAP
+                | Effects::PANICS
+                | Effects::READS_LOCAL
+                | Effects::WRITES_LOCAL
+                | Effects::SAFEPOINT,
         ),
         node(
             NodeKind::ExprStmt(IrId::new(4)),
             unit,
             Charge::ZERO,
-            Effects::CALLS | Effects::MAY_TRAP | Effects::SAFEPOINT,
+            Effects::CALLS
+                | Effects::MAY_TRAP
+                | Effects::PANICS
+                | Effects::READS_LOCAL
+                | Effects::WRITES_LOCAL
+                | Effects::SAFEPOINT,
         ),
         node(
             NodeKind::Return(None),
@@ -547,6 +567,8 @@ fn valid_call_and_mut_program() -> IrProgram {
             Effects::WRITES_LOCAL
                 | Effects::CALLS
                 | Effects::MAY_TRAP
+                | Effects::PANICS
+                | Effects::READS_LOCAL
                 | Effects::SAFEPOINT
                 | Effects::NONLOCAL_EXIT,
         ),
@@ -649,7 +671,7 @@ fn valid_builtin_method_program() -> IrProgram {
             NodeKind::MutArg(IrId::new(4)),
             list,
             Charge::ZERO,
-            Effects::NONE,
+            Effects::READS_LOCAL | Effects::WRITES_LOCAL | Effects::SHARES,
         ),
         node(
             NodeKind::Int(ConstId::new(1)),
@@ -668,7 +690,15 @@ fn valid_builtin_method_program() -> IrProgram {
             },
             unit,
             Charge::expression(),
-            Effects::DYN_COST | Effects::READS_HEAP | Effects::WRITES_HEAP | Effects::ALLOCATES,
+            Effects::DYN_COST
+                | Effects::READS_HEAP
+                | Effects::WRITES_HEAP
+                | Effects::ALLOCATES
+                | Effects::SHARES
+                | Effects::MAY_TRAP
+                | Effects::PANICS
+                | Effects::READS_LOCAL
+                | Effects::WRITES_LOCAL,
         ),
         node(
             NodeKind::ExprStmt(IrId::new(7)),
@@ -678,6 +708,11 @@ fn valid_builtin_method_program() -> IrProgram {
                 | Effects::READS_HEAP
                 | Effects::WRITES_HEAP
                 | Effects::ALLOCATES
+                | Effects::SHARES
+                | Effects::MAY_TRAP
+                | Effects::PANICS
+                | Effects::READS_LOCAL
+                | Effects::WRITES_LOCAL
                 | Effects::SAFEPOINT,
         ),
         node(
@@ -691,11 +726,14 @@ fn valid_builtin_method_program() -> IrProgram {
             unit,
             Charge::ZERO,
             Effects::WRITES_LOCAL
+                | Effects::READS_LOCAL
                 | Effects::ALLOCATES
                 | Effects::SHARES
                 | Effects::DYN_COST
                 | Effects::READS_HEAP
                 | Effects::WRITES_HEAP
+                | Effects::MAY_TRAP
+                | Effects::PANICS
                 | Effects::SAFEPOINT
                 | Effects::NONLOCAL_EXIT,
         ),
@@ -929,13 +967,18 @@ fn valid_match_program() -> IrProgram {
             },
             int,
             Charge::expression(),
-            Effects::MAY_TRAP | Effects::READS_HEAP | Effects::WRITES_LOCAL | Effects::READS_LOCAL,
+            Effects::MAY_TRAP
+                | Effects::PANICS
+                | Effects::READS_HEAP
+                | Effects::WRITES_LOCAL
+                | Effects::READS_LOCAL,
         ),
         node(
             NodeKind::ExprStmt(IrId::new(3)),
             unit,
             Charge::ZERO,
             Effects::MAY_TRAP
+                | Effects::PANICS
                 | Effects::READS_HEAP
                 | Effects::WRITES_LOCAL
                 | Effects::READS_LOCAL
@@ -946,6 +989,7 @@ fn valid_match_program() -> IrProgram {
             int,
             Charge::ZERO,
             Effects::MAY_TRAP
+                | Effects::PANICS
                 | Effects::READS_HEAP
                 | Effects::WRITES_LOCAL
                 | Effects::READS_LOCAL
@@ -1040,13 +1084,13 @@ fn host_program(grants: Vec<Box<str>>) -> IrProgram {
             },
             unit,
             Charge::expression(),
-            Effects::HOST | Effects::DYN_COST,
+            Effects::HOST | Effects::DYN_COST | Effects::MAY_TRAP | Effects::SAFEPOINT,
         ),
         node(
             NodeKind::ExprStmt(IrId::new(1)),
             unit,
             Charge::ZERO,
-            Effects::HOST | Effects::DYN_COST | Effects::SAFEPOINT,
+            Effects::HOST | Effects::DYN_COST | Effects::MAY_TRAP | Effects::SAFEPOINT,
         ),
         node(
             NodeKind::Return(None),
@@ -1058,11 +1102,15 @@ fn host_program(grants: Vec<Box<str>>) -> IrProgram {
             NodeKind::Block(ChildRange::new(1, 2)),
             unit,
             Charge::ZERO,
-            Effects::HOST | Effects::DYN_COST | Effects::SAFEPOINT | Effects::NONLOCAL_EXIT,
+            Effects::HOST
+                | Effects::DYN_COST
+                | Effects::MAY_TRAP
+                | Effects::SAFEPOINT
+                | Effects::NONLOCAL_EXIT,
         ),
     ];
     let mut safepoints = vec![false; nodes.len()];
-    for id in [2, 3, 4] {
+    for id in [1, 2, 3, 4] {
         safepoints[id] = true;
     }
     let function = IrFn {
@@ -1439,6 +1487,7 @@ fn rejects_out_of_range_builtin_function() {
         builtin: BuiltinFnId::new(99),
         first_arg: 0,
     };
+    program.fns[0].safepoints[8] = false;
     assert!(matches!(
         error_kind(program),
         VerifyErrorKind::Builtin { .. }
@@ -1506,7 +1555,7 @@ fn rejects_try_when_function_return_type_disagrees() {
                 first_payload: 0,
             },
             option_int,
-            Charge::new(1, 1, 0),
+            Charge::expression(),
             Effects::ALLOCATES,
         ),
         node(
@@ -1845,7 +1894,7 @@ fn valid_enum_and_prelude_variants_verify() {
                 first_payload: 0,
             },
             option_int,
-            Charge::new(1, 1, 0),
+            Charge::expression(),
             Effects::ALLOCATES,
         ),
         node(
@@ -1916,6 +1965,7 @@ fn rejects_uncallable_builtin_item() {
         item: martite_ir::BuiltinItemId::MATH_PI,
         first_arg: 0,
     };
+    program.fns[0].safepoints[8] = false;
     let error = error_kind(program);
     assert!(matches!(
         error,

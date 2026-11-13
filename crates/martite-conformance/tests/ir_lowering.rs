@@ -9,7 +9,10 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use martite_conformance::snapshot_cases;
-use martite_ir::{Charge, EntryKind, IrProgram, LowerOptions, NodeKind, lower, lower_with, verify};
+use martite_ir::{
+    BuiltinFnId, BuiltinItemId, Charge, Effects, EntryKind, IrId, IrProgram, LowerOptions,
+    NodeKind, lower, lower_with, verify,
+};
 
 #[test]
 fn every_checkable_fixture_lowers_and_verifies() {
@@ -34,6 +37,100 @@ fn every_checkable_fixture_lowers_and_verifies() {
         "every checked fixture must lower (lowered {lowered}, checked {checked}, skipped {skipped})"
     );
     eprintln!("ir lowering gate: lowered {lowered}, skipped {skipped}");
+}
+
+#[test]
+fn every_fixture_uses_the_lowered_schedule() {
+    let mut checked = 0;
+    for case in snapshot_cases::all_cases() {
+        let Some((program, sources)) = case.checked_program() else {
+            continue;
+        };
+        checked += 1;
+        let ir = lower(&program, &sources).unwrap_or_else(|error| panic!("{}: {error}", case.id()));
+        verify(&ir)
+            .unwrap_or_else(|error| panic!("{} lowered but did not verify: {error}", case.id()));
+
+        for function in &ir.fns {
+            for (index, node) in function.nodes.iter().enumerate() {
+                let id = IrId::new(index as u32);
+                let context = format!("{}: {} node #{index}", case.id(), function.name);
+                assert!(
+                    !matches!(node.kind, NodeKind::Charge(_)),
+                    "{context}: lowering must not insert Charge compensation nodes"
+                );
+                match node.kind {
+                    NodeKind::While { .. } | NodeKind::For { .. } => {
+                        assert_eq!(node.charge, Charge::new(0, 0, 1), "{context}: loop charge");
+                    }
+                    NodeKind::Map(_) => {
+                        assert_eq!(node.charge.post, 0, "{context}: map post is dynamic");
+                        assert!(
+                            node.effects.contains(Effects::DYN_COST),
+                            "{context}: dynamic map post must set DYN_COST"
+                        );
+                    }
+                    NodeKind::PreludeVariant { .. } => {
+                        assert_eq!(
+                            node.charge,
+                            Charge::expression(),
+                            "{context}: prelude charge"
+                        );
+                    }
+                    NodeKind::Break | NodeKind::Continue => {
+                        assert!(
+                            node.effects.contains(Effects::NONLOCAL_EXIT),
+                            "{context}: break/continue carry NONLOCAL_EXIT"
+                        );
+                    }
+                    NodeKind::MutArg(_) => {
+                        assert_eq!(node.charge, Charge::ZERO, "{context}: mut argument charge");
+                    }
+                    kind if kind.is_call() => {
+                        assert_eq!(node.charge, Charge::expression(), "{context}: call charge");
+                    }
+                    _ => {}
+                }
+
+                let required = id == function.body.expect("body")
+                    || matches!(
+                        node.kind,
+                        NodeKind::Let { .. }
+                            | NodeKind::Assign { .. }
+                            | NodeKind::AddAssign { .. }
+                            | NodeKind::SubAssign { .. }
+                            | NodeKind::MulAssign { .. }
+                            | NodeKind::DivAssign { .. }
+                            | NodeKind::RemAssign { .. }
+                            | NodeKind::ExprStmt(_)
+                            | NodeKind::Return(_)
+                            | NodeKind::CallHost { .. }
+                    )
+                    || matches!(
+                        node.kind,
+                        NodeKind::CallBuiltinFn { builtin, .. } if builtin == BuiltinFnId::PRINT
+                    )
+                    || matches!(
+                        node.kind,
+                        NodeKind::CallBuiltinMethod { method, .. }
+                            if method.def().is_some_and(|def| matches!(
+                                def.name,
+                                "sorted" | "sorted_by" | "sort"
+                            ))
+                    )
+                    || matches!(
+                        node.kind,
+                        NodeKind::CallBuiltinModule { item, .. } if item == BuiltinItemId::JSON_PARSE
+                    );
+                assert_eq!(
+                    function.is_safepoint(id),
+                    required,
+                    "{context}: safepoint placement"
+                );
+            }
+        }
+    }
+    assert!(checked > 0, "no conformance fixture checks");
 }
 
 #[test]

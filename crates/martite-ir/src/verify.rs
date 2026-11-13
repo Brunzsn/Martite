@@ -1695,6 +1695,22 @@ impl<'p> FnCheck<'p> {
                     | NodeKind::RemAssign { .. }
                     | NodeKind::ExprStmt(_)
                     | NodeKind::Return(_)
+                    | NodeKind::CallHost { .. }
+            )
+            || matches!(
+                node.kind,
+                NodeKind::CallBuiltinFn { builtin, .. } if builtin == BuiltinFnId::PRINT
+            )
+            || matches!(
+                node.kind,
+                NodeKind::CallBuiltinMethod { method, .. }
+                    if method
+                        .def()
+                        .is_some_and(|def| matches!(def.name, "sorted" | "sorted_by" | "sort"))
+            )
+            || matches!(
+                node.kind,
+                NodeKind::CallBuiltinModule { item, .. } if item == BuiltinItemId::JSON_PARSE
             );
         if self.function.is_safepoint(id) != required {
             return Err(self.error(
@@ -1729,7 +1745,9 @@ impl<'p> FnCheck<'p> {
         };
         let post = match node.kind {
             NodeKind::Tuple(range) | NodeKind::List(range) => range.len,
-            NodeKind::Map(range) => range.len,
+            // A map literal deduplicates keys, so the resulting entry count and
+            // its `2 * entries` post-charge are dynamic.
+            NodeKind::Map(_) => 0,
             NodeKind::Struct { type_id, .. } | NodeKind::StructUpdate { type_id, .. } => self
                 .program
                 .types
@@ -1756,10 +1774,9 @@ impl<'p> FnCheck<'p> {
                     _ => 0,
                 }
             }
-            NodeKind::PreludeVariant { variant, .. } => match variant {
-                PreludeVariant::None => 0,
-                PreludeVariant::Some | PreludeVariant::Ok | PreludeVariant::Err => 1,
-            },
+            // The interpreter boxes Option/Result payloads without charging
+            // their slots.
+            NodeKind::PreludeVariant { .. } => 0,
             _ => 0,
         };
         Ok(Charge::new(pre, post, per_iter))
@@ -5513,17 +5530,32 @@ impl<'a> EffectsCheck<'a> {
             | NodeKind::ExprBlock(_)
             | NodeKind::If(_)
             | NodeKind::While { .. }
-            | NodeKind::Break
-            | NodeKind::Continue
             | NodeKind::ExprStmt(_)
-            | NodeKind::Charge(_)
-            | NodeKind::MutArg(_) => {}
+            | NodeKind::Charge(_) => {}
+            NodeKind::Break | NodeKind::Continue => effects |= E::NONLOCAL_EXIT,
+            NodeKind::MutArg(place) => {
+                effects |= E::READS_LOCAL | E::WRITES_LOCAL;
+                let place_node = function.node(place);
+                if place_node.is_some_and(|node| !matches!(node.kind, NodeKind::SlotPlace(_))) {
+                    effects |= E::READS_HEAP
+                        | E::WRITES_HEAP
+                        | E::ALLOCATES
+                        | E::DYN_COST
+                        | E::SHARES
+                        | E::MAY_TRAP
+                        | E::PANICS;
+                } else if let Some(NodeKind::SlotPlace(slot)) = place_node.map(|node| node.kind)
+                    && self.is_heap_slot(function, slot)
+                {
+                    effects |= E::SHARES;
+                }
+            }
             NodeKind::Str(_) | NodeKind::StrInterp(_) => {
                 effects |= E::DYN_COST | E::ALLOCATES;
             }
             NodeKind::ConstRef(_) => {
                 if self.is_heap_ty(node.ty) {
-                    effects |= E::DYN_COST | E::ALLOCATES | E::SHARES;
+                    effects |= E::ALLOCATES | E::SHARES;
                 }
             }
             NodeKind::SlotRead { slot, mode } => {
@@ -5550,16 +5582,19 @@ impl<'a> EffectsCheck<'a> {
                     effects |= E::SHARES;
                 }
             }
-            NodeKind::Index { .. } => {
-                effects |= E::READS_HEAP | E::MAY_TRAP;
+            NodeKind::Index { index, .. } => {
+                effects |= E::READS_HEAP | E::MAY_TRAP | E::PANICS;
+                let index_ty = function.node(index).and_then(|node| self.ty(node.ty).ok());
+                if matches!(index_ty, Some(Ty::Range)) {
+                    effects |= E::DYN_COST | E::ALLOCATES;
+                }
                 if self.is_heap_ty(node.ty) {
                     effects |= E::SHARES;
                 }
-                effects |= E::DYN_COST;
             }
             NodeKind::Neg(_) => {
                 if !matches!(self.ty(node.ty), Ok(Ty::Float)) {
-                    effects |= E::MAY_TRAP;
+                    effects |= E::MAY_TRAP | E::PANICS;
                 }
             }
             NodeKind::Not(_) => {}
@@ -5570,10 +5605,10 @@ impl<'a> EffectsCheck<'a> {
             | NodeKind::Rem { .. } => {
                 let ty = self.ty(node.ty);
                 match ty {
-                    Ok(Ty::Int) => effects |= E::MAY_TRAP,
+                    Ok(Ty::Int) => effects |= E::MAY_TRAP | E::PANICS,
                     Ok(Ty::Str) => effects |= E::ALLOCATES | E::DYN_COST,
                     Ok(Ty::Float) => {}
-                    _ => effects |= E::MAY_TRAP,
+                    _ => effects |= E::MAY_TRAP | E::PANICS,
                 }
             }
             NodeKind::Eq { .. }
@@ -5604,7 +5639,13 @@ impl<'a> EffectsCheck<'a> {
                         effects |= builtin_item_effects(item);
                     }
                     _ => {
-                        effects |= E::MAY_TRAP | E::ALLOCATES | E::DYN_COST;
+                        effects |= E::MAY_TRAP
+                            | E::ALLOCATES
+                            | E::DYN_COST
+                            | E::READS_HEAP
+                            | E::WRITES_HEAP
+                            | E::SHARES
+                            | E::SAFEPOINT;
                         for summary in summaries {
                             effects |= mask_callee(*summary);
                         }
@@ -5616,9 +5657,17 @@ impl<'a> EffectsCheck<'a> {
                 effects |= builtin_fn_effects(builtin);
             }
             NodeKind::CallBuiltinMethod { method, .. } => {
-                let mut call_effects = E::DYN_COST | E::READS_HEAP;
+                // Builtin methods are conservative may-facts: the table does
+                // not classify every method's allocation, sharing and traps
+                // yet. Per-method precision belongs with the optimizer work.
+                let mut call_effects = E::DYN_COST
+                    | E::READS_HEAP
+                    | E::ALLOCATES
+                    | E::SHARES
+                    | E::MAY_TRAP
+                    | E::PANICS;
                 if method.def().is_some_and(|def| def.mut_self) {
-                    call_effects |= E::WRITES_HEAP | E::ALLOCATES;
+                    call_effects |= E::WRITES_HEAP;
                 }
                 if method
                     .def()
@@ -5635,7 +5684,7 @@ impl<'a> EffectsCheck<'a> {
                 effects |= builtin_item_effects(item);
             }
             NodeKind::CallHost { host, .. } => {
-                effects |= E::HOST | E::DYN_COST;
+                effects |= E::HOST | E::DYN_COST | E::MAY_TRAP;
                 if self
                     .program
                     .host(host)
@@ -5644,49 +5693,72 @@ impl<'a> EffectsCheck<'a> {
                     effects |= E::ALLOCATES | E::SHARES;
                 }
             }
-            NodeKind::Struct { .. } | NodeKind::Tuple(_) | NodeKind::List(_) | NodeKind::Map(_) => {
+            NodeKind::Struct { .. } | NodeKind::Tuple(_) | NodeKind::List(_) => {
                 effects |= E::ALLOCATES
             }
+            NodeKind::Map(_) => effects |= E::ALLOCATES | E::DYN_COST,
             NodeKind::StructUpdate { .. } => effects |= E::ALLOCATES | E::SHARES,
-            NodeKind::EnumVariant { first_payload, .. }
-            | NodeKind::PreludeVariant { first_payload, .. } => {
-                if !self.prelude_or_variant_empty(node, first_payload) {
+            NodeKind::EnumVariant { .. } => effects |= E::ALLOCATES,
+            NodeKind::PreludeVariant { variant, .. } => {
+                if !matches!(variant, PreludeVariant::None) {
                     effects |= E::ALLOCATES;
                 }
             }
             NodeKind::Let { pattern, .. } => {
                 effects |= self.pattern_effects(function, pattern);
             }
-            NodeKind::Assign { .. } | NodeKind::AddAssign { .. } => {
-                effects |= E::WRITES_LOCAL | E::WRITES_HEAP | E::ALLOCATES | E::DYN_COST;
-                if matches!(node.kind, NodeKind::AddAssign { .. }) {
-                    effects |= E::MAY_TRAP;
+            NodeKind::Assign { place, .. } => {
+                effects |= E::WRITES_LOCAL;
+                if self.place_is_nested(function, place) {
+                    effects |= E::READS_LOCAL
+                        | E::READS_HEAP
+                        | E::WRITES_HEAP
+                        | E::ALLOCATES
+                        | E::DYN_COST
+                        | E::SHARES
+                        | E::MAY_TRAP
+                        | E::PANICS;
                 }
             }
-            NodeKind::SubAssign { .. }
-            | NodeKind::MulAssign { .. }
-            | NodeKind::DivAssign { .. }
-            | NodeKind::RemAssign { .. } => {
-                effects |=
-                    E::WRITES_LOCAL | E::WRITES_HEAP | E::ALLOCATES | E::DYN_COST | E::MAY_TRAP;
+            NodeKind::AddAssign { place, .. } => {
+                self.compound_effects(function, place, true, &mut effects);
             }
-            NodeKind::For { .. } => {
-                effects |= E::ALLOCATES;
-                if let NodeKind::For { pattern, .. } = node.kind {
-                    effects |= self.pattern_effects(function, pattern);
+            NodeKind::SubAssign { place, .. }
+            | NodeKind::MulAssign { place, .. }
+            | NodeKind::DivAssign { place, .. }
+            | NodeKind::RemAssign { place, .. } => {
+                self.compound_effects(function, place, false, &mut effects);
+            }
+            NodeKind::For {
+                pattern,
+                first_child,
+            } => {
+                if let Some(iterable) = function
+                    .children
+                    .get(first_child as usize)
+                    .and_then(|id| function.node(*id))
+                {
+                    match self.ty(iterable.ty) {
+                        Ok(Ty::Map(_, _)) => effects |= E::ALLOCATES | E::SHARES,
+                        Ok(Ty::Str) => effects |= E::ALLOCATES,
+                        _ => {}
+                    }
                 }
+                effects |= self.pattern_effects(function, pattern);
             }
             NodeKind::Return(_) => effects |= E::NONLOCAL_EXIT,
-            NodeKind::Try(_) => effects |= E::NONLOCAL_EXIT | E::MAY_TRAP | E::ALLOCATES,
+            NodeKind::Try(_) => {
+                effects |= E::NONLOCAL_EXIT | E::MAY_TRAP | E::PANICS | E::ALLOCATES;
+            }
             NodeKind::Match { match_set, .. } => {
-                effects |= E::MAY_TRAP | E::READS_HEAP | E::WRITES_LOCAL;
+                effects |= E::MAY_TRAP | E::PANICS | E::READS_HEAP | E::WRITES_LOCAL;
                 if let Some(set) = function.match_set(match_set) {
                     for arm in &set.arms {
                         effects |= self.pattern_effects(function, arm.pattern);
                     }
                 }
             }
-            NodeKind::ConvertInt(_) => effects |= E::MAY_TRAP,
+            NodeKind::ConvertInt(_) => effects |= E::MAY_TRAP | E::PANICS,
             NodeKind::ConvertFloat(_) => {}
             NodeKind::ConvertStr(_) => effects |= E::DYN_COST | E::ALLOCATES,
             NodeKind::MakeClosure(target) => {
@@ -5707,6 +5779,36 @@ impl<'a> EffectsCheck<'a> {
             NodeKind::Assert(_) | NodeKind::Panic(_) => effects |= E::MAY_TRAP | E::PANICS,
         }
         effects
+    }
+
+    fn place_is_nested(&self, function: &IrFn, place: IrId) -> bool {
+        function
+            .node(place)
+            .is_some_and(|node| !matches!(node.kind, NodeKind::SlotPlace(_)))
+    }
+
+    fn compound_effects(&self, function: &IrFn, place: IrId, add: bool, effects: &mut Effects) {
+        use Effects as E;
+        *effects |= E::READS_LOCAL | E::WRITES_LOCAL;
+        let place_ty = function.node(place).map(|node| node.ty);
+        if place_ty.is_some_and(|ty| self.is_heap_ty(ty)) {
+            *effects |= E::SHARES;
+        }
+        if self.place_is_nested(function, place) {
+            *effects |= E::READS_HEAP
+                | E::WRITES_HEAP
+                | E::ALLOCATES
+                | E::DYN_COST
+                | E::SHARES
+                | E::MAY_TRAP
+                | E::PANICS;
+        }
+        match place_ty.and_then(|ty| self.ty(ty).ok()) {
+            Some(Ty::Int) => *effects |= E::MAY_TRAP | E::PANICS,
+            Some(Ty::Str) if add => *effects |= E::ALLOCATES | E::DYN_COST,
+            Some(Ty::Float) => {}
+            _ => *effects |= E::MAY_TRAP | E::PANICS,
+        }
     }
 
     fn is_heap_slot(&self, function: &IrFn, slot: Slot) -> bool {
@@ -5794,13 +5896,6 @@ impl<'a> EffectsCheck<'a> {
                     self.collect_pattern_effects(function, item, effects);
                 }
             }
-        }
-    }
-
-    fn prelude_or_variant_empty(&self, node: Node, first_payload: u32) -> bool {
-        match node.kind {
-            NodeKind::PreludeVariant { .. } => first_payload == 0,
-            _ => false,
         }
     }
 }

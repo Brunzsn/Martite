@@ -236,12 +236,12 @@ Every node carries a schedule rather than a single cost:
 ```rust
 pub struct Charge {
     pub pre: u32,       // charged on entry, before children (1 for every evaluated expression)
-    pub post: u32,      // static charge after children (e.g. list/tuple/struct/variant: element count; map: 2 * entries)
+    pub post: u32,      // static charge after children (list/tuple/struct/variant element count)
     pub per_iter: u32,  // loops: while charges before each condition check; for charges per element
 }
 ```
 
-plus the effect flag `DYN_COST` for charges computed at run time from values (string bytes, `show` slots, comparison cost, sort cost, copy-on-write slots, most builtins). Dynamic formulas live in `martite-fuel`, never inline in the evaluator.
+plus the effect flag `DYN_COST` for charges computed at run time from values (string bytes, `show` slots, comparison cost, sort cost, copy-on-write slots, most builtins). Dynamic formulas live in `martite-fuel`, never inline in the evaluator. A map literal has no static `post`: duplicate keys shrink the resulting map, and the interpreter charges `2 * map.len()` after insertion, so the node carries `post = 0` and `DYN_COST` and the evaluator charges `map_cost(actual entries)`. `Some`/`Ok`/`Err` box their payload without a slot charge, so `PreludeVariant` also has `post = 0`.
 
 Rules that lowering must follow, all derived from the interpreter:
 
@@ -260,7 +260,7 @@ The authoritative test is differential: every fixture's exact fuel used must mat
 
 ### 8.3 Safepoints
 
-Today memory is checked: after each `let`, expression statement and assignment; on function and lambda entry; on return; and on every 256th `charge` call; the deadline on every 1024th. The IR records exact placement in a per-node `safepoints` side vector (`Let`, `Assign`, `CompoundAssign`, `ExprStmt`, `Return`, and the function body for entry/fallthrough exit); `Effects::SAFEPOINT` is the subtree summary. The evaluator keeps the same tick counter and `& 255`/`& 1023` cadence. Memory accounting keeps its two-level scheme: a conservative `pending_bytes` estimate triggers an exact scan only when it could cross the limit.
+Today memory is checked: after each `let`, expression statement and assignment; on function and lambda entry; on return; and on every 256th `charge` call; the deadline on every 1024th. Builtin and host calls also check limits directly: `print` scans memory after logging, `std.json.parse` checks the input size, `sorted`/`sorted_by`/`sort` check the deadline, and host calls check the deadline before and after the call. The IR records exact placement in a per-node `safepoints` side vector (`Let`, `Assign`, `CompoundAssign`, `ExprStmt`, `Return`, the function body for entry/fallthrough exit, and those direct-check call sites); `Effects::SAFEPOINT` is the subtree summary. The call-site scan for a returned value remains part of call semantics (section 6.4) and is pinned by the evaluator parity work. The evaluator keeps the same tick counter and `& 255`/`& 1023` cadence. Memory accounting keeps its two-level scheme: a conservative `pending_bytes` estimate triggers an exact scan only when it could cross the limit.
 
 ### 8.4 Cadence decision (after migration)
 
@@ -294,6 +294,9 @@ Rules:
 
 - Leaf effects come from the node kind; parent effects are the union of children plus its own.
 - Stored effects must be a **superset** of true effects. The verifier recomputes and compares.
+- `PANICS` covers every runtime `Trap::Panic`, including arithmetic overflow, division by zero, bounds and missing-key failures, conversion range errors, match fallthrough and `expect`-style builtins, not only the `panic`/`assert` functions.
+- A mutable argument carries the caller-side read and writeback effects: `READS_LOCAL`/`WRITES_LOCAL`, and for nested places `READS_HEAP`/`WRITES_HEAP`/`ALLOCATES`/`DYN_COST`/`SHARES` because writeback can copy on write. A call's summary therefore includes both callee effects and caller-side writeback effects.
+- Builtin-method effects are conservative may-sets until the optimizer needs per-method precision: `DYN_COST`, `READS_HEAP`, `ALLOCATES`, `SHARES`, `MAY_TRAP` and `PANICS`, plus `WRITES_HEAP` for `mut self` and `CALLS` for methods that invoke a closure. Anything that can copy on write also carries `SHARES`, because the copy clones references to heap payloads.
 - Whole-program facts (call graph, use-def) are analyses computed on demand, not stored.
 
 ## 10. Lowering from `CheckedProgram`

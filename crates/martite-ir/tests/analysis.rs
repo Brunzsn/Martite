@@ -169,14 +169,16 @@ fn int_const(builder: &mut FnBuilder, ty: TyId) -> IrId {
 
 fn print_call(builder: &mut FnBuilder, unit: TyId, argument: IrId) -> IrId {
     let first_arg = builder.child(argument);
-    builder.node(
+    let id = builder.node(
         NodeKind::CallBuiltinFn {
             builtin: BuiltinFnId::PRINT,
             first_arg,
         },
         unit,
         Charge::expression(),
-    )
+    );
+    builder.safepoint(id);
+    id
 }
 
 #[test]
@@ -657,7 +659,7 @@ fn try_keeps_the_normal_path_definite() {
             first_payload: payload,
         },
         types.option_int,
-        Charge::new(1, 1, 0),
+        Charge::expression(),
     );
     let try_node = builder.node(NodeKind::Try(some), types.int, Charge::expression());
     let payload = builder.child(try_node);
@@ -667,7 +669,7 @@ fn try_keeps_the_normal_path_definite() {
             first_payload: payload,
         },
         types.option_int,
-        Charge::new(1, 1, 0),
+        Charge::expression(),
     );
     let expr_stmt = builder.statement(NodeKind::ExprStmt(returned), types.unit);
     let range = builder.range(&[let_node, expr_stmt]);

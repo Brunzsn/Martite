@@ -3,7 +3,9 @@
 //! Design section 8.1: every evaluated expression charges `pre` on entry and
 //! `post` after its children; loops charge `per_iter` once per iteration. The
 //! schedule is static. Dynamic costs are still computed at run time and are
-//! marked with [`crate::Effects::DYN_COST`].
+//! marked with [`crate::Effects::DYN_COST`]. A map literal's post-charge is
+//! dynamic because duplicate keys reduce the resulting entry count; its
+//! `Charge::post` is zero.
 
 /// Static fuel schedule for one node.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]

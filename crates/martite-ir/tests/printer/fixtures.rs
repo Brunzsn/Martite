@@ -1,10 +1,9 @@
 //! Hand-built IR for the printer goldens.
 //!
-//! Lowering does not exist yet (#103), so the corpus is built directly from
-//! the data model. Each fixture exercises one area the printer must make
-//! reviewable: literals, calls, closures, match, loops, mutable arguments and
-//! synthetic provenance. When lowering lands, #114 adds dumps of real sources
-//! alongside these.
+//! The corpus is built directly from the data model so each fixture exercises
+//! one area the printer must make reviewable: literals, calls, closures, match,
+//! loops, mutable arguments and synthetic provenance. #114 adds dumps of real
+//! sources alongside these.
 
 use martite_ir::{
     Charge, ChildRange, ConstId, ConstValue, Effects, Entries, EntryKind, FnId, FnKind, HostFnInfo,
@@ -586,7 +585,7 @@ fn loops() -> martite_ir::IrProgram {
             body: while_body,
         },
         UNIT,
-        Charge::new(1, 0, 1),
+        Charge::new(0, 0, 1),
         Effects::NONLOCAL_EXIT,
     );
 
@@ -634,7 +633,7 @@ fn loops() -> martite_ir::IrProgram {
             first_child: iter,
         },
         UNIT,
-        Charge::new(1, 0, 1),
+        Charge::new(0, 0, 1),
         Effects::NONLOCAL_EXIT,
     );
     debug_assert_eq!(body_child, iter + 1);
