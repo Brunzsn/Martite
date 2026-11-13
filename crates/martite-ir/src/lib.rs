@@ -1,9 +1,10 @@
 //! Resolved, self-contained tree IR for Martite.
 //!
 //! This crate is the data model between the checker and the runtime. Lowering
-//! from `CheckedProgram` starts in #103; this crate currently owns the type,
-//! builtin and id vocabulary that lowering and the runtime share. There is no
-//! evaluator, optimizer, printer or verifier here yet.
+//! from `CheckedProgram` starts in #103; the crate currently owns the type,
+//! builtin and id vocabulary that lowering and the runtime share, plus a
+//! deterministic text printer ([`Printer`]) for dumps and golden tests. There
+//! is no evaluator, lowering, optimizer or verifier here yet.
 //!
 //! Dependency direction: `martite-ir` may depend on `martite-base`,
 //! `martite-fuel`, `martite-syntax` and `martite-check` for lowering inputs,
@@ -36,6 +37,7 @@ pub mod effects;
 pub mod id;
 pub mod node;
 pub mod pattern;
+pub mod print;
 pub mod program;
 pub mod types;
 
@@ -51,6 +53,7 @@ pub use node::{
     AccessMode, BinaryOp, ChildRange, CompoundOp, Node, NodeKind, OperandClass, StrPart, UnaryOp,
 };
 pub use pattern::{MatchArm, MatchSet, Pattern, StructLayout};
+pub use print::{FORMAT_VERSION, Printer};
 pub use program::{
     CaptureInfo, ConstValue, Entries, EntryKind, FnKind, HookSig, HostFnInfo, IrFn, IrProgram,
     ParamInfo, PreludeVariant, SlotInfo,

@@ -1,0 +1,34 @@
+ir-format 1
+sources:
+  #0 "closures.mt"
+grants:
+  (none)
+hosts:
+  (none)
+entries:
+  kind=script
+  main=fn#0
+  tests=[]
+  handlers=[]
+  hooks=[]
+  init=-
+  shutdown=-
+  state=-
+  json=-
+consts:
+  (none)
+strings:
+  (none)
+
+fn #0 "main" kind=free source=src#0("closures.mt") slots=1 body=#1
+  slots:
+    #0 ty=ty#0 mut=no name="x"
+  nodes:
+    #0 make_closure fn=fn#1 ty=ty#0 charge=1/0/0 effects=ALLOCATES span=src#0:0..1 origin=-
+    #1 expr_stmt value=#0 ty=ty#1 charge=0/0/0 effects=ALLOCATES span=src#0:1..2 origin=-
+
+fn #1 "<lambda>" kind=lambda source=src#0("closures.mt") slots=0 body=#0
+  captures:
+    #0 outer=slot#0 ty=ty#0 name="x"
+  nodes:
+    #0 capture_read capture=#0 ty=ty#0 charge=1/0/0 effects=READS_LOCAL|SHARES span=src#0:0..1 origin=-

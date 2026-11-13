@@ -84,6 +84,7 @@ pub struct IrProgram {
     pub types: TypeTable,          // IR-owned, erased generics
     pub hosts: Vec<HostFnInfo>,    // stable name + signature + opaque-handle return type
     pub grants: Vec<String>,       // grants the program was loaded with
+    pub sources: Vec<Box<str>>,    // source names, indexed by SourceId
     pub entries: Entries,          // see 6.6
 }
 
@@ -388,18 +389,63 @@ Each is separate, edition-gated, and lands with updated goldens. **These items a
 
 ## Appendix: example text dump
 
-Illustrative; the format is not final. `charge` shows `pre/post`.
+`IrProgram::print` and the `Printer` type emit a flat arena dump. Program facts come
+first in a fixed order (source names, grants, hosts, entries, const and string
+pools). Each function then prints its signature, side arenas and every node in
+arena order. Children are explicit ids and unreachable nodes are still listed,
+so a lowering bug that leaves an orphan in the arena is visible.
 
-```
-fn fib(n: Int) -> Int                    ; slots: n=0   source=main.mt
-  if                                      ; charge 1/0   effects=READS_LOCAL|CALLS|MAY_TRAP
-    cond: lt_int(read n                    ; charge 1/0 ; the `lt` entry charge
-               const 2)                    ; charge 1/0
-    then: block(body)                      ; charge 0/0
-            read n                         ; charge 1/0
-    else: add_int                          ; charge 1/0   MAY_TRAP
-            call_direct fib(sub_int(read n, const 1))
-            call_direct fib(sub_int(read n, const 2))
+The dumps live in `crates/martite-ir/tests/printer/golden` and are regenerated
+by the ignored `update_printer_goldens` test. A complete dump for the
+`literals` fixture:
+
+```text
+ir-format 1
+sources:
+  #0 "literals.mt"
+grants:
+  (none)
+hosts:
+  (none)
+entries:
+  kind=script
+  main=fn#0
+  tests=[]
+  handlers=[]
+  hooks=[]
+  init=-
+  shutdown=-
+  state=-
+  json=-
+consts:
+  #0 int 7
+  #1 float 2.5
+  #2 bool true
+strings:
+  #0 "hello"
+
+fn #0 "main" kind=free source=src#0("literals.mt") slots=1 body=#5
+  slots:
+    #0 ty=ty#0 mut=no name=-
+  nodes:
+    #0 int const=#0 value=7 ty=ty#0 charge=1/0/0 effects=NONE span=src#0:0..1 origin=-
+    #1 float const=#1 value=2.5 ty=ty#0 charge=1/0/0 effects=NONE span=src#0:1..2 origin=-
+    #2 bool value=true ty=ty#0 charge=1/0/0 effects=NONE span=src#0:2..3 origin=-
+    #3 str#0("hello") ty=ty#0 charge=1/0/0 effects=NONE span=src#0:3..4 origin=-
+    #4 tuple items=[#0, #1, #2, #3] ty=ty#0 charge=1/4/0 effects=ALLOCATES span=src#0:4..5 origin=-
+    #5 return value=#4 ty=ty#1 charge=0/0/0 effects=NONE span=src#0:5..6 origin=-
 ```
 
-Note that `call_direct`'s callee name is not a node and charges nothing; only the call itself and its arguments do.
+Every node line ends with the same fields: the node type, the
+`pre/post/per_iter` charge schedule, the effect flags in their defined bit
+order (`DYN_COST` included), the source id plus byte range, and the synthetic
+origin (`-` for nodes produced by lowering). Pass-created nodes and carried
+charges look like this:
+
+```text
+    #2 add lhs=#0 rhs=#1 ty=ty#0 charge=1/0/0 effects=MAY_TRAP span=src#0:2..3 origin=#0
+    #3 charge units=2 ty=ty#0 charge=0/0/0 effects=NONE span=src#0:3..4 origin=#2
+```
+
+Note that `call_direct`'s callee is not a node: `target=fn#N` names the callee
+and charges nothing, while the call node and its arguments do.

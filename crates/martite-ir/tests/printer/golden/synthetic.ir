@@ -1,0 +1,32 @@
+ir-format 1
+sources:
+  #0 "synthetic.mt"
+grants:
+  (none)
+hosts:
+  (none)
+entries:
+  kind=script
+  main=fn#0
+  tests=[]
+  handlers=[]
+  hooks=[]
+  init=-
+  shutdown=-
+  state=-
+  json=-
+consts:
+  #0 int 1
+  #1 int 2
+strings:
+  (none)
+
+fn #0 "main" kind=free source=src#0("synthetic.mt") slots=1 body=#4
+  slots:
+    #0 ty=ty#0 mut=no name=-
+  nodes:
+    #0 int const=#0 value=1 ty=ty#0 charge=1/0/0 effects=NONE span=src#0:0..1 origin=-
+    #1 int const=#1 value=2 ty=ty#0 charge=1/0/0 effects=NONE span=src#0:1..2 origin=-
+    #2 add lhs=#0 rhs=#1 ty=ty#0 charge=1/0/0 effects=MAY_TRAP span=src#0:2..3 origin=#0
+    #3 charge units=2 ty=ty#0 charge=0/0/0 effects=NONE span=src#0:3..4 origin=#2
+    #4 return value=#3 ty=ty#1 charge=0/0/0 effects=NONE span=src#0:4..5 origin=-
