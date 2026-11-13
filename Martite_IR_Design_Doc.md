@@ -142,7 +142,7 @@ Complete for the current language (each kind has fixed arity and child roles):
 
 Initial lowering keeps `match` as ordered arms: pattern (variant index, struct field offsets, binding slots), optional guard, body. Patterns charge nothing; only guard and body expressions do.
 
-Matching is **two-phase**: a pure *test* walks the value with no writes; on success the arm's binding slots are written, then the guard runs; if the guard fails, those slots are cleared (restored to their pre-arm state) before the next arm is tried. This reproduces today's undo log and keeps failed arms out of the memory census (rule M2). Or-patterns bind the matched alternative (confirm against `match_pattern`; `bind_pattern` binds only the first alternative today).
+Matching is **two-phase**: a pure *test* walks the value with no writes; on success the arm's binding slots are written, then the guard runs; if the guard fails, those slots are cleared (restored to their pre-arm state) before the next arm is tried. This reproduces today's undo log and keeps failed arms out of the memory census (rule M2). Or-patterns bind the matched alternative: `match_pattern` tries alternatives in order and rolls back bindings between them. All alternatives bind the same names with the same types (checker E303) and share one `BindingId`, so lowering uses one slot per binding. `bind_pattern` binds only the first alternative, which is correct because it is only used for `let`, `for` and lambda parameters, where every alternative must be irrefutable (E302). Lowering uses the first alternative in those positions and the matched one in `match`.
 
 Decision-tree compilation is a later optimization and changes no fuel behavior, since patterns are free.
 
@@ -158,7 +158,9 @@ Evaluation of a call with `mut` arguments is, in order:
 
 The IR encodes this directly as `ArgMode::MutPlace(place)` plus the order above; there is no separate writeback list. Today step 2 makes the callee's first mutation copy the container (charged), see section 14, item 2. Handlers follow the same convention: state is the first (`self`) argument, and the updated state is written back to the embedder on success only.
 
-*Open:* whether `f(mut xs, mut xs)` is rejected by the checker. The IR verifier should assert distinct roots for `mut` arguments.
+The checker rejects two arguments of one call that share a root variable when either is `mut` (E403; the receiver counts for user methods). The IR verifier asserts distinct roots for `mut` arguments as a backstop. Known gap: a `mut` use nested inside another argument, as in `f(mut xs, g(mut xs))`, is not seen by E403, and `f`'s writeback overwrites `g`'s update. Tracked in #117.
+
+The step 2 copy is not a contract. Lowering reproduces it under Exact charging so thresholds stay identical; section 14, item 2 covers removing it.
 
 ### 6.5 Generics
 
@@ -182,7 +184,7 @@ pub struct Entries {
 
 ### 6.7 Constants and literals
 
-Constants and static string literals live in pools. First use in a run allocates and is accounted once; later uses share the payload and still charge their bytes (`div_ceil(len, 8)`) on every use, as today. Today the "first use" cache survives `reset()`, so accounting is history-dependent across invocations on one `Runtime`. The IR defines it as **once per `Runtime`** (preserving behavior) and flags per-invocation accounting as a candidate change (section 14).
+Constants and static string literals live in pools. First use in a run allocates and is accounted once; later uses share the payload and still charge their bytes (`div_ceil(len, 8)`) on every use, as today. Today the "first use" cache survives `reset()`, so accounting is history-dependent across invocations on one `Runtime`. The IR defines it as **once per `Runtime`** (preserving behavior) and flags per-invocation accounting as a candidate change (section 14). The "already accounted" state lives in `Runtime`, not in `IrProgram`, so changing to per-invocation accounting (section 14, item 5) does not change the snapshot format.
 
 ### 6.8 Node layout (scaffold decision)
 
@@ -215,7 +217,7 @@ Applies to every backend and every optimizer configuration. "Observable" is stat
   - `for`: the iterable is evaluated once and iterated as a snapshot of its value at loop start.
 - **Traps** (overflow, divide by zero, bounds, assert/panic, out of fuel, out of memory, depth, host fault) occur with the same kind at an equivalent point: every side effect before the trap in source order has happened and none after. Host calls charge fuel *after* the host returns, so a host's side effects precede an `OutOfFuel` raised by that call.
 - **Short-circuit** forms (`and`, `or`, `??`, `if`, `match`) evaluate only what the language says.
-- **Depth** has two parts: (a) *call depth*: one counted frame per user-function or closure call, with the check `frames.len() >= limit` applied also at host calls and builtin-invoked closures without pushing a frame; (b) *value depth*: nesting above `MAX_VALUE_DEPTH` (128) in constructed values, writes and returned values also reports `DepthExceeded`. Syntactic nesting is bounded by the parser, which bounds the evaluator's Rust recursion; the IR keeps that dependency explicit.
+- **Depth** has two parts: (a) *call depth*: one counted frame per user-function or closure call, with the check `frames.len() >= limit` applied also at host calls and builtin-invoked closures without pushing a frame; (b) *value depth*: nesting above `MAX_VALUE_DEPTH` (128) in constructed values, writes and returned values also reports `DepthExceeded`. The parser's `nesting_depth` does not bound tree depth: operator, postfix, `and`/`or` and `else if` chains build deep trees without increasing it. The IR therefore carries its own fixed maximum node depth, enforced by lowering and the verifier, and passes that would exceed it are refused. The evaluator, verifier and printer must guard or avoid unbounded recursion.
 - **Rule S1 (sharing is semantic).** Copy-on-write is charged: mutating a list, map, struct or tuple whose reference is shared charges its slot count and accounts an allocation. Therefore the number of live references to a container at each mutation is observable through fuel and memory. A slot read of a heap-typed value is `Share` (adds a reference). A pass under `Preserve` may not add, remove, move or duplicate a heap-typed slot read, or change a slot's liveness across a mutation of the same container. `Take` (move out) is a `Reduce`-class change.
 - **Rule M1 (safepoints).** `OutOfMemory` and `Deadline` may only be raised at safepoints (8.3). Safepoints are explicit and `Preserve` passes may not remove or merge them.
 - **Rule M2 (liveness).** The memory census scans all *slots of all live frames* plus captures, deduplicating shared payloads. Slots are never cleared before frame exit, except an arm's binding slots on guard failure (6.3). So lowering uses one slot per binding with no reuse, and no pass may reuse, clear or elide a heap-valued slot write under `Preserve`.
@@ -339,6 +341,7 @@ Runs after lowering and, in tests and debug builds, after each pass. Checks:
 - **Definite assignment:** every slot read is dominated by a write (this replaces the interpreter's runtime "unbound local" check).
 - Stored `effects` are a superset of recomputed effects; stored `charge` equals what the policy allows; safepoints present where lowering put them.
 - Host calls reference only hosts whose module appears in `IrProgram.grants` (defense in depth; the resolver already enforces grants).
+- Node depth per function is within the IR's maximum depth (section 7).
 - Every node has a span; every function has a source id.
 
 ## 13. Testing strategy
@@ -382,10 +385,10 @@ Each is separate, edition-gated, and lands with updated goldens. **These items a
 ## 17. Risks and open questions
 
 - **Cadence and Coalesced charging:** decided in section 14, item 1; until then, Exact only.
-- **Intent of the mutable-argument copy:** confirm with a measurement before treating it as a contract (6.4).
-- **Aliasing in `mut` arguments:** confirm the checker rejects repeated roots.
-- **Closure capture layout:** by-value snapshot; must match the `closures` and `captures` fixtures.
-- **Stack depth:** recursive evaluation depends on the parser's `nesting_depth` bound; keep that explicit if the IR gets deeper trees than the AST (for example after inlining).
+- **Intent of the mutable-argument copy:** reproduced, not a contract; confirm with the two snapshot cases listed in #117.
+- **Aliasing in `mut` arguments:** E403 covers direct place arguments; the nested-call case `f(mut xs, g(mut xs))` is open (#117).
+- **Closure capture layout:** by-value snapshot, confirmed against `closures/lambdas_capture_by_value`.
+- **Stack depth:** the parser limit does not bound evaluator recursion. The IR enforces its own depth limit and the evaluator needs a recursion guard (#117).
 - **Edition gating:** every section 14 item and any `Reduce` pass is edition-gated; the IR shape itself is not.
 - **Two representations to maintain** (AST and IR): mitigated by keeping lint and fmt on the AST and the IR strictly downstream.
 
