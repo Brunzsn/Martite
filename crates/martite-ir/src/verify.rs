@@ -3,7 +3,8 @@
 //! The verifier is the contract enforcement point for lowering and every pass.
 //! It checks ids, ownership, the tree property, node roles and types, calls,
 //! control flow, charge schedules, safepoints and stored effects. Definite
-//! assignment and slot liveness live in #102.
+//! assignment, one-initialization-site-per-slot and the on-demand slot
+//! analyses are provided by [`crate::analysis`].
 //!
 //! [`verify`] returns the first error. [`verify_after_pass`] is the hook for the
 //! pass manager: it verifies in tests and debug builds and is a no-op in
@@ -13,6 +14,7 @@ use std::fmt;
 
 use martite_base::{SourceId, Span};
 
+use crate::analysis::{DefiniteAssignment, check_slot_initialization};
 use crate::builtin::{BuiltinMethodDef, BuiltinReceiver};
 use crate::charge::Charge;
 use crate::effects::Effects;
@@ -122,6 +124,16 @@ pub enum VerifyErrorKind {
         slots: usize,
     },
     SlotInfo {
+        slot: Slot,
+        context: &'static str,
+    },
+    /// A slot read that is not definitely assigned.
+    UnboundSlot {
+        slot: Slot,
+        context: &'static str,
+    },
+    /// A slot with no initialization site or more than one.
+    SlotBinding {
         slot: Slot,
         context: &'static str,
     },
@@ -314,6 +326,16 @@ impl fmt::Display for VerifyErrorKind {
             }
             Self::SlotInfo { slot, context } => {
                 write!(f, "slot #{} is invalid ({context})", slot.0)
+            }
+            Self::UnboundSlot { slot, context } => {
+                write!(f, "read of unassigned slot #{} ({context})", slot.0)
+            }
+            Self::SlotBinding { slot, context } => {
+                write!(
+                    f,
+                    "slot #{} has an invalid initialization ({context})",
+                    slot.0
+                )
             }
             Self::Param { index, context } => write!(f, "parameter {index} is invalid ({context})"),
             Self::Capture { index, context } => {
@@ -1205,7 +1227,19 @@ impl<'a> Verifier<'a> {
                 Ok(())
             }
             Pattern::Or(items) => {
+                let mut first: Option<Vec<Slot>> = None;
                 for item in items {
+                    let slots = crate::analysis::pattern_binding_set(item);
+                    match &first {
+                        None => first = Some(slots),
+                        Some(expected) if *expected != slots => {
+                            return Err(error(VerifyErrorKind::PatternShape {
+                                pattern: id,
+                                context: "or-pattern alternatives bind different slots",
+                            }));
+                        }
+                        Some(_) => {}
+                    }
                     self.check_pattern_structure(function, id, item)?;
                 }
                 Ok(())
@@ -1426,6 +1460,28 @@ impl<'p> FnCheck<'p> {
                     },
                 ));
             }
+        }
+
+        if let Err(error) = DefiniteAssignment::compute(self.program, self.function) {
+            return Err(self.error(
+                Some(error.node),
+                VerifyErrorKind::UnboundSlot {
+                    slot: error.slot,
+                    context: error.context,
+                },
+            ));
+        }
+        if let Err(error) = check_slot_initialization(self.program, self.function) {
+            return Err(VerifyError {
+                function: Some(self.function.id),
+                source: Some(self.function.source),
+                node: error.node,
+                span: error.node.and_then(|node| self.function.span(node)),
+                kind: VerifyErrorKind::SlotBinding {
+                    slot: error.slot,
+                    context: error.context,
+                },
+            });
         }
         Ok(())
     }
@@ -5654,7 +5710,7 @@ fn method_calls_closure(name: &str) -> bool {
     )
 }
 
-fn children_of(program: &IrProgram, function: &IrFn, node: Node) -> Vec<IrId> {
+pub(crate) fn children_of(program: &IrProgram, function: &IrFn, node: Node) -> Vec<IrId> {
     let mut children = Vec::new();
     match node.kind {
         NodeKind::Field { base, .. }

@@ -46,7 +46,8 @@ define_id!(
 );
 define_id!(
     /// Identifies a frame slot in one function. Slots are never reused across
-    /// bindings (design section 7, rule M2).
+    /// bindings (design section 7, rule M2); the verifier enforces one
+    /// initialization site per slot.
     Slot
 );
 define_id!(

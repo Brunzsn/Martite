@@ -220,7 +220,7 @@ Applies to every backend and every optimizer configuration. "Observable" is stat
 - **Depth** has two parts: (a) *call depth*: one counted frame per user-function or closure call, with the check `frames.len() >= limit` applied also at host calls and builtin-invoked closures without pushing a frame; (b) *value depth*: nesting above `MAX_VALUE_DEPTH` (128) in constructed values, writes and returned values also reports `DepthExceeded`. The parser's `nesting_depth` does not bound tree depth: operator, postfix, `and`/`or` and `else if` chains build deep trees without increasing it. The IR therefore carries its own fixed maximum node depth, enforced by lowering and the verifier, and passes that would exceed it are refused. The evaluator, verifier and printer must guard or avoid unbounded recursion.
 - **Rule S1 (sharing is semantic).** Copy-on-write is charged: mutating a list, map, struct or tuple whose reference is shared charges its slot count and accounts an allocation. Therefore the number of live references to a container at each mutation is observable through fuel and memory. A slot read of a heap-typed value is `Share` (adds a reference). A pass under `Preserve` may not add, remove, move or duplicate a heap-typed slot read, or change a slot's liveness across a mutation of the same container. `Take` (move out) is a `Reduce`-class change.
 - **Rule M1 (safepoints).** `OutOfMemory` and `Deadline` may only be raised at safepoints (8.3). Safepoints are explicit and `Preserve` passes may not remove or merge them.
-- **Rule M2 (liveness).** The memory census scans all *slots of all live frames* plus captures, deduplicating shared payloads. Slots are never cleared before frame exit, except an arm's binding slots on guard failure (6.3). So lowering uses one slot per binding with no reuse, and no pass may reuse, clear or elide a heap-valued slot write under `Preserve`.
+- **Rule M2 (liveness).** The memory census scans all *slots of all live frames* plus captures, deduplicating shared payloads. Slots are never cleared before frame exit, except an arm's binding slots on guard failure (6.3). So lowering uses one slot per binding with no reuse, and no pass may reuse, clear or elide a heap-valued slot write under `Preserve`. The verifier enforces the static half: every slot has exactly one initialization site.
 - **Determinism:** same program and inputs produce the same result and the same observable sequence. No iteration over unordered containers may leak into output; `OrderedMap` is insertion-ordered.
 
 ## 8. Fuel model
@@ -297,7 +297,7 @@ Rules:
 Inputs: `CheckedProgram` (resolved program, `expr_types`, `resolutions`, `pattern_resolutions`, `struct_lit_fields`, `struct_pattern_fields`, `pattern_bindings`, `LambdaInfo`, `FnSig`, `ConstInfo`, entries).
 
 1. Allocate an `FnId` for every function, method, handler, test, hook, host function and lambda; record `source` per function.
-2. Assign one slot to every `BindingId` a function declares; parameters first. No reuse.
+2. Assign one slot to every `BindingId` a function declares; parameters first. No reuse. Every slot has exactly one initialization site: a parameter (plus its destructuring pattern), a `Let`/`For`/match-arm pattern binding, or a `SlotInit` node.
 3. Walk each body once. For every expression read its type and resolution and emit a node with kind, type, charge schedule (8.1), effects and span.
 4. Resolve method calls to `FnId`s and builtin methods to a builtin id plus receiver kind; resolve host functions to `HostFnInfo` (including the opaque-handle return type).
 5. Lower patterns (6.3), lambdas (separate fns with capture lists), constants and static strings (pools).
@@ -338,7 +338,7 @@ Runs after lowering and, in tests and debug builds, after each pass. Checks:
 - Each node kind has the right number and roles of children; types match the kind (including `Binary` operand class).
 - Call arity and argument types match the callee; `MutPlace` roots are distinct; no `mut` arguments on `CallValue`.
 - `break`/`continue` only inside a loop in the same function; `return`/`Try` types match `IrFn.ret`.
-- **Definite assignment:** every slot read is dominated by a write (this replaces the interpreter's runtime "unbound local" check).
+- **Definite assignment and slot binding:** every slot read is dominated by a write (this replaces the interpreter's runtime "unbound local" check). Parameters are written at function entry and a `MakeClosure` reads its target's capture slots from the enclosing frame; a `Take` read unassigns its slot; unreachable code is vacuously assigned. Each slot has exactly one initialization site, so lowering cannot reuse a slot and a pass cannot remap one binding onto another. The forward must-analysis and the backward use-liveness query live in `martite-ir::analysis` and are computed on demand, never stored on nodes.
 - Stored `effects` are a superset of recomputed effects; stored `charge` equals what the policy allows; safepoints present where lowering put them.
 - Host calls reference only hosts whose module appears in `IrProgram.grants` (defense in depth; the resolver already enforces grants).
 - Node depth per function is within the IR's maximum depth (section 7).
@@ -350,7 +350,7 @@ Runs after lowering and, in tests and debug builds, after each pass. Checks:
 - **Differential, migration:** AST interpreter versus IR evaluator on all of the above while both exist; afterwards IR versus snapshots.
 - **Golden fuel table:** the existing `FuelRow` cases run against the IR evaluator unchanged, including the copy-on-write rows.
 - **Add missing cases** found in the code review: `mut`-parameter and handler-state fuel; lambda traps across modules (to pin the source-file behavior); `for` over a list the body mutates; `Try` in lambdas; compound assignment versus the written-out form; fuel exactly at the limit.
-- **Verifier tests:** hand-built invalid IR per invariant.
+- **Verifier tests:** hand-built invalid IR per invariant, including read-before-write, loop first-iteration reads, guard-failed arm bindings, empty capture lists and slot reuse.
 - **Optimizer differential (when passes exist):** off versus on for every fixture and the fuzz corpus; under `Preserve`, fuel, trap and all three thresholds must match exactly.
 - **Property tests:** random well-typed programs (extend `fuzz_corpus`) through lower, verify, optimize, verify, execute, with limit sweeps.
 - **Benchmarks:** lowering time and IR execution reported separately from parse and check; each pass lands with a benchmark delta.

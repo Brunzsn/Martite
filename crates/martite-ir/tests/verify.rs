@@ -1867,3 +1867,153 @@ fn rejects_uncallable_builtin_item() {
         VerifyErrorKind::Builtin { .. } | VerifyErrorKind::Arity { .. }
     ));
 }
+
+#[test]
+fn rejects_read_before_let_binding() {
+    let mut program = valid_program();
+    // Move the print after the let but before it: [ExprStmt, Let, Assign, Return].
+    program.fns[0].children[1] = IrId::new(9);
+    program.fns[0].children[2] = IrId::new(1);
+    program.fns[0].children[3] = IrId::new(6);
+    assert!(matches!(
+        error_kind(program),
+        VerifyErrorKind::UnboundSlot { slot, .. } if slot == Slot::new(0)
+    ));
+}
+
+#[test]
+fn rejects_second_slot_initialization() {
+    let mut program = valid_program();
+    let int = program.fns[0].slot_info[0].ty;
+    let value = IrId::new(program.fns[0].nodes.len() as u32);
+    program.fns[0].nodes.push(node(
+        NodeKind::Int(ConstId::new(0)),
+        int,
+        Charge::expression(),
+        Effects::NONE,
+    ));
+    program.fns[0].spans.push(Span::empty(0));
+    program.fns[0].synthetic.push(None);
+    program.fns[0].safepoints.push(false);
+
+    let pattern = PatternId::new(program.fns[0].patterns.len() as u32);
+    program.fns[0].patterns.push(Pattern::Bind {
+        slot: Slot::new(0),
+        ty: int,
+    });
+    let unit = program.fns[0].ret;
+    let second = IrId::new(program.fns[0].nodes.len() as u32);
+    program.fns[0].nodes.push(node(
+        NodeKind::Let { pattern, value },
+        unit,
+        Charge::ZERO,
+        Effects::WRITES_LOCAL,
+    ));
+    program.fns[0].spans.push(Span::empty(0));
+    program.fns[0].synthetic.push(None);
+    program.fns[0].safepoints.push(true);
+    program.fns[0].children.push(second);
+    if let NodeKind::Block(range) = &mut program.fns[0].nodes[11].kind {
+        range.len += 1;
+    }
+
+    let error = program.verify().expect_err("second init");
+    assert_eq!(error.node, Some(second));
+    assert!(
+        matches!(error.kind, VerifyErrorKind::SlotBinding { slot, .. } if slot == Slot::new(0)),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn rejects_missing_slot_initialization() {
+    let mut program = valid_program();
+    let unit = program.fns[0].ret;
+    program.fns[0].nodes[1] = node(
+        NodeKind::SlotWrite {
+            slot: Slot::new(0),
+            value: IrId::new(0),
+        },
+        unit,
+        Charge::ZERO,
+        Effects::WRITES_LOCAL,
+    );
+    program.fns[0].safepoints[1] = false;
+    assert!(matches!(
+        error_kind(program),
+        VerifyErrorKind::SlotBinding { slot, .. } if slot == Slot::new(0)
+    ));
+}
+
+#[test]
+fn rejects_closure_created_before_capture_is_initialized() {
+    let mut program = valid_closure_program();
+    program.fns[0].children = vec![IrId::new(3), IrId::new(1), IrId::new(4)];
+    let error = program.verify().expect_err("capture read before init");
+    assert_eq!(error.node, Some(IrId::new(2)));
+    assert!(matches!(
+        error.kind,
+        VerifyErrorKind::UnboundSlot { slot, .. } if slot == Slot::new(0)
+    ));
+}
+
+#[test]
+fn rejects_capture_read_with_empty_capture_list() {
+    let mut program = valid_closure_program();
+    program.fns[1].captures.clear();
+    assert!(matches!(
+        error_kind(program),
+        VerifyErrorKind::Capture { .. }
+    ));
+}
+
+#[test]
+fn accepts_parameter_read_at_entry() {
+    let program = valid_call_and_mut_program();
+    program.verify().expect("parameters are written at entry");
+}
+
+#[test]
+fn unbound_slot_error_names_slot_function_and_span() {
+    let mut program = valid_program();
+    program.fns[0].children[1] = IrId::new(9);
+    program.fns[0].children[2] = IrId::new(1);
+    program.fns[0].children[3] = IrId::new(6);
+    program.fns[0].spans[7] = Span::new(5, 9);
+    let error = program.verify().expect_err("read before let");
+    assert_eq!(error.node, Some(IrId::new(7)));
+    assert!(matches!(
+        error.kind,
+        VerifyErrorKind::UnboundSlot { slot, .. } if slot == Slot::new(0)
+    ));
+    let text = error.to_string();
+    assert!(text.contains("fn #0"), "{text}");
+    assert!(text.contains("slot #0"), "{text}");
+    assert!(text.contains("at 5..9"), "{text}");
+}
+
+#[test]
+fn rejects_or_pattern_alternatives_that_bind_different_slots() {
+    let mut program = valid_program();
+    let int = program.fns[0].slot_info[0].ty;
+    program.fns[0].locals = 2;
+    program.fns[0].slot_info.push(SlotInfo {
+        ty: int,
+        mutable: false,
+        name: None,
+    });
+    program.fns[0].patterns[0] = Pattern::Or(vec![
+        Pattern::Bind {
+            slot: Slot::new(0),
+            ty: int,
+        },
+        Pattern::Bind {
+            slot: Slot::new(1),
+            ty: int,
+        },
+    ]);
+    assert!(matches!(
+        error_kind(program),
+        VerifyErrorKind::PatternShape { .. }
+    ));
+}

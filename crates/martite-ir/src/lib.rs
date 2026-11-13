@@ -3,9 +3,10 @@
 //! This crate is the data model between the checker and the runtime. Lowering
 //! from `CheckedProgram` starts in #103; the crate currently owns the type,
 //! builtin and id vocabulary that lowering and the runtime share, a
-//! deterministic text printer ([`Printer`]) for dumps and golden tests, and
-//! the verifier ([`verify`]) that enforces the contract between lowering and
-//! every pass. There is no evaluator, lowering or optimizer here yet.
+//! deterministic text printer ([`Printer`]) for dumps and golden tests, the
+//! verifier ([`verify`]) that enforces the contract between lowering and
+//! every pass, and the on-demand slot analyses in [`analysis`]. There is no
+//! evaluator, lowering or optimizer here yet.
 //!
 //! Dependency direction: `martite-ir` may depend on `martite-base`,
 //! `martite-fuel`, `martite-syntax` and `martite-check` for lowering inputs,
@@ -32,6 +33,7 @@
 //! the arenas whose payloads do not fit on a node. They are indexed by the ids
 //! in [`id`], and [`verify`] checks that they stay parallel to `nodes`.
 
+pub mod analysis;
 pub mod builtin;
 pub mod charge;
 pub mod effects;
