@@ -181,6 +181,12 @@ pub struct Entries {
 
 Constants and static string literals live in pools. First use in a run allocates and is accounted once; later uses share the payload and still charge their bytes (`div_ceil(len, 8)`) on every use, as today. Today the "first use" cache survives `reset()`, so accounting is history-dependent across invocations on one `Runtime`. The IR defines it as **once per `Runtime`** (preserving behavior) and flags per-invocation accounting as a candidate change (section 14).
 
+### 6.8 Node layout (scaffold decision)
+
+`martite-ir` pins `size_of::<Node>() == 32`: a 12-byte `NodeKind`, the 4-byte `TyId`, the 12-byte `Charge` and the 4-byte `Effects`. `NodeKind`'s variant is the operator or kind discriminator. Fixed-arity children are inline (at most two `IrId`s or one `ChildRange`); variable-arity children live in a per-function `Vec<IrId>`. The binary operand class is derived from the node and child types instead of being stored, and `Int`/`Float` literal payloads live in the const pool; both decisions keep `NodeKind` 4-byte aligned and within 12 bytes.
+
+Spans and synthetic origins are parallel side vectors on `IrFn`. Pattern, match-arm, string-interpolation and struct-update payloads use per-function side arenas so they do not enlarge a node. The size budget is pinned by `crates/martite-ir/tests/layout.rs`.
+
 ## 7. Semantics contract
 
 Applies to every backend and every optimizer configuration. "Observable" is stated precisely, and includes more than the final value and trap kind.

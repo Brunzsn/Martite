@@ -8,6 +8,7 @@ const CRATES: &[&str] = &[
     "martite-config",
     "martite-resolve",
     "martite-check",
+    "martite-ir",
     "martite-runtime",
     "martite-driver",
     "martite-lint",
@@ -49,4 +50,19 @@ fn benchmarks_are_isolated_from_production_crates() {
             "{name} must not depend on benchmark-only tooling"
         );
     }
+}
+
+#[test]
+fn ir_stays_above_the_runtime() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let manifest =
+        fs::read_to_string(root.join("crates/martite-ir/Cargo.toml")).expect("read IR manifest");
+    assert!(
+        !manifest.contains("martite-runtime"),
+        "martite-ir must not depend on the runtime"
+    );
+    assert!(
+        !manifest.contains("martite-bench"),
+        "martite-ir must not depend on the benchmark crate"
+    );
 }
