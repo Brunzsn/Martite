@@ -1,17 +1,19 @@
+use std::collections::HashMap;
+
 use martite_base::Span;
-use martite_check::{BindingId, Resolution, Ty as CheckTy};
-use martite_syntax::{Block, Expr};
+use martite_check::{BindingId, LambdaInfo, Resolution, Ty as CheckTy};
+use martite_syntax::{Block, Expr, LambdaBody, PatKind};
 
 use crate::charge::Charge;
 use crate::effects::Effects;
-use crate::id::{ConstId, MatchSetId, Slot, StrId};
+use crate::id::{CaptureIndex, ConstId, MatchSetId, Slot, StrId};
 use crate::node::{ChildRange, Node, NodeKind, StrPart};
 use crate::pattern::{MatchSet, Pattern, StructLayout};
 use crate::program::IrFn;
 use crate::types::TyId;
 use crate::{ConstValue, IrId, PatternId, StructLayoutId};
 
-use super::{LowerError, Lowerer, SlotPlan};
+use super::{BodySource, LowerError, Lowerer, SlotPlan};
 
 /// Where a pattern is being lowered.
 ///
@@ -28,23 +30,69 @@ pub(crate) struct FnLowerer<'a, 'p> {
     pub(crate) lowerer: &'a mut Lowerer<'p>,
     pub(crate) function: IrFn,
     pub(crate) plan: SlotPlan,
+    /// Captured bindings available in this lambda's frame.
+    pub(crate) captures: HashMap<BindingId, CaptureIndex>,
     depth: u32,
 }
 
 impl<'a, 'p> FnLowerer<'a, 'p> {
-    pub(crate) fn new(lowerer: &'a mut Lowerer<'p>, function: IrFn, plan: SlotPlan) -> Self {
+    pub(crate) fn new(
+        lowerer: &'a mut Lowerer<'p>,
+        function: IrFn,
+        plan: SlotPlan,
+        captures: HashMap<BindingId, CaptureIndex>,
+    ) -> Self {
         Self {
             lowerer,
             function,
             plan,
+            captures,
             depth: 0,
         }
     }
 
-    pub(crate) fn lower_function(mut self, block: &Block) -> Result<IrFn, LowerError> {
-        let body = self.lower_function_block(block)?;
+    pub(crate) fn lower_body(mut self, body: BodySource<'_>) -> Result<IrFn, LowerError> {
+        let body = match body {
+            BodySource::Block(block) => self.lower_function_block(block)?,
+            BodySource::Lambda(LambdaBody::Block(block)) => self.lower_function_block(&block)?,
+            BodySource::Lambda(LambdaBody::Expr(expr)) => self.lower_lambda_expr_body(&expr)?,
+        };
         self.function.body = Some(body);
         Ok(self.function)
+    }
+
+    /// Lower the destructured parameter patterns of a lambda.
+    ///
+    /// Plain bindings already own the parameter slots; only patterns need a
+    /// `Pattern` payload.
+    pub(crate) fn lower_lambda_params(&mut self, info: &LambdaInfo) -> Result<(), LowerError> {
+        for (index, param) in info.params.iter().enumerate() {
+            if matches!(param.pattern.kind, PatKind::Bind(_)) {
+                continue;
+            }
+            let span = param.span;
+            let pattern = self.lower_pattern(&param.pattern, PatternPosition::Binding)?;
+            if index >= self.function.params.len() {
+                return Err(self.internal(span, "lambda parameter is out of range"));
+            }
+            self.function.params[index].pattern = Some(pattern);
+        }
+        Ok(())
+    }
+
+    fn lower_lambda_expr_body(&mut self, expr: &Expr) -> Result<IrId, LowerError> {
+        let value = self.lower_expr(expr)?;
+        let ty = self.node_ty(value);
+        let unit = self.unit();
+        let stmt = self.push(
+            NodeKind::ExprStmt(value),
+            unit,
+            Charge::ZERO,
+            expr.span,
+            true,
+        );
+        let range = self.append_children(vec![stmt]);
+        Ok(self.push(NodeKind::Block(range), ty, Charge::ZERO, expr.span, true))
     }
 
     pub(crate) fn unit(&self) -> TyId {
@@ -93,14 +141,6 @@ impl<'a, 'p> FnLowerer<'a, 'p> {
             .node(id)
             .map(|node| node.ty)
             .unwrap_or_else(|| self.unit())
-    }
-
-    pub(crate) fn slot_for(&self, binding: BindingId, span: Span) -> Result<Slot, LowerError> {
-        self.plan
-            .binding_slots
-            .get(&binding)
-            .copied()
-            .ok_or_else(|| self.internal(span, "binding has no frame slot"))
     }
 
     pub(crate) fn push(

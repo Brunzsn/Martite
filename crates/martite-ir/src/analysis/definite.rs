@@ -258,7 +258,9 @@ impl<'a> Analyzer<'a> {
             NodeKind::MakeClosure(target) => {
                 if let Some(target) = self.program.function(target) {
                     for capture in &target.captures {
-                        self.require(id, capture.outer, state, "capture read")?;
+                        if let crate::program::CaptureSource::Slot(slot) = capture.source {
+                            self.require(id, slot, state, "capture read")?;
+                        }
                     }
                 }
                 Some(state.clone())

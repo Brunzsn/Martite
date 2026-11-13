@@ -192,7 +192,9 @@ impl<'a> Analyzer<'a> {
                 let mut before = after.clone();
                 if let Some(target) = self.program.function(target) {
                     for capture in &target.captures {
-                        before.insert(capture.outer);
+                        if let crate::program::CaptureSource::Slot(slot) = capture.source {
+                            before.insert(slot);
+                        }
                     }
                 }
                 (before, after.clone())

@@ -780,7 +780,7 @@ fn valid_closure_program() -> IrProgram {
         locals: 0,
         slot_info: Vec::new(),
         captures: vec![CaptureInfo {
-            outer: Slot::new(0),
+            source: martite_ir::CaptureSource::Slot(Slot::new(0)),
             ty: int,
             name: Some("value".into()),
         }],
@@ -1715,7 +1715,28 @@ fn rejects_bad_entry_function() {
 #[test]
 fn rejects_out_of_range_capture() {
     let mut program = valid_closure_program();
-    program.fns[1].captures[0].outer = Slot::new(99);
+    program.fns[1].captures[0].source = martite_ir::CaptureSource::Slot(Slot::new(99));
+    assert!(matches!(
+        error_kind(program),
+        VerifyErrorKind::Capture { .. }
+    ));
+}
+
+#[test]
+fn rejects_out_of_range_capture_source() {
+    let mut program = valid_closure_program();
+    program.fns[1].captures[0].source =
+        martite_ir::CaptureSource::Capture(martite_ir::CaptureIndex::new(0));
+    assert!(matches!(
+        error_kind(program),
+        VerifyErrorKind::Capture { .. }
+    ));
+}
+
+#[test]
+fn rejects_captures_on_non_lambda_functions() {
+    let mut program = valid_closure_program();
+    program.fns[0].captures = program.fns[1].captures.clone();
     assert!(matches!(
         error_kind(program),
         VerifyErrorKind::Capture { .. }

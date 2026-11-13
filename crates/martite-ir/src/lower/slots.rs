@@ -1,15 +1,23 @@
 //! Binding collection and frame-slot assignment.
 //!
 //! Rule M2: one slot per declared binding, no reuse. Parameters already own
-//! the first slots; body bindings are collected from the AST, including
-//! patterns in unreachable code, and sorted by `BindingId` for a stable frame
-//! layout. The `pattern_bindings` checker side table is read once here and the
-//! resulting `NodeId -> Slot` map is reused by the pattern lowerer.
+//! the first slots; body bindings, including destructured lambda parameter
+//! patterns and patterns in unreachable code, are collected from the AST and
+//! sorted by `BindingId` for a stable frame layout. The `pattern_bindings`
+//! checker side table is read once here and the resulting `NodeId -> Slot` map
+//! is reused by the pattern lowerer.
 
 use std::collections::{HashMap, HashSet};
 
 use martite_check::{BindingId, CheckedProgram};
 use martite_syntax::{Block, Expr, ExprKind, MatchBody, NodeId, PatKind, Pattern, Stmt, StmtKind};
+
+/// The root of a function body for slot planning.
+#[derive(Clone, Copy)]
+pub(crate) enum BodyRoot<'a> {
+    Block(&'a Block),
+    Expr(&'a Expr),
+}
 
 use crate::id::Slot;
 use crate::program::SlotInfo;
@@ -32,8 +40,9 @@ impl SlotPlan {
 pub(crate) fn plan_slots(
     program: &CheckedProgram,
     types: &mut TypeTable,
-    block: &Block,
+    root: BodyRoot<'_>,
     first_slot: u32,
+    parameter_patterns: &[&Pattern],
 ) -> Result<(SlotPlan, Vec<SlotInfo>), LowerError> {
     let mut walker = Walker {
         program,
@@ -41,7 +50,13 @@ pub(crate) fn plan_slots(
         seen: HashSet::new(),
         pattern_bindings: HashMap::new(),
     };
-    walker.walk_block(block)?;
+    for pattern in parameter_patterns {
+        walker.walk_pattern(pattern)?;
+    }
+    match root {
+        BodyRoot::Block(block) => walker.walk_block(block)?,
+        BodyRoot::Expr(expr) => walker.walk_expr(expr)?,
+    }
 
     let mut bindings = walker.bindings;
     bindings.sort_unstable_by_key(|(_, binding)| binding.0);

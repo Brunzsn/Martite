@@ -11,10 +11,12 @@ use martite_syntax::{
 
 use crate::builtin::BuiltinReceiver as IrBuiltinReceiver;
 use crate::charge::Charge;
-use crate::id::{BuiltinFnId, BuiltinItemId, BuiltinMethodId, IrId};
+use crate::id::{BuiltinFnId, BuiltinItemId, BuiltinMethodId, IrId, Slot};
 use crate::node::{AccessMode, NodeKind, StrPart};
 use crate::pattern::{MatchArm, MatchSet, Pattern};
-use crate::program::{ConstValue, FnKind, PreludeVariant};
+use crate::program::{
+    CaptureInfo, CaptureSource, ConstValue, FnKind, IrFn, ParamInfo, PreludeVariant, SlotInfo,
+};
 use crate::types::{TyId, TypeDefKind, TypeId};
 use crate::{PatternId, StructLayout};
 
@@ -122,7 +124,7 @@ impl FnLowerer<'_, '_> {
                 ))
             }
             ExprKind::Match { scrutinee, arms } => self.lower_match(expr, scrutinee, arms, ty),
-            ExprKind::Lambda { .. } => Err(self.unsupported(expr.span, "lambda")),
+            ExprKind::Lambda { .. } => self.lower_lambda(expr, ty),
             ExprKind::Block(block) => {
                 let (id, _) = self.lower_block(block, BlockKind::Expr, Some(ty))?;
                 Ok(id)
@@ -260,10 +262,15 @@ impl FnLowerer<'_, '_> {
         let resolution = self.resolution(expr)?;
         let node = match resolution {
             Resolution::Local(binding) => {
-                let slot = self.slot_for(binding, expr.span)?;
-                NodeKind::SlotRead {
-                    slot,
-                    mode: AccessMode::Share,
+                if let Some(slot) = self.plan.binding_slots.get(&binding).copied() {
+                    NodeKind::SlotRead {
+                        slot,
+                        mode: AccessMode::Share,
+                    }
+                } else if let Some(index) = self.captures.get(&binding).copied() {
+                    NodeKind::CaptureRead(index)
+                } else {
+                    return Err(self.internal(expr.span, "binding has no frame slot or capture"));
                 }
             }
             Resolution::Const(def) => NodeKind::ConstRef(self.const_ref(def, expr.span)?),
@@ -299,6 +306,123 @@ impl FnLowerer<'_, '_> {
             _ => return Err(self.internal(expr.span, "variable has no runtime value")),
         };
         Ok(self.push(node, ty, Charge::expression(), expr.span, false))
+    }
+
+    fn lower_lambda(&mut self, expr: &Expr, ty: TyId) -> Result<IrId, LowerError> {
+        let info = self
+            .lowerer
+            .program
+            .lambda(expr.id)
+            .cloned()
+            .ok_or_else(|| self.internal(expr.span, "lambda expression has no metadata"))?;
+        if let Some(id) = self.lowerer.lambda_ids.get(&expr.id).copied() {
+            return Ok(self.push(
+                NodeKind::MakeClosure(id),
+                ty,
+                Charge::expression(),
+                expr.span,
+                false,
+            ));
+        }
+        let check_ty = self
+            .lowerer
+            .program
+            .type_of(expr.id)
+            .cloned()
+            .ok_or_else(|| self.internal(expr.span, "lambda expression has no checked type"))?;
+        let martite_check::Ty::Fn(param_tys, ret_ty) = check_ty else {
+            return Err(self.internal(expr.span, "lambda expression is not a function type"));
+        };
+        if param_tys.len() != info.params.len() {
+            return Err(self.internal(
+                expr.span,
+                "lambda parameter count does not match its function type",
+            ));
+        }
+
+        let mut sources = Vec::with_capacity(info.captures.len());
+        for binding in &info.captures {
+            let source = if let Some(slot) = self.plan.binding_slots.get(binding).copied() {
+                CaptureSource::Slot(slot)
+            } else if let Some(index) = self.captures.get(binding).copied() {
+                CaptureSource::Capture(index)
+            } else {
+                return Err(self.internal(expr.span, "captured binding is not in scope"));
+            };
+            sources.push((*binding, source));
+        }
+
+        let mut params = Vec::with_capacity(info.params.len());
+        let mut slot_info = Vec::with_capacity(info.params.len());
+        for (index, (param, ty)) in info.params.iter().zip(&param_tys).enumerate() {
+            let ty = self.type_id(ty)?;
+            let plain = matches!(param.pattern.kind, PatKind::Bind(_));
+            let name: Box<str> = match &param.pattern.kind {
+                PatKind::Bind(name) if name != "_" => name.clone().into_boxed_str(),
+                _ => "_".into(),
+            };
+            params.push(ParamInfo {
+                slot: Slot::new(index as u32),
+                name: name.clone(),
+                ty,
+                mutable: false,
+                is_self: false,
+                pattern: None,
+            });
+            slot_info.push(SlotInfo {
+                ty,
+                mutable: false,
+                name: if plain { Some(name) } else { None },
+            });
+        }
+
+        let mut captures = Vec::with_capacity(sources.len());
+        for (binding, source) in sources {
+            let info = self.lowerer.program.bindings.get(&binding).ok_or_else(|| {
+                self.internal(expr.span, "captured binding has no checker metadata")
+            })?;
+            let ty = info.ty.clone();
+            let name = info.name.clone().into_boxed_str();
+            let ty = self.type_id(&ty)?;
+            captures.push(CaptureInfo {
+                source,
+                ty,
+                name: Some(name),
+            });
+        }
+
+        let ret = self.type_id(&ret_ty)?;
+        let id = crate::FnId::new(self.lowerer.fns.len() as u32);
+        self.lowerer.fns.push(IrFn {
+            id,
+            name: "<lambda>".into(),
+            source: self.function.source,
+            kind: FnKind::Lambda,
+            params,
+            ret,
+            locals: info.params.len() as u32,
+            slot_info,
+            captures,
+            patterns: Vec::new(),
+            matches: Vec::new(),
+            struct_layouts: Vec::new(),
+            str_parts: Vec::new(),
+            nodes: Vec::new(),
+            spans: Vec::new(),
+            synthetic: Vec::new(),
+            safepoints: Vec::new(),
+            children: Vec::new(),
+            body: None,
+        });
+        self.lowerer.lambda_ids.insert(expr.id, id);
+        self.lowerer.lambda_nodes.insert(id, expr.id);
+        Ok(self.push(
+            NodeKind::MakeClosure(id),
+            ty,
+            Charge::expression(),
+            expr.span,
+            false,
+        ))
     }
 
     fn lower_field(&mut self, expr: &Expr, base: &Expr, ty: TyId) -> Result<IrId, LowerError> {
@@ -890,8 +1014,14 @@ impl FnLowerer<'_, '_> {
         let node = match &expr.kind {
             ExprKind::Var(_) => match self.resolution(expr)? {
                 Resolution::Local(binding) => {
-                    let slot = self.slot_for(binding, expr.span)?;
-                    NodeKind::SlotPlace(slot)
+                    if let Some(slot) = self.plan.binding_slots.get(&binding).copied() {
+                        NodeKind::SlotPlace(slot)
+                    } else if self.captures.contains_key(&binding) {
+                        return Err(self
+                            .internal(expr.span, "captured variable is not an assignable place"));
+                    } else {
+                        return Err(self.internal(expr.span, "binding has no frame slot"));
+                    }
                 }
                 _ => return Err(self.internal(expr.span, "variable is not assignable")),
             },

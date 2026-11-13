@@ -273,11 +273,14 @@ impl<'a> Printer<'a> {
         }
         out.write_str("  captures:\n")?;
         for (index, capture) in captures.iter().enumerate() {
-            write!(
-                out,
-                "    #{} outer=slot#{} ty=ty#{} name=",
-                index, capture.outer.0, capture.ty.0
-            )?;
+            write!(out, "    #{} ", index)?;
+            match capture.source {
+                crate::CaptureSource::Slot(slot) => write!(out, "from=slot#{} ", slot.0)?,
+                crate::CaptureSource::Capture(capture) => {
+                    write!(out, "from=capture#{} ", capture.0)?
+                }
+            }
+            write!(out, "ty=ty#{} name=", capture.ty.0)?;
             match &capture.name {
                 Some(name) => {
                     write_quoted(out, name)?;

@@ -136,7 +136,9 @@ Complete for the current language (each kind has fixed arity and child roles):
 
 - A node is owned by one function's arena and referenced by `IrId`.
 - It is a **tree**: each node has one parent; no shared subtrees; a pass that wants to reuse a subtree clones it.
-- Lambdas are separate `IrFn`s. A closure value is `FnId + Rc<[Value]>` captures, copied by value at creation, matching today's semantics.
+- Lambdas are separate `IrFn`s named `<lambda>`. A closure value is `FnId + Rc<[Value]>` captures, copied by value at creation, matching today's semantics.
+- A lambda's `source` is the defining function's source. Lowering records that now; the AST interpreter's caller-source trap behavior (#118) must be preserved by the IR evaluator until #118 lands. The temporary inconsistency is deliberate and must stay until the separate fix.
+- Capture layout: `CaptureInfo.source` is either a `Slot` in the frame creating the closure or one of the creating lambda's own capture indices. The latter is how a nested lambda captures an ancestor binding without a synthetic slot: `fn(a) => fn(b) => base + a + b` gives the outer lambda a slot capture for `base`, and the inner lambda a `Capture` source for `base` plus a slot source for `a`. A lambda body always reads captured bindings with `CaptureRead`, never `SlotRead`. Captures belong only to `FnKind::Lambda`.
 
 ### 6.3 Patterns and `match`
 
@@ -181,6 +183,8 @@ pub struct Entries {
     pub entry_kind: EntryKind,            // Library | Script | Plugin
 }
 ```
+
+Lowering fills entries from the checker: `main`, `init` and `shutdown` by `FnId`; tests in source order; handlers sorted by name exactly as the checker's handler map (which includes `init` and omits `shutdown`, whose dedicated field is set instead); hooks sorted by name with their module path, signature, source and span; the state type, JSON type and entry kind converted into IR ids. Callers never consult the checker to resolve an entry.
 
 ### 6.7 Constants and literals
 
@@ -296,12 +300,14 @@ Rules:
 
 Inputs: `CheckedProgram` (resolved program, `expr_types`, `resolutions`, `pattern_resolutions`, `struct_lit_fields`, `struct_pattern_fields`, `pattern_bindings`, `LambdaInfo`, `FnSig`, `ConstInfo`, entries) and the `SourceMap` that names its `SourceId`s.
 
-1. Allocate an `FnId` for every function, method, handler, test, hook, host function and lambda; record `source` per function.
+1. Allocate an `FnId` for every function, method, handler, test, host function and lambda; hooks are signatures, not callable functions. Record `source` per function; a lambda inherits its defining function's source.
 2. Assign one slot to every `BindingId` a function declares; parameters first. No reuse. Every slot has exactly one initialization site: a parameter (plus its destructuring pattern), a `Let`/`For`/match-arm pattern binding, or a `SlotInit` node.
 3. Walk each body once. For every expression read its type and resolution and emit a node with kind, type, charge schedule (8.1), effects and span.
 4. Resolve method calls to `FnId`s and builtin methods to a builtin id plus receiver kind; resolve host functions to `HostFnInfo` (including the opaque-handle return type).
-5. Lower patterns (6.3), lambdas (separate fns with capture lists), constants and static strings (pools).
+5. Lower patterns (6.3), lambdas, constants and static strings (pools), then fill `Entries` (6.6).
 6. Run the verifier.
+
+Lambdas are allocated lazily when their expression is lowered, in parent-before-child order; sorting lambda `NodeId`s would visit an inner lambda first because the parser allocates a lambda's node after its body. A lambda's capture list is its checker-recorded free-variable set in sorted `BindingId` order. Each binding resolves to a local slot in the creating function or to one of its captures (6.2); `MakeClosure` carries the resulting list. Expression bodies lower as a zero-charge body `Block` with one zero-charge `ExprStmt` safepoint, so they keep a safepoint-bearing function body without adding expression fuel.
 
 Rules:
 
@@ -339,7 +345,8 @@ Runs after lowering and, in tests and debug builds, after each pass. Checks:
 - Each node kind has the right number and roles of children; types match the kind (including `Binary` operand class).
 - Call arity and argument types match the callee; `MutPlace` roots are distinct; no `mut` arguments on `CallValue`.
 - `break`/`continue` only inside a loop in the same function; `return`/`Try` types match `IrFn.ret`.
-- **Definite assignment and slot binding:** every slot read is dominated by a write (this replaces the interpreter's runtime "unbound local" check). Parameters are written at function entry and a `MakeClosure` reads its target's capture slots from the enclosing frame; a `Take` read unassigns its slot; unreachable code is vacuously assigned. Each slot has exactly one initialization site, so lowering cannot reuse a slot and a pass cannot remap one binding onto another. The forward must-analysis and the backward use-liveness query live in `martite-ir::analysis` and are computed on demand, never stored on nodes.
+- **Definite assignment and slot binding:** every slot read is dominated by a write (this replaces the interpreter's runtime "unbound local" check). Parameters are written at function entry and a `MakeClosure` reads its target's capture sources from the enclosing frame: a `Slot` source must be initialized, while a `Capture` source reads an already-installed capture of the creating lambda. A `Take` read unassigns its slot; unreachable code is vacuously assigned. Each slot has exactly one initialization site, so lowering cannot reuse a slot and a pass cannot remap one binding onto another. The forward must-analysis and the backward use-liveness query live in `martite-ir::analysis` and are computed on demand, never stored on nodes.
+- Captures exist only on lambdas. `CaptureRead` indices are in range for the lambda's capture list; capture reads are never slot reads.
 - Stored `effects` are a superset of recomputed effects; stored `charge` equals what the policy allows; safepoints present where lowering put them.
 - Host calls reference only hosts whose module appears in `IrProgram.grants` (defense in depth; the resolver already enforces grants).
 - Node depth per function is within the IR's maximum depth (section 7).
@@ -363,7 +370,7 @@ Each is separate, edition-gated, and lands with updated goldens. **These items a
 1. **Fuel-based safepoint cadence** (8.4). Unblocks Coalesced charging.
 2. **`Take` for mutable arguments** (and handler state with a trap-safe copy). Removes the per-call container copy described in 6.4. Today's behavior is not pinned by a golden test and may be unintentional; confirm intent first.
 3. **`Kill` at scope exit** for dead locals. Today a value bound in a loop body stays live until the function returns, which can raise `OutOfMemory` for programs that logically free it.
-4. **Lambda source file** taken from the defining function, not the caller (existing bug, `interp.rs:616`).
+4. **Lambda source file** taken from the defining function, not the caller (existing bug, `interp.rs:616`). Lowering already records the defining source; the IR evaluator keeps the caller-source behavior until this change lands.
 5. **Per-invocation literal/constant accounting** instead of per-`Runtime` (6.7).
 
 ## 15. Migration plan

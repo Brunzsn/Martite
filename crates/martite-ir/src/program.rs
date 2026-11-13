@@ -7,7 +7,9 @@
 
 use martite_base::{SourceId, Span};
 
-use crate::id::{ConstId, FnId, HostId, IrId, MatchSetId, PatternId, Slot, StrId, StructLayoutId};
+use crate::id::{
+    CaptureIndex, ConstId, FnId, HostId, IrId, MatchSetId, PatternId, Slot, StrId, StructLayoutId,
+};
 use crate::node::{ChildRange, Node, StrPart};
 use crate::pattern::{MatchSet, Pattern, StructLayout};
 use crate::types::{TyId, TypeId};
@@ -72,11 +74,22 @@ pub struct SlotInfo {
     pub name: Option<Box<str>>,
 }
 
-/// One lambda capture: the outer slot snapshotted when the closure is made.
+/// Where a closure's captured value comes from in the frame that creates it.
+///
+/// A direct capture reads a frame slot. A nested lambda may capture a binding
+/// that its enclosing lambda itself captured; that value is read from the
+/// enclosing closure's capture array instead of a local slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CaptureSource {
+    Slot(Slot),
+    Capture(CaptureIndex),
+}
+
+/// One lambda capture: the value snapshotted when the closure is made.
 /// The capture index is this entry's position in [`IrFn::captures`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CaptureInfo {
-    pub outer: Slot,
+    pub source: CaptureSource,
     pub ty: TyId,
     pub name: Option<Box<str>>,
 }
@@ -134,6 +147,11 @@ pub struct IrFn {
     pub name: Box<str>,
     /// The function's defining source. Kept per function so a lambda's traps
     /// can name the defining file instead of the caller.
+    ///
+    /// Migration note: the AST interpreter currently names the caller's source
+    /// for lambda traps (#118). Lowering records the correct defining source;
+    /// until #118 lands, the IR evaluator must reproduce the caller-source
+    /// behavior to keep snapshots green.
     pub source: SourceId,
     pub kind: FnKind,
     pub params: Vec<ParamInfo>,

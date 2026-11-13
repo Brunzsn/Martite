@@ -77,7 +77,16 @@ impl FnBuilder {
 
     pub fn capture(mut self, outer: u32, ty: TyId, name: &str) -> Self {
         self.function.captures.push(martite_ir::CaptureInfo {
-            outer: Slot::new(outer),
+            source: martite_ir::CaptureSource::Slot(Slot::new(outer)),
+            ty,
+            name: Some(name.into()),
+        });
+        self
+    }
+
+    pub fn capture_from(mut self, source: martite_ir::CaptureSource, ty: TyId, name: &str) -> Self {
+        self.function.captures.push(martite_ir::CaptureInfo {
+            source,
             ty,
             name: Some(name.into()),
         });
@@ -451,7 +460,12 @@ fn calls() -> martite_ir::IrProgram {
 fn closures() -> martite_ir::IrProgram {
     let mut lambda = FnBuilder::new(1, "<lambda>", FnKind::Lambda, 0)
         .ret(INT)
-        .capture(0, INT, "x");
+        .capture(0, INT, "x")
+        .capture_from(
+            martite_ir::CaptureSource::Capture(martite_ir::CaptureIndex::new(0)),
+            INT,
+            "y",
+        );
     let captured = lambda.node(
         NodeKind::CaptureRead(martite_ir::CaptureIndex::new(0)),
         INT,

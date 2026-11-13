@@ -5,8 +5,7 @@
 //! ([`Printer`]) for dumps and golden tests, the verifier ([`verify`]) that
 //! enforces the contract between lowering and every pass, the on-demand slot
 //! analyses in [`analysis`], and lowering ([`lower`]). Calls, patterns and
-//! lambdas are lowered in #104–#106; there is no evaluator or optimizer here
-//! yet.
+//! lambdas all lower here; there is no evaluator or optimizer yet.
 //!
 //! Dependency direction: `martite-ir` may depend on `martite-base`,
 //! `martite-fuel`, `martite-syntax` and `martite-check` for lowering inputs,
@@ -61,7 +60,7 @@ pub use id::{
     BuiltinFnId, BuiltinItemId, BuiltinMethodId, CaptureIndex, ConstId, FnId, HostId, IrId,
     MatchSetId, PatternId, Slot, StrId, StructLayoutId,
 };
-pub use lower::{LowerError, LowerErrorKind, lower};
+pub use lower::{LowerError, LowerErrorKind, LowerOptions, lower, lower_with};
 pub use martite_base::{SourceId, Span};
 pub use node::{
     AccessMode, BinaryOp, ChildRange, CompoundOp, Node, NodeKind, OperandClass, StrPart, UnaryOp,
@@ -69,8 +68,8 @@ pub use node::{
 pub use pattern::{MatchArm, MatchSet, Pattern, StructLayout};
 pub use print::{FORMAT_VERSION, Printer};
 pub use program::{
-    CaptureInfo, ConstValue, Entries, EntryKind, FnKind, HookSig, HostFnInfo, IrFn, IrProgram,
-    ParamInfo, PreludeVariant, SlotInfo,
+    CaptureInfo, CaptureSource, ConstValue, Entries, EntryKind, FnKind, HookSig, HostFnInfo, IrFn,
+    IrProgram, ParamInfo, PreludeVariant, SlotInfo,
 };
 pub use types::{FieldDef, Ty, TyId, TypeDef, TypeDefKind, TypeId, TypeTable, VariantDef};
 pub use verify::{VerifyError, VerifyErrorKind, verify, verify_after_pass};

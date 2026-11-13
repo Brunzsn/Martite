@@ -1,26 +1,19 @@
 //! Lowering gate for the conformance corpus.
 //!
-//! Calls are lowered by #104. The remaining gap set belongs to #105 (patterns
-//! and match) and #106 (lambdas and capture-dependent values). This test walks
-//! every snapshot case, verifies every program that lowers, and fails if
-//! lowering reports an internal error or an unexpected unsupported construct.
+//! Every snapshot case that checks must lower and verify. Errors are never an
+//! expected outcome: a lowering or verifier failure is a bug in lowering or in
+//! the corpus. The benchmark corpus separately records lowering and
+//! verification cost so verification stays cheap relative to lowering.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use martite_conformance::snapshot_cases;
-use martite_ir::{Charge, IrProgram, LowerErrorKind, NodeKind, lower, verify};
-
-const KNOWN_GAPS: &[&str] = &[
-    "lambda",
-    "method value",
-    "variant value",
-    "builtin item value",
-    "function value kind",
-];
+use martite_ir::{Charge, EntryKind, IrProgram, LowerOptions, NodeKind, lower, lower_with, verify};
 
 #[test]
-fn checkable_fixtures_lower_or_report_a_known_gap() {
+fn every_checkable_fixture_lowers_and_verifies() {
+    let mut checked = 0;
     let mut lowered = 0;
     let mut skipped = 0;
     for case in snapshot_cases::all_cases() {
@@ -28,27 +21,66 @@ fn checkable_fixtures_lower_or_report_a_known_gap() {
             skipped += 1;
             continue;
         };
-        match lower(&program, &sources) {
-            Ok(ir) => {
-                verify(&ir).unwrap_or_else(|error| {
-                    panic!("{} lowered but did not verify: {error}", case.id())
-                });
-                lowered += 1;
-            }
-            Err(error) => match error.kind {
-                LowerErrorKind::Unsupported { construct } => {
-                    assert!(
-                        KNOWN_GAPS.contains(&construct),
-                        "{}: unexpected unsupported construct `{construct}`",
-                        case.id()
-                    );
-                }
-                other => panic!("{}: unexpected lowering error {other:?}", case.id()),
-            },
-        }
+        checked += 1;
+        let ir: IrProgram =
+            lower(&program, &sources).unwrap_or_else(|error| panic!("{}: {error}", case.id()));
+        verify(&ir)
+            .unwrap_or_else(|error| panic!("{} lowered but did not verify: {error}", case.id()));
+        lowered += 1;
     }
-    assert!(lowered > 0, "no conformance fixture lowered");
+    assert!(checked > 0, "no conformance fixture checks");
+    assert_eq!(
+        lowered, checked,
+        "every checked fixture must lower (lowered {lowered}, checked {checked}, skipped {skipped})"
+    );
     eprintln!("ir lowering gate: lowered {lowered}, skipped {skipped}");
+}
+
+#[test]
+fn scripts_tests_and_plugins_have_entries() {
+    let find = |id: &str| {
+        snapshot_cases::all_cases()
+            .into_iter()
+            .find(|case| case.id() == id)
+            .unwrap_or_else(|| panic!("missing case {id}"))
+    };
+
+    let (program, sources) = find("e2e/hello_world")
+        .checked_program()
+        .expect("hello_world checks");
+    let ir = lower(&program, &sources).expect("lower hello_world");
+    assert_eq!(ir.entries.entry_kind, EntryKind::Script);
+    assert!(ir.entries.main.is_some());
+
+    let (program, sources) = find("plugins/init_state_and_handler_copy_out_work")
+        .checked_program()
+        .expect("plugin checks");
+    let ir = lower(&program, &sources).expect("lower plugin");
+    assert_eq!(ir.entries.entry_kind, EntryKind::Plugin);
+    assert!(ir.entries.main.is_none());
+    assert!(ir.entries.init.is_some());
+    assert!(ir.entries.shutdown.is_some());
+    assert!(ir.entries.state_type.is_some());
+    assert!(!ir.entries.hooks.is_empty());
+    assert!(
+        ir.entries
+            .handlers
+            .iter()
+            .any(|(name, _)| name.as_ref() == "init")
+    );
+    assert!(
+        ir.entries
+            .handlers
+            .iter()
+            .any(|(name, _)| name.as_ref() == "saved")
+    );
+    assert!(
+        !ir.entries
+            .handlers
+            .iter()
+            .any(|(name, _)| name.as_ref() == "shutdown"),
+        "shutdown has its own entry and is not in the handler map"
+    );
 }
 
 #[test]
@@ -115,19 +147,27 @@ fn assert_place_charges(function: &martite_ir::IrFn, id: martite_ir::IrId) {
 fn verification_cost_is_small_relative_to_lowering() {
     let cases: Vec<_> = snapshot_cases::all_cases()
         .into_iter()
+        .filter(|case| case.id().starts_with("bench/"))
         .filter_map(|case| case.checked_program())
         .collect();
+    assert!(!cases.is_empty(), "no benchmark fixtures check");
+
     let programs: Vec<_> = cases
         .iter()
-        .filter_map(|(program, sources)| lower(program, sources).ok())
+        .map(|(program, sources)| {
+            lower_with(program, sources, LowerOptions { verify: false })
+                .expect("benchmark fixture lowers")
+        })
         .collect();
-    assert!(!programs.is_empty(), "no programs to measure");
 
     const REPS: u32 = 10;
     let start = Instant::now();
     for _ in 0..REPS {
         for (program, sources) in &cases {
-            black_box(lower(program, sources).ok());
+            black_box(
+                lower_with(program, sources, LowerOptions { verify: false })
+                    .expect("benchmark fixture lowers"),
+            );
         }
     }
     let lower_time = start.elapsed();
@@ -141,7 +181,7 @@ fn verification_cost_is_small_relative_to_lowering() {
     let verify_time = start.elapsed();
 
     eprintln!(
-        "ir verification cost: lower={lower_time:?}, verify={verify_time:?}, ratio={:.3}",
+        "ir benchmark-corpus cost: lower={lower_time:?}, verify={verify_time:?}, ratio={:.3}",
         verify_time.as_secs_f64() / lower_time.as_secs_f64().max(f64::EPSILON)
     );
     assert!(

@@ -29,6 +29,7 @@ fn #0 "main" kind=free source=src#0("closures.mt") slots=1 ret=ty#1 body=#1
 
 fn #1 "<lambda>" kind=lambda source=src#0("closures.mt") slots=0 ret=ty#0 body=#0
   captures:
-    #0 outer=slot#0 ty=ty#0 name="x"
+    #0 from=slot#0 ty=ty#0 name="x"
+    #1 from=capture#0 ty=ty#0 name="y"
   nodes:
     #0 capture_read capture=#0 ty=ty#0 charge=1/0/0 effects=READS_LOCAL|SHARES span=src#0:0..1 safepoint=0 origin=-

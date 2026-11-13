@@ -26,7 +26,9 @@ use crate::id::{
 };
 use crate::node::{AccessMode, ChildRange, Node, NodeKind, StrPart};
 use crate::pattern::{MatchSet, Pattern, StructLayout};
-use crate::program::{ConstValue, FnKind, IrFn, IrProgram, ParamInfo, PreludeVariant};
+use crate::program::{
+    CaptureSource, ConstValue, FnKind, IrFn, IrProgram, ParamInfo, PreludeVariant,
+};
 use crate::types::{Ty, TyId, TypeDefKind, TypeId};
 
 /// Verify one lowered program.
@@ -916,6 +918,12 @@ impl<'a> Verifier<'a> {
         let mut param_slots = Vec::new();
         for (index, param) in function.params.iter().enumerate() {
             self.check_param(function, param, index as u32, &mut param_slots)?;
+        }
+        if !matches!(function.kind, FnKind::Lambda) && !function.captures.is_empty() {
+            return Err(error(VerifyErrorKind::Capture {
+                index: CaptureIndex(0),
+                context: "captures on a non-lambda function",
+            }));
         }
         for (index, capture) in function.captures.iter().enumerate() {
             self.ty_id(capture.ty, "capture type")?;
@@ -4424,22 +4432,38 @@ impl<'p> FnCheck<'p> {
                 },
             ));
         }
-        for capture in &target_fn.captures {
-            if capture.outer.index() >= self.function.locals as usize {
+        for (index, capture) in target_fn.captures.iter().enumerate() {
+            let outer_ty = match capture.source {
+                CaptureSource::Slot(slot) => {
+                    if slot.index() >= self.function.locals as usize {
+                        return Err(self.error(
+                            None,
+                            VerifyErrorKind::Capture {
+                                index: CaptureIndex(index as u32),
+                                context: "capture outer slot",
+                            },
+                        ));
+                    }
+                    self.function.slot_info[slot.index()].ty
+                }
+                CaptureSource::Capture(source) => {
+                    let Some(outer) = self.function.captures.get(source.index()) else {
+                        return Err(self.error(
+                            None,
+                            VerifyErrorKind::Capture {
+                                index: CaptureIndex(index as u32),
+                                context: "capture source index",
+                            },
+                        ));
+                    };
+                    outer.ty
+                }
+            };
+            if !type_accepts_owned(self.program, &self.ty(capture.ty)?, &self.ty(outer_ty)?)? {
                 return Err(self.error(
                     None,
                     VerifyErrorKind::Capture {
-                        index: CaptureIndex(target.0),
-                        context: "capture outer slot",
-                    },
-                ));
-            }
-            let outer = &self.function.slot_info[capture.outer.index()];
-            if !type_accepts_owned(self.program, &self.ty(capture.ty)?, &self.ty(outer.ty)?)? {
-                return Err(self.error(
-                    None,
-                    VerifyErrorKind::Capture {
-                        index: CaptureIndex(target.0),
+                        index: CaptureIndex(index as u32),
                         context: "capture type",
                     },
                 ));

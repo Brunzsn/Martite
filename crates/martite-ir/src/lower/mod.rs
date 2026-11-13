@@ -2,13 +2,19 @@
 //!
 //! # Scope
 //!
-//! This module lowers the checked AST into the resolved IR: function and slot
-//! allocation, the constant and static-string pools, expressions, statements,
-//! calls, mutable-argument places and patterns. Lambdas, captures and `Entries`
-//! (#106) are deliberately not lowered yet. A checked
-//! program that uses one of those constructs receives
-//! [`LowerErrorKind::Unsupported`]; any other failure is an internal compiler
-//! error.
+//! This module lowers the checked AST into the resolved IR: function, lambda
+//! and slot allocation, the constant and static-string pools, expressions,
+//! statements, calls, mutable-argument places, patterns, captures and program
+//! entries. A checked program that uses a construct the IR cannot represent
+//! receives [`LowerErrorKind::Unsupported`]; any other failure is an internal
+//! compiler error.
+//!
+//! Lambdas are separate [`IrFn`]s named `<lambda>`. They are allocated when
+//! their expression is lowered, which visits a parent lambda before any nested
+//! one, regardless of `NodeId` order. Their `source` is the defining
+//! function's source. `CaptureInfo` records whether the closure snapshots a
+//! local slot or one of the creating lambda's own captures; see
+//! [`crate::CaptureSource`].
 //!
 //! The checker's `expr_types`, `resolutions`, `struct_lit_fields`,
 //! `pattern_resolutions`, `struct_pattern_fields` and `pattern_bindings` side
@@ -26,18 +32,36 @@ use std::fmt;
 
 use martite_base::{SourceId, SourceMap, Span};
 use martite_check::{
-    CheckedProgram, ConstValue as CheckConstValue, DefId, FnKind as CheckFnKind,
-    PreludeVariant as CheckPreludeVariant, Ty as CheckTy, TypeDefKind as CheckTypeDefKind,
+    CheckedProgram, ConstValue as CheckConstValue, DefId, EntryKind as CheckEntryKind,
+    FnKind as CheckFnKind, PreludeVariant as CheckPreludeVariant, Ty as CheckTy,
+    TypeDefKind as CheckTypeDefKind,
 };
+use martite_syntax::{Block, LambdaBody, NodeId, PatKind, Pattern};
 
 use crate::id::{ConstId, FnId, HostId, Slot, StrId};
 use crate::program::{
-    ConstValue, Entries, FnKind, HostFnInfo, IrFn, IrProgram, ParamInfo, SlotInfo,
+    ConstValue, Entries, EntryKind, FnKind, HookSig, HostFnInfo, IrFn, IrProgram, ParamInfo,
+    SlotInfo,
 };
 use crate::types::{Ty, TyId, TypeId, TypeTable};
 
 pub(crate) use context::FnLowerer;
-pub(crate) use slots::SlotPlan;
+pub(crate) use slots::{BodyRoot, SlotPlan};
+
+/// Options for [`lower_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LowerOptions {
+    /// Run [`crate::verify`] on the result before returning it.
+    pub verify: bool,
+}
+
+impl Default for LowerOptions {
+    fn default() -> Self {
+        Self {
+            verify: cfg!(debug_assertions),
+        }
+    }
+}
 
 /// Lower one checked program into a self-contained IR program.
 ///
@@ -45,19 +69,32 @@ pub(crate) use slots::SlotPlan;
 /// `CheckedProgram` does not retain them, and the IR needs them for trap
 /// provenance and dumps.
 ///
-/// In debug builds the result is verified before it is returned.
+/// [`LowerOptions::default`] verifies the result in debug builds.
 pub fn lower(program: &CheckedProgram, sources: &SourceMap) -> Result<IrProgram, LowerError> {
+    lower_with(program, sources, LowerOptions::default())
+}
+
+/// Lower one checked program with explicit [`LowerOptions`].
+///
+/// Tests and benchmarks use this to measure lowering without the debug-build
+/// self-check; production callers should keep verification on.
+pub fn lower_with(
+    program: &CheckedProgram,
+    sources: &SourceMap,
+    options: LowerOptions,
+) -> Result<IrProgram, LowerError> {
     let mut lowerer = Lowerer::new(program, sources);
     lowerer.build_pools()?;
     lowerer.allocate_functions()?;
     lowerer.lower_bodies()?;
-    lowerer.into_program()
+    lowerer.into_program(options)
 }
 
 /// One lowering failure.
 ///
-/// [`LowerErrorKind::Unsupported`] is expected until #106 lands. Every other
-/// kind on a program that passed the checker is an internal compiler error.
+/// [`LowerErrorKind::Unsupported`] covers checked constructs the IR has no
+/// node for and the interpreter itself traps on. Every other kind on a program
+/// that passed the checker is an internal compiler error.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LowerError {
     pub fn_id: Option<FnId>,
@@ -69,7 +106,7 @@ pub struct LowerError {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum LowerErrorKind {
-    /// A construct owned by #106.
+    /// A checked construct the IR cannot represent.
     Unsupported { construct: &'static str },
     /// A lowering invariant failed.
     Internal { message: String },
@@ -132,6 +169,10 @@ pub(crate) struct Lowerer<'p> {
     fns: Vec<IrFn>,
     fn_ids: HashMap<DefId, FnId>,
     fn_defs: Vec<DefId>,
+    /// Lambda expression `NodeId` to the `IrFn` allocated for it.
+    lambda_ids: HashMap<NodeId, FnId>,
+    /// The inverse map, used to find the lambda body while lowering functions.
+    lambda_nodes: HashMap<FnId, NodeId>,
     hosts: Vec<HostFnInfo>,
     grants: Vec<Box<str>>,
     source_names: Vec<Box<str>>,
@@ -162,6 +203,8 @@ impl<'p> Lowerer<'p> {
             fns: Vec::new(),
             fn_ids: HashMap::new(),
             fn_defs: Vec::new(),
+            lambda_ids: HashMap::new(),
+            lambda_nodes: HashMap::new(),
             hosts: Vec::new(),
             grants,
             source_names,
@@ -380,35 +423,200 @@ impl<'p> Lowerer<'p> {
     }
 
     fn lower_bodies(&mut self) -> Result<(), LowerError> {
-        for index in 0..self.fns.len() {
+        // Lambdas are appended while their parent body is lowered, so a
+        // dynamically growing loop visits every parent before its children.
+        let mut index = 0;
+        while index < self.fns.len() {
             if matches!(self.fns[index].kind, FnKind::Host(_)) {
+                index += 1;
                 continue;
             }
-            let def = self.fn_defs[index];
-            let block = self
-                .program
-                .function_block(def)
-                .ok_or_else(|| LowerError::internal(format!("fn #{} has no body", index)))?;
+            let fn_id = FnId::new(index as u32);
+            let lambda_node = self.lambda_nodes.get(&fn_id).copied();
+            let (body, lambda) = match lambda_node {
+                Some(node) => {
+                    let info = self
+                        .program
+                        .lambda(node)
+                        .ok_or_else(|| {
+                            LowerError::internal(format!("lambda #{node:?} has no metadata"))
+                        })?
+                        .clone();
+                    let body = info.body.clone();
+                    (BodySource::Lambda(body), Some(info))
+                }
+                None => {
+                    let def = self.fn_defs.get(index).copied().ok_or_else(|| {
+                        LowerError::internal(format!("fn #{index} has no definition"))
+                    })?;
+                    let block = self
+                        .program
+                        .function_block(def)
+                        .ok_or_else(|| LowerError::internal(format!("fn #{index} has no body")))?;
+                    (BodySource::Block(block), None)
+                }
+            };
             let first_slot = self.fns[index].params.len() as u32;
-            let (mut plan, extra_slots) =
-                slots::plan_slots(self.program, &mut self.types, block, first_slot)?;
-            let sig = self
-                .program
-                .fn_sig(def)
-                .ok_or_else(|| LowerError::internal(format!("fn #{} has no signature", index)))?;
-            for (parameter, param) in sig.params.iter().enumerate() {
-                plan.add_parameter(param.binding, Slot::new(parameter as u32));
+            let parameter_patterns: Vec<&Pattern> = lambda
+                .as_ref()
+                .map(|info| {
+                    info.params
+                        .iter()
+                        .filter(|param| !matches!(param.pattern.kind, PatKind::Bind(_)))
+                        .map(|param| &param.pattern)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let root = body.root();
+            let (mut plan, extra_slots) = slots::plan_slots(
+                self.program,
+                &mut self.types,
+                root,
+                first_slot,
+                &parameter_patterns,
+            )?;
+            match &lambda {
+                Some(info) => {
+                    for (parameter, param) in info.params.iter().enumerate() {
+                        if matches!(param.pattern.kind, PatKind::Bind(_))
+                            && let Some(binding) =
+                                info.param_bindings.get(parameter).copied().flatten()
+                        {
+                            plan.add_parameter(binding, Slot::new(parameter as u32));
+                        }
+                    }
+                }
+                None => {
+                    let def = self.fn_defs[index];
+                    let sig = self.program.fn_sig(def).ok_or_else(|| {
+                        LowerError::internal(format!("fn #{index} has no signature"))
+                    })?;
+                    for (parameter, param) in sig.params.iter().enumerate() {
+                        plan.add_parameter(param.binding, Slot::new(parameter as u32));
+                    }
+                }
             }
             self.fns[index].slot_info.extend(extra_slots);
             self.fns[index].locals = self.fns[index].slot_info.len() as u32;
+            let captures = lambda
+                .as_ref()
+                .map(|info| {
+                    info.captures
+                        .iter()
+                        .enumerate()
+                        .map(|(index, binding)| (*binding, crate::CaptureIndex::new(index as u32)))
+                        .collect()
+                })
+                .unwrap_or_default();
             let function = self.fns[index].clone();
-            let function = FnLowerer::new(self, function, plan).lower_function(block)?;
+            let mut lowerer = FnLowerer::new(self, function, plan, captures);
+            if let Some(info) = &lambda {
+                lowerer.lower_lambda_params(info)?;
+            }
+            let function = lowerer.lower_body(body)?;
             self.fns[index] = function;
+            index += 1;
         }
         Ok(())
     }
 
-    fn into_program(self) -> Result<IrProgram, LowerError> {
+    fn build_entries(&mut self) -> Result<Entries, LowerError> {
+        let main = self
+            .program
+            .main
+            .map(|def| self.entry_fn(def, "main"))
+            .transpose()?;
+        let init = self
+            .program
+            .init
+            .map(|def| self.entry_fn(def, "init"))
+            .transpose()?;
+        let shutdown = self
+            .program
+            .shutdown
+            .map(|def| self.entry_fn(def, "shutdown"))
+            .transpose()?;
+
+        let mut tests = Vec::with_capacity(self.program.tests.len());
+        for def in &self.program.tests {
+            tests.push(self.entry_fn(*def, "test")?);
+        }
+
+        let mut handlers: Vec<_> = self.program.handlers.iter().collect();
+        handlers.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        let mut entries_handlers = Vec::with_capacity(handlers.len());
+        for (name, def) in handlers {
+            entries_handlers.push((
+                name.clone().into_boxed_str(),
+                self.entry_fn(*def, "handler")?,
+            ));
+        }
+
+        let mut hooks: Vec<_> = self.program.hooks.iter().collect();
+        hooks.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        let mut entries_hooks = Vec::with_capacity(hooks.len());
+        for (name, hook) in hooks {
+            let params = hook
+                .params
+                .iter()
+                .map(|ty| self.type_id(ty))
+                .collect::<Result<Vec<_>, _>>()?;
+            let ret = self.type_id(&hook.ret)?;
+            entries_hooks.push((
+                name.clone().into_boxed_str(),
+                HookSig {
+                    name: hook.name.clone().into_boxed_str(),
+                    module: self
+                        .program
+                        .resolved
+                        .module(hook.module)
+                        .path
+                        .clone()
+                        .into_boxed_str(),
+                    params,
+                    ret,
+                    source: hook.source,
+                    span: hook.span,
+                },
+            ));
+        }
+
+        let state_type = match &self.program.state_type {
+            Some(ty) => {
+                let ty = ty.clone();
+                Some(self.type_id(&ty)?)
+            }
+            None => None,
+        };
+        let json_type = self.program.json_type.map(|id| crate::TypeId::new(id.0));
+        let entry_kind = match self.program.entry_kind {
+            CheckEntryKind::Library => EntryKind::Library,
+            CheckEntryKind::Script => EntryKind::Script,
+            CheckEntryKind::Plugin => EntryKind::Plugin,
+        };
+
+        Ok(Entries {
+            main,
+            tests,
+            handlers: entries_handlers,
+            hooks: entries_hooks,
+            init,
+            shutdown,
+            state_type,
+            json_type,
+            entry_kind,
+        })
+    }
+
+    fn entry_fn(&self, def: DefId, context: &'static str) -> Result<FnId, LowerError> {
+        self.fn_ids
+            .get(&def)
+            .copied()
+            .ok_or_else(|| LowerError::internal(format!("{context} definition has no IR function")))
+    }
+
+    fn into_program(mut self, options: LowerOptions) -> Result<IrProgram, LowerError> {
+        let entries = self.build_entries()?;
         let mut program = IrProgram {
             fns: self.fns,
             consts: self.consts,
@@ -416,12 +624,13 @@ impl<'p> Lowerer<'p> {
             types: self.types,
             hosts: self.hosts,
             grants: self.grants,
-            entries: Entries::default(),
+            entries,
             source_names: self.source_names,
         };
         effects::fill(&mut program)?;
-        #[cfg(debug_assertions)]
-        if let Err(error) = crate::verify(&program) {
+        if options.verify
+            && let Err(error) = crate::verify(&program)
+        {
             return Err(LowerError {
                 fn_id: error.function,
                 source: error.source,
@@ -430,6 +639,22 @@ impl<'p> Lowerer<'p> {
             });
         }
         Ok(program)
+    }
+}
+
+/// The AST body of one function or lambda while it is being lowered.
+pub(crate) enum BodySource<'a> {
+    Block(&'a Block),
+    Lambda(LambdaBody),
+}
+
+impl BodySource<'_> {
+    fn root(&self) -> BodyRoot<'_> {
+        match self {
+            Self::Block(block) => BodyRoot::Block(block),
+            Self::Lambda(LambdaBody::Block(block)) => BodyRoot::Block(block),
+            Self::Lambda(LambdaBody::Expr(expr)) => BodyRoot::Expr(expr),
+        }
     }
 }
 

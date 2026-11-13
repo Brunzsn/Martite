@@ -42,6 +42,30 @@ fn lower_source(source: &str) -> IrProgram {
     ir
 }
 
+fn lower_files(files: &[(&str, &str)]) -> IrProgram {
+    let mut provider = MemoryProvider::new();
+    for (path, text) in files {
+        provider.insert(*path, *text);
+    }
+    let loaded = load(
+        &provider,
+        &LoadOptions {
+            entry: "main.mt".into(),
+            edition: "1".into(),
+            ..LoadOptions::default()
+        },
+    );
+    assert!(
+        !loaded.has_errors(),
+        "fixture must check: {:?}",
+        loaded.diagnostics
+    );
+    let program = loaded.program.expect("checked program");
+    let ir = lower(&program, &loaded.sources).expect("lower");
+    verify(&ir).expect("verify");
+    ir
+}
+
 fn lower_source_with(
     source: &str,
     interfaces: Vec<InterfaceSource>,
@@ -673,6 +697,7 @@ fn compute() -> int {
         .expect("host info");
     assert_eq!(info.module.as_ref(), "app.bench");
     assert!(info.opaque_return.is_some());
+    assert!(ir.grants.iter().any(|grant| grant.as_ref() == "app.bench"));
 }
 
 #[test]
@@ -747,22 +772,263 @@ fn f(p: P) -> int {
             construct: "method value"
         }
     ));
+}
 
-    let lambda = lower_source_result(
+#[test]
+fn lowers_lambdas_with_direct_captures() {
+    let ir = lower_source(
         r#"
-fn f() -> int {
-    let g = fn(x: int) => x
-    g(1)
+fn main() {
+    let value = 1
+    let read = fn() => value
+    let _ = read()
 }
 "#,
-    )
-    .expect_err("lambda is #106");
-    assert!(matches!(
-        lambda.kind,
-        LowerErrorKind::Unsupported {
-            construct: "lambda"
-        }
-    ));
+    );
+    let lambda = ir
+        .fns
+        .iter()
+        .find(|function| matches!(function.kind, martite_ir::FnKind::Lambda))
+        .expect("lambda function");
+    assert_eq!(lambda.name.as_ref(), "<lambda>");
+    assert_eq!(ir.source_name(lambda.source), Some("main.mt"));
+    assert_eq!(lambda.captures.len(), 1);
+    assert_eq!(
+        lambda.captures[0].source,
+        martite_ir::CaptureSource::Slot(martite_ir::Slot::new(0))
+    );
+    assert!(lambda.params.is_empty());
+    assert!(
+        lambda
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, martite_ir::NodeKind::CaptureRead(_))),
+        "capture read must not lower to a slot read"
+    );
+    let main = named_function(&ir, "main");
+    let (_, closure) = find_node(main, |kind| {
+        matches!(kind, martite_ir::NodeKind::MakeClosure(_))
+    });
+    assert_eq!(closure.charge, martite_ir::Charge::expression());
+}
+
+#[test]
+fn lowers_nested_lambdas_with_transitive_captures() {
+    let ir = lower_source(
+        r#"
+fn main() {
+    let base = 10
+    let add = fn(a: int) => fn(b: int) => base + a + b
+    let _ = add(5)
+}
+"#,
+    );
+    let lambdas: Vec<_> = ir
+        .fns
+        .iter()
+        .filter(|function| matches!(function.kind, martite_ir::FnKind::Lambda))
+        .collect();
+    assert_eq!(lambdas.len(), 2);
+    let outer = lambdas
+        .iter()
+        .find(|function| function.captures.len() == 1)
+        .expect("outer lambda");
+    let inner = lambdas
+        .iter()
+        .find(|function| function.captures.len() == 2)
+        .expect("inner lambda");
+    assert_eq!(
+        outer.captures[0].source,
+        martite_ir::CaptureSource::Slot(martite_ir::Slot::new(0))
+    );
+    assert_eq!(outer.locals, 1, "outer lambda has only parameter `a`");
+    let sources: Vec<_> = inner
+        .captures
+        .iter()
+        .map(|capture| (capture.name.as_deref(), capture.source))
+        .collect();
+    assert!(sources.contains(&(
+        Some("base"),
+        martite_ir::CaptureSource::Capture(martite_ir::CaptureIndex::new(0))
+    )));
+    assert!(sources.contains(&(
+        Some("a"),
+        martite_ir::CaptureSource::Slot(martite_ir::Slot::new(0))
+    )));
+    assert_eq!(
+        inner
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, martite_ir::NodeKind::CaptureRead(_)))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn lambda_source_is_the_defining_file_not_the_caller() {
+    let ir = lower_files(&[
+        (
+            "main.mt",
+            r#"
+use util.make
+fn main() {
+    let read = make()
+    let _ = read()
+}
+"#,
+        ),
+        (
+            "util.mt",
+            r#"
+pub fn make() -> fn() -> int {
+    let value = 7
+    fn() => value
+}
+"#,
+        ),
+    ]);
+    let lambda = ir
+        .fns
+        .iter()
+        .find(|function| matches!(function.kind, martite_ir::FnKind::Lambda))
+        .expect("lambda function");
+    assert_eq!(ir.source_name(lambda.source), Some("util.mt"));
+}
+
+#[test]
+fn lowers_expression_and_block_lambda_bodies() {
+    let ir = lower_source(
+        r#"
+fn main() {
+    let expression = fn(value: int) => value + 1
+    let block = fn(value: int) {
+        let doubled = value * 2
+        doubled
+    }
+    let _ = (expression(1), block(2))
+}
+"#,
+    );
+    let lambdas: Vec<_> = ir
+        .fns
+        .iter()
+        .filter(|function| matches!(function.kind, martite_ir::FnKind::Lambda))
+        .collect();
+    assert_eq!(lambdas.len(), 2);
+    for lambda in lambdas {
+        assert!(lambda.body.is_some());
+        assert!(lambda.is_safepoint(lambda.body.expect("body")));
+    }
+}
+
+#[test]
+fn lowers_lambdas_inside_methods_handlers_and_tests() {
+    let ir = lower_source(
+        r#"
+struct Counter { value: int }
+
+impl Counter {
+    fn read(self) -> int {
+        let read = fn() => self.value
+        read()
+    }
+}
+
+test "lambda in test" {
+    let value = 1
+    let read = fn() => value
+    assert(read() == 1, "value")
+}
+"#,
+    );
+    let lambdas: Vec<_> = ir
+        .fns
+        .iter()
+        .filter(|function| matches!(function.kind, martite_ir::FnKind::Lambda))
+        .collect();
+    assert_eq!(lambdas.len(), 2);
+    assert_eq!(ir.entries.tests.len(), 1);
+}
+
+#[test]
+fn lowers_destructured_lambda_parameters() {
+    let ir = lower_source(
+        r#"
+fn main() {
+    let pair = (1, 2)
+    let sum = fn((a, b): (int, int)) => a + b
+    let _ = sum(pair)
+}
+"#,
+    );
+    let lambda = ir
+        .fns
+        .iter()
+        .find(|function| matches!(function.kind, martite_ir::FnKind::Lambda))
+        .expect("lambda function");
+    assert_eq!(lambda.params.len(), 1);
+    assert!(lambda.params[0].pattern.is_some());
+    assert_eq!(lambda.locals, 3, "one parameter slot plus two bindings");
+    assert!(
+        lambda
+            .patterns
+            .iter()
+            .any(|pattern| matches!(pattern, martite_ir::Pattern::Tuple(_)))
+    );
+}
+
+#[test]
+fn lowers_script_test_and_plugin_entries() {
+    let script = lower_source(
+        r#"
+fn main() {}
+test "first" { assert(true, "ok") }
+test "second" { assert(true, "ok") }
+"#,
+    );
+    assert_eq!(script.entries.entry_kind, martite_ir::EntryKind::Script);
+    assert!(script.entries.main.is_some());
+    let test_names: Vec<_> = script
+        .entries
+        .tests
+        .iter()
+        .map(|id| script.function(*id).expect("test function").name.as_ref())
+        .collect();
+    assert_eq!(test_names, vec!["first", "second"]);
+
+    let library = lower_source("fn helper() -> int { 1 }");
+    assert_eq!(library.entries.entry_kind, martite_ir::EntryKind::Library);
+    assert!(library.entries.main.is_none());
+
+    let plugin = lower_source_with(
+        r#"
+use app.hooks
+on init() -> int { 1 }
+on saved() {}
+on shutdown() {}
+"#,
+        vec![InterfaceSource {
+            path: "app.hooks".into(),
+            text: "on saved()\n".into(),
+        }],
+        vec!["app.hooks".into()],
+    );
+    assert_eq!(plugin.entries.entry_kind, martite_ir::EntryKind::Plugin);
+    assert!(plugin.entries.main.is_none());
+    assert!(plugin.entries.init.is_some());
+    assert!(plugin.entries.shutdown.is_some());
+    assert!(plugin.entries.state_type.is_some());
+    assert_eq!(plugin.entries.hooks.len(), 1);
+    assert_eq!(plugin.entries.hooks[0].0.as_ref(), "saved");
+    assert_eq!(plugin.entries.hooks[0].1.module.as_ref(), "app.hooks");
+    let handler_names: Vec<_> = plugin
+        .entries
+        .handlers
+        .iter()
+        .map(|(name, _)| name.as_ref())
+        .collect();
+    assert_eq!(handler_names, vec!["init", "saved"]);
 }
 
 #[test]
