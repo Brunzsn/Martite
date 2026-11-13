@@ -693,6 +693,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 variant,
                 first_payload,
             } => self.eval_enum(variant, first_payload, node.ty, node.charge.post, span),
+            NodeKind::EnumValue { variant } => self.eval_enum_value(variant, node.ty, span),
             NodeKind::PreludeVariant {
                 variant,
                 first_payload,
@@ -1249,6 +1250,28 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         self.charge(u64::from(post))?;
         self.note_alloc(16 + 8 * payload_count as u64);
         let value = Value::Enum(Rc::new(EnumValue::new(type_id, variant as usize, payload)));
+        self.check_value_depth(&value, span)?;
+        Ok(value)
+    }
+
+    /// Zero-payload variant used as a value. The interpreter allocates it
+    /// without taking a charge, unlike the constructor form.
+    fn eval_enum_value(
+        &mut self,
+        variant: u32,
+        ty: martite_ir::TyId,
+        span: Span,
+    ) -> EvalResult<Value> {
+        let Some(Ty::Named(type_id, _)) = self.program.types.get_ty(ty) else {
+            return self.trap(self.internal_panic("enum value has no named type"));
+        };
+        let type_id = *type_id;
+        self.note_alloc(16);
+        let value = Value::Enum(Rc::new(EnumValue::new(
+            type_id,
+            variant as usize,
+            Vec::new(),
+        )));
         self.check_value_depth(&value, span)?;
         Ok(value)
     }

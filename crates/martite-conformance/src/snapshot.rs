@@ -538,36 +538,7 @@ impl SnapshotCase {
         }
         let caps = self.caps();
         let expected = expected_outcomes(baseline);
-        let fuel = binary_min_from(1, caps.fuel.max(1), |value| {
-            self.outcomes_at(ExecLimits {
-                fuel: value,
-                memory: caps.memory,
-                depth: caps.depth,
-                deadline: None,
-            }) == expected
-        });
-        let memory = binary_min(caps.memory, |value| {
-            self.outcomes_at(ExecLimits {
-                fuel: caps.fuel,
-                memory: value,
-                depth: caps.depth,
-                deadline: None,
-            }) == expected
-        });
-        let depth = binary_min(caps.depth as u64, |value| {
-            self.outcomes_at(ExecLimits {
-                fuel: caps.fuel,
-                memory: caps.memory,
-                depth: value as u32,
-                deadline: None,
-            }) == expected
-        }) as u32;
-        ThresholdsRecord {
-            fuel: Some(fuel),
-            memory: Some(memory),
-            depth: Some(depth),
-            note: None,
-        }
+        search_thresholds(caps, &expected, |limits| self.outcomes_at(limits))
     }
 
     pub fn verify(&self, expected: &SnapshotRecord) {
@@ -671,6 +642,103 @@ impl SnapshotCase {
         }
     }
 
+    /// Check the IR evaluator at the AST oracle's minimum thresholds.
+    ///
+    /// The AST record already proves that each threshold is minimal. The IR
+    /// must complete at the threshold and differ one unit below it, which
+    /// makes its minimum equal to the oracle's without a second binary search.
+    pub fn verify_ir_thresholds(&self, expected: &SnapshotRecord) {
+        if expected.thresholds.note.is_some() {
+            return;
+        }
+        let caps = self.caps();
+        let outcomes = expected_outcomes(expected);
+        let fuel = expected
+            .thresholds
+            .fuel
+            .unwrap_or_else(|| panic!("{}: missing fuel threshold", expected.id));
+        let memory = expected
+            .thresholds
+            .memory
+            .unwrap_or_else(|| panic!("{}: missing memory threshold", expected.id));
+        let depth = expected
+            .thresholds
+            .depth
+            .unwrap_or_else(|| panic!("{}: missing depth threshold", expected.id));
+        assert_eq!(
+            self.outcomes_at_ir(ExecLimits {
+                fuel,
+                memory: caps.memory,
+                depth: caps.depth,
+                deadline: None,
+            }),
+            outcomes,
+            "{}: IR fuel threshold",
+            expected.id
+        );
+        if fuel > 1 {
+            assert_ne!(
+                self.outcomes_at_ir(ExecLimits {
+                    fuel: fuel - 1,
+                    memory: caps.memory,
+                    depth: caps.depth,
+                    deadline: None,
+                }),
+                outcomes,
+                "{}: IR fuel threshold is not minimal",
+                expected.id
+            );
+        }
+        assert_eq!(
+            self.outcomes_at_ir(ExecLimits {
+                fuel: caps.fuel,
+                memory,
+                depth: caps.depth,
+                deadline: None,
+            }),
+            outcomes,
+            "{}: IR memory threshold",
+            expected.id
+        );
+        if memory > 0 {
+            assert_ne!(
+                self.outcomes_at_ir(ExecLimits {
+                    fuel: caps.fuel,
+                    memory: memory - 1,
+                    depth: caps.depth,
+                    deadline: None,
+                }),
+                outcomes,
+                "{}: IR memory threshold is not minimal",
+                expected.id
+            );
+        }
+        assert_eq!(
+            self.outcomes_at_ir(ExecLimits {
+                fuel: caps.fuel,
+                memory: caps.memory,
+                depth,
+                deadline: None,
+            }),
+            outcomes,
+            "{}: IR depth threshold",
+            expected.id
+        );
+        if depth > 0 {
+            assert_ne!(
+                self.outcomes_at_ir(ExecLimits {
+                    fuel: caps.fuel,
+                    memory: caps.memory,
+                    depth: depth - 1,
+                    deadline: None,
+                }),
+                outcomes,
+                "{}: IR depth threshold is not minimal",
+                expected.id
+            );
+        }
+    }
+
     fn caps(&self) -> ProbeCaps {
         match self {
             Self::Main { caps, .. } | Self::Plugin { caps, .. } => *caps,
@@ -691,6 +759,59 @@ impl SnapshotCase {
                     .collect()
             }
         }
+    }
+
+    fn outcomes_at_ir(&self, limits: ExecLimits) -> Vec<OutcomeRecord> {
+        match self {
+            Self::Main { case, hosts, .. } => {
+                vec![run_main_ir(case, hosts.as_ref(), limits).outcome]
+            }
+            Self::Plugin { scenario, .. } => {
+                let plugin = load_plugin(scenario);
+                run_plugin_ir(&plugin, scenario, limits)
+                    .steps
+                    .into_iter()
+                    .filter_map(|step| step.outcome)
+                    .collect()
+            }
+        }
+    }
+}
+
+fn search_thresholds(
+    caps: ProbeCaps,
+    expected: &[OutcomeRecord],
+    mut outcomes_at: impl FnMut(ExecLimits) -> Vec<OutcomeRecord>,
+) -> ThresholdsRecord {
+    let fuel = binary_min_from(1, caps.fuel.max(1), |value| {
+        outcomes_at(ExecLimits {
+            fuel: value,
+            memory: caps.memory,
+            depth: caps.depth,
+            deadline: None,
+        }) == expected
+    });
+    let memory = binary_min(caps.memory, |value| {
+        outcomes_at(ExecLimits {
+            fuel: caps.fuel,
+            memory: value,
+            depth: caps.depth,
+            deadline: None,
+        }) == expected
+    });
+    let depth = binary_min(caps.depth as u64, |value| {
+        outcomes_at(ExecLimits {
+            fuel: caps.fuel,
+            memory: caps.memory,
+            depth: value as u32,
+            deadline: None,
+        }) == expected
+    }) as u32;
+    ThresholdsRecord {
+        fuel: Some(fuel),
+        memory: Some(memory),
+        depth: Some(depth),
+        note: None,
     }
 }
 

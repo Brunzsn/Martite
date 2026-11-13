@@ -629,7 +629,7 @@ fn make() -> Point {
 }
 
 #[test]
-fn static_strings_are_interned() {
+fn static_strings_are_pooled_per_literal_site() {
     let ir = lower_source(
         r#"
 fn names() -> int {
@@ -650,7 +650,50 @@ fn names() -> int {
         })
         .collect();
     assert_eq!(strings.len(), 2);
-    assert_eq!(strings[0], strings[1]);
+    assert_ne!(
+        strings[0], strings[1],
+        "identical literals at different sites must not share the first-use cache"
+    );
+    assert_eq!(ir.string(strings[0]), Some("same"));
+    assert_eq!(ir.string(strings[1]), Some("same"));
+}
+
+#[test]
+fn zero_payload_variant_value_and_constructor_are_distinct_nodes() {
+    let ir = lower_source(
+        r#"
+enum Shape { Empty, Dot(int) }
+
+fn make() {
+    let value = Shape.Empty
+    let constructed = Shape.Empty()
+    let _ = (value, constructed)
+}
+"#,
+    );
+    let function = named_function(&ir, "make");
+    let value = function
+        .nodes
+        .iter()
+        .find_map(|node| match node.kind {
+            martite_ir::NodeKind::EnumValue { variant } => Some(variant),
+            _ => None,
+        })
+        .expect("value-form variant");
+    let constructed = function
+        .nodes
+        .iter()
+        .find_map(|node| match node.kind {
+            martite_ir::NodeKind::EnumVariant {
+                variant,
+                first_payload,
+            } => Some((variant, first_payload)),
+            _ => None,
+        })
+        .expect("constructor-form variant");
+    assert_eq!(value, 0);
+    assert_eq!(constructed.0, 0);
+    assert_eq!(constructed.1, 0);
 }
 
 #[test]

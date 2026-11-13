@@ -231,6 +231,18 @@ impl<'p> Lowerer<'p> {
         id
     }
 
+    /// Append a new pool entry without deduplicating the text.
+    ///
+    /// Static literal expressions are cached and accounted per source node by
+    /// the interpreter, so two identical literals at different sites must get
+    /// distinct pool entries. Constants, patterns and interpolation text keep
+    /// using [`Self::intern_str`], where only the text matters.
+    fn literal_str(&mut self, text: &str) -> StrId {
+        let id = StrId::new(self.strs.len() as u32);
+        self.strs.push(text.into());
+        id
+    }
+
     fn push_const(&mut self, value: ConstValue) -> ConstId {
         let id = ConstId::new(self.consts.len() as u32);
         self.consts.push(value);

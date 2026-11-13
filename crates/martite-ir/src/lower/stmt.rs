@@ -46,12 +46,15 @@ impl FnLowerer<'_, '_> {
                 let value = self.lower_expr(expr)?;
                 let ty = self.node_ty(value);
                 let unit = self.unit();
+                // The interpreter special-cases a block's trailing
+                // expression statement and does not run a memory check after
+                // it, so this statement is deliberately not a safepoint.
                 children.push(self.push(
                     NodeKind::ExprStmt(value),
                     unit,
                     Charge::ZERO,
                     stmt.span,
-                    true,
+                    false,
                 ));
                 tail_ty = Some(ty);
                 continue;

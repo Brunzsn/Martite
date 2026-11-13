@@ -124,7 +124,27 @@ impl FnBuilder {
         self.body = Some(body);
     }
 
-    fn build(self, name: &str, kind: FnKind) -> IrFn {
+    fn build(mut self, name: &str, kind: FnKind) -> IrFn {
+        // A trailing expression statement is the block's value and is not a
+        // safepoint in the interpreter.
+        for node in &self.nodes {
+            let (NodeKind::Block(range) | NodeKind::ExprBlock(range)) = node.kind else {
+                continue;
+            };
+            if range.len == 0 {
+                continue;
+            }
+            let last = range.start as usize + range.len as usize - 1;
+            let Some(last) = self.children.get(last).copied() else {
+                continue;
+            };
+            if matches!(
+                self.nodes.get(last.index()).map(|node| node.kind),
+                Some(NodeKind::ExprStmt(_))
+            ) {
+                self.safepoints[last.index()] = false;
+            }
+        }
         let synthetic = vec![None; self.nodes.len()];
         IrFn {
             id: FnId::new(0),

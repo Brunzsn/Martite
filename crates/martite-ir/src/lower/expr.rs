@@ -181,7 +181,7 @@ impl FnLowerer<'_, '_> {
                     text.push_str(part);
                 }
             }
-            let string = self.intern_str(&text);
+            let string = self.literal_str(&text);
             return Ok(self.push(
                 NodeKind::Str(string),
                 ty,
@@ -288,10 +288,9 @@ impl FnLowerer<'_, '_> {
                 if self.variant_payload_count(type_id, index)? != 0 {
                     return Err(self.unsupported(expr.span, "variant value"));
                 }
-                NodeKind::EnumVariant {
+                NodeKind::EnumValue {
                     variant: u32::try_from(index)
                         .map_err(|_| self.internal(expr.span, "variant index exceeds u32"))?,
-                    first_payload: 0,
                 }
             }
             Resolution::PreludeVariant(variant) => {
@@ -446,10 +445,9 @@ impl FnLowerer<'_, '_> {
                 if self.variant_payload_count(type_id, index)? != 0 {
                     return Err(self.unsupported(expr.span, "variant value"));
                 }
-                NodeKind::EnumVariant {
+                NodeKind::EnumValue {
                     variant: u32::try_from(index)
                         .map_err(|_| self.internal(expr.span, "variant index exceeds u32"))?,
-                    first_payload: 0,
                 }
             }
             Resolution::ModuleItem(def) => self.def_ref_node(def, expr.span)?,

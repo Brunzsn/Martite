@@ -1,7 +1,10 @@
 use std::time::Duration;
 
 use martite_base::Code;
-use martite_conformance::{Case, min_depth, min_fuel, min_memory, run_case, run_case_with_limits};
+use martite_conformance::{
+    Case, min_depth, min_depth_ir, min_fuel, min_fuel_ir, min_memory, min_memory_ir, run_case,
+    run_case_with_limits,
+};
 use martite_runtime::{
     ExecLimits, HostContext, HostDispatcher, HostFault, MAX_VALUE_DEPTH, Trap, Value,
     value_depth_exceeds,
@@ -174,12 +177,9 @@ const FUEL_ROWS: &[FuelRow] = &[
 #[test]
 fn fuel_table_costs_are_golden() {
     for row in FUEL_ROWS {
-        assert_eq!(
-            min_fuel(&Case::single(row.source)),
-            row.expected,
-            "fuel for {}",
-            row.name
-        );
+        let case = Case::single(row.source);
+        assert_eq!(min_fuel(&case), row.expected, "fuel for {}", row.name);
+        assert_eq!(min_fuel_ir(&case), row.expected, "IR fuel for {}", row.name);
     }
 }
 
@@ -200,52 +200,60 @@ fn memory_costs_are_golden() {
             72,
         ),
     ] {
-        assert_eq!(
-            min_memory(&Case::single(source)),
-            expected,
-            "memory for {name}"
-        );
+        let case = Case::single(source);
+        assert_eq!(min_memory(&case), expected, "memory for {name}");
+        assert_eq!(min_memory_ir(&case), expected, "IR memory for {name}");
     }
 }
 
 #[test]
 fn repeated_small_allocations_do_not_inflate_memory() {
-    let short = min_memory(&Case::single(
-        "fn main() { var i = 0\nwhile i < 10 { let xs = [i, i]\n i += 1 } }",
-    ));
-    let long = min_memory(&Case::single(
-        "fn main() { var i = 0\nwhile i < 1000 { let xs = [i, i]\n i += 1 } }",
-    ));
+    let short_case =
+        Case::single("fn main() { var i = 0\nwhile i < 10 { let xs = [i, i]\n i += 1 } }");
+    let long_case =
+        Case::single("fn main() { var i = 0\nwhile i < 1000 { let xs = [i, i]\n i += 1 } }");
+    let short = min_memory(&short_case);
+    let long = min_memory(&long_case);
     assert_eq!(long, short);
     assert_eq!(long, 32);
+    assert_eq!(min_memory_ir(&short_case), short);
+    assert_eq!(min_memory_ir(&long_case), long);
 }
 
 #[test]
 fn shared_const_values_are_counted_once() {
-    let shared = min_memory(&Case::single(
+    let shared_case = Case::single(
         "const VALUES: list[int] = [1, 2, 3]\nfn main() { var all: list[list[int]] = []\nvar i = 0\nwhile i < 10 { all.push(VALUES)\ni += 1 } }",
-    ));
-    let rebuilt = min_memory(&Case::single(
+    );
+    let rebuilt_case = Case::single(
         "fn main() { var all: list[list[int]] = []\nvar i = 0\nwhile i < 10 { all.push([1, 2, 3])\ni += 1 } }",
-    ));
+    );
+    let shared = min_memory(&shared_case);
+    let rebuilt = min_memory(&rebuilt_case);
     assert!(
         shared < rebuilt,
         "cached constants must share one payload: shared {shared}, rebuilt {rebuilt}"
     );
+    assert_eq!(min_memory_ir(&shared_case), shared);
+    assert_eq!(min_memory_ir(&rebuilt_case), rebuilt);
 }
 
 #[test]
 fn shared_string_literals_are_counted_once() {
-    let shared = min_memory(&Case::single(
+    let shared_case = Case::single(
         "fn main() { var all: list[str] = []\nvar i = 0\nwhile i < 10 { all.push(\"abc\")\ni += 1 } }",
-    ));
-    let rebuilt = min_memory(&Case::single(
+    );
+    let rebuilt_case = Case::single(
         "fn main() { var all: list[str] = []\nvar i = 0\nwhile i < 10 { all.push(\"a\" + \"bc\")\ni += 1 } }",
-    ));
+    );
+    let shared = min_memory(&shared_case);
+    let rebuilt = min_memory(&rebuilt_case);
     assert!(
         shared < rebuilt,
         "cached literals must share one payload: shared {shared}, rebuilt {rebuilt}"
     );
+    assert_eq!(min_memory_ir(&shared_case), shared);
+    assert_eq!(min_memory_ir(&rebuilt_case), rebuilt);
 }
 
 #[test]
@@ -308,7 +316,9 @@ fn failed_guard_bindings_do_not_leak_a_reference() {
 #[test]
 fn depth_cost_is_golden() {
     let recursive = "fn down(n: int) -> int {\n    if n == 0 { 0 } else { down(n - 1) }\n}\nfn main() { print(down(10)) }";
-    assert_eq!(min_depth(&Case::single(recursive)), 12);
+    let case = Case::single(recursive);
+    assert_eq!(min_depth(&case), 12);
+    assert_eq!(min_depth_ir(&case), 12);
 }
 
 #[test]

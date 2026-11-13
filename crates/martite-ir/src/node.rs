@@ -327,10 +327,20 @@ pub enum NodeKind {
         type_id: TypeId,
         layout: StructLayoutId,
     },
-    /// Payloads start at `first_payload`; the enum type is this node's `ty`.
+    /// Constructor form, `Enum.Variant(...)`. Payloads start at
+    /// `first_payload`; the enum type is this node's `ty`. The post-charge is
+    /// the payload count, so a zero-payload constructor still takes the
+    /// interpreter's zero-unit `slot_cost(0)` charge and advances the tick
+    /// counter.
     EnumVariant {
         variant: u32,
         first_payload: u32,
+    },
+    /// Value form, `Enum.Variant` for a zero-payload variant. The interpreter
+    /// allocates the value without taking a charge, so this is a distinct node
+    /// from the constructor form.
+    EnumValue {
+        variant: u32,
     },
     /// Payloads start at `first_payload`; the variant supplies the arity.
     PreludeVariant {
@@ -407,6 +417,9 @@ pub enum NodeKind {
         place: IrId,
         value: IrId,
     },
+    /// Statement wrapper for an expression. It is a safepoint except when it
+    /// is the trailing expression statement of a block: the interpreter
+    /// evaluates that tail without a memory check.
     ExprStmt(IrId),
 
     // Conversions.

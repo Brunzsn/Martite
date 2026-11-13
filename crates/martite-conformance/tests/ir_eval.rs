@@ -5,10 +5,13 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use martite_base::Severity;
-use martite_conformance::{Case, min_memory};
-use martite_ir::{IrProgram, TypeTable, lower, verify};
+use martite_conformance::{
+    Case, min_depth, min_depth_ir, min_fuel, min_fuel_ir, min_memory, min_memory_ir,
+};
+use martite_ir::{TypeTable, lower, verify};
 use martite_runtime::{
     ExecLimits, HostContext, HostDispatcher, HostFault, IrHostDispatcher, IrRuntime, Runtime, Trap,
     Value, show,
@@ -75,46 +78,12 @@ fn observe_ir(case: &Case, limits: ExecLimits) -> Observation {
     Observation { outcome, log, fuel }
 }
 
-fn lowered_ir(case: &Case) -> IrProgram {
-    let (program, sources) = checked(case);
-    let ir = lower(&program, &sources).expect("fixture lowers");
-    verify(&ir).expect("fixture verifies");
-    ir
-}
-
-fn run_ir(ir: &IrProgram, limits: ExecLimits) -> Result<(), Trap> {
-    let mut runtime = IrRuntime::new(ir, limits);
-    runtime.run_main().map(|_| ())
-}
-
-fn min_memory_ir(case: &Case) -> u64 {
-    let ir = lowered_ir(case);
-    let mut low = 0u64;
-    let mut high = 8 << 20;
-    let limits = |memory| ExecLimits {
-        fuel: 1_000_000,
-        memory,
-        depth: 200,
-        deadline: None,
-    };
-    assert!(
-        run_ir(&ir, limits(high)).is_ok(),
-        "fixture needs more than the probe cap"
-    );
-    while low < high {
-        let mid = low + (high - low) / 2;
-        match run_ir(&ir, limits(mid)) {
-            Ok(()) => high = mid,
-            Err(Trap::OutOfMemory) => low = mid + 1,
-            Err(trap) => panic!("unexpected trap while probing memory: {trap:?}"),
-        }
-    }
-    low
-}
-
 fn assert_matches(id: &str, source: &str) {
+    assert_matches_limits(id, source, ExecLimits::default());
+}
+
+fn assert_matches_limits(id: &str, source: &str, limits: ExecLimits) {
     let case = Case::single(source);
-    let limits = ExecLimits::default();
     let ast = observe_ast(&case, limits);
     let ir = observe_ir(&case, limits);
     assert_eq!(ir.outcome, ast.outcome, "{id}: outcome");
@@ -289,6 +258,114 @@ fn core_fixtures_match_the_ast_interpreter() {
         ),
     ] {
         assert_matches(id, source);
+    }
+}
+
+#[test]
+fn zero_payload_variant_value_keeps_the_ast_tick_cadence() {
+    // The value form takes no charge; the constructor form takes a zero-unit
+    // slot charge. Sweep enough loop iterations to cross the 1024-tick
+    // deadline check, where a one-tick difference becomes observable.
+    for iterations in 0..=260 {
+        let source = format!(
+            "enum Shape {{ Empty }}\nfn main() {{\n    var i = 0\n    while i < {iterations} {{ i += 1 }}\n    let _ = Shape.Empty\n    let _ = Shape.Empty()\n}}"
+        );
+        assert_matches_limits(
+            &format!("zero_payload_variant/{iterations}"),
+            &source,
+            ExecLimits {
+                fuel: 1_000_000,
+                memory: 8 << 20,
+                depth: 200,
+                deadline: Some(Duration::ZERO),
+            },
+        );
+    }
+}
+
+#[test]
+fn identical_static_literals_at_distinct_nodes_account_separately() {
+    let case = Case::single(
+        "fn main() {\n    let a = \"abcd\"\n    let b = \"abcd\"\n    let _ = (a, b)\n}",
+    );
+    assert_eq!(
+        min_memory_ir(&case),
+        min_memory(&case),
+        "each literal site has its own first-use cache"
+    );
+}
+
+#[test]
+fn trailing_expression_statement_skips_its_memory_check() {
+    let case =
+        Case::single("fn main() {\n    var xs = [1, 2, 3]\n    let keep = xs\n    xs.push(4)\n}");
+    assert_eq!(
+        min_memory_ir(&case),
+        min_memory(&case),
+        "the AST skips the memory check after a block's trailing expression statement"
+    );
+}
+
+#[test]
+fn value_depth_checks_match_the_ast_interpreter() {
+    let build = r#"
+        enum Nested { Leaf, Next(Nested) }
+        fn build(n: int) -> Nested {
+            var value = Nested.Leaf
+            var i = 0
+            while i < n {
+                value = Nested.Next(value)
+                i += 1
+            }
+            value
+        }
+    "#;
+    for source in [
+        format!("{build}\nfn main() {{ print(\"{{build(129)}}\") }}"),
+        format!("{build}\nfn main() {{ var xs: list[Nested] = []\n    xs.push(build(127))\n}}"),
+        format!(
+            "{build}\nfn main() {{ var xs: list[Nested] = []\n    xs.push(build(126))\n    xs.insert(1, build(126))\n}}"
+        ),
+    ] {
+        let case = Case::single(&source);
+        let ast = observe_ast(&case, ExecLimits::default());
+        let ir = observe_ir(&case, ExecLimits::default());
+        assert_eq!(ir.outcome, ast.outcome);
+        assert_eq!(ir.fuel, ast.fuel);
+    }
+}
+
+#[test]
+fn closure_call_depth_through_builtins_matches() {
+    let case = Case::single(
+        "fn main() {\n    let xs = [1, 2, 3]\n    let ys = xs.map(fn(x) => x + 1)\n    print(\"{ys}\")\n}",
+    );
+    assert_eq!(min_depth_ir(&case), min_depth(&case));
+}
+
+#[test]
+fn fuel_limit_edge_matches_the_ast_interpreter() {
+    for source in [
+        "fn main() {}",
+        "fn main() { let x = 1 }",
+        "fn main() { let xs = [1, 2, 3] }",
+        "fn main() { var i = 0\nwhile i < 3 { i += 1 } }",
+    ] {
+        let case = Case::single(source);
+        let fuel = min_fuel(&case);
+        assert_eq!(min_fuel_ir(&case), fuel);
+        for limit in [fuel.saturating_sub(1), fuel] {
+            let limits = ExecLimits {
+                fuel: limit,
+                memory: 8 << 20,
+                depth: 200,
+                deadline: None,
+            };
+            let ast = observe_ast(&case, limits);
+            let ir = observe_ir(&case, limits);
+            assert_eq!(ir.outcome, ast.outcome, "fuel {limit}: outcome");
+            assert_eq!(ir.fuel, ast.fuel, "fuel {limit}: fuel used");
+        }
     }
 }
 
@@ -468,8 +545,8 @@ let part = text[1..9] }"#,
 }
 
 /// Snapshot cases whose call, builtin, host, closure and pattern surface is
-/// executable by the #110 evaluator. Exact memory and depth thresholds remain
-/// with #111, and the full corpus harness with #112.
+/// executable by the #110 evaluator. #111 compares their exact fuel, memory and
+/// depth thresholds; #112 widens this to the full corpus.
 const IR_READY_CASES: &[&str] = &[
     "bench/load/multi",
     "bench/runtime/captures.mt",
@@ -549,7 +626,13 @@ fn call_and_host_fixtures_match_the_ast_interpreter() {
             .iter()
             .find(|case| case.id() == *id)
             .unwrap_or_else(|| panic!("missing snapshot case {id}"));
-        assert_eq!(case.observe_ir(), case.observe(), "{id}");
+        let expected = case.record();
+        let mut ir = case.observe_ir();
+        // Outcomes, logs, host calls, steps and exact fuel are compared here;
+        // the thresholds are checked separately against the AST oracle.
+        ir.thresholds = expected.thresholds.clone();
+        assert_eq!(ir, expected, "{id}");
+        case.verify_ir_thresholds(&expected);
     }
 }
 

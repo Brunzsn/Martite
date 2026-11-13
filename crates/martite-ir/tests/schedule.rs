@@ -465,9 +465,30 @@ fn main() {
 "#,
     );
     for function in &ir.fns {
+        let mut tail_exprs = vec![false; function.nodes.len()];
+        for node in &function.nodes {
+            let (NodeKind::Block(range) | NodeKind::ExprBlock(range)) = node.kind else {
+                continue;
+            };
+            if range.len == 0 {
+                continue;
+            }
+            let last_index = range.start as usize + range.len as usize - 1;
+            let Some(last) = function.children.get(last_index).copied() else {
+                continue;
+            };
+            if matches!(
+                function.node(last).map(|node| node.kind),
+                Some(NodeKind::ExprStmt(_))
+            ) && let Some(slot) = tail_exprs.get_mut(last.index())
+            {
+                *slot = true;
+            }
+        }
         for (index, node) in function.nodes.iter().enumerate() {
             let id = IrId::new(index as u32);
             let expected = id == function.body.expect("body")
+                || (matches!(node.kind, NodeKind::ExprStmt(_)) && !tail_exprs[index])
                 || matches!(
                     node.kind,
                     NodeKind::Let { .. }
@@ -477,7 +498,6 @@ fn main() {
                         | NodeKind::MulAssign { .. }
                         | NodeKind::DivAssign { .. }
                         | NodeKind::RemAssign { .. }
-                        | NodeKind::ExprStmt(_)
                         | NodeKind::Return(_)
                         | NodeKind::CallHost { .. }
                 )
@@ -505,6 +525,50 @@ fn main() {
             );
         }
     }
+}
+
+#[test]
+fn trailing_expression_statements_are_not_safepoints() {
+    let ir = lower_source(
+        r#"
+fn value() -> int {
+    let x = 1
+    x
+}
+
+fn main() {
+    let f = fn() => value()
+    let _ = f()
+}
+"#,
+    );
+    let value = named_function(&ir, "value");
+    let tail = value
+        .nodes
+        .iter()
+        .enumerate()
+        .find_map(|(index, node)| {
+            matches!(node.kind, NodeKind::ExprStmt(_)).then(|| IrId::new(index as u32))
+        })
+        .expect("value tail expression statement");
+    assert!(!value.is_safepoint(tail));
+    assert!(value.is_safepoint(value.body.expect("body")));
+
+    let lambda = ir
+        .fns
+        .iter()
+        .find(|function| matches!(function.kind, martite_ir::FnKind::Lambda))
+        .expect("expression-bodied lambda");
+    let NodeKind::Block(range) = lambda.node(lambda.body.expect("body")).expect("body").kind else {
+        panic!("expression lambda body must be a block");
+    };
+    let child = lambda.child_slice(range)[0];
+    assert!(matches!(
+        lambda.node(child).expect("child").kind,
+        NodeKind::ExprStmt(_)
+    ));
+    assert!(!lambda.is_safepoint(child));
+    assert!(lambda.is_safepoint(lambda.body.expect("body")));
 }
 
 #[test]

@@ -52,6 +52,26 @@ fn every_fixture_uses_the_lowered_schedule() {
             .unwrap_or_else(|error| panic!("{} lowered but did not verify: {error}", case.id()));
 
         for function in &ir.fns {
+            let mut tail_exprs = vec![false; function.nodes.len()];
+            for node in &function.nodes {
+                let (NodeKind::Block(range) | NodeKind::ExprBlock(range)) = node.kind else {
+                    continue;
+                };
+                if range.len == 0 {
+                    continue;
+                }
+                let last_index = range.start as usize + range.len as usize - 1;
+                let Some(last) = function.children.get(last_index).copied() else {
+                    continue;
+                };
+                if matches!(
+                    function.node(last).map(|node| node.kind),
+                    Some(NodeKind::ExprStmt(_))
+                ) && let Some(slot) = tail_exprs.get_mut(last.index())
+                {
+                    *slot = true;
+                }
+            }
             for (index, node) in function.nodes.iter().enumerate() {
                 let id = IrId::new(index as u32);
                 let context = format!("{}: {} node #{index}", case.id(), function.name);
@@ -93,6 +113,7 @@ fn every_fixture_uses_the_lowered_schedule() {
                 }
 
                 let required = id == function.body.expect("body")
+                    || (matches!(node.kind, NodeKind::ExprStmt(_)) && !tail_exprs[index])
                     || matches!(
                         node.kind,
                         NodeKind::Let { .. }
@@ -102,7 +123,6 @@ fn every_fixture_uses_the_lowered_schedule() {
                             | NodeKind::MulAssign { .. }
                             | NodeKind::DivAssign { .. }
                             | NodeKind::RemAssign { .. }
-                            | NodeKind::ExprStmt(_)
                             | NodeKind::Return(_)
                             | NodeKind::CallHost { .. }
                     )

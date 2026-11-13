@@ -84,12 +84,14 @@ impl<'a, 'p> FnLowerer<'a, 'p> {
         let value = self.lower_expr(expr)?;
         let ty = self.node_ty(value);
         let unit = self.unit();
+        // Expression-bodied lambdas evaluate the expression directly in the
+        // interpreter, with no memory check after it.
         let stmt = self.push(
             NodeKind::ExprStmt(value),
             unit,
             Charge::ZERO,
             expr.span,
-            true,
+            false,
         );
         let range = self.append_children(vec![stmt]);
         Ok(self.push(NodeKind::Block(range), ty, Charge::ZERO, expr.span, true))
@@ -195,6 +197,10 @@ impl<'a, 'p> FnLowerer<'a, 'p> {
 
     pub(crate) fn intern_str(&mut self, text: &str) -> StrId {
         self.lowerer.intern_str(text)
+    }
+
+    pub(crate) fn literal_str(&mut self, text: &str) -> StrId {
+        self.lowerer.literal_str(text)
     }
 
     pub(crate) fn push_const(&mut self, value: ConstValue) -> ConstId {

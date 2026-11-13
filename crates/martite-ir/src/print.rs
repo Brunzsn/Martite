@@ -585,6 +585,9 @@ impl<'a> Printer<'a> {
                 out,
                 "enum_variant variant={variant} first_payload={first_payload}"
             ),
+            NodeKind::EnumValue { variant } => {
+                write!(out, "enum_value variant={variant}")
+            }
             NodeKind::PreludeVariant {
                 variant,
                 first_payload,

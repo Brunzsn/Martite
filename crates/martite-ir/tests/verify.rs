@@ -290,6 +290,8 @@ fn rejects_cycle() {
 fn rejects_unreachable_node() {
     let mut program = valid_program();
     program.fns[0].nodes[11].kind = NodeKind::Block(ChildRange::new(1, 3));
+    // The new tail expression statement is not a safepoint.
+    program.fns[0].safepoints[9] = false;
     assert!(matches!(error_kind(program), VerifyErrorKind::Tree { .. }));
 }
 
@@ -466,7 +468,7 @@ fn valid_call_and_mut_program() -> IrProgram {
         ),
     ];
     let mut inc_safepoints = vec![false; inc_nodes.len()];
-    inc_safepoints[5] = true;
+    // The trailing expression statement is not a safepoint.
     inc_safepoints[6] = true;
     let inc = IrFn {
         id: FnId::new(0),
@@ -997,7 +999,7 @@ fn valid_match_program() -> IrProgram {
         ),
     ];
     let mut safepoints = vec![false; nodes.len()];
-    safepoints[4] = true;
+    // The trailing expression statement is not a safepoint.
     safepoints[5] = true;
     let function = IrFn {
         id: FnId::new(0),
@@ -1232,7 +1234,7 @@ fn valid_struct_literal_verifies() {
         ),
     ];
     let mut safepoints = vec![false; nodes.len()];
-    safepoints[3] = true;
+    // The trailing expression statement is not a safepoint.
     safepoints[4] = true;
     let function = IrFn {
         id: FnId::new(0),
@@ -1594,7 +1596,7 @@ fn rejects_try_when_function_return_type_disagrees() {
         nodes,
         spans: vec![Span::empty(0); 5],
         synthetic: vec![None; 5],
-        safepoints: vec![false, false, false, true, true],
+        safepoints: vec![false, false, false, false, true],
         children: vec![IrId::new(0), IrId::new(3)],
         body: Some(IrId::new(4)),
     };
@@ -1876,7 +1878,7 @@ fn valid_enum_and_prelude_variants_verify() {
         nodes: variant_nodes,
         spans: vec![Span::empty(0); 4],
         synthetic: vec![None; 4],
-        safepoints: vec![false, false, true, true],
+        safepoints: vec![false, false, false, true],
         children: vec![IrId::new(0), IrId::new(2)],
         body: Some(IrId::new(3)),
     };
@@ -1927,7 +1929,7 @@ fn valid_enum_and_prelude_variants_verify() {
         nodes: prelude_nodes,
         spans: vec![Span::empty(0); 4],
         synthetic: vec![None; 4],
-        safepoints: vec![false, false, true, true],
+        safepoints: vec![false, false, false, true],
         children: vec![IrId::new(0), IrId::new(2)],
         body: Some(IrId::new(3)),
     };
@@ -1947,6 +1949,81 @@ fn valid_enum_and_prelude_variants_verify() {
         source_names: vec!["variants.mt".into()],
     };
     program.verify().expect("variant program");
+}
+
+#[test]
+fn valid_zero_payload_enum_value_verifies() {
+    let mut types = TypeTable::default();
+    let unit = types.intern_ty(Ty::Unit);
+    let choice_id = types.add_def(TypeDef {
+        name: "Choice".into(),
+        kind: TypeDefKind::Enum {
+            variants: vec![martite_ir::VariantDef {
+                name: "Empty".into(),
+                payload: Vec::new(),
+            }],
+        },
+        params: 0,
+        is_interface: false,
+        is_builtin: false,
+    });
+    let choice = types.intern_ty(Ty::Named(choice_id, Vec::new()));
+    let nodes = vec![
+        node(
+            NodeKind::EnumValue { variant: 0 },
+            choice,
+            Charge::expression(),
+            Effects::ALLOCATES,
+        ),
+        node(
+            NodeKind::ExprStmt(IrId::new(0)),
+            unit,
+            Charge::ZERO,
+            Effects::ALLOCATES | Effects::SAFEPOINT,
+        ),
+        node(
+            NodeKind::Block(ChildRange::new(0, 1)),
+            choice,
+            Charge::ZERO,
+            Effects::ALLOCATES | Effects::SAFEPOINT,
+        ),
+    ];
+    let function = IrFn {
+        id: FnId::new(0),
+        name: "empty".into(),
+        source: SourceId(0),
+        kind: FnKind::Free,
+        params: Vec::new(),
+        ret: choice,
+        locals: 0,
+        slot_info: Vec::new(),
+        captures: Vec::new(),
+        patterns: Vec::new(),
+        matches: Vec::new(),
+        struct_layouts: Vec::new(),
+        str_parts: Vec::new(),
+        nodes,
+        spans: vec![Span::empty(0); 3],
+        synthetic: vec![None; 3],
+        safepoints: vec![false, false, true],
+        children: vec![IrId::new(1)],
+        body: Some(IrId::new(2)),
+    };
+    let program = IrProgram {
+        fns: vec![function],
+        consts: Vec::new(),
+        strs: Vec::new(),
+        types,
+        hosts: Vec::new(),
+        grants: Vec::new(),
+        entries: Entries {
+            main: Some(FnId::new(0)),
+            entry_kind: EntryKind::Script,
+            ..Entries::default()
+        },
+        source_names: vec!["enum_value.mt".into()],
+    };
+    program.verify().expect("enum value program");
 }
 
 #[cfg(debug_assertions)]

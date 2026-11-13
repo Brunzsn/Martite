@@ -1427,10 +1427,35 @@ struct FnCheck<'p> {
     stack: Vec<IrId>,
     loop_depth: u32,
     depth: u32,
+    /// Expression statements that are the last child of a `Block` or
+    /// `ExprBlock`. The interpreter evaluates a block's tail directly and
+    /// skips the memory check after it, so these are not safepoints.
+    tail_exprs: Vec<bool>,
 }
 
 impl<'p> FnCheck<'p> {
     fn new(program: &'p IrProgram, function: &'p IrFn) -> Self {
+        let mut tail_exprs = vec![false; function.nodes.len()];
+        for node in &function.nodes {
+            let range = match node.kind {
+                NodeKind::Block(range) | NodeKind::ExprBlock(range) => range,
+                _ => continue,
+            };
+            if range.len == 0 {
+                continue;
+            }
+            let last_index = range.start as usize + range.len as usize - 1;
+            let Some(last) = function.children.get(last_index).copied() else {
+                continue;
+            };
+            if matches!(
+                function.node(last).map(|node| node.kind),
+                Some(NodeKind::ExprStmt(_))
+            ) && let Some(slot) = tail_exprs.get_mut(last.index())
+            {
+                *slot = true;
+            }
+        }
         Self {
             program,
             function,
@@ -1438,6 +1463,7 @@ impl<'p> FnCheck<'p> {
             stack: Vec::new(),
             loop_depth: 0,
             depth: 0,
+            tail_exprs,
         }
     }
 
@@ -1683,7 +1709,10 @@ impl<'p> FnCheck<'p> {
                 },
             ));
         }
+        let tail_expr = matches!(node.kind, NodeKind::ExprStmt(_))
+            && self.tail_exprs.get(id.index()).copied().unwrap_or(false);
         let required = id == self.function.body.expect("body")
+            || (matches!(node.kind, NodeKind::ExprStmt(_)) && !tail_expr)
             || matches!(
                 node.kind,
                 NodeKind::Let { .. }
@@ -1693,7 +1722,6 @@ impl<'p> FnCheck<'p> {
                     | NodeKind::MulAssign { .. }
                     | NodeKind::DivAssign { .. }
                     | NodeKind::RemAssign { .. }
-                    | NodeKind::ExprStmt(_)
                     | NodeKind::Return(_)
                     | NodeKind::CallHost { .. }
             )
@@ -2274,6 +2302,7 @@ impl<'p> FnCheck<'p> {
                 variant,
                 first_payload,
             } => self.check_enum_variant(variant, first_payload, node.ty, id),
+            NodeKind::EnumValue { variant } => self.check_enum_value(variant, node.ty, id),
             NodeKind::PreludeVariant {
                 variant,
                 first_payload,
@@ -3702,6 +3731,62 @@ impl<'p> FnCheck<'p> {
             let child = self.function.children[first_payload as usize + index];
             let expected = self.substitute(*payload_ty, &args);
             self.expect_child_type(child, &expected, "enum payload")?;
+        }
+        Ok(ty)
+    }
+
+    /// Value form of a zero-payload variant. It has no children and,
+    /// unlike the constructor form, takes no charge in the interpreter.
+    fn check_enum_value(&self, variant: u32, node_ty: TyId, id: IrId) -> Result<Ty, VerifyError> {
+        let ty = self.ty(node_ty)?;
+        let Ty::Named(type_id, _) = &ty else {
+            return Err(self.error(
+                Some(id),
+                VerifyErrorKind::TypeMismatch {
+                    expected: Box::new(Ty::Named(TypeId(0), Vec::new())),
+                    found: Box::new(ty),
+                    context: "enum value",
+                },
+            ));
+        };
+        let Some(def) = self.program.types.get(*type_id) else {
+            return Err(self.error(
+                Some(id),
+                VerifyErrorKind::TypeTable {
+                    context: "enum value",
+                    ty: None,
+                    def: Some(*type_id),
+                },
+            ));
+        };
+        let TypeDefKind::Enum { variants } = &def.kind else {
+            return Err(self.error(
+                Some(id),
+                VerifyErrorKind::TypeMismatch {
+                    expected: Box::new(Ty::Named(*type_id, Vec::new())),
+                    found: Box::new(ty),
+                    context: "enum value on a non-enum",
+                },
+            ));
+        };
+        let Some(def_variant) = variants.get(variant as usize) else {
+            return Err(self.error(
+                Some(id),
+                VerifyErrorKind::Path {
+                    index: variant,
+                    context: "enum value",
+                },
+            ));
+        };
+        if !def_variant.payload.is_empty() {
+            return Err(self.error(
+                Some(id),
+                VerifyErrorKind::Arity {
+                    expected: 0,
+                    found: def_variant.payload.len() as u32,
+                    context: "zero-payload enum value",
+                },
+            ));
         }
         Ok(ty)
     }
@@ -5663,7 +5748,9 @@ impl<'a> EffectsCheck<'a> {
             }
             NodeKind::Map(_) => effects |= E::ALLOCATES | E::DYN_COST,
             NodeKind::StructUpdate { .. } => effects |= E::ALLOCATES | E::SHARES,
-            NodeKind::EnumVariant { .. } => effects |= E::ALLOCATES,
+            NodeKind::EnumVariant { .. } | NodeKind::EnumValue { .. } => {
+                effects |= E::ALLOCATES;
+            }
             NodeKind::PreludeVariant { variant, .. } => {
                 if !matches!(variant, PreludeVariant::None) {
                     effects |= E::ALLOCATES;
@@ -6079,6 +6166,7 @@ pub(crate) fn children_of(program: &IrProgram, function: &IrFn, node: Node) -> V
                 }
             }
         }
+        NodeKind::EnumValue { .. } => {}
         NodeKind::PreludeVariant {
             variant,
             first_payload,
