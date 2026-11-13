@@ -400,24 +400,22 @@ impl<'p> Lowerer<'p> {
         Ok(())
     }
 
+    /// The opaque type `HostContext::make_handle` may construct for this host.
+    ///
+    /// Mirrors the AST interpreter: only a direct opaque interface return, its
+    /// `Option` payload, or the success payload of a `Result` is a handle.
+    /// Hosts that merely mention an opaque type elsewhere (a list element, a
+    /// tuple member, a function parameter or the `Err` payload) cannot create
+    /// handles.
     fn opaque_return(&self, ty: &CheckTy) -> Option<TypeId> {
         match ty {
-            CheckTy::Named(type_id, args) => {
+            CheckTy::Named(type_id, args) if args.is_empty() => {
                 let def = self.program.types.get(*type_id)?;
-                if def.is_interface && matches!(def.kind, CheckTypeDefKind::Opaque) {
-                    return Some(TypeId::new(type_id.0));
-                }
-                args.iter().find_map(|arg| self.opaque_return(arg))
+                (def.is_interface && matches!(def.kind, CheckTypeDefKind::Opaque))
+                    .then_some(TypeId::new(type_id.0))
             }
-            CheckTy::Tuple(items) => items.iter().find_map(|item| self.opaque_return(item)),
-            CheckTy::List(item) | CheckTy::Option(item) => self.opaque_return(item),
-            CheckTy::Map(key, value) | CheckTy::Result(key, value) => self
-                .opaque_return(key)
-                .or_else(|| self.opaque_return(value)),
-            CheckTy::Fn(params, ret) => params
-                .iter()
-                .find_map(|param| self.opaque_return(param))
-                .or_else(|| self.opaque_return(ret)),
+            CheckTy::Option(inner) => self.opaque_return(inner),
+            CheckTy::Result(ok, _) => self.opaque_return(ok),
             _ => None,
         }
     }

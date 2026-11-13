@@ -139,6 +139,13 @@ pub struct HostContext {
 }
 
 impl HostContext {
+    pub(crate) fn new(handle_type: Option<TypeId>) -> Self {
+        Self {
+            charged: 0,
+            handle_type,
+        }
+    }
+
     pub fn charge(&mut self, units: u64) {
         self.charged = self.charged.saturating_add(units);
     }
@@ -656,10 +663,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 trace: Vec::new(),
             });
         };
-        let mut cx = HostContext {
-            charged: 0,
-            handle_type,
-        };
+        let mut cx = HostContext::new(handle_type);
         let result = host.call(def, &args, &mut cx);
         self.fuel = self.fuel.saturating_sub(fuel::host_call_cost(cx.charged));
         if self.fuel == 0 {
@@ -775,11 +779,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
         let mut value = Value::Unit;
         for (i, stmt) in block.stmts.iter().enumerate() {
             let is_last = i + 1 == block.stmts.len();
-            if is_last {
-                if let StmtKind::Expr { expr, assign: None } = &stmt.kind {
-                    value = self.eval_expr(expr)?;
-                    continue;
-                }
+            if is_last && let StmtKind::Expr { expr, assign: None } = &stmt.kind {
+                value = self.eval_expr(expr)?;
+                continue;
             }
             self.eval_stmt(stmt)?;
             value = Value::Unit;
@@ -1131,8 +1133,8 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 match (to, value) {
                     (martite_syntax::PrimTy::Int, Value::Float(f)) => {
                         if !f.is_finite()
-                            || f >= 9_223_372_036_854_775_808.0
-                            || f < -9_223_372_036_854_775_808.0
+                            || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0)
+                                .contains(&f)
                         {
                             self.trap(self.panic("float is out of int range", expr.span))
                         } else {
@@ -1333,13 +1335,12 @@ impl<'p, 'h> Runtime<'p, 'h> {
             _ => return self.trap(self.internal_panic("unknown struct type")),
         };
         let mut out = vec![Value::Unit; decl_count];
-        if let Some(base) = base {
-            if let Value::Struct(struct_value) = self.eval_expr(base)? {
-                if struct_value.type_id == type_id {
-                    for (slot, value) in out.iter_mut().zip(struct_value.fields.iter()) {
-                        *slot = value.clone();
-                    }
-                }
+        if let Some(base) = base
+            && let Value::Struct(struct_value) = self.eval_expr(base)?
+            && struct_value.type_id == type_id
+        {
+            for (slot, value) in out.iter_mut().zip(struct_value.fields.iter()) {
+                *slot = value.clone();
             }
         }
         if let Some(slots) = program.struct_lit_fields.get(&expr.id) {
@@ -1375,7 +1376,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     return self.call_method(expr, def, base, args);
                 }
                 Some(Resolution::BuiltinMethod { receiver, name }) => {
-                    return self.call_builtin_method(expr, receiver, &name, base, args);
+                    return self.call_builtin_method(expr, receiver, name, base, args);
                 }
                 Some(Resolution::Variant(id, index)) => {
                     return self.construct_variant(id, index, args, expr.span);
@@ -1505,12 +1506,11 @@ impl<'p, 'h> Runtime<'p, 'h> {
         let (value, mut updated) = self
             .call_def_sig(def, sig, values)
             .map_err(EvalError::Trap)?;
-        if sig.self_mutable() {
-            if let (Some(place), Some(new_value)) =
+        if sig.self_mutable()
+            && let (Some(place), Some(new_value)) =
                 (receiver_place, take_writeback(&mut updated, 0))
-            {
-                self.write_place(place, new_value)?;
-            }
+        {
+            self.write_place(place, new_value)?;
         }
         for (place, index) in writebacks {
             if let Some(value) = take_writeback(&mut updated, index) {
@@ -2532,16 +2532,16 @@ impl<'p, 'h> Runtime<'p, 'h> {
             ConstValue::Struct(check_type_id, fields) => {
                 let type_id = ids.type_id(*check_type_id);
                 let mut values = Vec::new();
-                if let Some(def) = ids.types.get(type_id) {
-                    if let martite_ir::TypeDefKind::Struct { fields: def_fields } = &def.kind {
-                        for field in def_fields {
-                            let value = fields
-                                .iter()
-                                .find(|(name, _)| name.as_str() == field.name.as_ref())
-                                .map(|(_, v)| Self::const_to_value(ids, v))
-                                .unwrap_or(Value::Unit);
-                            values.push(value);
-                        }
+                if let Some(def) = ids.types.get(type_id)
+                    && let martite_ir::TypeDefKind::Struct { fields: def_fields } = &def.kind
+                {
+                    for field in def_fields {
+                        let value = fields
+                            .iter()
+                            .find(|(name, _)| name.as_str() == field.name.as_ref())
+                            .map(|(_, v)| Self::const_to_value(ids, v))
+                            .unwrap_or(Value::Unit);
+                        values.push(value);
                     }
                 }
                 Value::Struct(Rc::new(StructValue::new(type_id, values)))

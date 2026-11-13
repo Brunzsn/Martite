@@ -545,14 +545,14 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             "parse_int" => {
                 self.charge(fuel::string_cost(text.len() as u64))?;
-                Ok(match parse_int(&text) {
+                Ok(match parse_int(text) {
                     Some(v) => Value::Option(Some(Box::new(Value::Int(v)))),
                     None => Value::Option(None),
                 })
             }
             "parse_float" => {
                 self.charge(fuel::string_cost(text.len() as u64))?;
-                Ok(match parse_float(&text) {
+                Ok(match parse_float(text) {
                     Some(v) => Value::Option(Some(Box::new(Value::Float(v)))),
                     None => Value::Option(None),
                 })
@@ -825,14 +825,14 @@ impl<'p, 'h> Runtime<'p, 'h> {
     }
 }
 
-fn int_arg(args: &[Value], index: usize) -> Option<i64> {
+pub(crate) fn int_arg(args: &[Value], index: usize) -> Option<i64> {
     match args.get(index) {
         Some(Value::Int(v)) => Some(*v),
         _ => None,
     }
 }
 
-fn range_len(start: i64, end: i64, inclusive: bool) -> i64 {
+pub(crate) fn range_len(start: i64, end: i64, inclusive: bool) -> i64 {
     if inclusive {
         if start > end {
             0
@@ -846,7 +846,7 @@ fn range_len(start: i64, end: i64, inclusive: bool) -> i64 {
     }
 }
 
-fn parse_int(text: &str) -> Option<i64> {
+pub(crate) fn parse_int(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
     if bytes.is_empty() {
         return None;
@@ -864,7 +864,7 @@ fn parse_int(text: &str) -> Option<i64> {
     text.parse::<i64>().ok()
 }
 
-fn parse_float(text: &str) -> Option<f64> {
+pub(crate) fn parse_float(text: &str) -> Option<f64> {
     let bytes = text.as_bytes();
     if bytes.is_empty() {
         return None;

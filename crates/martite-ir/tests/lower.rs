@@ -701,6 +701,53 @@ fn compute() -> int {
 }
 
 #[test]
+fn host_opaque_returns_follow_the_runtime_handle_contract() {
+    let mut provider = MemoryProvider::new();
+    provider.insert("main.mt", "fn compute() -> int {\n    1\n}\n");
+    let interface = martite_resolve::InterfaceSource {
+        path: "app.api".into(),
+        text: "\
+struct Doc
+fn direct() -> Doc
+fn optional() -> Doc?
+fn ok_result() -> Result[Doc, str]
+fn err_result() -> Result[str, Doc]
+fn listed() -> list[Doc]
+fn tuple() -> (Doc, int)
+"
+        .into(),
+    };
+    let loaded = load(
+        &provider,
+        &LoadOptions {
+            entry: "main.mt".into(),
+            edition: "1".into(),
+            interfaces: vec![interface],
+            grants: vec!["app.api".into()],
+            ..LoadOptions::default()
+        },
+    );
+    assert!(!loaded.has_errors(), "{:?}", loaded.diagnostics);
+    let program = loaded.program.expect("checked program");
+    let ir = lower(&program, &loaded.sources).expect("lower");
+    verify(&ir).expect("verify");
+    let has_handle = |name: &str| {
+        ir.hosts
+            .iter()
+            .find(|info| info.name.as_ref() == name)
+            .unwrap_or_else(|| panic!("missing host {name}"))
+            .opaque_return
+            .is_some()
+    };
+    assert!(has_handle("direct"));
+    assert!(has_handle("optional"));
+    assert!(has_handle("ok_result"));
+    assert!(!has_handle("err_result"));
+    assert!(!has_handle("listed"));
+    assert!(!has_handle("tuple"));
+}
+
+#[test]
 fn slots_are_not_reused_across_scopes() {
     let ir = lower_source(
         r#"

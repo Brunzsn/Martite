@@ -1,13 +1,20 @@
 //! Recursive evaluator for the resolved tree IR.
 //!
-//! This slice adds closures, captures, `match` and pattern binding (#110).
-//! Calls, builtins, hosts and mutable writeback land in #109.
+//! This is the third evaluator slice (#110): values, places, scalar
+//! operators, aggregates, control flow, calls, builtins, hosts, mutable
+//! writeback, closures, captures, `match` and pattern binding.
 //!
 //! The evaluator only reads [`martite_ir::IrProgram`]. Frame slots are a dense
 //! `Vec<Option<Value>>` sized by `IrFn::locals`; there are no binding-id scans
 //! and no per-frame hash maps. `None` marks a slot taken by `SlotRead` with
 //! [`martite_ir::AccessMode::Take`], which is a `Reduce`-class feature and not
 //! emitted by migration lowering.
+//!
+//! Host dispatch uses [`IrHostDispatcher`], whose argument is a [`HostId`].
+//! This keeps the evaluator independent of checker definition ids; embedders
+//! map their host registry to the IR host table once, at setup time.
+
+mod builtins;
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -17,19 +24,32 @@ use martite_base::{SourceId, Span};
 use martite_fuel as fuel;
 use martite_ir::{
     AccessMode, BuiltinFnId, BuiltinItemId, CaptureIndex, CaptureSource, ChildRange, ConstId,
-    ConstValue, FnId, FnKind, IrFn, IrId, IrProgram, MatchSetId, NodeKind, Pattern, PreludeVariant,
-    Slot, StrId, StructLayoutId, Ty, TypeDefKind, TypeId,
+    ConstValue, FnId, FnKind, HostId, IrFn, IrId, IrProgram, MatchSetId, NodeKind, Pattern,
+    PreludeVariant, Slot, StrId, StructLayoutId, Ty, TypeDefKind, TypeId,
 };
 use smallvec::SmallVec;
 
-use crate::interp::{CallResult, ExecLimits, MainResult, Trap};
+use crate::interp::{CallResult, ExecLimits, HostContext, HostFault, MainResult, Trap};
 use crate::ops::{show, value_eq, value_ord, write_show};
 use crate::value::{
     Closure, EnumValue, FnValue, MAX_VALUE_DEPTH, MapValue, OrderedMap, SeqValue, StructValue,
     Value, key_from_value, key_value_size, value_depth_exceeds,
 };
 
+/// Host functions resolved by the IR. Dispatch is by [`HostId`]; the embedder
+/// builds the mapping from its own registry once.
+pub trait IrHostDispatcher {
+    fn call(
+        &mut self,
+        host: HostId,
+        args: &[Value],
+        cx: &mut HostContext,
+    ) -> Result<Value, HostFault>;
+}
+
 type EvalResult<T> = Result<T, EvalError>;
+type CallArgs = SmallVec<[Value; 4]>;
+type Writebacks = SmallVec<[(usize, Value); 2]>;
 
 /// Previous slot values for the bindings of an attempted match arm. Entries
 /// are restored in reverse order when a guard fails.
@@ -66,7 +86,7 @@ enum Accessor {
 
 /// Executes one [`IrProgram`] with the same limits and observable accounting
 /// rules as the AST interpreter.
-pub struct IrRuntime<'p> {
+pub struct IrRuntime<'p, 'h> {
     program: &'p IrProgram,
     limits: ExecLimits,
     fuel: u64,
@@ -74,6 +94,7 @@ pub struct IrRuntime<'p> {
     ticks: u64,
     frames: Vec<Frame<'p>>,
     log: Vec<String>,
+    host: Option<&'h mut dyn IrHostDispatcher>,
     /// Live bytes at the last exact scan.
     census_bytes: u64,
     /// Allocation bytes recorded since the last exact scan.
@@ -87,7 +108,7 @@ pub struct IrRuntime<'p> {
     literal_values: Vec<Option<Value>>,
 }
 
-impl<'p> IrRuntime<'p> {
+impl<'p, 'h> IrRuntime<'p, 'h> {
     pub fn new(program: &'p IrProgram, limits: ExecLimits) -> Self {
         Self {
             program,
@@ -97,11 +118,26 @@ impl<'p> IrRuntime<'p> {
             ticks: 0,
             frames: Vec::new(),
             log: Vec::new(),
+            host: None,
             census_bytes: 0,
             pending_bytes: 0,
             const_values: vec![None; program.consts.len()],
             literal_values: vec![None; program.strs.len()],
         }
+    }
+
+    pub fn with_host(
+        program: &'p IrProgram,
+        limits: ExecLimits,
+        host: &'h mut dyn IrHostDispatcher,
+    ) -> Self {
+        let mut runtime = Self::new(program, limits);
+        runtime.host = Some(host);
+        runtime
+    }
+
+    pub fn set_host(&mut self, host: &'h mut dyn IrHostDispatcher) {
+        self.host = Some(host);
     }
 
     pub fn limits(&self) -> ExecLimits {
@@ -124,11 +160,51 @@ impl<'p> IrRuntime<'p> {
     pub fn invoke(&mut self, function: FnId, args: Vec<Value>) -> Result<CallResult, Trap> {
         self.reset();
         self.note_values(&args);
-        let value = self.call_function(function, args)?;
+        let (value, updated) =
+            self.call_function_with_writebacks(function, CallArgs::from_vec(args))?;
         Ok(CallResult {
             value,
-            params: Vec::new(),
+            params: updated.into_iter().map(|(_, value)| value).collect(),
         })
+    }
+
+    pub fn invoke_handler(
+        &mut self,
+        name: &str,
+        state: &mut Option<Value>,
+        args: Vec<Value>,
+    ) -> Result<Option<Value>, Trap> {
+        let Some(function) = self
+            .program
+            .entries
+            .handlers
+            .iter()
+            .find(|(handler, _)| handler.as_ref() == name)
+            .map(|(_, function)| *function)
+        else {
+            return Ok(None);
+        };
+        self.reset();
+        if let Some(state) = state.as_ref() {
+            self.note_values(std::slice::from_ref(state));
+        }
+        self.note_values(&args);
+        let program = self.program;
+        let info = program
+            .function(function)
+            .ok_or_else(|| self.internal_panic("missing handler function"))?;
+        let has_self = info.params.first().is_some_and(|param| param.is_self);
+        let self_mutable = info.params.first().is_some_and(|param| param.mutable);
+        let mut call_args = CallArgs::with_capacity(args.len() + usize::from(has_self));
+        if has_self {
+            call_args.push(state.clone().unwrap_or(Value::Unit));
+        }
+        call_args.extend(args);
+        let (value, mut updated) = self.call_function_with_writebacks(function, call_args)?;
+        if has_self && self_mutable {
+            *state = take_writeback(&mut updated, 0);
+        }
+        Ok(Some(value))
     }
 
     pub fn run_main(&mut self) -> Result<MainResult, Trap> {
@@ -141,7 +217,7 @@ impl<'p> IrRuntime<'p> {
             });
         };
         self.reset();
-        let value = self.call_function(main, Vec::new())?;
+        let value = self.call_function(main, CallArgs::new())?;
         Ok(MainResult {
             value,
             log: self.take_log(),
@@ -198,24 +274,36 @@ impl<'p> IrRuntime<'p> {
         Err(EvalError::Trap(trap))
     }
 
-    fn call_function(&mut self, function: FnId, args: Vec<Value>) -> Result<Value, Trap> {
-        self.call_function_with_captures(function, args, None)
+    fn call_function(&mut self, function: FnId, args: CallArgs) -> Result<Value, Trap> {
+        self.call_function_with_writebacks(function, args)
+            .map(|(value, _)| value)
+    }
+
+    fn call_function_with_writebacks(
+        &mut self,
+        function: FnId,
+        args: CallArgs,
+    ) -> Result<(Value, Writebacks), Trap> {
+        self.call_function_with_writebacks_and_captures(function, args, None)
     }
 
     /// Calls a closure value. Lambda parameters cannot be `mut`, so a closure
-    /// call never produces writeback values. The #109 call-node evaluator and
-    /// higher-order builtins use this entry point.
-    #[allow(dead_code)]
-    fn call_closure(&mut self, closure: &Closure, args: Vec<Value>) -> Result<Value, Trap> {
-        self.call_function_with_captures(closure.target, args, closure.captures.clone())
+    /// call never produces writeback values.
+    fn call_closure(&mut self, closure: &Closure, args: CallArgs) -> Result<Value, Trap> {
+        self.call_function_with_writebacks_and_captures(
+            closure.target,
+            args,
+            closure.captures.clone(),
+        )
+        .map(|(value, _)| value)
     }
 
-    fn call_function_with_captures(
+    fn call_function_with_writebacks_and_captures(
         &mut self,
         function: FnId,
-        args: Vec<Value>,
+        args: CallArgs,
         captures: Option<Rc<[Value]>>,
-    ) -> Result<Value, Trap> {
+    ) -> Result<(Value, Writebacks), Trap> {
         if self.frames.len() >= self.limits.depth as usize {
             return Err(Trap::DepthExceeded);
         }
@@ -223,6 +311,9 @@ impl<'p> IrRuntime<'p> {
         let function_info = program
             .function(function)
             .ok_or_else(|| self.internal_panic(format!("missing function #{:?}", function)))?;
+        if let FnKind::Host(host) = function_info.kind {
+            return Ok((self.call_host(host, &args)?, Writebacks::new()));
+        }
         if function_info.body.is_none() {
             return Err(
                 self.internal_panic(format!("function `{}` has no body", function_info.name))
@@ -316,6 +407,25 @@ impl<'p> IrRuntime<'p> {
                 Err(self.internal_panic("`break`/`continue` escaped a loop"))
             }
         };
+        let updated: Writebacks = if result.is_ok() {
+            let frame = self.frames.last_mut().expect("evaluation frame");
+            function_info
+                .params
+                .iter()
+                .enumerate()
+                .filter(|(_, param)| param.mutable)
+                .map(|(index, param)| {
+                    let value = frame
+                        .slots
+                        .get_mut(param.slot.index())
+                        .and_then(|slot| slot.take())
+                        .unwrap_or(Value::Unit);
+                    (index, value)
+                })
+                .collect()
+        } else {
+            Writebacks::new()
+        };
         self.frames.pop();
         let value = result?;
         self.maybe_check_returned_value(&value)
@@ -326,7 +436,51 @@ impl<'p> IrRuntime<'p> {
         if value_depth_exceeds(&value, MAX_VALUE_DEPTH) {
             return Err(Trap::DepthExceeded);
         }
-        Ok(value)
+        Ok((value, updated))
+    }
+
+    fn call_closure_value(&mut self, function: &FnValue, args: CallArgs) -> Result<Value, Trap> {
+        match function {
+            FnValue::Def(id) => self.call_function(*id, args),
+            FnValue::Closure(closure) => self.call_closure(closure, args),
+        }
+    }
+
+    fn call_host(&mut self, host: HostId, args: &[Value]) -> Result<Value, Trap> {
+        if self.deadline_due() {
+            return Err(Trap::Deadline);
+        }
+        let program = self.program;
+        let Some(info) = program.host(host) else {
+            return Err(self.internal_panic(format!("missing host function #{:?}", host)));
+        };
+        let Some(dispatcher) = self.host.as_deref_mut() else {
+            return Err(Trap::Panic {
+                message: "no test double".into(),
+                source: None,
+                span: None,
+                trace: Vec::new(),
+            });
+        };
+        let mut cx = HostContext::new(info.opaque_return);
+        let result = dispatcher.call(host, args, &mut cx);
+        self.fuel = self.fuel.saturating_sub(fuel::host_call_cost(cx.charged));
+        if self.fuel == 0 {
+            return Err(Trap::OutOfFuel);
+        }
+        if self.deadline_due() {
+            return Err(Trap::Deadline);
+        }
+        match result {
+            Ok(value) => {
+                if value_depth_exceeds(&value, MAX_VALUE_DEPTH) {
+                    return Err(Trap::DepthExceeded);
+                }
+                self.note_value(&value);
+                Ok(value)
+            }
+            Err(fault) => Err(Trap::HostFault(fault.message)),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -408,6 +562,14 @@ impl<'p> IrRuntime<'p> {
         self.limits
             .deadline
             .is_some_and(|deadline| self.start.elapsed() >= deadline)
+    }
+
+    fn ensure_deadline(&self) -> EvalResult<()> {
+        if self.deadline_due() {
+            Err(EvalError::Trap(Trap::Deadline))
+        } else {
+            Ok(())
+        }
     }
 
     fn safepoint(&mut self, id: IrId) -> EvalResult<()> {
@@ -501,17 +663,25 @@ impl<'p> IrRuntime<'p> {
                 }
             }
 
-            NodeKind::CallDirect { .. }
-            | NodeKind::CallMethod { .. }
-            | NodeKind::CallValue { .. }
-            | NodeKind::CallBuiltinMethod { .. }
-            | NodeKind::CallBuiltinModule { .. }
-            | NodeKind::CallHost { .. } => {
-                self.trap(self.internal_panic("calls are not implemented until #109"))
+            NodeKind::CallDirect { target, first_arg } => self.eval_call(target, first_arg),
+            NodeKind::CallMethod {
+                target,
+                first_child,
+            } => self.eval_call(target, first_child),
+            NodeKind::CallValue { first_child, argc } => {
+                self.eval_call_value(first_child, argc, span)
             }
             NodeKind::CallBuiltinFn { builtin, first_arg } => {
-                self.eval_builtin_fn(builtin, first_arg, id, span)
+                self.eval_builtin_fn_call(builtin, first_arg, span)
             }
+            NodeKind::CallBuiltinMethod {
+                method,
+                first_child,
+            } => self.call_builtin_method(method, first_child, span),
+            NodeKind::CallBuiltinModule { item, first_arg } => {
+                self.eval_builtin_module_call(item, first_arg, span)
+            }
+            NodeKind::CallHost { host, first_arg } => self.eval_host_call(host, first_arg),
 
             NodeKind::Struct { type_id, layout } => {
                 self.eval_struct(type_id, layout, false, span, node.charge.post)
@@ -632,7 +802,7 @@ impl<'p> IrRuntime<'p> {
             NodeKind::Assert(range) => self.eval_assert(range, span),
             NodeKind::Panic(range) => self.eval_panic(range, span),
             NodeKind::MutArg(_) => {
-                self.trap(self.internal_panic("mutable arguments are not implemented until #109"))
+                self.trap(self.internal_panic("mutable argument used as a value"))
             }
             NodeKind::Charge(units) => {
                 self.charge(u64::from(units))?;
@@ -1596,36 +1766,149 @@ impl<'p> IrRuntime<'p> {
         self.trap(self.panic(message, span))
     }
 
-    fn eval_builtin_fn(
-        &mut self,
-        builtin: BuiltinFnId,
-        first_arg: u32,
-        node: IrId,
-        _span: Span,
-    ) -> EvalResult<Value> {
-        if builtin != BuiltinFnId::PRINT {
-            return self.trap(self.internal_panic("builtin calls are not implemented until #109"));
-        }
-        let function = self.current_function();
-        let value = match function.children.get(first_arg as usize).copied() {
-            Some(arg) => self.eval(arg)?,
-            None => Value::Unit,
-        };
-        self.charge(fuel::show_cost(value.meta().slots))?;
-        let mut text = String::new();
-        write_show(&mut text, &value, &self.program.types, true);
-        self.charge(fuel::string_cost(text.len() as u64))?;
-        self.log.push(text);
-        self.safepoint(node)?;
-        Ok(Value::Unit)
-    }
-
     fn check_value_depth(&self, value: &Value, _span: Span) -> EvalResult<()> {
         if value_depth_exceeds(value, MAX_VALUE_DEPTH) {
             Err(EvalError::Trap(Trap::DepthExceeded))
         } else {
             Ok(())
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Calls
+    // ------------------------------------------------------------------
+
+    fn eval_call(&mut self, target: FnId, first_child: u32) -> EvalResult<Value> {
+        let program = self.program;
+        let Some(function_info) = program.function(target) else {
+            return self.trap(self.internal_panic("call target is out of range"));
+        };
+        let params = function_info.params.clone();
+        let function = self.current_function();
+        let mut values = CallArgs::with_capacity(params.len());
+        let mut writebacks: SmallVec<[(Place, usize); 2]> = SmallVec::new();
+        for (index, param) in params.iter().enumerate() {
+            let Some(child) = function.children.get(first_child as usize + index).copied() else {
+                return self.trap(self.internal_panic("call argument is out of range"));
+            };
+            if param.mutable {
+                let Some(node) = function.node(child).copied() else {
+                    return self.trap(self.internal_panic("call argument is out of range"));
+                };
+                let NodeKind::MutArg(place) = node.kind else {
+                    return self
+                        .trap(self.internal_panic("mutable parameter needs a place argument"));
+                };
+                let place = self.eval_place(place)?;
+                let value = self.read_place(&place)?;
+                values.push(value);
+                writebacks.push((place, index));
+            } else {
+                values.push(self.eval(child)?);
+            }
+        }
+        let (value, mut updated) = self
+            .call_function_with_writebacks(target, values)
+            .map_err(EvalError::Trap)?;
+        for (place, index) in writebacks {
+            if let Some(value) = take_writeback(&mut updated, index) {
+                self.write_place(place, value)?;
+            }
+        }
+        Ok(value)
+    }
+
+    fn eval_call_value(&mut self, first_child: u32, argc: u32, span: Span) -> EvalResult<Value> {
+        let function = self.current_function();
+        let Some(callee_id) = function.children.get(first_child as usize).copied() else {
+            return self.trap(self.internal_panic("value call has no callee"));
+        };
+        let callee = self.eval(callee_id)?;
+        let mut values = CallArgs::with_capacity(argc as usize);
+        for index in 0..argc as usize {
+            let Some(child) = function
+                .children
+                .get(first_child as usize + 1 + index)
+                .copied()
+            else {
+                return self.trap(self.internal_panic("value call argument is out of range"));
+            };
+            let Some(node) = function.node(child).copied() else {
+                return self.trap(self.internal_panic("value call argument is out of range"));
+            };
+            if matches!(node.kind, NodeKind::MutArg(_)) {
+                return self
+                    .trap(self.internal_panic("function values have no mutable parameters"));
+            }
+            values.push(self.eval(child)?);
+        }
+        match callee {
+            Value::Fn(function) => self
+                .call_closure_value(&function, values)
+                .map_err(EvalError::Trap),
+            Value::Builtin(function) => self.call_builtin_fn_values(function, &values, span),
+            Value::BuiltinModuleFn(item) => self.call_builtin_item_values(item, &values, span),
+            _ => self.trap(self.internal_panic("callee is not callable")),
+        }
+    }
+
+    fn eval_plain_children(&mut self, first: u32, count: u32) -> EvalResult<CallArgs> {
+        let function = self.current_function();
+        let mut values = CallArgs::with_capacity(count as usize);
+        for index in 0..count as usize {
+            let Some(child) = function.children.get(first as usize + index).copied() else {
+                return self.trap(self.internal_panic("call argument is out of range"));
+            };
+            let Some(node) = function.node(child).copied() else {
+                return self.trap(self.internal_panic("call argument is out of range"));
+            };
+            if matches!(node.kind, NodeKind::MutArg(_)) {
+                return self.trap(self.internal_panic("mutable argument on a value-only call"));
+            }
+            values.push(self.eval(child)?);
+        }
+        Ok(values)
+    }
+
+    fn eval_builtin_fn_call(
+        &mut self,
+        builtin: BuiltinFnId,
+        first_arg: u32,
+        span: Span,
+    ) -> EvalResult<Value> {
+        let Some(arity) = builtin.arity() else {
+            return self.trap(self.internal_panic("unknown builtin function"));
+        };
+        let values = self.eval_plain_children(first_arg, arity)?;
+        self.call_builtin_fn_values(builtin, &values, span)
+    }
+
+    fn eval_builtin_module_call(
+        &mut self,
+        item: BuiltinItemId,
+        first_arg: u32,
+        span: Span,
+    ) -> EvalResult<Value> {
+        let Some(arity) = item.arity() else {
+            return self.trap(self.internal_panic("unknown builtin module item"));
+        };
+        let values = self.eval_plain_children(first_arg, arity)?;
+        self.call_builtin_item_values(item, &values, span)
+    }
+
+    fn eval_host_call(&mut self, host: HostId, first_arg: u32) -> EvalResult<Value> {
+        let program = self.program;
+        let Some(info) = program.host(host) else {
+            return self.trap(self.internal_panic("host function is out of range"));
+        };
+        let count = u32::try_from(info.params.len()).map_err(|_| {
+            EvalError::Trap(self.internal_panic("host parameter count exceeds u32"))
+        })?;
+        let values = self.eval_plain_children(first_arg, count)?;
+        if self.frames.len() >= self.limits.depth as usize {
+            return self.trap(Trap::DepthExceeded);
+        }
+        self.call_host(host, &values).map_err(EvalError::Trap)
     }
 
     // ------------------------------------------------------------------
@@ -1870,6 +2153,137 @@ impl<'p> IrRuntime<'p> {
         }
     }
 
+    /// Move the value at `accessors` out of `value`, leaving `Unit`.
+    ///
+    /// Copy-on-write charges apply to shared parents, exactly as in `set_path`.
+    /// Mutable builtin receivers use this before applying the method so the
+    /// receiver itself is uniquely owned when the method mutates it.
+    fn take_path_value(&mut self, value: &mut Value, accessors: &[Accessor]) -> EvalResult<Value> {
+        let Some((first, rest)) = accessors.split_first() else {
+            return Ok(std::mem::replace(value, Value::Unit));
+        };
+        match first {
+            Accessor::Field(index) => {
+                let Value::Struct(struct_value) = value else {
+                    return self.trap(self.internal_panic("invalid place access"));
+                };
+                let slots = struct_value.fields.len();
+                let struct_value = self.cow_struct_mut(struct_value, slots)?;
+                let old = struct_value
+                    .fields
+                    .get(*index)
+                    .ok_or_else(|| {
+                        EvalError::Trap(self.internal_panic("struct field out of range"))
+                    })?
+                    .meta();
+                let taken = {
+                    let slot = struct_value.field_mut(*index).expect("field was checked");
+                    self.take_path_value(slot, rest)?
+                };
+                let new = struct_value.fields[*index].meta();
+                struct_value.note_field_replaced(old, new);
+                Ok(taken)
+            }
+            Accessor::Tuple(index) => {
+                let Value::Tuple(items) = value else {
+                    return self.trap(self.internal_panic("invalid place access"));
+                };
+                let slots = items.len();
+                let items = self.cow_vec_mut(items, slots)?;
+                let index = *index as usize;
+                let old = items
+                    .get(index)
+                    .ok_or_else(|| {
+                        EvalError::Trap(self.internal_panic("tuple field out of range"))
+                    })?
+                    .meta();
+                let taken = {
+                    let slot = items.slot_mut(index).expect("field was checked");
+                    self.take_path_value(slot, rest)?
+                };
+                let new = items[index].meta();
+                items.note_child_replaced(old, new);
+                Ok(taken)
+            }
+            Accessor::Index(index_value) => match value {
+                Value::List(items) => {
+                    let Value::Int(index) = index_value else {
+                        return self.trap(self.internal_panic("invalid place access"));
+                    };
+                    let slots = items.len();
+                    let items = self.cow_vec_mut(items, slots)?;
+                    let index = *index;
+                    if index < 0 || index as usize >= items.len() {
+                        return self.trap(self.internal_panic("index out of bounds"));
+                    }
+                    let index = index as usize;
+                    let old = items[index].meta();
+                    let taken = {
+                        let slot = items.slot_mut(index).expect("index was checked");
+                        self.take_path_value(slot, rest)?
+                    };
+                    let new = items[index].meta();
+                    items.note_child_replaced(old, new);
+                    Ok(taken)
+                }
+                Value::Map(map) => {
+                    let key = key_from_value(index_value)
+                        .map_err(|message| EvalError::Trap(self.internal_panic(message)))?;
+                    let slots = map.len().saturating_mul(2);
+                    let map = self.cow_map_mut(map, slots)?;
+                    let old = map
+                        .get(&key)
+                        .ok_or_else(|| EvalError::Trap(self.internal_panic("missing map key")))?
+                        .meta();
+                    let taken = {
+                        let slot = map.value_mut(&key).expect("key was checked");
+                        self.take_path_value(slot, rest)?
+                    };
+                    let new = map.get(&key).expect("key was checked").meta();
+                    map.note_value_replaced(&key, old, new);
+                    Ok(taken)
+                }
+                _ => self.trap(self.internal_panic("invalid place access")),
+            },
+        }
+    }
+
+    fn check_builtin_mutation_depth(
+        &self,
+        name: &str,
+        args: &[Value],
+        path_depth: usize,
+    ) -> EvalResult<()> {
+        let item_limit = MAX_VALUE_DEPTH.saturating_sub(path_depth).saturating_sub(1);
+        let list_limit = MAX_VALUE_DEPTH.saturating_sub(path_depth);
+        let check = |value: &Value, limit: usize| -> EvalResult<()> {
+            if value_depth_exceeds(value, limit) {
+                Err(EvalError::Trap(Trap::DepthExceeded))
+            } else {
+                Ok(())
+            }
+        };
+        match name {
+            "push" => {
+                if let Some(value) = args.first() {
+                    check(value, item_limit)?;
+                }
+            }
+            "insert" => {
+                if let Some(value) = args.get(1) {
+                    check(value, item_limit)?;
+                }
+            }
+            "extend" => {
+                if let Some(value) = args.first() {
+                    check(value, list_limit)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn index_value(&mut self, base: Value, index: Value, span: Span) -> EvalResult<Value> {
         match (base, index) {
             (Value::List(items), Value::Int(index)) => {
@@ -1942,6 +2356,11 @@ enum BinaryKind {
     Ge,
 }
 
+fn take_writeback(updated: &mut Writebacks, index: usize) -> Option<Value> {
+    let position = updated.iter().position(|(slot, _)| *slot == index)?;
+    Some(updated.swap_remove(position).1)
+}
+
 fn slice_bounds(start: i64, end: i64, inclusive: bool, len: i64) -> Option<(usize, usize)> {
     if start < 0 || end < start {
         return None;
@@ -1980,7 +2399,7 @@ fn variant_payload(value: &Value) -> Option<&[Value]> {
     }
 }
 
-impl<'p> IrRuntime<'p> {
+impl<'p, 'h> IrRuntime<'p, 'h> {
     fn bind_pattern(&mut self, pattern: &Pattern, value: &Value) -> EvalResult<()> {
         match pattern {
             Pattern::Wild => {}
@@ -2021,7 +2440,7 @@ impl<'p> IrRuntime<'p> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Frame, IrRuntime};
+    use super::{CallArgs, Frame, IrRuntime};
     use crate::interp::Trap;
     use crate::value::{Closure, FnValue, Value};
     use martite_ir::{
@@ -2241,7 +2660,7 @@ mod tests {
             "the closure snapshots the creating frame's slot"
         );
         let value = runtime
-            .call_closure(&closure, Vec::new())
+            .call_closure(&closure, CallArgs::new())
             .expect("closure call runs");
         assert_eq!(value, Value::Int(7));
     }
@@ -2315,7 +2734,7 @@ mod tests {
         let value = runtime
             .call_closure(
                 &closure,
-                vec![Value::tuple(vec![Value::Int(2), Value::Int(3)])],
+                CallArgs::from(vec![Value::tuple(vec![Value::Int(2), Value::Int(3)])]),
             )
             .expect("destructured lambda call runs");
         assert_eq!(value, Value::Int(5));
@@ -2363,7 +2782,7 @@ mod tests {
         let captures: Rc<[Value]> = Rc::from(vec![Value::Int(11)]);
         let outer = Closure::new(FnId::new(0), Some(captures));
         let value = runtime
-            .call_closure(&outer, Vec::new())
+            .call_closure(&outer, CallArgs::new())
             .expect("outer lambda call runs");
         let Value::Fn(FnValue::Closure(inner)) = value else {
             panic!("outer lambda must return the inner closure");
@@ -2375,7 +2794,7 @@ mod tests {
         );
         assert_eq!(
             runtime
-                .call_closure(&inner, Vec::new())
+                .call_closure(&inner, CallArgs::new())
                 .expect("inner lambda call runs"),
             Value::Int(11)
         );
@@ -2413,7 +2832,7 @@ mod tests {
         });
         let closure = Closure::new(FnId::new(1), None);
         let error = runtime
-            .call_closure(&closure, Vec::new())
+            .call_closure(&closure, CallArgs::new())
             .expect_err("the lambda panics");
         let Trap::Panic {
             message,
