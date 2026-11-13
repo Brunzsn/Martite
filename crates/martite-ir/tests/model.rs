@@ -160,6 +160,7 @@ fn program_owns_pools_hosts_grants_and_entries() {
         types: TypeTable,
         hosts: vec![host],
         grants: vec!["std.io".into()],
+        source_names: vec!["main.mt".into()],
         entries: Entries {
             main: Some(FnId::new(0)),
             tests: vec![FnId::new(1)],
@@ -185,6 +186,8 @@ fn program_owns_pools_hosts_grants_and_entries() {
     );
     assert!(program.has_grant("std.io"));
     assert!(!program.has_grant("std.env"));
+    assert_eq!(program.source_name(SourceId(0)), Some("main.mt"));
+    assert_eq!(program.source_name(SourceId(1)), None);
     assert_eq!(program.entries.main, Some(FnId::new(0)));
     assert_eq!(program.entries.entry_kind, EntryKind::Plugin);
     assert_eq!(program.entries.hooks[0].1.params.len(), 0);

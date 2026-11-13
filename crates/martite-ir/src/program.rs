@@ -210,6 +210,9 @@ pub struct IrProgram {
     pub hosts: Vec<HostFnInfo>,
     pub grants: Vec<Box<str>>,
     pub entries: Entries,
+    /// Source names indexed by [`SourceId`]. The IR itself only needs the name
+    /// for diagnostics and dumps, so the text stays in [`martite_base::SourceMap`].
+    pub source_names: Vec<Box<str>>,
 }
 
 impl IrProgram {
@@ -227,6 +230,10 @@ impl IrProgram {
 
     pub fn host(&self, id: HostId) -> Option<&HostFnInfo> {
         self.hosts.get(id.index())
+    }
+
+    pub fn source_name(&self, id: SourceId) -> Option<&str> {
+        self.source_names.get(id.0 as usize).map(AsRef::as_ref)
     }
 
     pub fn has_grant(&self, module: &str) -> bool {
