@@ -2,9 +2,10 @@
 //!
 //! This crate is the data model between the checker and the runtime. Lowering
 //! from `CheckedProgram` starts in #103; the crate currently owns the type,
-//! builtin and id vocabulary that lowering and the runtime share, plus a
-//! deterministic text printer ([`Printer`]) for dumps and golden tests. There
-//! is no evaluator, lowering, optimizer or verifier here yet.
+//! builtin and id vocabulary that lowering and the runtime share, a
+//! deterministic text printer ([`Printer`]) for dumps and golden tests, and
+//! the verifier ([`verify`]) that enforces the contract between lowering and
+//! every pass. There is no evaluator, lowering or optimizer here yet.
 //!
 //! Dependency direction: `martite-ir` may depend on `martite-base`,
 //! `martite-fuel`, `martite-syntax` and `martite-check` for lowering inputs,
@@ -27,9 +28,9 @@
 //! 64-bit scalar literals live in the const pool so `NodeKind` stays 4-byte
 //! aligned. The exact sizes are pinned by `tests/layout.rs`.
 //!
-//! Per-function side vectors carry spans, synthetic provenance and the
-//! arenas whose payloads do not fit on a node. They are indexed by the ids in
-//! [`id`], and the verifier will check that they stay parallel to `nodes`.
+//! Per-function side vectors carry spans, synthetic provenance, safepoints and
+//! the arenas whose payloads do not fit on a node. They are indexed by the ids
+//! in [`id`], and [`verify`] checks that they stay parallel to `nodes`.
 
 pub mod builtin;
 pub mod charge;
@@ -40,8 +41,11 @@ pub mod pattern;
 pub mod print;
 pub mod program;
 pub mod types;
+pub mod verify;
 
-pub use builtin::{BuiltinFnDef, BuiltinItemDef, BuiltinItemKind};
+pub use builtin::{
+    BuiltinFnDef, BuiltinItemDef, BuiltinItemKind, BuiltinMethodDef, BuiltinReceiver,
+};
 pub use charge::Charge;
 pub use effects::Effects;
 pub use id::{
@@ -59,3 +63,4 @@ pub use program::{
     ParamInfo, PreludeVariant, SlotInfo,
 };
 pub use types::{FieldDef, Ty, TyId, TypeDef, TypeDefKind, TypeId, TypeTable, VariantDef};
+pub use verify::{VerifyError, VerifyErrorKind, verify, verify_after_pass};

@@ -318,8 +318,9 @@ pub enum NodeKind {
         type_id: TypeId,
         first_field: u32,
     },
-    /// Children are `[base, values...]`; [`crate::StructLayout`] maps each
-    /// value to its declaration slot.
+    /// Children start at the layout's `first_child` with the base first,
+    /// followed by the values. [`crate::StructLayout`] maps each value to its
+    /// declaration slot.
     StructUpdate {
         type_id: TypeId,
         layout: StructLayoutId,

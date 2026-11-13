@@ -74,6 +74,6 @@ define_id!(
     BuiltinItemId
 );
 define_id!(
-    /// Identifies a builtin method. The id encodes the receiver kind and name.
+    /// Identifies a builtin method in [`crate::builtin::BUILTIN_METHODS`].
     BuiltinMethodId
 );

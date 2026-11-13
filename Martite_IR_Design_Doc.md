@@ -94,11 +94,13 @@ pub struct IrFn {
     pub source: SourceId,          // per function: fixes the lambda source-file bug
     pub kind: FnKind,              // Free | Method(TypeId) | Handler | Test | Hook | Lambda | Host
     pub params: Vec<ParamInfo>,    // slot, mutability, type; self first if present
+    pub ret: TyId,                 // declared or inferred return type
     pub locals: u32,               // frame size in slots
     pub slot_info: Vec<SlotInfo>,  // type, mutability, debug name
     pub captures: Vec<CaptureInfo>,// lambdas only: (outer slot -> capture index)
     pub nodes: Vec<Node>,          // per-function arena
     pub spans: Vec<Span>,          // side vector indexed by IrId (not inline)
+    pub safepoints: Vec<bool>,     // exact per-node safepoint placement
     pub body: IrId,
 }
 
@@ -186,7 +188,7 @@ Constants and static string literals live in pools. First use in a run allocates
 
 `martite-ir` pins `size_of::<Node>() == 32`: a 12-byte `NodeKind`, the 4-byte `TyId`, the 12-byte `Charge` and the 4-byte `Effects`. `NodeKind`'s variant is the operator or kind discriminator. Fixed-arity children are inline (at most two `IrId`s or one `ChildRange`); variable-arity children live in a per-function `Vec<IrId>`. The binary operand class is derived from the node and child types instead of being stored, and `Int`/`Float` literal payloads live in the const pool; both decisions keep `NodeKind` 4-byte aligned and within 12 bytes.
 
-Spans and synthetic origins are parallel side vectors on `IrFn`. Pattern, match-arm, string-interpolation and struct-update payloads use per-function side arenas so they do not enlarge a node. The size budget is pinned by `crates/martite-ir/tests/layout.rs`.
+Spans, synthetic origins and safepoints are parallel side vectors on `IrFn`. Pattern, match-arm, string-interpolation and struct-update payloads use per-function side arenas so they do not enlarge a node; `StructLayout` carries the `StructUpdate` child offset. The size budget is pinned by `crates/martite-ir/tests/layout.rs`.
 
 ## 7. Semantics contract
 
@@ -252,7 +254,7 @@ The authoritative test is differential: every fixture's exact fuel used must mat
 
 ### 8.3 Safepoints
 
-Today memory is checked: after each `let`, expression statement and assignment; on function and lambda entry; on return; and on every 256th `charge` call; the deadline on every 1024th. The IR marks these as `SAFEPOINT` on the corresponding nodes (`Let`, `Assign`, `CompoundAssign`, `ExprStmt`, function entry/exit), and the evaluator keeps the same tick counter and `& 255`/`& 1023` cadence. Memory accounting keeps its two-level scheme: a conservative `pending_bytes` estimate triggers an exact scan only when it could cross the limit.
+Today memory is checked: after each `let`, expression statement and assignment; on function and lambda entry; on return; and on every 256th `charge` call; the deadline on every 1024th. The IR records exact placement in a per-node `safepoints` side vector (`Let`, `Assign`, `CompoundAssign`, `ExprStmt`, `Return`, and the function body for entry/fallthrough exit); `Effects::SAFEPOINT` is the subtree summary. The evaluator keeps the same tick counter and `& 255`/`& 1023` cadence. Memory accounting keeps its two-level scheme: a conservative `pending_bytes` estimate triggers an exact scan only when it could cross the limit.
 
 ### 8.4 Cadence decision (after migration)
 
@@ -333,7 +335,7 @@ Runs after lowering and, in tests and debug builds, after each pass. Checks:
 - All ids (`IrId`, `FnId`, slot, const, str, host) are in range; the tree property holds.
 - Each node kind has the right number and roles of children; types match the kind (including `Binary` operand class).
 - Call arity and argument types match the callee; `MutPlace` roots are distinct; no `mut` arguments on `CallValue`.
-- `break`/`continue` only inside a loop in the same function; `return`/`Try` types match the function.
+- `break`/`continue` only inside a loop in the same function; `return`/`Try` types match `IrFn.ret`.
 - **Definite assignment:** every slot read is dominated by a write (this replaces the interpreter's runtime "unbound local" check).
 - Stored `effects` are a superset of recomputed effects; stored `charge` equals what the policy allows; safepoints present where lowering put them.
 - Host calls reference only hosts whose module appears in `IrProgram.grants` (defense in depth; the resolver already enforces grants).

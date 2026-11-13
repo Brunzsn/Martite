@@ -9,12 +9,14 @@
 //! Every node line has the same tail:
 //!
 //! ```text
-//! #12 add lhs=#10 rhs=#11 ty=ty#0 charge=1/0/0 effects=MAY_TRAP span=src#0:20..25 origin=-
+//! #12 add lhs=#10 rhs=#11 ty=ty#0 charge=1/0/0 effects=MAY_TRAP span=src#0:20..25 safepoint=0 origin=-
 //! ```
 //!
 //! `charge` is `pre/post/per_iter`, `effects` uses the flag order from
-//! [`crate::Effects`], `span` carries the defining function's source id, and
-//! `origin` is the synthetic node's source id or `-`.
+//! [`crate::Effects`], `span` carries the defining function's source id,
+//! `safepoint` is `1` when this exact node performs a safepoint check, and
+//! `origin` is the synthetic node's source id or `-`. The function header also
+//! carries `ret=ty#N`.
 
 use std::fmt::{self, Write};
 
@@ -86,7 +88,11 @@ impl<'a> Printer<'a> {
             write_quoted(out, name)?;
             out.write_char(')')?;
         }
-        write!(out, " slots={} body=", function.locals)?;
+        write!(
+            out,
+            " slots={} ret=ty#{} body=",
+            function.locals, function.ret.0
+        )?;
         match function.body {
             Some(body) => writeln!(out, "#{}", body.0)?,
             None => out.write_str("-\n")?,
@@ -329,7 +335,11 @@ impl<'a> Printer<'a> {
         }
         out.write_str("  layouts:\n")?;
         for (index, layout) in layouts.iter().enumerate() {
-            write!(out, "    #{index} fields=")?;
+            write!(
+                out,
+                "    #{index} first_child={} fields=",
+                layout.first_child
+            )?;
             write_u32_list(out, &layout.fields)?;
             out.write_char('\n')?;
         }
@@ -377,6 +387,12 @@ impl<'a> Printer<'a> {
             out.write_str(" span=")?;
             match function.span(id) {
                 Some(span) => write_span(out, function.source, span)?,
+                None => out.write_str("-")?,
+            }
+            out.write_str(" safepoint=")?;
+            match function.safepoints.get(index) {
+                Some(true) => out.write_str("1")?,
+                Some(false) => out.write_str("0")?,
                 None => out.write_str("-")?,
             }
             out.write_str(" origin=")?;
@@ -1077,6 +1093,7 @@ mod tests {
             source: SourceId(7),
             kind: FnKind::Free,
             params: Vec::new(),
+            ret: TyId::new(0),
             locals: 0,
             slot_info: Vec::new(),
             captures: Vec::new(),
@@ -1095,6 +1112,7 @@ mod tests {
             )],
             spans: Vec::new(),
             synthetic: Vec::new(),
+            safepoints: Vec::new(),
             children: Vec::new(),
             body: Some(IrId::new(0)),
         };

@@ -137,6 +137,9 @@ pub struct IrFn {
     pub source: SourceId,
     pub kind: FnKind,
     pub params: Vec<ParamInfo>,
+    /// Declared or inferred return type. The body's value type and every
+    /// `Return`/`Try` in the function are checked against it.
+    pub ret: TyId,
     /// Frame size in slots.
     pub locals: u32,
     pub slot_info: Vec<SlotInfo>,
@@ -151,6 +154,10 @@ pub struct IrFn {
     /// Parallel to `nodes`. `None` for lowered nodes, `Some(origin)` for a
     /// node created by an optimizer pass.
     pub synthetic: Vec<Option<IrId>>,
+    /// Parallel to `nodes`. True when this exact node performs the memory and
+    /// deadline check. `Effects::SAFEPOINT` remains the subtree summary; this
+    /// vector records where the safepoint actually is.
+    pub safepoints: Vec<bool>,
     /// Children of n-ary nodes and the inline first child of call nodes.
     pub children: Vec<IrId>,
     /// Absent for host and interface declarations.
@@ -172,6 +179,10 @@ impl IrFn {
 
     pub fn is_synthetic(&self, id: IrId) -> bool {
         matches!(self.synthetic.get(id.index()), Some(Some(_)))
+    }
+
+    pub fn is_safepoint(&self, id: IrId) -> bool {
+        self.safepoints.get(id.index()).copied().unwrap_or(false)
     }
 
     pub fn child_slice(&self, range: ChildRange) -> &[IrId] {

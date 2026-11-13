@@ -5,11 +5,49 @@
 //! resolver's `BuiltinItem` is mapped here by module and name, never by its
 //! private numeric id.
 
-use crate::id::{BuiltinFnId, BuiltinItemId};
+use crate::id::{BuiltinFnId, BuiltinItemId, BuiltinMethodId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BuiltinFnDef {
     pub name: &'static str,
+}
+
+/// The receiver kind of a builtin method. The checker has the same set; the IR
+/// owns this copy so lowering and the verifier never read checker enums.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BuiltinReceiver {
+    List,
+    Map,
+    Str,
+    Int,
+    Float,
+    Range,
+    Option,
+    Result,
+}
+
+impl BuiltinReceiver {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Map => "map",
+            Self::Str => "str",
+            Self::Int => "int",
+            Self::Float => "float",
+            Self::Range => "range",
+            Self::Option => "Option",
+            Self::Result => "Result",
+        }
+    }
+}
+
+/// One builtin method. `BuiltinMethodId` indexes [`BUILTIN_METHODS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BuiltinMethodDef {
+    pub receiver: BuiltinReceiver,
+    pub name: &'static str,
+    /// The receiver is a mutable place (`push`, `sort`, `remove`, ...).
+    pub mut_self: bool,
 }
 
 pub const BUILTIN_FNS: [BuiltinFnDef; 3] = [
@@ -156,6 +194,111 @@ impl BuiltinItemId {
     }
 }
 
+/// Canonical builtin-method table. The order is the `BuiltinMethodId` order.
+pub const BUILTIN_METHODS: &[BuiltinMethodDef] = &[
+    // List.
+    method(BuiltinReceiver::List, "len", false),
+    method(BuiltinReceiver::List, "get", false),
+    method(BuiltinReceiver::List, "first", false),
+    method(BuiltinReceiver::List, "last", false),
+    method(BuiltinReceiver::List, "contains", false),
+    method(BuiltinReceiver::List, "map", false),
+    method(BuiltinReceiver::List, "filter", false),
+    method(BuiltinReceiver::List, "fold", false),
+    method(BuiltinReceiver::List, "any", false),
+    method(BuiltinReceiver::List, "all", false),
+    method(BuiltinReceiver::List, "enumerate", false),
+    method(BuiltinReceiver::List, "reversed", false),
+    method(BuiltinReceiver::List, "sorted", false),
+    method(BuiltinReceiver::List, "sorted_by", false),
+    method(BuiltinReceiver::List, "join", false),
+    method(BuiltinReceiver::List, "push", true),
+    method(BuiltinReceiver::List, "pop", true),
+    method(BuiltinReceiver::List, "sort", true),
+    method(BuiltinReceiver::List, "insert", true),
+    method(BuiltinReceiver::List, "remove_at", true),
+    method(BuiltinReceiver::List, "extend", true),
+    method(BuiltinReceiver::List, "clear", true),
+    // Map.
+    method(BuiltinReceiver::Map, "len", false),
+    method(BuiltinReceiver::Map, "get", false),
+    method(BuiltinReceiver::Map, "has", false),
+    method(BuiltinReceiver::Map, "keys", false),
+    method(BuiltinReceiver::Map, "values", false),
+    method(BuiltinReceiver::Map, "entries", false),
+    method(BuiltinReceiver::Map, "remove", true),
+    method(BuiltinReceiver::Map, "clear", true),
+    // Str.
+    method(BuiltinReceiver::Str, "len", false),
+    method(BuiltinReceiver::Str, "chars", false),
+    method(BuiltinReceiver::Str, "split", false),
+    method(BuiltinReceiver::Str, "trim", false),
+    method(BuiltinReceiver::Str, "contains", false),
+    method(BuiltinReceiver::Str, "find", false),
+    method(BuiltinReceiver::Str, "starts_with", false),
+    method(BuiltinReceiver::Str, "ends_with", false),
+    method(BuiltinReceiver::Str, "replace", false),
+    method(BuiltinReceiver::Str, "to_upper", false),
+    method(BuiltinReceiver::Str, "to_lower", false),
+    method(BuiltinReceiver::Str, "parse_int", false),
+    method(BuiltinReceiver::Str, "parse_float", false),
+    // Int.
+    method(BuiltinReceiver::Int, "abs", false),
+    method(BuiltinReceiver::Int, "pow", false),
+    // Float.
+    method(BuiltinReceiver::Float, "abs", false),
+    method(BuiltinReceiver::Float, "floor", false),
+    method(BuiltinReceiver::Float, "ceil", false),
+    method(BuiltinReceiver::Float, "trunc", false),
+    method(BuiltinReceiver::Float, "sqrt", false),
+    method(BuiltinReceiver::Float, "pow", false),
+    method(BuiltinReceiver::Float, "round", false),
+    method(BuiltinReceiver::Float, "is_nan", false),
+    method(BuiltinReceiver::Float, "is_finite", false),
+    // Range.
+    method(BuiltinReceiver::Range, "len", false),
+    method(BuiltinReceiver::Range, "contains", false),
+    method(BuiltinReceiver::Range, "to_list", false),
+    // Option.
+    method(BuiltinReceiver::Option, "is_some", false),
+    method(BuiltinReceiver::Option, "is_none", false),
+    method(BuiltinReceiver::Option, "map", false),
+    method(BuiltinReceiver::Option, "and_then", false),
+    method(BuiltinReceiver::Option, "unwrap_or", false),
+    method(BuiltinReceiver::Option, "ok_or", false),
+    method(BuiltinReceiver::Option, "expect", false),
+    // Result.
+    method(BuiltinReceiver::Result, "is_ok", false),
+    method(BuiltinReceiver::Result, "is_err", false),
+    method(BuiltinReceiver::Result, "map", false),
+    method(BuiltinReceiver::Result, "map_err", false),
+    method(BuiltinReceiver::Result, "and_then", false),
+    method(BuiltinReceiver::Result, "unwrap_or", false),
+    method(BuiltinReceiver::Result, "ok", false),
+    method(BuiltinReceiver::Result, "expect", false),
+];
+
+const fn method(receiver: BuiltinReceiver, name: &'static str, mut_self: bool) -> BuiltinMethodDef {
+    BuiltinMethodDef {
+        receiver,
+        name,
+        mut_self,
+    }
+}
+
+impl BuiltinMethodId {
+    pub fn def(self) -> Option<&'static BuiltinMethodDef> {
+        BUILTIN_METHODS.get(self.index())
+    }
+
+    pub fn lookup(receiver: BuiltinReceiver, name: &str) -> Option<Self> {
+        BUILTIN_METHODS
+            .iter()
+            .position(|method| method.receiver == receiver && method.name == name)
+            .map(|index| Self(index as u32))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +315,43 @@ mod tests {
             assert_eq!(id.def(), Some(function));
             assert_eq!(BuiltinFnId::lookup(function.name), Some(id));
         }
+    }
+
+    #[test]
+    fn builtin_methods_are_indexed_and_unique() {
+        for (index, method) in BUILTIN_METHODS.iter().enumerate() {
+            let id = BuiltinMethodId::new(index as u32);
+            assert_eq!(id.def(), Some(method));
+            assert_eq!(
+                BuiltinMethodId::lookup(method.receiver, method.name),
+                Some(id)
+            );
+        }
+        for (index, a) in BUILTIN_METHODS.iter().enumerate() {
+            for b in BUILTIN_METHODS.iter().skip(index + 1) {
+                assert!(
+                    a.receiver != b.receiver || a.name != b.name,
+                    "duplicate builtin method {} {}",
+                    a.receiver.as_str(),
+                    a.name
+                );
+            }
+        }
+        assert_eq!(BUILTIN_METHODS.len(), 72);
+        assert!(
+            BuiltinMethodId::lookup(BuiltinReceiver::List, "push")
+                .expect("push")
+                .def()
+                .expect("push def")
+                .mut_self
+        );
+        assert!(
+            !BuiltinMethodId::lookup(BuiltinReceiver::List, "len")
+                .expect("len")
+                .def()
+                .expect("len def")
+                .mut_self
+        );
     }
 
     #[test]

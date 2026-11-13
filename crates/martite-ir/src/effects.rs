@@ -2,7 +2,7 @@
 //!
 //! Effects are facts about a node's whole subtree, not an optimization. A
 //! parent's stored flags must be a superset of its own effects and all child
-//! effects; the verifier recomputes them in #101.
+//! effects; the verifier recomputes them bottom-up.
 
 use std::fmt;
 use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};

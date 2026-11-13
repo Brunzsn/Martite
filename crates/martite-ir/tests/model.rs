@@ -68,6 +68,7 @@ fn function_side_vectors_and_arenas_are_indexed_by_id() {
             is_self: false,
             pattern: None,
         }],
+        ret: ty,
         locals: 1,
         slot_info: vec![SlotInfo {
             ty,
@@ -89,11 +90,15 @@ fn function_side_vectors_and_arenas_are_indexed_by_id() {
                 body: IrId::new(2),
             }],
         }],
-        struct_layouts: vec![StructLayout { fields: vec![0, 2] }],
+        struct_layouts: vec![StructLayout {
+            first_child: 0,
+            fields: vec![0, 2],
+        }],
         str_parts: vec![StrPart::Text(StrId::new(0)), StrPart::Expr(IrId::new(2))],
         nodes,
         spans,
         synthetic,
+        safepoints: vec![false; 5],
         children: vec![IrId::new(0), IrId::new(1)],
         body: Some(IrId::new(4)),
     };
@@ -201,6 +206,7 @@ fn optional_dimensions_are_explicit() {
         source: SourceId(2),
         kind: FnKind::Lambda,
         params: Vec::new(),
+        ret: TyId::new(0),
         locals: 0,
         slot_info: Vec::new(),
         captures: Vec::new(),
@@ -211,6 +217,7 @@ fn optional_dimensions_are_explicit() {
         nodes: Vec::new(),
         spans: Vec::new(),
         synthetic: Vec::new(),
+        safepoints: Vec::new(),
         children: Vec::new(),
         body: None,
     };

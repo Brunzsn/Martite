@@ -30,6 +30,7 @@ impl FnBuilder {
                 source: SOURCE,
                 kind,
                 params: Vec::new(),
+                ret: TyId::new(0),
                 locals,
                 slot_info: Vec::new(),
                 captures: Vec::new(),
@@ -40,11 +41,17 @@ impl FnBuilder {
                 nodes: Vec::new(),
                 spans: Vec::new(),
                 synthetic: Vec::new(),
+                safepoints: Vec::new(),
                 children: Vec::new(),
                 body: None,
             },
             next_span: 0,
         }
+    }
+
+    pub fn ret(mut self, ty: TyId) -> Self {
+        self.function.ret = ty;
+        self
     }
 
     pub fn param(mut self, slot: u32, name: &str, ty: TyId, mutable: bool) -> Self {
@@ -139,6 +146,14 @@ impl FnBuilder {
             .push(Node::new(kind, ty, charge, effects));
         self.function.spans.push(span);
         self.function.synthetic.push(None);
+        self.function.safepoints.push(false);
+        id
+    }
+
+    pub fn safepoint(&mut self, id: IrId) -> IrId {
+        if let Some(flag) = self.function.safepoints.get_mut(id.index()) {
+            *flag = true;
+        }
         id
     }
 }
@@ -217,7 +232,9 @@ pub fn all() -> Vec<(&'static str, martite_ir::IrProgram)> {
 }
 
 fn literals() -> martite_ir::IrProgram {
-    let mut function = FnBuilder::new(0, "main", FnKind::Free, 1).slot(INT, false, None);
+    let mut function = FnBuilder::new(0, "main", FnKind::Free, 1)
+        .ret(INT)
+        .slot(INT, false, None);
     let int = function.node(
         NodeKind::Int(ConstId::new(0)),
         INT,
@@ -255,6 +272,7 @@ fn literals() -> martite_ir::IrProgram {
         Charge::ZERO,
         Effects::NONE,
     );
+    function.safepoint(body);
     ProgramBuilder::new("literals.mt")
         .consts(vec![
             ConstValue::Int(7),
@@ -276,6 +294,7 @@ fn calls() -> martite_ir::IrProgram {
     };
 
     let mut fib = FnBuilder::new(0, "fib", FnKind::Free, 1)
+        .ret(INT)
         .param(0, "n", INT, false)
         .slot(INT, false, Some("n"));
     let read_n = fib.node(
@@ -430,7 +449,9 @@ fn calls() -> martite_ir::IrProgram {
 }
 
 fn closures() -> martite_ir::IrProgram {
-    let mut lambda = FnBuilder::new(1, "<lambda>", FnKind::Lambda, 0).capture(0, INT, "x");
+    let mut lambda = FnBuilder::new(1, "<lambda>", FnKind::Lambda, 0)
+        .ret(INT)
+        .capture(0, INT, "x");
     let captured = lambda.node(
         NodeKind::CaptureRead(martite_ir::CaptureIndex::new(0)),
         INT,
@@ -438,7 +459,9 @@ fn closures() -> martite_ir::IrProgram {
         Effects::READS_LOCAL | Effects::SHARES,
     );
 
-    let mut main = FnBuilder::new(0, "main", FnKind::Free, 1).slot(INT, false, Some("x"));
+    let mut main = FnBuilder::new(0, "main", FnKind::Free, 1)
+        .ret(UNIT)
+        .slot(INT, false, Some("x"));
     let closure = main.node(
         NodeKind::MakeClosure(FnId::new(1)),
         INT,
@@ -460,6 +483,7 @@ fn closures() -> martite_ir::IrProgram {
 
 fn match_program() -> martite_ir::IrProgram {
     let mut function = FnBuilder::new(0, "classify", FnKind::Free, 1)
+        .ret(INT)
         .param(0, "value", INT, false)
         .slot(INT, false, Some("value"));
     let one_pattern = function.pattern(Pattern::Int(1));
@@ -525,7 +549,9 @@ fn match_program() -> martite_ir::IrProgram {
 }
 
 fn loops() -> martite_ir::IrProgram {
-    let mut function = FnBuilder::new(0, "main", FnKind::Free, 1).slot(INT, false, None);
+    let mut function = FnBuilder::new(0, "main", FnKind::Free, 1)
+        .ret(UNIT)
+        .slot(INT, false, None);
     let condition = function.node(
         NodeKind::Bool(true),
         INT,
@@ -614,6 +640,7 @@ fn loops() -> martite_ir::IrProgram {
 
 fn mut_params() -> martite_ir::IrProgram {
     let mut bump = FnBuilder::new(0, "bump", FnKind::Free, 1)
+        .ret(UNIT)
         .param(0, "value", INT, true)
         .slot(INT, true, Some("value"));
     let one = bump.node(
@@ -632,7 +659,10 @@ fn mut_params() -> martite_ir::IrProgram {
         Effects::WRITES_LOCAL,
     );
 
-    let mut main = FnBuilder::new(1, "main", FnKind::Free, 1).slot(INT, true, Some("value"));
+    let mut main =
+        FnBuilder::new(1, "main", FnKind::Free, 1)
+            .ret(UNIT)
+            .slot(INT, true, Some("value"));
     let place = main.node(
         NodeKind::SlotPlace(Slot::new(0)),
         INT,
@@ -670,7 +700,9 @@ fn mut_params() -> martite_ir::IrProgram {
 }
 
 fn synthetic() -> martite_ir::IrProgram {
-    let mut function = FnBuilder::new(0, "main", FnKind::Free, 1).slot(INT, false, None);
+    let mut function = FnBuilder::new(0, "main", FnKind::Free, 1)
+        .ret(INT)
+        .slot(INT, false, None);
     let zero = function.node(
         NodeKind::Int(ConstId::new(0)),
         INT,
