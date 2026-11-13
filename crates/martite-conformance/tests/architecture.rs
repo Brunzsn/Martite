@@ -89,12 +89,23 @@ fn ir_stays_above_the_runtime() {
 #[test]
 fn ir_evaluator_reads_only_the_ir_program() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let source = fs::read_to_string(root.join("crates/martite-runtime/src/ir_eval.rs"))
-        .expect("read IR evaluator source");
-    for forbidden in ["martite_check", "CheckedProgram", "BindingId", "HashMap"] {
-        assert!(
-            !source.contains(forbidden),
-            "the IR evaluator must not use {forbidden}"
-        );
+    for name in ["ir_eval.rs", "ir_eval/builtins.rs"] {
+        let path = root.join("crates/martite-runtime/src").join(name);
+        let source = fs::read_to_string(&path).expect("read IR evaluator source");
+        for forbidden in [
+            "martite_check",
+            "CheckedProgram",
+            "BindingId",
+            "DefId",
+            "NodeId",
+            "HashMap",
+            "BuiltinFn::",
+            "BuiltinItem::",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{name}: the IR evaluator must not use {forbidden}"
+            );
+        }
     }
 }

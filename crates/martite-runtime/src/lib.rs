@@ -21,7 +21,7 @@ pub use interp::{
     CallResult, ExecLimits, HostContext, HostDispatcher, HostFault, MainResult, Runtime, Trap,
 };
 #[cfg(feature = "ir-eval")]
-pub use ir_eval::IrRuntime;
+pub use ir_eval::{IrHostDispatcher, IrRuntime};
 pub use ops::{show, value_eq, value_ord};
 pub use value::{
     Closure, EnumValue, FnValue, HandleValue, KeyValue, MAX_VALUE_DEPTH, MapValue, OrderedMap,

@@ -71,6 +71,15 @@ impl BuiltinFnId {
             .position(|def| def.name == name)
             .map(|index| Self(index as u32))
     }
+
+    /// Number of arguments the evaluator reads for a direct call node.
+    pub fn arity(self) -> Option<u32> {
+        match self {
+            Self::PRINT | Self::PANIC => Some(1),
+            Self::ASSERT => Some(2),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -192,6 +201,24 @@ impl BuiltinItemId {
             .position(|item| item.module == module && item.name == name)
             .map(|index| Self(index as u32))
     }
+
+    /// Number of arguments the evaluator reads for a direct call node.
+    ///
+    /// Only `Fn` items are callable; constants and enums return `None`.
+    pub fn arity(self) -> Option<u32> {
+        let item = self.item()?;
+        if item.kind != BuiltinItemKind::Fn {
+            return None;
+        }
+        match (item.module, item.name) {
+            ("std.math", "min" | "max") => Some(2),
+            ("std.math", "clamp") => Some(3),
+            ("std.math", "atan2") => Some(2),
+            ("std.math", "sin" | "cos" | "tan" | "exp" | "ln" | "log10") => Some(1),
+            ("std.json", "parse" | "stringify") => Some(1),
+            _ => None,
+        }
+    }
 }
 
 /// Canonical builtin-method table. The order is the `BuiltinMethodId` order.
@@ -297,6 +324,51 @@ impl BuiltinMethodId {
             .position(|method| method.receiver == receiver && method.name == name)
             .map(|index| Self(index as u32))
     }
+
+    /// Number of arguments after the receiver that the evaluator reads.
+    pub fn arity(self) -> Option<u32> {
+        let def = self.def()?;
+        builtin_method_arity(def.receiver, def.name)
+    }
+}
+
+/// Argument count (excluding the receiver) for one builtin method.
+///
+/// The evaluator needs this because call nodes do not store argument counts;
+/// the verifier uses the same table so execution and verification agree.
+pub fn builtin_method_arity(receiver: BuiltinReceiver, name: &str) -> Option<u32> {
+    use BuiltinReceiver::*;
+    Some(match (receiver, name) {
+        (
+            List,
+            "len" | "first" | "last" | "pop" | "enumerate" | "reversed" | "sorted" | "sort"
+            | "clear",
+        ) => 0,
+        (
+            List,
+            "get" | "contains" | "map" | "filter" | "any" | "all" | "sorted_by" | "join" | "push"
+            | "remove_at" | "extend",
+        ) => 1,
+        (List, "fold" | "insert") => 2,
+        (Map, "len" | "keys" | "values" | "entries" | "clear") => 0,
+        (Map, "get" | "has" | "remove") => 1,
+        (Str, "len" | "chars" | "trim" | "to_upper" | "to_lower" | "parse_int" | "parse_float") => {
+            0
+        }
+        (Str, "split" | "contains" | "find" | "starts_with" | "ends_with") => 1,
+        (Str, "replace") => 2,
+        (Int, "abs") => 0,
+        (Int, "pow") => 1,
+        (Float, "abs" | "floor" | "ceil" | "trunc" | "sqrt" | "is_nan" | "is_finite") => 0,
+        (Float, "pow" | "round") => 1,
+        (Range, "len" | "to_list") => 0,
+        (Range, "contains") => 1,
+        (Option, "is_some" | "is_none") => 0,
+        (Option, "map" | "and_then" | "unwrap_or" | "ok_or" | "expect") => 1,
+        (Result, "is_ok" | "is_err" | "ok") => 0,
+        (Result, "map" | "map_err" | "and_then" | "unwrap_or" | "expect") => 1,
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -351,6 +423,53 @@ mod tests {
                 .def()
                 .expect("len def")
                 .mut_self
+        );
+    }
+
+    #[test]
+    fn builtin_arities_cover_the_tables() {
+        for (index, function) in BUILTIN_FNS.iter().enumerate() {
+            assert!(
+                BuiltinFnId::new(index as u32).arity().is_some(),
+                "missing arity for builtin function {}",
+                function.name
+            );
+        }
+        for (index, item) in BUILTIN_ITEMS.iter().enumerate() {
+            let arity = BuiltinItemId::new(index as u32).arity();
+            assert_eq!(
+                arity.is_some(),
+                item.kind == BuiltinItemKind::Fn,
+                "arity for {}.{}",
+                item.module,
+                item.name
+            );
+        }
+        for (index, method) in BUILTIN_METHODS.iter().enumerate() {
+            assert_eq!(
+                BuiltinMethodId::new(index as u32).arity(),
+                builtin_method_arity(method.receiver, method.name),
+                "arity for {} {}",
+                method.receiver.as_str(),
+                method.name
+            );
+            assert!(
+                BuiltinMethodId::new(index as u32).arity().is_some(),
+                "missing arity for builtin method {} {}",
+                method.receiver.as_str(),
+                method.name
+            );
+        }
+        assert_eq!(BuiltinFnId::PRINT.arity(), Some(1));
+        assert_eq!(BuiltinFnId::ASSERT.arity(), Some(2));
+        assert_eq!(BuiltinItemId::MATH_MIN.arity(), Some(2));
+        assert_eq!(BuiltinItemId::MATH_CLAMP.arity(), Some(3));
+        assert_eq!(BuiltinItemId::MATH_PI.arity(), None);
+        assert_eq!(
+            BuiltinMethodId::lookup(BuiltinReceiver::List, "fold")
+                .expect("fold")
+                .arity(),
+            Some(2)
         );
     }
 

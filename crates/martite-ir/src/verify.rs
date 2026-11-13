@@ -4827,7 +4827,7 @@ impl<'p> FnCheck<'p> {
         self.check_child_count(first_child, 1, "builtin method receiver")?;
         let receiver = self.function.children[first_child as usize];
         let (receiver_ty, _) = self.check_arg(receiver, def.mut_self, 0)?;
-        let arity = builtin_method_arity(def.receiver, def.name).ok_or_else(|| {
+        let arity = method.arity().ok_or_else(|| {
             self.error(
                 None,
                 VerifyErrorKind::Builtin {
@@ -5381,41 +5381,6 @@ impl<'p> FnCheck<'p> {
             },
         )
     }
-}
-
-fn builtin_method_arity(receiver: BuiltinReceiver, name: &str) -> Option<u32> {
-    use BuiltinReceiver::*;
-    Some(match (receiver, name) {
-        (
-            List,
-            "len" | "first" | "last" | "pop" | "enumerate" | "reversed" | "sorted" | "sort"
-            | "clear",
-        ) => 0,
-        (
-            List,
-            "get" | "contains" | "map" | "filter" | "any" | "all" | "sorted_by" | "join" | "push"
-            | "remove_at" | "extend",
-        ) => 1,
-        (List, "fold" | "insert") => 2,
-        (Map, "len" | "keys" | "values" | "entries" | "clear") => 0,
-        (Map, "get" | "has" | "remove") => 1,
-        (Str, "len" | "chars" | "trim" | "to_upper" | "to_lower" | "parse_int" | "parse_float") => {
-            0
-        }
-        (Str, "split" | "contains" | "find" | "starts_with" | "ends_with") => 1,
-        (Str, "replace") => 2,
-        (Int, "abs") => 0,
-        (Int, "pow") => 1,
-        (Float, "abs" | "floor" | "ceil" | "trunc" | "sqrt" | "is_nan" | "is_finite") => 0,
-        (Float, "pow" | "round") => 1,
-        (Range, "len" | "to_list") => 0,
-        (Range, "contains") => 1,
-        (Option, "is_some" | "is_none") => 0,
-        (Option, "map" | "and_then" | "unwrap_or" | "ok_or" | "expect") => 1,
-        (Result, "is_ok" | "is_err" | "ok") => 0,
-        (Result, "map" | "map_err" | "and_then" | "unwrap_or" | "expect") => 1,
-        _ => return None,
-    })
 }
 
 pub(crate) struct EffectsCheck<'a> {
@@ -6027,7 +5992,7 @@ pub(crate) fn children_of(program: &IrProgram, function: &IrFn, node: Node) -> V
             }
         }
         NodeKind::CallBuiltinFn { builtin, first_arg } => {
-            if let Some(arity) = builtin.def().map(|def| builtin_fn_arity(def.name)) {
+            if let Some(arity) = builtin.arity() {
                 for index in 0..arity {
                     if let Some(child) = function.children.get(first_arg as usize + index as usize)
                     {
@@ -6040,10 +6005,7 @@ pub(crate) fn children_of(program: &IrProgram, function: &IrFn, node: Node) -> V
             method,
             first_child,
         } => {
-            if let Some(arity) = method
-                .def()
-                .and_then(|def| builtin_method_arity(def.receiver, def.name))
-            {
+            if let Some(arity) = method.arity() {
                 for index in 0..=arity {
                     if let Some(child) =
                         function.children.get(first_child as usize + index as usize)
@@ -6054,7 +6016,7 @@ pub(crate) fn children_of(program: &IrProgram, function: &IrFn, node: Node) -> V
             }
         }
         NodeKind::CallBuiltinModule { item, first_arg } => {
-            if let Some(arity) = item.item().map(|def| builtin_item_arity(def.name)) {
+            if let Some(arity) = item.arity() {
                 for index in 0..arity {
                     if let Some(child) = function.children.get(first_arg as usize + index as usize)
                     {
@@ -6201,21 +6163,4 @@ pub(crate) fn children_of(program: &IrProgram, function: &IrFn, node: Node) -> V
         }
     }
     children
-}
-
-fn builtin_fn_arity(name: &str) -> u32 {
-    match name {
-        "print" | "panic" => 1,
-        "assert" => 2,
-        _ => 0,
-    }
-}
-
-fn builtin_item_arity(name: &str) -> u32 {
-    match name {
-        "min" | "max" | "atan2" => 2,
-        "clamp" => 3,
-        "sin" | "cos" | "tan" | "exp" | "ln" | "log10" | "parse" | "stringify" => 1,
-        _ => 0,
-    }
 }
