@@ -1,8 +1,15 @@
 use martite_base::{LoadLimits, MemoryProvider};
 use martite_driver::{LoadOptions, load};
-use martite_ir::{IrProgram, LowerError, LowerErrorKind, lower, verify};
+use martite_ir::{
+    IrFn, IrId, IrProgram, LowerError, LowerErrorKind, Node, NodeKind, lower, verify,
+};
+use martite_resolve::InterfaceSource;
 
-fn lower_source_result(source: &str) -> Result<IrProgram, LowerError> {
+fn lower_source_result_with(
+    source: &str,
+    interfaces: Vec<InterfaceSource>,
+    grants: Vec<String>,
+) -> Result<IrProgram, LowerError> {
     let mut provider = MemoryProvider::new();
     provider.insert("main.mt", source);
     let loaded = load(
@@ -10,6 +17,8 @@ fn lower_source_result(source: &str) -> Result<IrProgram, LowerError> {
         &LoadOptions {
             entry: "main.mt".into(),
             edition: "1".into(),
+            interfaces,
+            grants,
             limits: LoadLimits::default(),
             ..LoadOptions::default()
         },
@@ -23,10 +32,35 @@ fn lower_source_result(source: &str) -> Result<IrProgram, LowerError> {
     lower(&program, &loaded.sources)
 }
 
+fn lower_source_result(source: &str) -> Result<IrProgram, LowerError> {
+    lower_source_result_with(source, Vec::new(), Vec::new())
+}
+
 fn lower_source(source: &str) -> IrProgram {
     let ir = lower_source_result(source).unwrap_or_else(|error| panic!("{error}"));
     verify(&ir).unwrap_or_else(|error| panic!("{error}"));
     ir
+}
+
+fn lower_source_with(
+    source: &str,
+    interfaces: Vec<InterfaceSource>,
+    grants: Vec<String>,
+) -> IrProgram {
+    let ir = lower_source_result_with(source, interfaces, grants)
+        .unwrap_or_else(|error| panic!("{error}"));
+    verify(&ir).unwrap_or_else(|error| panic!("{error}"));
+    ir
+}
+
+fn find_node(function: &IrFn, predicate: impl Fn(&NodeKind) -> bool) -> (IrId, &Node) {
+    function
+        .nodes
+        .iter()
+        .enumerate()
+        .find(|(_, node)| predicate(&node.kind))
+        .map(|(index, node)| (IrId::new(index as u32), node))
+        .unwrap_or_else(|| panic!("no matching node in `{}`", function.name))
 }
 
 fn node_kinds(ir: &IrProgram, function: martite_ir::FnId) -> Vec<martite_ir::NodeKind> {
@@ -192,6 +226,295 @@ fn check(x: int) -> int {
             .iter()
             .any(|kind| matches!(kind, martite_ir::NodeKind::Panic(_)))
     );
+}
+
+#[test]
+fn lowers_every_call_form() {
+    let ir = lower_source(
+        r#"
+use std.math
+
+struct Counter { n: int }
+
+impl Counter {
+    fn bump(mut self, mut by: int) -> int {
+        self.n += by
+        by += 1
+        self.n + by
+    }
+}
+
+fn add(a: int, b: int) -> int { a + b }
+
+fn main() {
+    var counter = Counter { n: 0 }
+    var by = 1
+    let f = add
+    let first = add(1, 2)
+    let second = f(3, 4)
+    let third = counter.bump(mut by)
+    var values = [1, 2, 3]
+    values.push(4)
+    let smallest = math.min(first, second)
+    print("{smallest + third + values.len()}")
+}
+"#,
+    );
+    let main = named_function(&ir, "main");
+
+    let (_, direct) = find_node(main, |kind| matches!(kind, NodeKind::CallDirect { .. }));
+    let NodeKind::CallDirect { target, .. } = direct.kind else {
+        unreachable!()
+    };
+    assert_eq!(ir.function(target).expect("target").name.as_ref(), "add");
+
+    let (_, value_call) = find_node(main, |kind| matches!(kind, NodeKind::CallValue { .. }));
+    let NodeKind::CallValue { first_child, argc } = value_call.kind else {
+        unreachable!()
+    };
+    assert_eq!(argc, 2);
+    let callee = main.children[first_child as usize];
+    assert!(matches!(
+        main.node(callee).expect("callee").kind,
+        NodeKind::SlotRead { .. }
+    ));
+
+    let (_, method) = find_node(main, |kind| matches!(kind, NodeKind::CallMethod { .. }));
+    let NodeKind::CallMethod {
+        target,
+        first_child,
+    } = method.kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(ir.function(target).expect("target").name.as_ref(), "bump");
+    let receiver = main.children[first_child as usize];
+    assert!(matches!(
+        main.node(receiver).expect("receiver").kind,
+        NodeKind::MutArg(_)
+    ));
+
+    let (_, builtin_method) = find_node(main, |kind| {
+        matches!(kind, NodeKind::CallBuiltinMethod { .. })
+    });
+    let NodeKind::CallBuiltinMethod {
+        method,
+        first_child,
+    } = builtin_method.kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(method.def().expect("method").name, "push");
+    let receiver = main.children[first_child as usize];
+    assert!(matches!(
+        main.node(receiver).expect("receiver").kind,
+        NodeKind::MutArg(_)
+    ));
+
+    let (_, builtin_module) = find_node(main, |kind| {
+        matches!(kind, NodeKind::CallBuiltinModule { .. })
+    });
+    let NodeKind::CallBuiltinModule { item, .. } = builtin_module.kind else {
+        unreachable!()
+    };
+    assert_eq!(item.item().expect("item").name, "min");
+
+    let (_, builtin_fn) = find_node(main, |kind| matches!(kind, NodeKind::CallBuiltinFn { .. }));
+    let NodeKind::CallBuiltinFn { builtin, .. } = builtin_fn.kind else {
+        unreachable!()
+    };
+    assert_eq!(builtin, martite_ir::BuiltinFnId::PRINT);
+}
+
+#[test]
+fn mutable_receiver_and_arguments_follow_parameter_order() {
+    let ir = lower_source(
+        r#"
+struct Counter { n: int }
+
+impl Counter {
+    fn apply(mut self, mut a: int, mut b: int) { self.n += a + b }
+}
+
+fn pair(mut a: int, mut b: int) {
+    a += 1
+    b += 1
+}
+
+fn main() {
+    var counter = Counter { n: 0 }
+    var a = 1
+    var b = 2
+    counter.apply(mut a, mut b)
+    pair(mut a, mut b)
+}
+"#,
+    );
+    let main = named_function(&ir, "main");
+
+    let (_, method) = find_node(main, |kind| matches!(kind, NodeKind::CallMethod { .. }));
+    let NodeKind::CallMethod { first_child, .. } = method.kind else {
+        unreachable!()
+    };
+    let children: Vec<_> = (0..3)
+        .map(|offset| main.children[first_child as usize + offset])
+        .collect();
+    let slots: Vec<_> = children
+        .iter()
+        .map(|child| match main.node(*child).expect("child").kind {
+            NodeKind::MutArg(place) => match main.node(place).expect("place").kind {
+                NodeKind::SlotPlace(slot) => slot.index(),
+                other => panic!("expected slot place, found {other:?}"),
+            },
+            other => panic!("expected mut argument, found {other:?}"),
+        })
+        .collect();
+    assert_eq!(slots, vec![0, 1, 2], "receiver first, then arguments");
+
+    let (_, direct) = find_node(main, |kind| matches!(kind, NodeKind::CallDirect { .. }));
+    let NodeKind::CallDirect { first_arg, .. } = direct.kind else {
+        unreachable!()
+    };
+    let children: Vec<_> = (0..2)
+        .map(|offset| main.children[first_arg as usize + offset])
+        .collect();
+    assert!(
+        children
+            .iter()
+            .all(|child| matches!(main.node(*child).expect("child").kind, NodeKind::MutArg(_)))
+    );
+    assert!(
+        !main.nodes.iter().any(|node| matches!(
+            node.kind,
+            NodeKind::Assign { .. }
+                | NodeKind::AddAssign { .. }
+                | NodeKind::SubAssign { .. }
+                | NodeKind::MulAssign { .. }
+                | NodeKind::DivAssign { .. }
+                | NodeKind::RemAssign { .. }
+        )),
+        "writeback is part of call semantics, not lowered nodes"
+    );
+}
+
+#[test]
+fn mutable_argument_places_charge_only_index_expressions() {
+    let ir = lower_source(
+        r#"
+fn bump(mut value: int) {}
+
+fn main() {
+    var values = [1, 2, 3]
+    var index = 0
+    bump(mut values[index])
+}
+"#,
+    );
+    let main = named_function(&ir, "main");
+    let (_, call) = find_node(main, |kind| matches!(kind, NodeKind::CallDirect { .. }));
+    assert_eq!(call.charge, martite_ir::Charge::expression());
+
+    let (_, mut_arg) = find_node(main, |kind| matches!(kind, NodeKind::MutArg(_)));
+    assert_eq!(mut_arg.charge, martite_ir::Charge::ZERO);
+    let NodeKind::MutArg(place) = mut_arg.kind else {
+        unreachable!()
+    };
+    let place = main.node(place).expect("place");
+    assert_eq!(place.charge, martite_ir::Charge::ZERO);
+    let NodeKind::Index { base, index } = place.kind else {
+        panic!("expected an index place, found {:?}", place.kind);
+    };
+    let base = main.node(base).expect("base");
+    assert!(matches!(base.kind, NodeKind::SlotPlace(_)));
+    assert_eq!(base.charge, martite_ir::Charge::ZERO);
+    let index = main.node(index).expect("index");
+    assert!(matches!(index.kind, NodeKind::SlotRead { .. }));
+    assert_eq!(index.charge, martite_ir::Charge::expression());
+
+    let reads: Vec<_> = main
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::SlotRead { slot, .. } => Some(slot.index()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reads, vec![1], "the place root is not read as a value");
+}
+
+#[test]
+fn lowers_handler_calls_with_state_as_the_receiver() {
+    let ir = lower_source_with(
+        r#"
+struct State { n: int }
+
+on init() -> State { State { n: 0 } }
+on tick(mut self) { self.n += 1 }
+
+test "handler call" {
+    var state = State { n: 0 }
+    tick(mut state)
+    assert(state.n == 1, "state")
+}
+"#,
+        vec![InterfaceSource {
+            path: "app.hooks".into(),
+            text: "on tick()\n".into(),
+        }],
+        vec!["app.hooks".into()],
+    );
+    let test = ir
+        .fns
+        .iter()
+        .find(|function| matches!(function.kind, martite_ir::FnKind::Test))
+        .expect("test function");
+    let (_, call) = find_node(test, |kind| matches!(kind, NodeKind::CallMethod { .. }));
+    let NodeKind::CallMethod {
+        target,
+        first_child,
+    } = call.kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(ir.function(target).expect("target").name.as_ref(), "tick");
+    let receiver = test.children[first_child as usize];
+    let receiver = test.node(receiver).expect("receiver");
+    assert!(matches!(receiver.kind, NodeKind::MutArg(_)));
+}
+
+#[test]
+fn lowers_host_calls() {
+    let ir = lower_source_with(
+        r#"
+use app.bench
+
+fn compute(seed: int) -> int {
+    let token = bench.mint(seed)
+    bench.mix(token, seed)
+}
+"#,
+        vec![InterfaceSource {
+            path: "app.bench".into(),
+            text: "struct Token\nfn mint(seed: int) -> Token\nfn mix(token: Token, value: int) -> int\n"
+                .into(),
+        }],
+        vec!["app.bench".into()],
+    );
+    let function = named_function(&ir, "compute");
+    let hosts: Vec<_> = function
+        .nodes
+        .iter()
+        .filter_map(|node| match node.kind {
+            NodeKind::CallHost { host, .. } => Some(host),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(hosts.len(), 2);
+    let names: Vec<_> = hosts
+        .iter()
+        .map(|host| ir.host(*host).expect("host").name.as_ref())
+        .collect();
+    assert_eq!(names, vec!["mint", "mix"]);
 }
 
 #[test]
@@ -402,17 +725,27 @@ fn compute(n: int) -> int {
 
 #[test]
 fn unsupported_constructs_are_reported() {
-    let call = lower_source_result(
+    let method = lower_source_result(
         r#"
-fn f() -> int {
-    f()
+struct P { n: int }
+
+impl P {
+    fn get(self) -> int { self.n }
+}
+
+fn f(p: P) -> int {
+    let m = p.get
+    let _ = m
+    0
 }
 "#,
     )
-    .expect_err("call is #104");
+    .expect_err("method value is not lowered yet");
     assert!(matches!(
-        call.kind,
-        LowerErrorKind::Unsupported { construct: "call" }
+        method.kind,
+        LowerErrorKind::Unsupported {
+            construct: "method value"
+        }
     ));
 
     let pattern = lower_source_result(

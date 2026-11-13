@@ -69,6 +69,14 @@ impl<'a, 'p> FnLowerer<'a, 'p> {
             .ok_or_else(|| self.internal(expr.span, "expression has no resolution"))
     }
 
+    /// The checker's resolution for `expr`, if it recorded one.
+    ///
+    /// Calls use this to mirror the interpreter's dispatch: only a `Var` or
+    /// `Field` callee has a resolution, and anything else is a value call.
+    pub(crate) fn resolution_opt(&self, expr: &Expr) -> Option<Resolution> {
+        self.lowerer.program.resolution(expr.id).copied()
+    }
+
     pub(crate) fn node_ty(&self, id: IrId) -> TyId {
         self.function
             .node(id)

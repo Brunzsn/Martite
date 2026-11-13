@@ -2,12 +2,13 @@
 //!
 //! # Scope
 //!
-//! This module is the first half of lowering: function and slot allocation,
-//! the constant and static-string pools, and the expression and statement node
-//! kinds listed in #103. Calls (#104), match patterns (#105) and lambdas plus
-//! `Entries` (#106) are deliberately not lowered yet. A checked program that
-//! uses one of those constructs receives [`LowerErrorKind::Unsupported`]; any
-//! other failure is an internal compiler error.
+//! This module lowers the checked AST into the resolved IR: function and slot
+//! allocation, the constant and static-string pools, expressions, statements,
+//! calls and mutable-argument places. Match patterns (#105) and lambdas,
+//! captures and `Entries` (#106) are deliberately not lowered yet. A checked
+//! program that uses one of those constructs receives
+//! [`LowerErrorKind::Unsupported`]; any other failure is an internal compiler
+//! error.
 //!
 //! The checker's `expr_types`, `resolutions`, `struct_lit_fields` and
 //! `pattern_bindings` side tables are read only here. After [`lower`] returns,
@@ -68,7 +69,7 @@ pub struct LowerError {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum LowerErrorKind {
-    /// A construct owned by #104, #105 or #106.
+    /// A construct owned by #105 or #106.
     Unsupported { construct: &'static str },
     /// A lowering invariant failed.
     Internal { message: String },

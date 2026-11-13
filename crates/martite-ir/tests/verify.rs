@@ -1632,6 +1632,37 @@ fn rejects_mut_arguments_on_value_call() {
 }
 
 #[test]
+fn rejects_value_call_arity_mismatch() {
+    let mut program = duplicate_mut_program();
+    let int = type_id(&program, Ty::Int);
+    let unit = type_id(&program, Ty::Unit);
+    let fn_ty = program.types.intern_ty(Ty::Fn(vec![int, int], unit));
+    let fn_ref = IrId::new(program.fns[1].nodes.len() as u32);
+    program.fns[1].nodes.push(node(
+        NodeKind::FnRef(FnId::new(0)),
+        fn_ty,
+        Charge::expression(),
+        Effects::NONE,
+    ));
+    program.fns[1].spans.push(Span::empty(0));
+    program.fns[1].synthetic.push(None);
+    program.fns[1].safepoints.push(false);
+    program.fns[1].nodes[4].kind = NodeKind::CallValue {
+        first_child: 0,
+        argc: 1,
+    };
+    program.fns[1].children = vec![
+        fn_ref,
+        IrId::new(1),
+        IrId::new(3),
+        IrId::new(5),
+        IrId::new(6),
+    ];
+    program.fns[1].nodes[7].kind = NodeKind::Block(ChildRange::new(3, 2));
+    assert!(matches!(error_kind(program), VerifyErrorKind::Arity { .. }));
+}
+
+#[test]
 fn rejects_builtin_method_receiver_mismatch() {
     let mut program = valid_builtin_method_program();
     program.fns[0].nodes[5].kind = NodeKind::SlotRead {

@@ -4,9 +4,9 @@
 //! the type, builtin and id vocabulary, the deterministic text printer
 //! ([`Printer`]) for dumps and golden tests, the verifier ([`verify`]) that
 //! enforces the contract between lowering and every pass, the on-demand slot
-//! analyses in [`analysis`], and the first half of lowering ([`lower`]). Calls,
-//! match patterns and lambdas are lowered in #104–#106; there is no evaluator
-//! or optimizer here yet.
+//! analyses in [`analysis`], and lowering ([`lower`]). Match patterns are
+//! lowered in #105 and lambdas, captures and `Entries` in #106; there is no
+//! evaluator or optimizer here yet.
 //!
 //! Dependency direction: `martite-ir` may depend on `martite-base`,
 //! `martite-fuel`, `martite-syntax` and `martite-check` for lowering inputs,
