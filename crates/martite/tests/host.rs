@@ -99,8 +99,8 @@ fn plugin_init_hook_and_state() {
 
     let mut restored = plugin.instantiate().expect("init");
     restored.restore(&snapshot).expect("restore");
-    let before = martite_runtime::show(instance.state().unwrap(), &plugin.program().types, false);
-    let after = martite_runtime::show(restored.state().unwrap(), &plugin.program().types, false);
+    let before = martite_runtime::show(instance.state().unwrap(), plugin.types(), false);
+    let after = martite_runtime::show(restored.state().unwrap(), plugin.types(), false);
     assert_eq!(before, after);
 }
 

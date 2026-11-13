@@ -5,9 +5,10 @@ use std::time::{Duration, Instant};
 use martite_base::{SourceId, Span};
 use martite_check::{
     BindingId, BuiltinFn, BuiltinItem, BuiltinReceiver, CheckedProgram, ConstValue, DefId, FnKind,
-    FnSig, PatResolution, PreludeVariant, Resolution, Ty, TypeDefKind, TypeId,
+    FnSig, PatResolution, PreludeVariant, Resolution, Ty, TypeDefKind, TypeId as CheckTypeId,
 };
 use martite_fuel as fuel;
+use martite_ir::{BuiltinFnId, BuiltinItemId, FnId, TypeId, TypeTable};
 use martite_syntax::{
     AssignOp, BinaryOp, Block, Expr, ExprKind, LambdaBody, MatchBody, NodeId, PatKind, Pattern,
     Stmt, StmtKind, StrExprPart, UnaryOp,
@@ -16,9 +17,8 @@ use smallvec::{SmallVec, smallvec};
 
 use crate::ops::{show, value_eq, value_ord, write_show};
 use crate::value::{
-    Closure, ClosureTarget, EnumValue, FnValue, HandleValue, MAX_VALUE_DEPTH, MapValue, OrderedMap,
-    SeqValue, StructValue, Value, key_from_value, key_to_value, key_value_size,
-    value_depth_exceeds,
+    Closure, EnumValue, FnValue, HandleValue, MAX_VALUE_DEPTH, MapValue, OrderedMap, SeqValue,
+    StructValue, Value, key_from_value, key_to_value, key_value_size, value_depth_exceeds,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -38,6 +38,81 @@ impl Default for ExecLimits {
             deadline: None,
         }
     }
+}
+
+/// Temporary bridge between checker ids and IR ids.
+///
+/// The AST evaluator is the only remaining `martite-check` consumer. It maps
+/// definitions and resolved names into the IR vocabulary so runtime values
+/// never carry checker ids. Real lowering replaces this bridge in #103 and the
+/// whole AST path is removed in #115/#116.
+#[derive(Debug, Clone)]
+struct ProgramIds {
+    types: TypeTable,
+    lambda_base: u32,
+    lambda_nodes: Vec<NodeId>,
+}
+
+impl ProgramIds {
+    fn new(program: &CheckedProgram) -> Self {
+        let types = TypeTable::from_checker(program);
+        let mut lambda_nodes: Vec<NodeId> = program.lambdas.keys().copied().collect();
+        lambda_nodes.sort_unstable();
+        Self {
+            types,
+            lambda_base: program.functions.len() as u32,
+            lambda_nodes,
+        }
+    }
+
+    fn type_id(&self, id: CheckTypeId) -> TypeId {
+        debug_assert!(
+            (id.0 as usize) < self.types.defs.len(),
+            "checker type id is out of range"
+        );
+        TypeId::new(id.0)
+    }
+
+    fn fn_id(def: DefId) -> FnId {
+        FnId::new(def.0)
+    }
+
+    fn lambda_fn_id(&self, node: NodeId) -> Option<FnId> {
+        self.lambda_nodes
+            .iter()
+            .position(|lambda| *lambda == node)
+            .map(|index| FnId::new(self.lambda_base + index as u32))
+    }
+
+    fn lambda_node(&self, id: FnId) -> Option<NodeId> {
+        let index = id.index().checked_sub(self.lambda_base as usize)?;
+        self.lambda_nodes.get(index).copied()
+    }
+
+    fn is_lambda(&self, id: FnId) -> bool {
+        id.index() >= self.lambda_base as usize
+    }
+
+    fn json_type(&self, id: Option<CheckTypeId>) -> Option<TypeId> {
+        id.map(|id| self.type_id(id))
+    }
+}
+
+fn ir_builtin_fn(function: BuiltinFn) -> BuiltinFnId {
+    match function {
+        BuiltinFn::Print => BuiltinFnId::PRINT,
+        BuiltinFn::Panic => BuiltinFnId::PANIC,
+        BuiltinFn::Assert => BuiltinFnId::ASSERT,
+    }
+}
+
+fn ir_builtin_item(item: &BuiltinItem) -> BuiltinItemId {
+    BuiltinItemId::lookup(item.module, item.name).unwrap_or_else(|| {
+        panic!(
+            "builtin item `{}.{}` has no IR vocabulary entry",
+            item.module, item.name
+        )
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -91,7 +166,8 @@ fn opaque_handle_type(ty: &Ty, program: &CheckedProgram) -> Option<TypeId> {
     match ty {
         Ty::Named(id, args) if args.is_empty() => {
             let def = program.type_def(*id)?;
-            (def.is_interface && matches!(&def.kind, TypeDefKind::Opaque)).then_some(*id)
+            (def.is_interface && matches!(&def.kind, TypeDefKind::Opaque))
+                .then_some(TypeId::new(id.0))
         }
         Ty::Option(inner) => opaque_handle_type(inner.as_ref(), program),
         Ty::Result(ok, _) => opaque_handle_type(ok.as_ref(), program),
@@ -152,6 +228,7 @@ pub struct MainResult {
 
 pub struct Runtime<'p, 'h> {
     program: &'p CheckedProgram,
+    ids: ProgramIds,
     limits: ExecLimits,
     fuel: u64,
     start: Instant,
@@ -180,7 +257,10 @@ struct Frame<'p> {
     /// entry restores the previous value, or removes the binding when it was
     /// absent.
     undo: Vec<(BindingId, Option<Value>)>,
-    captures: Option<Rc<HashMap<BindingId, Value>>>,
+    /// Dense capture values in the lambda's capture order.
+    captures: Option<Rc<[Value]>>,
+    /// The binding ids corresponding to `captures`, in the same order.
+    capture_bindings: &'p [BindingId],
     source: SourceId,
     name: &'p str,
 }
@@ -246,6 +326,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
     pub fn new(program: &'p CheckedProgram, limits: ExecLimits) -> Self {
         Self {
             program,
+            ids: ProgramIds::new(program),
             limits,
             fuel: limits.fuel,
             start: Instant::now(),
@@ -437,7 +518,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 total = total.saturating_add(value.size_bytes(&mut seen));
             }
             if let Some(captures) = &frame.captures {
-                for value in captures.values() {
+                for value in captures.iter() {
                     total = total.saturating_add(value.size_bytes(&mut seen));
                 }
             }
@@ -510,6 +591,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             locals,
             undo: Vec::new(),
             captures: None,
+            capture_bindings: &[],
             source,
             name: sig.name.as_str(),
         });
@@ -600,81 +682,88 @@ impl<'p, 'h> Runtime<'p, 'h> {
 
     fn call_closure(&mut self, function: &FnValue, args: CallArgs) -> Result<Value, Trap> {
         let closure = match function {
-            FnValue::Def(def) => return self.call_def(*def, args).map(|(value, _)| value),
+            FnValue::Def(id) => {
+                let def = DefId(id.0);
+                return self.call_def(def, args).map(|(value, _)| value);
+            }
             FnValue::Closure(closure) => closure,
         };
-        match &closure.target {
-            ClosureTarget::Def(def) => self.call_def(*def, args).map(|(value, _)| value),
-            ClosureTarget::Lambda { node } => {
-                let program = self.program;
-                let Some(lambda) = program.lambda(*node) else {
-                    return Err(self.internal_panic("missing lambda body"));
-                };
-                let params = &lambda.params;
-                let body = &lambda.body;
-                if params.len() != args.len() {
-                    return Err(self.internal_panic("lambda argument count mismatch"));
+        if !self.ids.is_lambda(closure.target) {
+            let def = DefId(closure.target.0);
+            return self.call_def(def, args).map(|(value, _)| value);
+        }
+        let node = self
+            .ids
+            .lambda_node(closure.target)
+            .ok_or_else(|| self.internal_panic("missing lambda body"))?;
+        let program = self.program;
+        let Some(lambda) = program.lambda(node) else {
+            return Err(self.internal_panic("missing lambda body"));
+        };
+        let params = &lambda.params;
+        let body = &lambda.body;
+        if params.len() != args.len() {
+            return Err(self.internal_panic("lambda argument count mismatch"));
+        }
+        if self.frames.len() >= self.limits.depth as usize {
+            return Err(Trap::DepthExceeded);
+        }
+        let source = self.frames.last().map(|f| f.source).unwrap_or(SourceId(0));
+        self.frames.push(Frame {
+            locals: Locals::default(),
+            undo: Vec::new(),
+            captures: closure.captures.clone(),
+            capture_bindings: &lambda.captures,
+            source,
+            name: "<lambda>",
+        });
+        for (index, (param, value)) in params.iter().zip(args.iter()).enumerate() {
+            match lambda.param_bindings.get(index).copied().flatten() {
+                Some(id) => {
+                    self.current_locals_mut().insert(id, value.clone());
                 }
-                if self.frames.len() >= self.limits.depth as usize {
-                    return Err(Trap::DepthExceeded);
+                None => self.bind_pattern(&param.pattern, value),
+            }
+        }
+        if let Err(trap) = self.maybe_check_memory() {
+            self.frames.pop();
+            return Err(match trap {
+                EvalError::Trap(trap) => trap,
+                _ => Trap::OutOfMemory,
+            });
+        }
+        let result = match body {
+            LambdaBody::Block(block) => match self.eval_block(block) {
+                Ok(v) => Ok(v),
+                Err(EvalError::Return(v)) => Ok(v),
+                Err(EvalError::Trap(t)) => Err(t),
+                Err(EvalError::Break) | Err(EvalError::Continue) => {
+                    Err(self.internal_panic("loop control escaped a lambda"))
                 }
-                let source = self.frames.last().map(|f| f.source).unwrap_or(SourceId(0));
-                self.frames.push(Frame {
-                    locals: Locals::default(),
-                    undo: Vec::new(),
-                    captures: closure.captures.clone(),
-                    source,
-                    name: "<lambda>",
-                });
-                for (index, (param, value)) in params.iter().zip(args.iter()).enumerate() {
-                    match lambda.param_bindings.get(index).copied().flatten() {
-                        Some(id) => {
-                            self.current_locals_mut().insert(id, value.clone());
-                        }
-                        None => self.bind_pattern(&param.pattern, value),
-                    }
+            },
+            LambdaBody::Expr(expr) => match self.eval_expr(expr) {
+                Ok(v) => Ok(v),
+                Err(EvalError::Return(v)) => Ok(v),
+                Err(EvalError::Trap(t)) => Err(t),
+                Err(EvalError::Break) | Err(EvalError::Continue) => {
+                    Err(self.internal_panic("loop control escaped a lambda"))
                 }
-                if let Err(trap) = self.maybe_check_memory() {
-                    self.frames.pop();
-                    return Err(match trap {
+            },
+        };
+        self.frames.pop();
+        match result {
+            Ok(value) => {
+                self.maybe_check_returned_value(&value)
+                    .map_err(|error| match error {
                         EvalError::Trap(trap) => trap,
                         _ => Trap::OutOfMemory,
-                    });
+                    })?;
+                if value_depth_exceeds(&value, MAX_VALUE_DEPTH) {
+                    return Err(Trap::DepthExceeded);
                 }
-                let result = match body {
-                    LambdaBody::Block(block) => match self.eval_block(block) {
-                        Ok(v) => Ok(v),
-                        Err(EvalError::Return(v)) => Ok(v),
-                        Err(EvalError::Trap(t)) => Err(t),
-                        Err(EvalError::Break) | Err(EvalError::Continue) => {
-                            Err(self.internal_panic("loop control escaped a lambda"))
-                        }
-                    },
-                    LambdaBody::Expr(expr) => match self.eval_expr(expr) {
-                        Ok(v) => Ok(v),
-                        Err(EvalError::Return(v)) => Ok(v),
-                        Err(EvalError::Trap(t)) => Err(t),
-                        Err(EvalError::Break) | Err(EvalError::Continue) => {
-                            Err(self.internal_panic("loop control escaped a lambda"))
-                        }
-                    },
-                };
-                self.frames.pop();
-                match result {
-                    Ok(value) => {
-                        self.maybe_check_returned_value(&value)
-                            .map_err(|error| match error {
-                                EvalError::Trap(trap) => trap,
-                                _ => Trap::OutOfMemory,
-                            })?;
-                        if value_depth_exceeds(&value, MAX_VALUE_DEPTH) {
-                            return Err(Trap::DepthExceeded);
-                        }
-                        Ok(value)
-                    }
-                    Err(error) => Err(error),
-                }
+                Ok(value)
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -990,22 +1079,27 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 let Some(info) = program.lambda(expr.id) else {
                     return self.trap(self.internal_panic("missing lambda metadata"));
                 };
+                let fn_id = self
+                    .ids
+                    .lambda_fn_id(expr.id)
+                    .ok_or_else(|| EvalError::Trap(self.internal_panic("missing lambda id")))?;
                 let captures = if info.captures.is_empty() {
                     None
                 } else {
-                    let mut values = HashMap::with_capacity(info.captures.len());
-                    for id in &info.captures {
-                        let value = self.local_value(*id).cloned().ok_or_else(|| {
-                            EvalError::Trap(self.internal_panic("missing captured binding"))
-                        })?;
-                        values.insert(*id, value);
-                    }
-                    Some(Rc::new(values))
+                    let values: Vec<Value> = info
+                        .captures
+                        .iter()
+                        .map(|id| {
+                            self.local_value(*id).cloned().ok_or_else(|| {
+                                EvalError::Trap(self.internal_panic("missing captured binding"))
+                            })
+                        })
+                        .collect::<Result<_, _>>()?;
+                    Some(Rc::<[Value]>::from(values))
                 };
                 self.note_alloc(16);
                 Ok(Value::Fn(FnValue::Closure(Rc::new(Closure::new(
-                    ClosureTarget::Lambda { node: expr.id },
-                    captures,
+                    fn_id, captures,
                 )))))
             }
             ExprKind::Block(block) => self.eval_block(block),
@@ -1028,7 +1122,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     }
                     other => self.trap(self.internal_panic(format!(
                         "`?` applied to non-option value {}",
-                        show(&other, &self.program.types, true)
+                        show(&other, &self.ids.types, true)
                     ))),
                 }
             }
@@ -1049,7 +1143,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     (martite_syntax::PrimTy::Str, value) => {
                         self.charge(fuel::show_cost(value.meta().slots))?;
                         let mut text = String::new();
-                        write_show(&mut text, &value, &self.program.types, true);
+                        write_show(&mut text, &value, &self.ids.types, true);
                         self.note_alloc(16 + text.len() as u64);
                         Ok(Value::str(text))
                     }
@@ -1074,7 +1168,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 StrExprPart::Expr(expr) => {
                     let value = self.eval_expr(expr)?;
                     show_slots += fuel::show_cost(value.meta().slots);
-                    write_show(&mut out, &value, &self.program.types, true);
+                    write_show(&mut out, &value, &self.ids.types, true);
                 }
             }
         }
@@ -1124,7 +1218,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             Some(Resolution::Const(def)) => self.materialize_const(def),
             Some(Resolution::Fn(def))
             | Some(Resolution::Handler(def))
-            | Some(Resolution::Test(def)) => Ok(Value::Fn(FnValue::Def(def))),
+            | Some(Resolution::Test(def)) => Ok(Value::Fn(FnValue::Def(ProgramIds::fn_id(def)))),
             Some(Resolution::PreludeVariant(PreludeVariant::None)) => Ok(Value::Option(None)),
             Some(Resolution::PreludeVariant(variant)) => {
                 self.note_alloc(16);
@@ -1134,19 +1228,24 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     _ => Ok(Box::new(Value::Unit)),
                 }))
             }
-            Some(Resolution::BuiltinFn(function)) => Ok(Value::Builtin(function)),
+            Some(Resolution::BuiltinFn(function)) => Ok(Value::Builtin(ir_builtin_fn(function))),
             Some(Resolution::ModuleItem(def)) => self.value_of_def(def),
             Some(Resolution::BuiltinItem(item)) => self.value_of_builtin_item(&item),
             Some(Resolution::Variant(id, index)) => {
+                let type_id = self.ids.type_id(id);
                 let payload = self
-                    .program
+                    .ids
                     .types
-                    .variant(id, index)
+                    .variant(type_id, index)
                     .map(|v| v.payload.len())
                     .unwrap_or(0);
                 if payload == 0 {
                     self.note_alloc(16);
-                    Ok(Value::Enum(Rc::new(EnumValue::new(id, index, Vec::new()))))
+                    Ok(Value::Enum(Rc::new(EnumValue::new(
+                        type_id,
+                        index,
+                        Vec::new(),
+                    ))))
                 } else {
                     self.trap(self.internal_panic("variant constructor used as a value"))
                 }
@@ -1162,15 +1261,16 @@ impl<'p, 'h> Runtime<'p, 'h> {
         if self.program.consts.contains_key(&def) {
             return self.materialize_const(def);
         }
-        Ok(Value::Fn(FnValue::Def(def)))
+        Ok(Value::Fn(FnValue::Def(ProgramIds::fn_id(def))))
     }
 
     fn value_of_builtin_item(&self, item: &BuiltinItem) -> EvalResult<Value> {
-        match (item.module, item.name) {
-            ("std.math", "PI") => Ok(Value::Float(std::f64::consts::PI)),
-            ("std.math", "EULER") => Ok(Value::Float(std::f64::consts::E)),
-            ("std.json", "Json") => self.trap(self.internal_panic("type used as a value")),
-            _ => Ok(Value::BuiltinModuleFn(item.id)),
+        let id = ir_builtin_item(item);
+        match id {
+            BuiltinItemId::MATH_PI => Ok(Value::Float(std::f64::consts::PI)),
+            BuiltinItemId::MATH_EULER => Ok(Value::Float(std::f64::consts::E)),
+            BuiltinItemId::JSON => self.trap(self.internal_panic("type used as a value")),
+            _ => Ok(Value::BuiltinModuleFn(id)),
         }
     }
 
@@ -1200,8 +1300,13 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 }
             }
             Some(Resolution::Variant(id, index)) => {
+                let type_id = self.ids.type_id(id);
                 self.note_alloc(16);
-                Ok(Value::Enum(Rc::new(EnumValue::new(id, index, Vec::new()))))
+                Ok(Value::Enum(Rc::new(EnumValue::new(
+                    type_id,
+                    index,
+                    Vec::new(),
+                ))))
             }
             Some(Resolution::ModuleItem(def)) => self.value_of_def(def),
             Some(Resolution::BuiltinItem(item)) => self.value_of_builtin_item(&item),
@@ -1219,11 +1324,12 @@ impl<'p, 'h> Runtime<'p, 'h> {
         base: Option<&Expr>,
     ) -> EvalResult<Value> {
         let program = self.program;
-        let Some(Resolution::TypeName(type_id)) = program.resolution(expr.id).copied() else {
+        let Some(Resolution::TypeName(check_type_id)) = program.resolution(expr.id).copied() else {
             return self.trap(self.internal_panic("struct literal has no type"));
         };
-        let decl_count = match program.types.get(type_id).map(|def| &def.kind) {
-            Some(martite_check::TypeDefKind::Struct { fields }) => fields.len(),
+        let type_id = self.ids.type_id(check_type_id);
+        let decl_count = match self.ids.types.get(type_id).map(|def| &def.kind) {
+            Some(martite_ir::TypeDefKind::Struct { fields }) => fields.len(),
             _ => return self.trap(self.internal_panic("unknown struct type")),
         };
         let mut out = vec![Value::Unit; decl_count];
@@ -1291,7 +1397,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     return self.call_named_fn(expr, def, args);
                 }
                 Some(Resolution::BuiltinFn(function)) => {
-                    return self.call_builtin(function, args, expr.span);
+                    return self.call_builtin(ir_builtin_fn(function), args, expr.span);
                 }
                 Some(Resolution::PreludeVariant(variant)) => {
                     return self.construct_prelude(variant, args, expr.span);
@@ -1317,7 +1423,9 @@ impl<'p, 'h> Runtime<'p, 'h> {
             Value::Fn(closure) => self.call_closure(&closure, values).map_err(EvalError::Trap),
             Value::Builtin(function) => self.call_builtin_values(function, values, expr.span),
             Value::BuiltinModuleFn(id) => {
-                let item = id.item();
+                let Some(item) = id.item() else {
+                    return self.trap(self.internal_panic("unknown builtin module item"));
+                };
                 self.call_builtin_module_values(item.module, item.name, values, expr.span)
             }
             _ => self.trap(self.internal_panic("callee is not callable")),
@@ -1415,11 +1523,12 @@ impl<'p, 'h> Runtime<'p, 'h> {
 
     fn construct_variant(
         &mut self,
-        type_id: martite_check::TypeId,
+        type_id: CheckTypeId,
         index: usize,
         args: &[martite_syntax::Arg],
         span: Span,
     ) -> EvalResult<Value> {
+        let type_id = self.ids.type_id(type_id);
         let mut payload = Vec::new();
         for arg in args {
             if arg.mutable {
@@ -1840,7 +1949,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
 
     fn call_builtin(
         &mut self,
-        function: BuiltinFn,
+        function: BuiltinFnId,
         args: &[martite_syntax::Arg],
         span: Span,
     ) -> EvalResult<Value> {
@@ -1853,22 +1962,22 @@ impl<'p, 'h> Runtime<'p, 'h> {
 
     fn call_builtin_values(
         &mut self,
-        function: BuiltinFn,
+        function: BuiltinFnId,
         values: CallArgs,
         span: Span,
     ) -> EvalResult<Value> {
         match function {
-            BuiltinFn::Print => {
+            BuiltinFnId::PRINT => {
                 let value = values.into_iter().next().unwrap_or(Value::Unit);
                 self.charge(fuel::show_cost(value.meta().slots))?;
                 let mut text = String::new();
-                write_show(&mut text, &value, &self.program.types, true);
+                write_show(&mut text, &value, &self.ids.types, true);
                 self.charge(fuel::string_cost(text.len() as u64))?;
                 self.log.push(text);
                 self.maybe_check_memory()?;
                 Ok(Value::Unit)
             }
-            BuiltinFn::Panic => {
+            BuiltinFnId::PANIC => {
                 let message = values
                     .into_iter()
                     .next()
@@ -1876,7 +1985,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     .unwrap_or_else(|| "panic".into());
                 self.trap(self.panic(message, span))
             }
-            BuiltinFn::Assert => {
+            BuiltinFnId::ASSERT => {
                 let mut iter = values.into_iter();
                 let condition = iter.next().unwrap_or(Value::Bool(false));
                 let message = iter
@@ -1889,6 +1998,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                     self.trap(self.panic(message, span))
                 }
             }
+            _ => self.trap(self.internal_panic("unknown builtin function")),
         }
     }
 
@@ -1972,7 +2082,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
                 if text.len() as u64 > self.limits.memory {
                     return Err(EvalError::Trap(Trap::OutOfMemory));
                 }
-                let json_type = self.program.json_type;
+                let json_type = self.ids.json_type(self.program.json_type);
                 match crate::json::parse(&text, json_type) {
                     Ok(value) => {
                         self.check_value_depth(&value, span)?;
@@ -1988,7 +2098,7 @@ impl<'p, 'h> Runtime<'p, 'h> {
             }
             ("std.json", "stringify") => {
                 let value = values.into_iter().next().unwrap_or(Value::Unit);
-                let text = crate::json::stringify(&value, &self.program.types);
+                let text = crate::json::stringify(&value, &self.ids.types);
                 self.charge(fuel::string_cost(text.len() as u64))?;
                 self.note_alloc(16 + text.len() as u64);
                 Ok(Value::str(text))
@@ -2094,7 +2204,8 @@ impl<'p, 'h> Runtime<'p, 'h> {
                         matches!(value, Value::Result(Err(_)))
                     }
                     Some(PatResolution::Variant(id, index)) => {
-                        matches!(value, Value::Enum(e) if e.type_id == *id && e.variant == *index)
+                        let type_id = self.ids.type_id(*id);
+                        matches!(value, Value::Enum(e) if e.type_id == type_id && e.variant == *index)
                     }
                     _ => true,
                 };
@@ -2144,12 +2255,15 @@ impl<'p, 'h> Runtime<'p, 'h> {
 
     fn local_value(&self, id: BindingId) -> Option<&Value> {
         let frame = self.frames.last()?;
-        frame.locals.get(id).or_else(|| {
-            frame
-                .captures
-                .as_ref()
-                .and_then(|captures| captures.get(&id))
-        })
+        if let Some(value) = frame.locals.get(id) {
+            return Some(value);
+        }
+        let captures = frame.captures.as_ref()?;
+        let index = frame
+            .capture_bindings
+            .iter()
+            .position(|binding| *binding == id)?;
+        captures.get(index)
     }
 
     fn current_locals_mut(&mut self) -> &mut Locals {
@@ -2386,69 +2500,67 @@ impl<'p, 'h> Runtime<'p, 'h> {
             .consts
             .get(&def)
             .ok_or_else(|| EvalError::Trap(self.internal_panic("unknown constant")))?;
-        let value = Self::const_to_value(program, &info.value);
+        let value = Self::const_to_value(&self.ids, &info.value);
         self.note_value(&value);
         self.const_values.insert(def, value.clone());
         Ok(value)
     }
 
-    fn const_to_value(program: &CheckedProgram, value: &ConstValue) -> Value {
+    fn const_to_value(ids: &ProgramIds, value: &ConstValue) -> Value {
         match value {
             ConstValue::Unit => Value::Unit,
             ConstValue::Int(v) => Value::Int(*v),
             ConstValue::Float(v) => Value::Float(*v),
             ConstValue::Bool(v) => Value::Bool(*v),
             ConstValue::Str(v) => Value::str(v.clone()),
-            ConstValue::Tuple(items) => Value::tuple(
-                items
-                    .iter()
-                    .map(|v| Self::const_to_value(program, v))
-                    .collect(),
-            ),
-            ConstValue::List(items) => Value::list(
-                items
-                    .iter()
-                    .map(|v| Self::const_to_value(program, v))
-                    .collect(),
-            ),
+            ConstValue::Tuple(items) => {
+                Value::tuple(items.iter().map(|v| Self::const_to_value(ids, v)).collect())
+            }
+            ConstValue::List(items) => {
+                Value::list(items.iter().map(|v| Self::const_to_value(ids, v)).collect())
+            }
             ConstValue::Map(entries) => {
                 let mut map = OrderedMap::new();
                 for (k, v) in entries {
-                    let key_value = Self::const_to_value(program, k);
+                    let key_value = Self::const_to_value(ids, k);
                     if let Ok(key) = key_from_value(&key_value) {
-                        map.insert(key, Self::const_to_value(program, v));
+                        map.insert(key, Self::const_to_value(ids, v));
                     }
                 }
                 Value::map(map)
             }
-            ConstValue::Struct(type_id, fields) => {
+            ConstValue::Struct(check_type_id, fields) => {
+                let type_id = ids.type_id(*check_type_id);
                 let mut values = Vec::new();
-                if let Some(def) = program.types.get(*type_id) {
-                    if let martite_check::TypeDefKind::Struct { fields: def_fields } = &def.kind {
+                if let Some(def) = ids.types.get(type_id) {
+                    if let martite_ir::TypeDefKind::Struct { fields: def_fields } = &def.kind {
                         for field in def_fields {
                             let value = fields
                                 .iter()
-                                .find(|(name, _)| name == &field.name)
-                                .map(|(_, v)| Self::const_to_value(program, v))
+                                .find(|(name, _)| name.as_str() == field.name.as_ref())
+                                .map(|(_, v)| Self::const_to_value(ids, v))
                                 .unwrap_or(Value::Unit);
                             values.push(value);
                         }
                     }
                 }
-                Value::Struct(Rc::new(StructValue::new(*type_id, values)))
+                Value::Struct(Rc::new(StructValue::new(type_id, values)))
             }
-            ConstValue::Enum(type_id, variant, payload) => Value::Enum(Rc::new(EnumValue::new(
-                *type_id,
-                *variant,
-                payload
-                    .iter()
-                    .map(|v| Self::const_to_value(program, v))
-                    .collect(),
-            ))),
+            ConstValue::Enum(type_id, variant, payload) => {
+                let type_id = ids.type_id(*type_id);
+                Value::Enum(Rc::new(EnumValue::new(
+                    type_id,
+                    *variant,
+                    payload
+                        .iter()
+                        .map(|v| Self::const_to_value(ids, v))
+                        .collect(),
+                )))
+            }
             ConstValue::Prelude(variant, payload) => {
                 let value = payload
                     .first()
-                    .map(|v| Self::const_to_value(program, v))
+                    .map(|v| Self::const_to_value(ids, v))
                     .unwrap_or(Value::Unit);
                 match variant {
                     PreludeVariant::None => Value::Option(None),

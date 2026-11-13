@@ -1,9 +1,9 @@
 //! Resolved, self-contained tree IR for Martite.
 //!
 //! This crate is the data model between the checker and the runtime. Lowering
-//! from `CheckedProgram` starts in #103; this scaffold only defines the plain
-//! data that lowering produces and every later stage consumes. There is no
-//! evaluator, lowering, optimizer, printer or verifier here yet.
+//! from `CheckedProgram` starts in #103; this crate currently owns the type,
+//! builtin and id vocabulary that lowering and the runtime share. There is no
+//! evaluator, optimizer, printer or verifier here yet.
 //!
 //! Dependency direction: `martite-ir` may depend on `martite-base`,
 //! `martite-fuel`, `martite-syntax` and `martite-check` for lowering inputs,
@@ -30,6 +30,7 @@
 //! arenas whose payloads do not fit on a node. They are indexed by the ids in
 //! [`id`], and the verifier will check that they stay parallel to `nodes`.
 
+pub mod builtin;
 pub mod charge;
 pub mod effects;
 pub mod id;
@@ -38,6 +39,7 @@ pub mod pattern;
 pub mod program;
 pub mod types;
 
+pub use builtin::{BuiltinFnDef, BuiltinItemDef, BuiltinItemKind};
 pub use charge::Charge;
 pub use effects::Effects;
 pub use id::{
@@ -53,4 +55,4 @@ pub use program::{
     CaptureInfo, ConstValue, Entries, EntryKind, FnKind, HookSig, HostFnInfo, IrFn, IrProgram,
     ParamInfo, PreludeVariant, SlotInfo,
 };
-pub use types::{TyId, TypeId, TypeTable};
+pub use types::{FieldDef, Ty, TyId, TypeDef, TypeDefKind, TypeId, TypeTable, VariantDef};

@@ -6,9 +6,12 @@ use std::rc::Rc;
 use martite_base::{
     Code, Diagnostic, FileSystemProvider, LoadLimits, MemoryProvider, SourceMap, SourceProvider,
 };
-use martite_check::{CheckedProgram, FnSig, Ty, TypeDefKind, TypeId};
+use martite_check::{
+    CheckedProgram, FnSig, Ty, TypeDefKind as CheckTypeDefKind, TypeId as CheckTypeId,
+};
 use martite_config::{Manifest, parse_manifest};
 use martite_driver::{LoadOptions, load};
+use martite_ir::{TypeDefKind, TypeId, TypeTable};
 use martite_resolve::{DefId, InterfaceSource};
 use martite_runtime::{
     ExecLimits, HostContext, HostDispatcher, HostFault, MAX_VALUE_DEPTH, Runtime, Trap, Value,
@@ -85,7 +88,9 @@ fn host_type_matches(host: &HostType, ty: &Ty, program: &CheckedProgram) -> bool
         }
         (HostType::Handle(name), Ty::Named(id, _)) => program
             .type_def(*id)
-            .map(|d| &d.name == name && d.is_interface && matches!(&d.kind, TypeDefKind::Opaque))
+            .map(|d| {
+                &d.name == name && d.is_interface && matches!(&d.kind, CheckTypeDefKind::Opaque)
+            })
             .unwrap_or(false),
         _ => false,
     }
@@ -321,8 +326,10 @@ impl Engine {
         if !diagnostics.is_empty() {
             return Err(diagnostics);
         }
+        let types = TypeTable::from_checker(&program);
         Ok(Plugin {
             program,
+            types,
             sources: loaded.sources,
             host_by_def,
             settings: manifest.settings.clone(),
@@ -404,8 +411,10 @@ impl Engine {
         if !diagnostics.is_empty() {
             return Err(diagnostics);
         }
+        let types = TypeTable::from_checker(&program);
         Ok(Plugin {
             program,
+            types,
             sources: loaded.sources,
             host_by_def,
             settings: toml::Value::Table(Default::default()),
@@ -451,6 +460,7 @@ fn parse_api(api: &str) -> Result<(u32, u32), ()> {
 
 pub struct Plugin {
     program: CheckedProgram,
+    types: TypeTable,
     sources: SourceMap,
     host_by_def: HashMap<DefId, RegisteredFn>,
     settings: toml::Value,
@@ -494,6 +504,14 @@ impl Plugin {
         &self.program
     }
 
+    /// IR-owned type definitions for this program.
+    ///
+    /// Values, `show`, JSON conversion and snapshot validation use this table;
+    /// the checker table stays available for tooling through [`Self::program`].
+    pub fn types(&self) -> &TypeTable {
+        &self.types
+    }
+
     pub fn sources(&self) -> &SourceMap {
         &self.sources
     }
@@ -526,16 +544,13 @@ impl Plugin {
     /// `HostContext::make_handle`, which derives the type from the function's
     /// declared return type.
     pub fn make_handle(&self, type_name: &str, token: impl Into<String>) -> Option<Value> {
-        let type_id = self
-            .program
-            .types
-            .defs
-            .iter()
-            .find(|d| d.name == type_name && matches!(d.kind, TypeDefKind::Opaque))
-            .map(|d| d.id)?;
+        let type_id =
+            self.types.defs.iter().position(|d| {
+                d.name.as_ref() == type_name && matches!(d.kind, TypeDefKind::Opaque)
+            })?;
         Some(Value::Handle(std::rc::Rc::new(
             martite_runtime::HandleValue {
-                type_id,
+                type_id: TypeId::new(type_id as u32),
                 token: token.into(),
             },
         )))
@@ -614,8 +629,12 @@ impl Plugin {
     }
 
     fn settings_json(&self) -> Value {
-        let json_type = self.program.json_type.unwrap_or(TypeId(0));
-        toml_to_json(&self.settings, json_type, &self.program)
+        let json_type = self
+            .program
+            .json_type
+            .map(|id| TypeId::new(id.0))
+            .unwrap_or(TypeId(0));
+        toml_to_json(&self.settings, json_type, &self.types)
     }
 }
 
@@ -693,7 +712,7 @@ impl<'p> Instance<'p> {
         if pos != snapshot.bytes.len() {
             return Err("trailing bytes in snapshot".into());
         }
-        validate_snapshot_value(&value, &self.plugin.program, 0)?;
+        validate_snapshot_value(&value, &self.plugin.types, 0)?;
         self.state = Some(value);
         Ok(())
     }
@@ -728,8 +747,8 @@ impl HostDispatcher for Dispatch<'_> {
     }
 }
 
-fn toml_to_json(value: &toml::Value, json_type: TypeId, program: &CheckedProgram) -> Value {
-    let variant = |name: &str| program.types.variant_index(json_type, name).unwrap_or(0);
+fn toml_to_json(value: &toml::Value, json_type: TypeId, types: &TypeTable) -> Value {
+    let variant = |name: &str| types.variant_index(json_type, name).unwrap_or(0);
     let make = |variant: usize, payload: Vec<Value>| {
         Value::Enum(Rc::new(martite_runtime::EnumValue::new(
             json_type, variant, payload,
@@ -745,7 +764,7 @@ fn toml_to_json(value: &toml::Value, json_type: TypeId, program: &CheckedProgram
             vec![Value::list(
                 items
                     .iter()
-                    .map(|v| toml_to_json(v, json_type, program))
+                    .map(|v| toml_to_json(v, json_type, types))
                     .collect(),
             )],
         ),
@@ -754,7 +773,7 @@ fn toml_to_json(value: &toml::Value, json_type: TypeId, program: &CheckedProgram
             for (key, value) in table {
                 map.insert(
                     martite_runtime::KeyValue::Str(key.clone()),
-                    toml_to_json(value, json_type, program),
+                    toml_to_json(value, json_type, types),
                 );
             }
             make(variant("Obj"), vec![Value::map(map)])
@@ -783,7 +802,7 @@ fn fingerprint_into(
     hash: &mut blake3::Hasher,
     ty: &Ty,
     program: &CheckedProgram,
-    stack: &mut Vec<TypeId>,
+    stack: &mut Vec<CheckTypeId>,
 ) {
     match ty {
         Ty::Int => {
@@ -852,10 +871,10 @@ fn fingerprint_into(
             if let Some(def) = program.type_def(*id) {
                 hash_bytes(hash, def.name.as_bytes());
                 match &def.kind {
-                    TypeDefKind::Opaque => {
+                    CheckTypeDefKind::Opaque => {
                         hash.update(b"opaque");
                     }
-                    TypeDefKind::Struct { fields } => {
+                    CheckTypeDefKind::Struct { fields } => {
                         hash.update(b"struct");
                         hash.update(&(fields.len() as u64).to_le_bytes());
                         for field in fields {
@@ -863,7 +882,7 @@ fn fingerprint_into(
                             fingerprint_into(hash, &field.ty, program, stack);
                         }
                     }
-                    TypeDefKind::Enum { variants } => {
+                    CheckTypeDefKind::Enum { variants } => {
                         hash.update(b"enum");
                         hash.update(&(variants.len() as u64).to_le_bytes());
                         for variant in variants {
@@ -1284,11 +1303,7 @@ fn read_string(bytes: &[u8], pos: &mut usize) -> Result<String, String> {
     String::from_utf8(slice.to_vec()).map_err(|_| "invalid UTF-8 in snapshot".into())
 }
 
-fn validate_snapshot_value(
-    value: &Value,
-    program: &CheckedProgram,
-    depth: usize,
-) -> Result<(), String> {
+fn validate_snapshot_value(value: &Value, types: &TypeTable, depth: usize) -> Result<(), String> {
     if depth > MAX_VALUE_DEPTH {
         return Err("snapshot value nesting is too deep".into());
     }
@@ -1302,19 +1317,19 @@ fn validate_snapshot_value(
         | Value::Option(None) => Ok(()),
         Value::List(items) | Value::Tuple(items) => {
             for item in items.iter() {
-                validate_snapshot_value(item, program, depth + 1)?;
+                validate_snapshot_value(item, types, depth + 1)?;
             }
             Ok(())
         }
         Value::Map(map) => {
             for (key, value) in map.entries() {
-                validate_snapshot_key(key, program, depth + 1)?;
-                validate_snapshot_value(value, program, depth + 1)?;
+                validate_snapshot_key(key, types, depth + 1)?;
+                validate_snapshot_value(value, types, depth + 1)?;
             }
             Ok(())
         }
         Value::Struct(value) => {
-            let Some(def) = program.types.get(value.type_id) else {
+            let Some(def) = types.get(value.type_id) else {
                 return Err("snapshot references an unknown struct type".into());
             };
             let TypeDefKind::Struct { fields } = &def.kind else {
@@ -1324,12 +1339,12 @@ fn validate_snapshot_value(
                 return Err("snapshot struct field count does not match its type".into());
             }
             for field in &value.fields {
-                validate_snapshot_value(field, program, depth + 1)?;
+                validate_snapshot_value(field, types, depth + 1)?;
             }
             Ok(())
         }
         Value::Enum(value) => {
-            let Some(def) = program.types.get(value.type_id) else {
+            let Some(def) = types.get(value.type_id) else {
                 return Err("snapshot references an unknown enum type".into());
             };
             let TypeDefKind::Enum { variants } = &def.kind else {
@@ -1342,16 +1357,16 @@ fn validate_snapshot_value(
                 return Err("snapshot enum payload count does not match its variant".into());
             }
             for field in &value.payload {
-                validate_snapshot_value(field, program, depth + 1)?;
+                validate_snapshot_value(field, types, depth + 1)?;
             }
             Ok(())
         }
-        Value::Option(Some(value)) => validate_snapshot_value(value, program, depth + 1),
+        Value::Option(Some(value)) => validate_snapshot_value(value, types, depth + 1),
         Value::Result(Ok(value)) | Value::Result(Err(value)) => {
-            validate_snapshot_value(value, program, depth + 1)
+            validate_snapshot_value(value, types, depth + 1)
         }
         Value::Handle(value) => {
-            let Some(def) = program.types.get(value.type_id) else {
+            let Some(def) = types.get(value.type_id) else {
                 return Err("snapshot references an unknown handle type".into());
             };
             if matches!(&def.kind, TypeDefKind::Opaque) {
@@ -1368,7 +1383,7 @@ fn validate_snapshot_value(
 
 fn validate_snapshot_key(
     key: &martite_runtime::KeyValue,
-    program: &CheckedProgram,
+    types: &TypeTable,
     depth: usize,
 ) -> Result<(), String> {
     use martite_runtime::KeyValue;
@@ -1379,12 +1394,12 @@ fn validate_snapshot_key(
         KeyValue::Int(_) | KeyValue::Bool(_) | KeyValue::Str(_) => Ok(()),
         KeyValue::Tuple(items) => {
             for item in items.iter() {
-                validate_snapshot_key(item, program, depth + 1)?;
+                validate_snapshot_key(item, types, depth + 1)?;
             }
             Ok(())
         }
         KeyValue::Struct(type_id, fields) => {
-            let Some(def) = program.types.get(*type_id) else {
+            let Some(def) = types.get(*type_id) else {
                 return Err("snapshot key references an unknown struct type".into());
             };
             let TypeDefKind::Struct { fields: def_fields } = &def.kind else {
@@ -1394,12 +1409,12 @@ fn validate_snapshot_key(
                 return Err("snapshot key field count does not match its type".into());
             }
             for field in fields {
-                validate_snapshot_key(field, program, depth + 1)?;
+                validate_snapshot_key(field, types, depth + 1)?;
             }
             Ok(())
         }
         KeyValue::Enum(type_id, variant, fields) => {
-            let Some(def) = program.types.get(*type_id) else {
+            let Some(def) = types.get(*type_id) else {
                 return Err("snapshot key references an unknown enum type".into());
             };
             let TypeDefKind::Enum { variants } = &def.kind else {
@@ -1412,16 +1427,16 @@ fn validate_snapshot_key(
                 return Err("snapshot key payload count does not match its variant".into());
             }
             for field in fields {
-                validate_snapshot_key(field, program, depth + 1)?;
+                validate_snapshot_key(field, types, depth + 1)?;
             }
             Ok(())
         }
         KeyValue::Option(Some(value))
         | KeyValue::Result(Ok(value))
-        | KeyValue::Result(Err(value)) => validate_snapshot_key(value, program, depth + 1),
+        | KeyValue::Result(Err(value)) => validate_snapshot_key(value, types, depth + 1),
         KeyValue::Option(None) => Ok(()),
         KeyValue::Handle(type_id, _) => {
-            let Some(def) = program.types.get(*type_id) else {
+            let Some(def) = types.get(*type_id) else {
                 return Err("snapshot key references an unknown handle type".into());
             };
             if matches!(&def.kind, TypeDefKind::Opaque) {

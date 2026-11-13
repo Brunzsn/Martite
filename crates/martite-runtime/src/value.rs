@@ -1,11 +1,9 @@
-use std::collections::HashMap;
 use std::ops::Deref;
 use std::rc::Rc;
 
 use indexmap::IndexMap;
-use martite_check::{BindingId, BuiltinFn, BuiltinItemId, DefId, TypeId};
 use martite_fuel as fuel;
-use martite_syntax::NodeId;
+use martite_ir::{BuiltinFnId, BuiltinItemId, CaptureIndex, FnId, TypeId};
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -27,7 +25,7 @@ pub enum Value {
     Option(Option<Box<Value>>),
     Result(Result<Box<Value>, Box<Value>>),
     Fn(FnValue),
-    Builtin(BuiltinFn),
+    Builtin(BuiltinFnId),
     BuiltinModuleFn(BuiltinItemId),
     Handle(Rc<HandleValue>),
 }
@@ -594,15 +592,17 @@ pub struct HandleValue {
 
 #[derive(Debug, Clone)]
 pub struct Closure {
-    pub target: ClosureTarget,
-    /// Captured free values. `None` for free-function values, which cannot
-    /// capture locals, and for lambdas with no free variables.
-    pub captures: Option<Rc<HashMap<BindingId, Value>>>,
+    /// The IR function the closure calls.
+    pub target: FnId,
+    /// Captured free values in capture-index order. `None` for free-function
+    /// values, which cannot capture locals, and for lambdas with no free
+    /// variables.
+    pub captures: Option<Rc<[Value]>>,
     meta: ValueMeta,
 }
 
 impl Closure {
-    pub fn new(target: ClosureTarget, captures: Option<Rc<HashMap<BindingId, Value>>>) -> Self {
+    pub fn new(target: FnId, captures: Option<Rc<[Value]>>) -> Self {
         let mut meta = ValueMeta {
             depth: 1,
             slots: 0,
@@ -610,7 +610,7 @@ impl Closure {
             bytes: 16,
         };
         if let Some(captures) = &captures {
-            for value in captures.values() {
+            for value in captures.iter() {
                 meta.bytes = meta.bytes.saturating_add(value.meta().bytes);
                 meta.depth = meta.depth.max(1 + value.meta().depth);
             }
@@ -621,21 +621,19 @@ impl Closure {
             meta,
         }
     }
-}
 
-#[derive(Debug, Clone)]
-pub enum ClosureTarget {
-    Def(DefId),
-    Lambda { node: NodeId },
+    pub fn capture(&self, index: CaptureIndex) -> Option<&Value> {
+        self.captures.as_ref()?.get(index.index())
+    }
 }
 
 /// A callable function value.
 ///
-/// Free functions hold only their `DefId`; the `Rc<Closure>` allocation is
+/// Free functions hold only their `FnId`; the `Rc<Closure>` allocation is
 /// reserved for lambdas, which may capture a local environment.
 #[derive(Debug, Clone)]
 pub enum FnValue {
-    Def(DefId),
+    Def(FnId),
     Closure(Rc<Closure>),
 }
 
@@ -949,7 +947,7 @@ impl Value {
                 }
                 let mut total = 16;
                 if let Some(captures) = &closure.captures {
-                    for value in captures.values() {
+                    for value in captures.iter() {
                         total += value.size_bytes(seen);
                     }
                 }
@@ -1173,7 +1171,7 @@ mod tests {
             Value::Fn(FnValue::Closure(closure)) => {
                 let mut meta = RefMeta::container();
                 if let Some(captures) = &closure.captures {
-                    for value in captures.values() {
+                    for value in captures.iter() {
                         let child = reference_meta(value);
                         meta.bytes += child.bytes;
                         meta.depth = meta.depth.max(1 + child.depth);
@@ -1317,7 +1315,7 @@ mod tests {
                 | Value::Result(Err(value)) => stack.push((value, depth + 1)),
                 Value::Fn(FnValue::Closure(closure)) => {
                     if let Some(captures) = &closure.captures {
-                        for value in captures.values() {
+                        for value in captures.iter() {
                             stack.push((value, depth + 1));
                         }
                     }
@@ -1396,11 +1394,10 @@ mod tests {
                 ],
             ))),
         );
-        let mut captures = HashMap::new();
-        captures.insert(BindingId(1), Value::list(vec![Value::Int(3)]));
+        let captures: Rc<[Value]> = Rc::from(vec![Value::list(vec![Value::Int(3)])]);
         let closure = Value::Fn(FnValue::Closure(Rc::new(Closure::new(
-            ClosureTarget::Lambda { node: NodeId(1) },
-            Some(Rc::new(captures)),
+            FnId(1),
+            Some(captures),
         ))));
         Value::tuple(vec![
             Value::Int(1),

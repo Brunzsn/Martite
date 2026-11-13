@@ -10,6 +10,7 @@ use martite_base::{
 };
 use martite_config::ToolConfig;
 use martite_driver::{LoadOptions, LoadedProgram, load};
+use martite_ir::TypeTable;
 use martite_lint::{LintInputs, ManifestInput, SettingsResolver, lint};
 use martite_resolve::InterfaceSource;
 use martite_runtime::{ExecLimits, MainResult, Runtime, Trap, Value};
@@ -335,11 +336,12 @@ pub fn run_case_with_limits(case: &Case, limits: ExecLimits) -> Result<MainResul
         );
     }
     let program = loaded.program.expect("program");
+    let types = TypeTable::from_checker(&program);
     let mut runtime = Runtime::new(&program, limits);
     let main = runtime.run_main()?;
     if let Value::Result(Err(error)) = &main.value {
         return Err(Trap::Panic {
-            message: martite_runtime::show(error, &program.types, true),
+            message: martite_runtime::show(error, &types, true),
             source: None,
             span: None,
             trace: Vec::new(),

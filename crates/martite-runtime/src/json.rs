@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use martite_check::{TypeDefKind, TypeId, TypeTable};
+use martite_ir::{TypeDefKind, TypeId, TypeTable};
 use serde_json::{Map, Number, Value as JsonValue};
 
 use crate::value::{EnumValue, KeyValue, OrderedMap, Value};
@@ -69,7 +69,7 @@ fn to_json(value: &Value, types: &TypeTable, depth: usize) -> JsonValue {
     let Some(variant) = variants.get(enum_value.variant) else {
         return JsonValue::Null;
     };
-    match variant.name.as_str() {
+    match variant.name.as_ref() {
         "Null" => JsonValue::Null,
         "Bool" => match enum_value.payload.first() {
             Some(Value::Bool(true)) => JsonValue::Bool(true),

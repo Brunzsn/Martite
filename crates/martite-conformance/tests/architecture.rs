@@ -53,6 +53,25 @@ fn benchmarks_are_isolated_from_production_crates() {
 }
 
 #[test]
+fn runtime_values_use_the_ir_vocabulary() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for name in ["value.rs", "ops.rs", "json.rs"] {
+        let path = root.join("crates/martite-runtime/src").join(name);
+        let source = fs::read_to_string(&path).expect("read runtime source");
+        assert!(
+            !source.contains("martite_check"),
+            "{name} must use the IR vocabulary, not martite-check"
+        );
+    }
+    let value = fs::read_to_string(root.join("crates/martite-runtime/src/value.rs"))
+        .expect("read runtime value source");
+    assert!(
+        !value.contains("NodeId"),
+        "runtime values must not carry syntax node ids"
+    );
+}
+
+#[test]
 fn ir_stays_above_the_runtime() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let manifest =

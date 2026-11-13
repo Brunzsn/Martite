@@ -12,6 +12,7 @@ use martite::{Engine, HostSignature, Plugin};
 use martite_base::{MemoryProvider, SourceId, SourceMap, Span};
 use martite_check::{CheckedProgram, DefId};
 use martite_config::parse_manifest;
+use martite_ir::TypeTable;
 use martite_runtime::{ExecLimits, HostContext, HostDispatcher, HostFault, Runtime, Trap, Value};
 use martite_syntax::Item;
 use serde::{Deserialize, Serialize};
@@ -203,7 +204,7 @@ impl HostSet {
         self.trace.borrow_mut().clear();
     }
 
-    pub fn take_calls(&self, program: &CheckedProgram) -> Vec<HostCallRecord> {
+    pub fn take_calls(&self, types: &TypeTable) -> Vec<HostCallRecord> {
         let calls = std::mem::take(&mut *self.trace.borrow_mut());
         calls
             .into_iter()
@@ -212,7 +213,7 @@ impl HostSet {
                 args: call
                     .args
                     .iter()
-                    .map(|value| value_repr(value, &program.types, false))
+                    .map(|value| value_repr(value, types, false))
                     .collect(),
                 charged: call.charged,
             })
@@ -651,6 +652,7 @@ fn run_main(case: &Case, hosts: Option<&HostSet>, limits: ExecLimits) -> MainObs
     );
     let sources = loaded.sources;
     let program = loaded.program.expect("snapshot program");
+    let types = TypeTable::from_checker(&program);
     let mut dispatcher = hosts.map(|hosts| hosts.dispatcher(&program));
     let mut runtime = match dispatcher.as_mut() {
         Some(dispatcher) => {
@@ -665,10 +667,10 @@ fn run_main(case: &Case, hosts: Option<&HostSet>, limits: ExecLimits) -> MainObs
     };
     let fuel_used = runtime.fuel_used();
     let host_calls = hosts
-        .map(|hosts| hosts.take_calls(&program))
+        .map(|hosts| hosts.take_calls(&types))
         .unwrap_or_default();
     MainObservation {
-        outcome: outcome_from_result(result, &sources, &program),
+        outcome: outcome_from_result(result, &sources, &types),
         log,
         host_calls,
         fuel_used,
@@ -716,6 +718,7 @@ fn load_plugin(scenario: &PluginScenario) -> Plugin {
 
 fn run_plugin(plugin: &Plugin, scenario: &PluginScenario, limits: ExecLimits) -> PluginObservation {
     let program = plugin.program();
+    let types = plugin.types();
     let mut state: Option<Value> = None;
     let mut steps = Vec::new();
     let mut total_fuel = 0u64;
@@ -757,18 +760,16 @@ fn run_plugin(plugin: &Plugin, scenario: &PluginScenario, limits: ExecLimits) ->
                 let host_calls = scenario
                     .hosts
                     .as_ref()
-                    .map(|hosts| hosts.take_calls(program))
+                    .map(|hosts| hosts.take_calls(types))
                     .unwrap_or_default();
                 total_fuel = total_fuel.saturating_add(fuel_used);
                 steps.push(StepRecord {
                     action: "init".into(),
                     hook: None,
                     args: Vec::new(),
-                    state: state
-                        .as_ref()
-                        .map(|value| value_repr(value, &program.types, true)),
+                    state: state.as_ref().map(|value| value_repr(value, types, true)),
                     outcome: Some(match result {
-                        Ok(result) => outcome_from_value(&result.value, &program.types),
+                        Ok(result) => outcome_from_value(&result.value, types),
                         Err(trap) => outcome_from_trap(&trap, plugin.sources()),
                     }),
                     log,
@@ -780,7 +781,7 @@ fn run_plugin(plugin: &Plugin, scenario: &PluginScenario, limits: ExecLimits) ->
                 let args = resolve_args(plugin, args);
                 let rendered = args
                     .iter()
-                    .map(|value| value_repr(value, &program.types, false))
+                    .map(|value| value_repr(value, types, false))
                     .collect();
                 let (result, log, fuel_used) = run_with_runtime(
                     program,
@@ -793,18 +794,16 @@ fn run_plugin(plugin: &Plugin, scenario: &PluginScenario, limits: ExecLimits) ->
                 let host_calls = scenario
                     .hosts
                     .as_ref()
-                    .map(|hosts| hosts.take_calls(program))
+                    .map(|hosts| hosts.take_calls(types))
                     .unwrap_or_default();
                 total_fuel = total_fuel.saturating_add(fuel_used);
                 steps.push(StepRecord {
                     action: "call".into(),
                     hook: Some((*hook).into()),
                     args: rendered,
-                    state: state
-                        .as_ref()
-                        .map(|value| value_repr(value, &program.types, true)),
+                    state: state.as_ref().map(|value| value_repr(value, types, true)),
                     outcome: Some(match result {
-                        Ok(Some(value)) => outcome_from_value(&value, &program.types),
+                        Ok(Some(value)) => outcome_from_value(&value, types),
                         Ok(None) => OutcomeRecord::NoHandler,
                         Err(trap) => outcome_from_trap(&trap, plugin.sources()),
                     }),
@@ -825,18 +824,16 @@ fn run_plugin(plugin: &Plugin, scenario: &PluginScenario, limits: ExecLimits) ->
                 let host_calls = scenario
                     .hosts
                     .as_ref()
-                    .map(|hosts| hosts.take_calls(program))
+                    .map(|hosts| hosts.take_calls(types))
                     .unwrap_or_default();
                 total_fuel = total_fuel.saturating_add(fuel_used);
                 steps.push(StepRecord {
                     action: "shutdown".into(),
                     hook: Some("shutdown".into()),
                     args: Vec::new(),
-                    state: state
-                        .as_ref()
-                        .map(|value| value_repr(value, &program.types, true)),
+                    state: state.as_ref().map(|value| value_repr(value, types, true)),
                     outcome: Some(match result {
-                        Ok(Some(value)) => outcome_from_value(&value, &program.types),
+                        Ok(Some(value)) => outcome_from_value(&value, types),
                         Ok(None) => OutcomeRecord::NoHandler,
                         Err(trap) => outcome_from_trap(&trap, plugin.sources()),
                     }),
@@ -883,15 +880,15 @@ fn run_with_runtime<'p, 'h, R>(
 fn outcome_from_result(
     result: Result<martite_runtime::MainResult, Trap>,
     sources: &SourceMap,
-    program: &CheckedProgram,
+    types: &TypeTable,
 ) -> OutcomeRecord {
     match result {
-        Ok(result) => outcome_from_value(&result.value, &program.types),
+        Ok(result) => outcome_from_value(&result.value, types),
         Err(trap) => outcome_from_trap(&trap, sources),
     }
 }
 
-fn outcome_from_value(value: &Value, types: &martite_check::TypeTable) -> OutcomeRecord {
+fn outcome_from_value(value: &Value, types: &TypeTable) -> OutcomeRecord {
     OutcomeRecord::Value {
         show: value_repr(value, types, true),
     }
@@ -954,12 +951,12 @@ fn trap_kind(trap: &Trap) -> &'static str {
     }
 }
 
-pub fn value_repr(value: &Value, types: &martite_check::TypeTable, top: bool) -> String {
+pub fn value_repr(value: &Value, types: &TypeTable, top: bool) -> String {
     match value {
         Value::Handle(handle) => {
             let name = types
                 .get(handle.type_id)
-                .map(|def| def.name.as_str())
+                .map(|def| def.name.as_ref())
                 .unwrap_or("Handle");
             format!("<{name}:{}>", handle.token)
         }

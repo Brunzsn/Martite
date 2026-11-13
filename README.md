@@ -13,7 +13,7 @@ The workspace is split along the compiler pipeline:
 - `martite-resolve` — module graph, imports, grants, top-level names
 - `martite-check` — bidirectional type checker, patterns, constants, handlers
 - `martite-ir` — resolved, self-contained tree IR data model
-- `martite-runtime` — tree-walking interpreter, standard library, limits, traps
+- `martite-runtime` — tree-walking interpreter, IR-owned values, standard library, limits, traps
 - `martite-driver` — load orchestration
 - `martite` — embedding and plugin host API
 - `martite-cli` — `martite` binary and standalone `std.io`/`std.env` host

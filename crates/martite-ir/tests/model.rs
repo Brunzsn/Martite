@@ -157,7 +157,7 @@ fn program_owns_pools_hosts_grants_and_entries() {
         fns: Vec::new(),
         consts: vec![ConstValue::Int(7), ConstValue::Bool(true)],
         strs: vec!["hello".into()],
-        types: TypeTable,
+        types: TypeTable::default(),
         hosts: vec![host],
         grants: vec!["std.io".into()],
         entries: Entries {
