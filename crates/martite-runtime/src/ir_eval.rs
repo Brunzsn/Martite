@@ -1,8 +1,8 @@
 //! Recursive evaluator for the resolved tree IR.
 //!
-//! This is the second evaluator slice (#109): values, places, scalar
-//! operators, aggregates, control flow, calls, builtins, hosts and mutable
-//! writeback. Closures, captures and `match` land in #110.
+//! This is the third evaluator slice (#110): values, places, scalar
+//! operators, aggregates, control flow, calls, builtins, hosts, mutable
+//! writeback, closures, captures, `match` and pattern binding.
 //!
 //! The evaluator only reads [`martite_ir::IrProgram`]. Frame slots are a dense
 //! `Vec<Option<Value>>` sized by `IrFn::locals`; there are no binding-id scans
@@ -23,17 +23,17 @@ use std::time::Instant;
 use martite_base::{SourceId, Span};
 use martite_fuel as fuel;
 use martite_ir::{
-    AccessMode, BuiltinFnId, BuiltinItemId, ChildRange, ConstId, ConstValue, FnId, FnKind, HostId,
-    IrFn, IrId, IrProgram, NodeKind, Pattern, PreludeVariant, Slot, StrId, StructLayoutId, Ty,
-    TypeDefKind, TypeId,
+    AccessMode, BuiltinFnId, BuiltinItemId, CaptureIndex, CaptureSource, ChildRange, ConstId,
+    ConstValue, FnId, FnKind, HostId, IrFn, IrId, IrProgram, MatchSetId, NodeKind, Pattern,
+    PreludeVariant, Slot, StrId, StructLayoutId, Ty, TypeDefKind, TypeId,
 };
 use smallvec::SmallVec;
 
 use crate::interp::{CallResult, ExecLimits, HostContext, HostFault, MainResult, Trap};
 use crate::ops::{show, value_eq, value_ord, write_show};
 use crate::value::{
-    EnumValue, FnValue, MAX_VALUE_DEPTH, MapValue, OrderedMap, SeqValue, StructValue, Value,
-    key_from_value, key_value_size, value_depth_exceeds,
+    Closure, EnumValue, FnValue, MAX_VALUE_DEPTH, MapValue, OrderedMap, SeqValue, StructValue,
+    Value, key_from_value, key_value_size, value_depth_exceeds,
 };
 
 /// Host functions resolved by the IR. Dispatch is by [`HostId`]; the embedder
@@ -51,6 +51,10 @@ type EvalResult<T> = Result<T, EvalError>;
 type CallArgs = SmallVec<[Value; 4]>;
 type Writebacks = SmallVec<[(usize, Value); 2]>;
 
+/// Previous slot values for the bindings of an attempted match arm. Entries
+/// are restored in reverse order when a guard fails.
+type BindingUndo = SmallVec<[(Slot, Option<Value>); 8]>;
+
 #[derive(Debug)]
 enum EvalError {
     Trap(Trap),
@@ -63,6 +67,8 @@ struct Frame<'p> {
     function: FnId,
     /// One entry per declared local. `None` is a slot whose value was taken.
     slots: Vec<Option<Value>>,
+    /// Dense capture values in the lambda's capture order.
+    captures: Option<Rc<[Value]>>,
     source: SourceId,
     name: &'p str,
 }
@@ -278,6 +284,26 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         function: FnId,
         args: CallArgs,
     ) -> Result<(Value, Writebacks), Trap> {
+        self.call_function_with_writebacks_and_captures(function, args, None)
+    }
+
+    /// Calls a closure value. Lambda parameters cannot be `mut`, so a closure
+    /// call never produces writeback values.
+    fn call_closure(&mut self, closure: &Closure, args: CallArgs) -> Result<Value, Trap> {
+        self.call_function_with_writebacks_and_captures(
+            closure.target,
+            args,
+            closure.captures.clone(),
+        )
+        .map(|(value, _)| value)
+    }
+
+    fn call_function_with_writebacks_and_captures(
+        &mut self,
+        function: FnId,
+        args: CallArgs,
+        captures: Option<Rc<[Value]>>,
+    ) -> Result<(Value, Writebacks), Trap> {
         if self.frames.len() >= self.limits.depth as usize {
             return Err(Trap::DepthExceeded);
         }
@@ -301,31 +327,69 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 args.len()
             )));
         }
-        if let Some(param) = function_info
-            .params
-            .iter()
-            .find(|param| param.pattern.is_some())
-        {
-            return Err(self.internal_panic(format!(
-                "destructured parameter `{}` is not implemented until #110",
-                param.name
-            )));
-        }
+        let captures = if matches!(function_info.kind, FnKind::Lambda) {
+            let provided = captures.as_ref().map_or(0, |captures| captures.len());
+            if provided != function_info.captures.len() {
+                return Err(self.internal_panic(format!(
+                    "lambda `{}` expected {} captures, got {}",
+                    function_info.name,
+                    function_info.captures.len(),
+                    provided
+                )));
+            }
+            captures
+        } else {
+            if captures.is_some() {
+                return Err(self.internal_panic("captures on a non-lambda function"));
+            }
+            None
+        };
 
         let mut slots = vec![None; function_info.locals as usize];
+        let mut pattern_params: SmallVec<[(&Pattern, Value); 2]> = SmallVec::new();
         for (param, value) in function_info.params.iter().zip(args) {
-            let Some(slot) = slots.get_mut(param.slot.index()) else {
-                return Err(self.internal_panic("parameter slot is out of range"));
-            };
-            *slot = Some(value);
+            if let Some(pattern_id) = param.pattern {
+                let Some(pattern) = function_info.pattern(pattern_id) else {
+                    return Err(self.internal_panic("parameter pattern is out of range"));
+                };
+                pattern_params.push((pattern, value));
+            } else {
+                let Some(slot) = slots.get_mut(param.slot.index()) else {
+                    return Err(self.internal_panic("parameter slot is out of range"));
+                };
+                *slot = Some(value);
+            }
         }
+
+        // Until #118 lands, lambda traps name the caller's source file exactly
+        // like the AST interpreter. Lowering already records the defining
+        // source in `IrFn::source`.
+        let source = if matches!(function_info.kind, FnKind::Lambda) {
+            self.frames
+                .last()
+                .map(|frame| frame.source)
+                .unwrap_or(SourceId(0))
+        } else {
+            function_info.source
+        };
         let frame = Frame {
             function,
             slots,
-            source: function_info.source,
+            captures,
+            source,
             name: function_info.name.as_ref(),
         };
         self.frames.push(frame);
+        for (pattern, value) in pattern_params {
+            if let Err(error) = self.bind_pattern(pattern, &value) {
+                let trap = match error {
+                    EvalError::Trap(trap) => trap,
+                    _ => self.internal_panic("lambda parameter binding failed"),
+                };
+                self.frames.pop();
+                return Err(trap);
+            }
+        }
         if let Err(trap) = self.maybe_check_memory() {
             self.frames.pop();
             return Err(match trap {
@@ -378,9 +442,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
     fn call_closure_value(&mut self, function: &FnValue, args: CallArgs) -> Result<Value, Trap> {
         match function {
             FnValue::Def(id) => self.call_function(*id, args),
-            FnValue::Closure(_) => {
-                Err(self.internal_panic("closure calls are not implemented until #110"))
-            }
+            FnValue::Closure(closure) => self.call_closure(closure, args),
         }
     }
 
@@ -478,6 +540,11 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             for value in frame.slots.iter().flatten() {
                 total = total.saturating_add(value.size_bytes(&mut seen));
             }
+            if let Some(captures) = &frame.captures {
+                for value in captures.iter() {
+                    total = total.saturating_add(value.size_bytes(&mut seen));
+                }
+            }
         }
         if let Some(value) = extra {
             total = total.saturating_add(value.size_bytes(&mut seen));
@@ -539,9 +606,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             NodeKind::BuiltinModuleRef(item) => self.builtin_item_value(item),
 
             NodeKind::SlotRead { slot, mode } => self.read_slot(slot, mode),
-            NodeKind::CaptureRead(_) => {
-                self.trap(self.internal_panic("capture reads are not implemented until #110"))
-            }
+            NodeKind::CaptureRead(index) => self.read_capture(index),
             NodeKind::SlotPlace(_) => self.trap(self.internal_panic("slot place used as a value")),
             NodeKind::SlotWrite { slot, value } | NodeKind::SlotInit { slot, value } => {
                 let value = self.eval(value)?;
@@ -656,9 +721,10 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 };
                 Err(EvalError::Return(value))
             }
-            NodeKind::Match { .. } => {
-                self.trap(self.internal_panic("match is not implemented until #110"))
-            }
+            NodeKind::Match {
+                match_set,
+                scrutinee,
+            } => self.eval_match(match_set, scrutinee),
             NodeKind::Try(inner) => self.eval_try(inner),
 
             NodeKind::Let { pattern, value } => {
@@ -730,9 +796,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 Ok(Value::str(text))
             }
 
-            NodeKind::MakeClosure(_) => {
-                self.trap(self.internal_panic("closures are not implemented until #110"))
-            }
+            NodeKind::MakeClosure(target) => self.eval_make_closure(target),
 
             NodeKind::StrInterp(range) => self.eval_string(range),
             NodeKind::Assert(range) => self.eval_assert(range, span),
@@ -1362,6 +1426,252 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             _ => return self.trap(self.internal_panic("value is not iterable")),
         }
         Ok(Value::Unit)
+    }
+
+    fn eval_make_closure(&mut self, target: FnId) -> EvalResult<Value> {
+        let program = self.program;
+        let Some(function) = program.function(target) else {
+            return self.trap(self.internal_panic("closure target is out of range"));
+        };
+        if !matches!(function.kind, FnKind::Lambda) {
+            return self.trap(self.internal_panic("closure target is not a lambda"));
+        }
+        let mut captured = Vec::with_capacity(function.captures.len());
+        for capture in &function.captures {
+            let value = match capture.source {
+                CaptureSource::Slot(slot) => self.read_slot(slot, AccessMode::Share)?,
+                CaptureSource::Capture(index) => self.read_capture(index)?,
+            };
+            captured.push(value);
+        }
+        self.note_alloc(16);
+        let captures = if captured.is_empty() {
+            None
+        } else {
+            Some(Rc::<[Value]>::from(captured))
+        };
+        Ok(Value::Fn(FnValue::Closure(Rc::new(Closure::new(
+            target, captures,
+        )))))
+    }
+
+    fn read_capture(&self, index: CaptureIndex) -> EvalResult<Value> {
+        let Some(value) = self
+            .frames
+            .last()
+            .and_then(|frame| frame.captures.as_ref())
+            .and_then(|captures| captures.get(index.index()))
+            .cloned()
+        else {
+            return self.trap(self.internal_panic("capture index is out of range"));
+        };
+        Ok(value)
+    }
+
+    fn eval_match(&mut self, match_set: MatchSetId, scrutinee: IrId) -> EvalResult<Value> {
+        let value = self.eval(scrutinee)?;
+        let function = self.current_function();
+        let Some(set) = function.match_set(match_set) else {
+            return self.trap(self.internal_panic("match has no arm table"));
+        };
+        for arm in &set.arms {
+            let Some(pattern) = function.pattern(arm.pattern) else {
+                return self.trap(self.internal_panic("match arm pattern is out of range"));
+            };
+            if !self.test_pattern(pattern, &value)? {
+                continue;
+            }
+            let mut undo = BindingUndo::new();
+            self.bind_match_pattern(pattern, &value, &mut undo)?;
+            let passes = match arm.guard {
+                Some(guard) => matches!(self.eval(guard)?, Value::Bool(true)),
+                None => true,
+            };
+            if !passes {
+                self.rollback_bindings(&mut undo)?;
+                continue;
+            }
+            // Drop the pre-arm values before the body, exactly like the AST's
+            // `commit_locals`; retaining them would add observable references.
+            drop(undo);
+            return self.eval(arm.body);
+        }
+        self.trap(self.internal_panic("match fell through"))
+    }
+
+    /// Pure pattern test: no writes, no charges, no allocation notes.
+    fn test_pattern(&self, pattern: &Pattern, value: &Value) -> EvalResult<bool> {
+        match pattern {
+            Pattern::Wild | Pattern::Bind { .. } => Ok(true),
+            Pattern::Int(expected) => Ok(matches!(value, Value::Int(actual) if actual == expected)),
+            Pattern::Bool(expected) => {
+                Ok(matches!(value, Value::Bool(actual) if actual == expected))
+            }
+            Pattern::Str(expected) => Ok(match value {
+                Value::Str(actual) => self
+                    .program
+                    .string(*expected)
+                    .is_some_and(|text| actual.as_ref() == text),
+                _ => false,
+            }),
+            Pattern::Tuple(items) => {
+                let Value::Tuple(values) = value else {
+                    return Ok(false);
+                };
+                if items.len() != values.len() {
+                    return Ok(false);
+                }
+                for (pattern, value) in items.iter().zip(values.iter()) {
+                    if !self.test_pattern(pattern, value)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Pattern::Variant {
+                type_id,
+                variant,
+                args,
+            } => {
+                let Value::Enum(enum_value) = value else {
+                    return Ok(false);
+                };
+                if enum_value.type_id != *type_id || enum_value.variant != *variant as usize {
+                    return Ok(false);
+                }
+                for (pattern, value) in args.iter().zip(enum_value.payload.iter()) {
+                    if !self.test_pattern(pattern, value)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Pattern::Prelude { variant, args } => {
+                let Some(payload) = prelude_payload(value, *variant) else {
+                    return Ok(false);
+                };
+                for (pattern, value) in args.iter().zip(payload.iter()) {
+                    if !self.test_pattern(pattern, value)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Pattern::Struct { fields, .. } => {
+                let Value::Struct(struct_value) = value else {
+                    return Ok(false);
+                };
+                for (declaration, pattern) in fields {
+                    let Some(field) = struct_value.fields.get(*declaration as usize) else {
+                        return Ok(false);
+                    };
+                    if !self.test_pattern(pattern, field)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Pattern::Or(alternatives) => {
+                for alternative in alternatives {
+                    if self.test_pattern(alternative, value)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    fn bind_match_pattern(
+        &mut self,
+        pattern: &Pattern,
+        value: &Value,
+        undo: &mut BindingUndo,
+    ) -> EvalResult<()> {
+        match pattern {
+            Pattern::Wild | Pattern::Int(_) | Pattern::Bool(_) | Pattern::Str(_) => {}
+            Pattern::Bind { slot, .. } => {
+                self.bind_match_slot(*slot, value.clone(), undo)?;
+            }
+            Pattern::Tuple(items) => {
+                if let Value::Tuple(values) = value {
+                    for (pattern, value) in items.iter().zip(values.iter()) {
+                        self.bind_match_pattern(pattern, value, undo)?;
+                    }
+                }
+            }
+            Pattern::Variant { args, .. } => {
+                if let Value::Enum(enum_value) = value {
+                    for (pattern, value) in args.iter().zip(enum_value.payload.iter()) {
+                        self.bind_match_pattern(pattern, value, undo)?;
+                    }
+                }
+            }
+            Pattern::Prelude { variant, args } => {
+                if let Some(payload) = prelude_payload(value, *variant) {
+                    for (pattern, value) in args.iter().zip(payload.iter()) {
+                        self.bind_match_pattern(pattern, value, undo)?;
+                    }
+                }
+            }
+            Pattern::Struct { fields, .. } => {
+                if let Value::Struct(struct_value) = value {
+                    for (declaration, pattern) in fields {
+                        if let Some(field) = struct_value.fields.get(*declaration as usize) {
+                            self.bind_match_pattern(pattern, field, undo)?;
+                        }
+                    }
+                }
+            }
+            Pattern::Or(alternatives) => {
+                for alternative in alternatives {
+                    if self.test_pattern(alternative, value)? {
+                        return self.bind_match_pattern(alternative, value, undo);
+                    }
+                }
+                return self.trap(self.internal_panic("or-pattern alternative did not match"));
+            }
+        }
+        Ok(())
+    }
+
+    fn bind_match_slot(
+        &mut self,
+        slot: Slot,
+        value: Value,
+        undo: &mut BindingUndo,
+    ) -> EvalResult<()> {
+        let index = slot.index();
+        if !self
+            .frames
+            .last()
+            .is_some_and(|frame| index < frame.slots.len())
+        {
+            return self.trap(self.internal_panic("match binding slot is out of range"));
+        }
+        let frame = self.frames.last_mut().expect("evaluation frame");
+        undo.push((slot, frame.slots[index].clone()));
+        frame.slots[index] = Some(value);
+        Ok(())
+    }
+
+    /// Restores the bindings of a failed guard to their exact pre-arm state.
+    /// Slots are never otherwise cleared before frame exit, so a later
+    /// iteration can observe the restored value.
+    fn rollback_bindings(&mut self, undo: &mut BindingUndo) -> EvalResult<()> {
+        while let Some((slot, previous)) = undo.pop() {
+            let index = slot.index();
+            if !self
+                .frames
+                .last()
+                .is_some_and(|frame| index < frame.slots.len())
+            {
+                return self.trap(self.internal_panic("match binding slot is out of range"));
+            }
+            let frame = self.frames.last_mut().expect("evaluation frame");
+            frame.slots[index] = previous;
+        }
+        Ok(())
     }
 
     fn eval_try(&mut self, inner: IrId) -> EvalResult<Value> {
@@ -2062,6 +2372,22 @@ fn slice_bounds(start: i64, end: i64, inclusive: bool, len: i64) -> Option<(usiz
     Some((start as usize, end as usize))
 }
 
+fn prelude_payload(value: &Value, variant: PreludeVariant) -> Option<&[Value]> {
+    match (variant, value) {
+        (PreludeVariant::None, Value::Option(None)) => Some(&[]),
+        (PreludeVariant::Some, Value::Option(Some(value))) => {
+            Some(std::slice::from_ref(value.as_ref()))
+        }
+        (PreludeVariant::Ok, Value::Result(Ok(value))) => {
+            Some(std::slice::from_ref(value.as_ref()))
+        }
+        (PreludeVariant::Err, Value::Result(Err(value))) => {
+            Some(std::slice::from_ref(value.as_ref()))
+        }
+        _ => None,
+    }
+}
+
 fn variant_payload(value: &Value) -> Option<&[Value]> {
     match value {
         Value::Option(Some(value)) => Some(std::slice::from_ref(value.as_ref())),
@@ -2114,11 +2440,32 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Frame, IrRuntime};
+    use super::{CallArgs, Frame, IrRuntime};
+    use crate::interp::Trap;
+    use crate::value::{Closure, FnValue, Value};
     use martite_ir::{
-        Charge, ChildRange, ConstValue, Effects, Entries, FnId, FnKind, IrFn, IrId, IrProgram,
-        Node, NodeKind, Slot, TyId,
+        AccessMode, CaptureIndex, CaptureInfo, CaptureSource, Charge, ChildRange, ConstId,
+        ConstValue, Effects, Entries, FnId, FnKind, IrFn, IrId, IrProgram, Node, NodeKind,
+        ParamInfo, Pattern, PatternId, Slot, SlotInfo, StrId, TyId,
     };
+    use std::rc::Rc;
+
+    fn expression(kind: NodeKind) -> Node {
+        Node::new(kind, TyId::new(0), Charge::expression(), Effects::NONE)
+    }
+
+    fn zero(kind: NodeKind) -> Node {
+        Node::new(kind, TyId::new(0), Charge::ZERO, Effects::NONE)
+    }
+
+    fn finish(mut function: IrFn, nodes: Vec<Node>, children: Vec<IrId>) -> IrFn {
+        function.spans = vec![martite_base::Span::empty(0); nodes.len()];
+        function.synthetic = vec![None; nodes.len()];
+        function.safepoints = vec![false; nodes.len()];
+        function.nodes = nodes;
+        function.children = children;
+        function
+    }
 
     fn empty_function(locals: u32) -> IrFn {
         IrFn {
@@ -2150,6 +2497,7 @@ mod tests {
         let frame = Frame {
             function: function.id,
             slots: vec![None; function.locals as usize],
+            captures: None,
             source: function.source,
             name: function.name.as_ref(),
         };
@@ -2255,5 +2603,248 @@ mod tests {
         let mut runtime = IrRuntime::new(&program, crate::interp::ExecLimits::default());
         let result = runtime.run_main().expect("slot test runs");
         assert_eq!(result.value, crate::value::Value::Int(8));
+    }
+
+    #[test]
+    fn make_closure_snapshots_slots_and_capture_reads_them() {
+        let mut lambda = empty_function(0);
+        lambda.id = FnId::new(1);
+        lambda.name = "<lambda>".into();
+        lambda.kind = FnKind::Lambda;
+        lambda.captures = vec![CaptureInfo {
+            source: CaptureSource::Slot(Slot::new(0)),
+            ty: TyId::new(0),
+            name: Some("value".into()),
+        }];
+        let mut lambda = finish(
+            lambda,
+            vec![expression(NodeKind::CaptureRead(CaptureIndex::new(0)))],
+            Vec::new(),
+        );
+        lambda.body = Some(IrId::new(0));
+
+        let mut main = empty_function(1);
+        main.name = "main".into();
+        let mut main = finish(
+            main,
+            vec![
+                expression(NodeKind::Int(ConstId::new(0))),
+                zero(NodeKind::SlotInit {
+                    slot: Slot::new(0),
+                    value: IrId::new(0),
+                }),
+                expression(NodeKind::MakeClosure(FnId::new(1))),
+                zero(NodeKind::Block(ChildRange::new(0, 2))),
+            ],
+            vec![IrId::new(1), IrId::new(2)],
+        );
+        main.body = Some(IrId::new(3));
+
+        let program = IrProgram {
+            fns: vec![main, lambda],
+            consts: vec![ConstValue::Int(7)],
+            entries: Entries {
+                main: Some(FnId::new(0)),
+                ..Entries::default()
+            },
+            ..IrProgram::default()
+        };
+        let mut runtime = IrRuntime::new(&program, crate::interp::ExecLimits::default());
+        let result = runtime.run_main().expect("closure creation runs");
+        let Value::Fn(FnValue::Closure(closure)) = result.value else {
+            panic!("main must return a closure");
+        };
+        assert_eq!(
+            closure.capture(CaptureIndex::new(0)),
+            Some(&Value::Int(7)),
+            "the closure snapshots the creating frame's slot"
+        );
+        let value = runtime
+            .call_closure(&closure, CallArgs::new())
+            .expect("closure call runs");
+        assert_eq!(value, Value::Int(7));
+    }
+
+    #[test]
+    fn destructured_lambda_parameters_bind_pattern_slots() {
+        let mut lambda = empty_function(3);
+        lambda.name = "<lambda>".into();
+        lambda.kind = FnKind::Lambda;
+        lambda.params = vec![ParamInfo {
+            slot: Slot::new(0),
+            name: "pair".into(),
+            ty: TyId::new(0),
+            mutable: false,
+            is_self: false,
+            pattern: Some(PatternId::new(0)),
+        }];
+        lambda.slot_info = vec![
+            SlotInfo {
+                ty: TyId::new(0),
+                mutable: false,
+                name: None,
+            },
+            SlotInfo {
+                ty: TyId::new(0),
+                mutable: false,
+                name: Some("a".into()),
+            },
+            SlotInfo {
+                ty: TyId::new(0),
+                mutable: false,
+                name: Some("b".into()),
+            },
+        ];
+        lambda.patterns = vec![Pattern::Tuple(vec![
+            Pattern::Bind {
+                slot: Slot::new(1),
+                ty: TyId::new(0),
+            },
+            Pattern::Bind {
+                slot: Slot::new(2),
+                ty: TyId::new(0),
+            },
+        ])];
+        let mut lambda = finish(
+            lambda,
+            vec![
+                expression(NodeKind::SlotRead {
+                    slot: Slot::new(1),
+                    mode: AccessMode::Share,
+                }),
+                expression(NodeKind::SlotRead {
+                    slot: Slot::new(2),
+                    mode: AccessMode::Share,
+                }),
+                expression(NodeKind::Add {
+                    lhs: IrId::new(0),
+                    rhs: IrId::new(1),
+                }),
+            ],
+            Vec::new(),
+        );
+        lambda.body = Some(IrId::new(2));
+
+        let program = IrProgram {
+            fns: vec![lambda],
+            ..IrProgram::default()
+        };
+        let mut runtime = IrRuntime::new(&program, crate::interp::ExecLimits::default());
+        let closure = Closure::new(FnId::new(0), None);
+        let value = runtime
+            .call_closure(
+                &closure,
+                CallArgs::from(vec![Value::tuple(vec![Value::Int(2), Value::Int(3)])]),
+            )
+            .expect("destructured lambda call runs");
+        assert_eq!(value, Value::Int(5));
+    }
+
+    #[test]
+    fn nested_closures_read_captures_from_the_creating_lambda() {
+        let mut inner = empty_function(0);
+        inner.id = FnId::new(1);
+        inner.name = "<lambda>".into();
+        inner.kind = FnKind::Lambda;
+        inner.captures = vec![CaptureInfo {
+            source: CaptureSource::Capture(CaptureIndex::new(0)),
+            ty: TyId::new(0),
+            name: Some("value".into()),
+        }];
+        let mut inner = finish(
+            inner,
+            vec![expression(NodeKind::CaptureRead(CaptureIndex::new(0)))],
+            Vec::new(),
+        );
+        inner.body = Some(IrId::new(0));
+
+        let mut outer = empty_function(0);
+        outer.id = FnId::new(0);
+        outer.name = "<lambda>".into();
+        outer.kind = FnKind::Lambda;
+        outer.captures = vec![CaptureInfo {
+            source: CaptureSource::Slot(Slot::new(0)),
+            ty: TyId::new(0),
+            name: Some("value".into()),
+        }];
+        let mut outer = finish(
+            outer,
+            vec![expression(NodeKind::MakeClosure(FnId::new(1)))],
+            Vec::new(),
+        );
+        outer.body = Some(IrId::new(0));
+
+        let program = IrProgram {
+            fns: vec![outer, inner],
+            ..IrProgram::default()
+        };
+        let mut runtime = IrRuntime::new(&program, crate::interp::ExecLimits::default());
+        let captures: Rc<[Value]> = Rc::from(vec![Value::Int(11)]);
+        let outer = Closure::new(FnId::new(0), Some(captures));
+        let value = runtime
+            .call_closure(&outer, CallArgs::new())
+            .expect("outer lambda call runs");
+        let Value::Fn(FnValue::Closure(inner)) = value else {
+            panic!("outer lambda must return the inner closure");
+        };
+        assert_eq!(
+            inner.capture(CaptureIndex::new(0)),
+            Some(&Value::Int(11)),
+            "the inner closure reads the outer lambda's capture"
+        );
+        assert_eq!(
+            runtime
+                .call_closure(&inner, CallArgs::new())
+                .expect("inner lambda call runs"),
+            Value::Int(11)
+        );
+    }
+
+    #[test]
+    fn lambda_traps_use_the_callers_source_until_118() {
+        let mut lambda = empty_function(0);
+        lambda.id = FnId::new(1);
+        lambda.name = "<lambda>".into();
+        lambda.kind = FnKind::Lambda;
+        lambda.source = martite_base::SourceId(0);
+        let mut lambda = finish(
+            lambda,
+            vec![
+                expression(NodeKind::Str(StrId::new(0))),
+                expression(NodeKind::Panic(ChildRange::new(0, 1))),
+            ],
+            vec![IrId::new(0)],
+        );
+        lambda.body = Some(IrId::new(1));
+
+        let program = IrProgram {
+            fns: vec![empty_function(1), lambda],
+            strs: vec!["boom".into()],
+            ..IrProgram::default()
+        };
+        let mut runtime = IrRuntime::new(&program, crate::interp::ExecLimits::default());
+        runtime.frames.push(Frame {
+            function: FnId::new(0),
+            slots: vec![None],
+            captures: None,
+            source: martite_base::SourceId(1),
+            name: "main",
+        });
+        let closure = Closure::new(FnId::new(1), None);
+        let error = runtime
+            .call_closure(&closure, CallArgs::new())
+            .expect_err("the lambda panics");
+        let Trap::Panic {
+            message,
+            source,
+            trace,
+            ..
+        } = error
+        else {
+            panic!("expected a panic trap, got {error:?}");
+        };
+        assert_eq!(message, "boom");
+        assert_eq!(source, Some(martite_base::SourceId(1)));
+        assert_eq!(trace, vec!["main".to_string(), "<lambda>".to_string()]);
     }
 }

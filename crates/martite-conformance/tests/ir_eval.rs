@@ -1,15 +1,14 @@
-//! AST-vs-IR differential for the first evaluator slice (#108).
+//! AST-vs-IR differential for the evaluator slices (#108, #109, #110).
 //!
-//! Calls, builtin methods, hosts and closures are #109/#110, so this file
-//! deliberately exercises only the core expression, aggregate and control-flow
-//! surface. The cases compare result, log and exact fuel used.
+//! The cases compare result, log, exact fuel used and, for the match
+//! rollback regression, the minimum memory budget.
 
 use std::cell::Cell;
 use std::rc::Rc;
 
 use martite_base::Severity;
-use martite_conformance::Case;
-use martite_ir::{TypeTable, lower, verify};
+use martite_conformance::{Case, min_memory};
+use martite_ir::{IrProgram, TypeTable, lower, verify};
 use martite_runtime::{
     ExecLimits, HostContext, HostDispatcher, HostFault, IrHostDispatcher, IrRuntime, Runtime, Trap,
     Value, show,
@@ -74,6 +73,43 @@ fn observe_ir(case: &Case, limits: ExecLimits) -> Observation {
         Err(trap) => Err(format!("{trap:?}")),
     };
     Observation { outcome, log, fuel }
+}
+
+fn lowered_ir(case: &Case) -> IrProgram {
+    let (program, sources) = checked(case);
+    let ir = lower(&program, &sources).expect("fixture lowers");
+    verify(&ir).expect("fixture verifies");
+    ir
+}
+
+fn run_ir(ir: &IrProgram, limits: ExecLimits) -> Result<(), Trap> {
+    let mut runtime = IrRuntime::new(ir, limits);
+    runtime.run_main().map(|_| ())
+}
+
+fn min_memory_ir(case: &Case) -> u64 {
+    let ir = lowered_ir(case);
+    let mut low = 0u64;
+    let mut high = 8 << 20;
+    let limits = |memory| ExecLimits {
+        fuel: 1_000_000,
+        memory,
+        depth: 200,
+        deadline: None,
+    };
+    assert!(
+        run_ir(&ir, limits(high)).is_ok(),
+        "fixture needs more than the probe cap"
+    );
+    while low < high {
+        let mid = low + (high - low) / 2;
+        match run_ir(&ir, limits(mid)) {
+            Ok(()) => high = mid,
+            Err(Trap::OutOfMemory) => low = mid + 1,
+            Err(trap) => panic!("unexpected trap while probing memory: {trap:?}"),
+        }
+    }
+    low
 }
 
 fn assert_matches(id: &str, source: &str) {
@@ -257,6 +293,155 @@ fn core_fixtures_match_the_ast_interpreter() {
 }
 
 #[test]
+fn match_patterns_and_guards_match_the_ast_interpreter() {
+    for (id, source) in [
+        (
+            "enum_or_patterns",
+            r#"
+            enum Shape { Pair(int, int), Single(int), Empty }
+            fn main() {
+                let value = Shape.Pair(2, 3)
+                match value {
+                    Pair(x, 1) | Pair(x, 2) => print("early {x}"),
+                    Pair(x, y) => print("pair {x}:{y}"),
+                    Single(x) => print("single {x}"),
+                    Empty => print("empty"),
+                }
+                match Shape.Pair(2, 2) {
+                    Pair(x, 1) | Pair(x, 2) => print("or {x}"),
+                    _ => print("other"),
+                }
+            }
+            "#,
+        ),
+        (
+            "nested_prelude_and_failed_guard",
+            r#"
+            fn main() {
+                let nested: (int?, int) = (Some(4), 5)
+                match nested {
+                    (Some(x), y) if x > 10 => print("big {x}:{y}"),
+                    (Some(x), y) => print("nested {x}:{y}"),
+                    (None, _) => print("none"),
+                }
+            }
+            "#,
+        ),
+        (
+            "struct_patterns",
+            r#"
+            struct Point { x: int, y: int }
+            fn main() {
+                let point = Point { x: 1, y: 2 }
+                match point {
+                    Point { x, y } => print("{x}:{y}"),
+                }
+            }
+            "#,
+        ),
+        (
+            "literal_patterns_and_wildcards",
+            r#"
+            fn main() {
+                match "b" {
+                    "a" => print("a"),
+                    "b" => print("b"),
+                    _ => print("other"),
+                }
+                match true {
+                    true => print("yes"),
+                    false => print("no"),
+                }
+                match 3 {
+                    1 | 2 => print("small"),
+                    n if n > 2 => print("big {n}"),
+                    _ => print("other"),
+                }
+                let none: int? = None
+                match none {
+                    None => print("none"),
+                    Some(value) => print("{value}"),
+                }
+            }
+            "#,
+        ),
+        (
+            "match_block_arms",
+            r#"
+            fn main() {
+                match 1 {
+                    1 => { print("one") },
+                    _ => {},
+                }
+                match 2 {
+                    value if value > 1 => { print("{value}") },
+                    _ => {},
+                }
+            }
+            "#,
+        ),
+    ] {
+        assert_matches(id, source);
+    }
+}
+
+#[test]
+fn failed_guards_restore_the_previous_binding_for_copy_on_write() {
+    let case = Case::single(
+        r#"
+        fn main() {
+            var items = [1, 2, 3]
+            for i in 0..2 {
+                match Some(items) {
+                    Some(bound) if i == 0 => print("{bound[0]}"),
+                    _ => {}
+                }
+            }
+            items[0] = 9
+            print("{items[0]}")
+        }
+        "#,
+    );
+    let limits = ExecLimits::default();
+    let ast = observe_ast(&case, limits);
+    let ir = observe_ir(&case, limits);
+    assert_eq!(ir.outcome, ast.outcome, "outcome");
+    assert_eq!(ir.log, ast.log, "log");
+    assert_eq!(ir.fuel, ast.fuel, "fuel used");
+    assert_eq!(
+        min_memory_ir(&case),
+        min_memory(&case),
+        "a failed guard must restore the previous binding, not clear the slot"
+    );
+}
+
+#[test]
+fn failed_guard_bindings_do_not_leak_a_reference_in_ir() {
+    let baseline = Case::single(
+        "fn main() {\n    var items = [1, 2, 3]\n    items.push(4)\n    print(\"{items.len()}\")\n}",
+    );
+    let with_failed_guard = Case::single(
+        "fn main() {\n    var items = [1, 2, 3]\n    match Some(items) {\n        Some(bound) if false => print(\"{bound.len()}\"),\n        _ => {}\n    }\n    items.push(4)\n    print(\"{items.len()}\")\n}",
+    );
+    let limits = ExecLimits::default();
+    let ast = observe_ast(&with_failed_guard, limits);
+    let ir = observe_ir(&with_failed_guard, limits);
+    assert_eq!(ir.outcome, ast.outcome, "outcome");
+    assert_eq!(ir.log, ast.log, "log");
+    assert_eq!(ir.fuel, ast.fuel, "fuel used");
+    assert_eq!(
+        min_memory_ir(&with_failed_guard),
+        min_memory(&with_failed_guard),
+        "IR must match the AST failed-guard memory oracle"
+    );
+    assert_eq!(
+        min_memory_ir(&with_failed_guard),
+        min_memory_ir(&baseline),
+        "a failed guard must not keep its binding slot live into later copy-on-write"
+    );
+}
+
+#[test]
 fn panic_and_assert_traps_match_the_ast_interpreter() {
     for (id, source) in [
         ("panic", r#"fn main() { panic("boom") }"#),
@@ -282,20 +467,39 @@ let part = text[1..9] }"#,
     }
 }
 
-/// Snapshot cases whose call, builtin, host and handler surface is executable
-/// by the #109 evaluator. Closures, captures and `match` cases stay out until
-/// #110.
+/// Snapshot cases whose call, builtin, host, closure and pattern surface is
+/// executable by the #110 evaluator. Exact memory and depth thresholds remain
+/// with #111, and the full corpus harness with #112.
 const IR_READY_CASES: &[&str] = &[
     "bench/load/multi",
+    "bench/runtime/captures.mt",
+    "bench/runtime/closures.mt",
     "bench/runtime/field_index_ops.mt",
     "bench/runtime/fib.mt",
     "bench/runtime/function_calls.mt",
     "bench/runtime/host_calls",
+    "bench/runtime/list_ops.mt",
     "bench/runtime/map_ops.mt",
     "bench/runtime/method_dispatch.mt",
     "bench/runtime/mut_params.mt",
+    "bench/runtime/option_ops.mt",
+    "bench/runtime/pattern_match.mt",
     "bench/runtime/plugin",
+    "bench/runtime/string_ops.mt",
+    "closures/builtin_module_function_values_are_callable",
+    "closures/calls_copy_out_only_mutable_parameters",
+    "closures/free_function_values_work_in_higher_order_builtins",
+    "closures/higher_order_builtins_accept_borrowed_closures",
+    "closures/lambdas_capture_by_value",
+    "closures/lambdas_record_only_free_variables",
+    "closures/loop_lambdas_capture_each_iteration",
+    "closures/nested_lambdas_capture_transitively",
+    "closures/nested_lambdas_record_transitive_captures",
+    "e2e/enums_and_match",
+    "e2e/functions_and_closures",
     "e2e/generic_stack",
+    "e2e/option_match",
+    "e2e/result_and_try",
     "host/host_functions_can_construct_handles",
     "host/make_handle_without_an_opaque_return_is_a_host_fault",
     "host/plugin_init_hook_and_state",
@@ -311,6 +515,13 @@ const IR_READY_CASES: &[&str] = &[
     "limits/fuel/unique-remove-shifts-only",
     "limits/memory/arguments-and-locals",
     "limits/memory/copy-on-write",
+    "patterns/failed_guards_keep_side_effects",
+    "patterns/match_guards_and_or_patterns_fall_through_cleanly",
+    "patterns/nested_or_patterns_and_failed_guards_restore_bindings",
+    "patterns/struct_literal_fields_evaluate_after_base_in_source_order",
+    "patterns/struct_literals_preserve_declaration_order_and_updates",
+    "patterns/struct_patterns_use_declaration_slots",
+    "patterns/variant_patterns_bind_payloads",
     "plugins/a_trap_rolls_back_the_state_and_an_err_commits_it",
     "plugins/handler_parameters_are_copy_in_and_copy_out",
     "plugins/host_functions_can_create_handles_during_a_call",
