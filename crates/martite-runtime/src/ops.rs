@@ -1,7 +1,6 @@
 use std::cmp::Ordering;
 
-use martite_check::TypeDefKind;
-use martite_check::TypeTable;
+use martite_ir::{TypeDefKind, TypeTable};
 
 use crate::value::{Value, key_from_value};
 
@@ -246,7 +245,7 @@ pub(crate) fn write_show(out: &mut String, value: &Value, types: &TypeTable, top
         }
         Value::Struct(value) => {
             let def = types.get(value.type_id);
-            let name = def.map(|d| d.name.as_str()).unwrap_or("<struct>");
+            let name = def.map(|d| d.name.as_ref()).unwrap_or("<struct>");
             let _ = write!(out, "{name} {{ ");
             if let Some(TypeDefKind::Struct { fields }) = def.map(|d| &d.kind) {
                 for (i, (field, field_value)) in fields.iter().zip(value.fields.iter()).enumerate()
@@ -262,13 +261,13 @@ pub(crate) fn write_show(out: &mut String, value: &Value, types: &TypeTable, top
         }
         Value::Enum(value) => {
             let def = types.get(value.type_id);
-            let name = def.map(|d| d.name.as_str()).unwrap_or("<enum>");
+            let name = def.map(|d| d.name.as_ref()).unwrap_or("<enum>");
             let variant = def
                 .and_then(|d| match &d.kind {
                     TypeDefKind::Enum { variants } => variants.get(value.variant),
                     _ => None,
                 })
-                .map(|v| v.name.as_str())
+                .map(|v| v.name.as_ref())
                 .unwrap_or("<variant>");
             let _ = write!(out, "{name}.{variant}");
             if !value.payload.is_empty() {
@@ -305,7 +304,7 @@ pub(crate) fn write_show(out: &mut String, value: &Value, types: &TypeTable, top
         Value::Handle(handle) => {
             let name = types
                 .get(handle.type_id)
-                .map(|d| d.name.as_str())
+                .map(|d| d.name.as_ref())
                 .unwrap_or("Handle");
             let _ = write!(out, "<{name}>");
         }

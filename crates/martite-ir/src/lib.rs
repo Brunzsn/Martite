@@ -1,8 +1,8 @@
 //! Resolved, self-contained tree IR for Martite.
 //!
 //! This crate is the data model between the checker and the runtime. Lowering
-//! from `CheckedProgram` starts in #103; for now the crate defines the plain
-//! data that lowering produces, every later stage consumes, and a
+//! from `CheckedProgram` starts in #103; the crate currently owns the type,
+//! builtin and id vocabulary that lowering and the runtime share, plus a
 //! deterministic text printer ([`Printer`]) for dumps and golden tests. There
 //! is no evaluator, lowering, optimizer or verifier here yet.
 //!
@@ -31,6 +31,7 @@
 //! arenas whose payloads do not fit on a node. They are indexed by the ids in
 //! [`id`], and the verifier will check that they stay parallel to `nodes`.
 
+pub mod builtin;
 pub mod charge;
 pub mod effects;
 pub mod id;
@@ -40,6 +41,7 @@ pub mod print;
 pub mod program;
 pub mod types;
 
+pub use builtin::{BuiltinFnDef, BuiltinItemDef, BuiltinItemKind};
 pub use charge::Charge;
 pub use effects::Effects;
 pub use id::{
@@ -56,4 +58,4 @@ pub use program::{
     CaptureInfo, ConstValue, Entries, EntryKind, FnKind, HookSig, HostFnInfo, IrFn, IrProgram,
     ParamInfo, PreludeVariant, SlotInfo,
 };
-pub use types::{TyId, TypeId, TypeTable};
+pub use types::{FieldDef, Ty, TyId, TypeDef, TypeDefKind, TypeId, TypeTable, VariantDef};

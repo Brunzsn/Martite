@@ -154,7 +154,7 @@ impl ProgramBuilder {
                 fns: Vec::new(),
                 consts: Vec::new(),
                 strs: Vec::new(),
-                types: TypeTable,
+                types: TypeTable::default(),
                 hosts: Vec::new(),
                 grants: Vec::new(),
                 entries: Entries {

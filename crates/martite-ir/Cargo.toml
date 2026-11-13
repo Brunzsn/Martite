@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 martite-base.workspace = true
+martite-check.workspace = true
 
 [lints]
 workspace = true

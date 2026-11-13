@@ -1348,10 +1348,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
             }
             match main.value {
                 Value::Result(Err(error)) => {
-                    eprintln!(
-                        "{}",
-                        martite_runtime::show(&error, &plugin.program().types, true)
-                    );
+                    eprintln!("{}", martite_runtime::show(&error, plugin.types(), true));
                     ExitCode::from(1)
                 }
                 _ => ExitCode::SUCCESS,

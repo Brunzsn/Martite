@@ -548,6 +548,7 @@ dependencies = [
  "martite-check",
  "martite-config",
  "martite-driver",
+ "martite-ir",
  "martite-resolve",
  "martite-runtime",
  "martite-syntax",
@@ -625,6 +626,7 @@ dependencies = [
  "martite-config",
  "martite-driver",
  "martite-fmt",
+ "martite-ir",
  "martite-lint",
  "martite-resolve",
  "martite-runtime",
@@ -662,6 +664,7 @@ name = "martite-ir"
 version = "0.1.0"
 dependencies = [
  "martite-base",
+ "martite-check",
 ]
 
 [[package]]
@@ -695,6 +698,7 @@ dependencies = [
  "martite-base",
  "martite-check",
  "martite-fuel",
+ "martite-ir",
  "martite-syntax",
  "serde_json",
  "smallvec",
