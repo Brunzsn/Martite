@@ -430,7 +430,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let body = function_info.body.expect("simple function body");
         let previous = self.current;
         self.current = Some(function_info);
-        let result = match self.eval(body) {
+        let result = match self.eval_body(body) {
             Ok(value) => Ok(value),
             Err(EvalError::Return(value)) => Ok(value),
             Err(EvalError::Trap(trap)) => Err(trap),
@@ -463,7 +463,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let body = function_info.body.expect("lambda body");
         let previous = self.current;
         self.current = Some(function_info);
-        let result = match self.eval(body) {
+        let result = match self.eval_body(body) {
             Ok(value) => Ok(value),
             Err(EvalError::Return(value)) => Ok(value),
             Err(EvalError::Trap(trap)) => Err(trap),
@@ -1516,6 +1516,27 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         Ok(value)
     }
 
+    /// Evaluate a function or branch body. A single-statement block and its
+    /// trailing `ExprStmt` are transparent: neither charges nor safepoints, so
+    /// callers can evaluate the inner value directly.
+    #[inline]
+    fn eval_body(&mut self, body: IrId) -> EvalResult<Value> {
+        let function = self.current_function();
+        if let NodeKind::Block(range) = function.nodes[body.index()].kind {
+            if range.len == 0 {
+                return Ok(Value::Unit);
+            }
+            if range.len == 1 {
+                let child = function.children[range.start as usize];
+                if let NodeKind::ExprStmt(inner) = function.nodes[child.index()].kind {
+                    return self.eval(inner);
+                }
+                return self.eval(child);
+            }
+        }
+        self.eval(body)
+    }
+
     fn eval_block(&mut self, range: ChildRange) -> EvalResult<Value> {
         let function = self.current_function();
         let mut value = Value::Unit;
@@ -1546,9 +1567,9 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let else_branch = (range.len >= 3).then(|| function.children[range.start as usize + 2]);
         let cond = self.eval(cond)?;
         if matches!(cond, Value::Bool(true)) {
-            self.eval(then_branch)
+            self.eval_body(then_branch)
         } else if let Some(else_branch) = else_branch {
-            self.eval(else_branch)
+            self.eval_body(else_branch)
         } else {
             Ok(Value::Unit)
         }
