@@ -384,6 +384,18 @@ snapshot fixture and every generated property case; any `Preserve` difference
 in result, trap, log, host calls, exact fuel or the three thresholds is a bug,
 not a snapshot update.
 
+Benchmark comparison [43628842207](https://github.com/Brunzsn/Martite/actions/runs/43628842207)
+compares `a63941c` against the frozen `ba36546` baseline on the `runtime` target:
+
+| Runner | Pass (clone + optimize) | Lowered fixture | Optimized fixture | Delta |
+| --- | ---: | ---: | ---: | ---: |
+| Windows | 9.97 µs | 754.0 µs | 484.2 µs | -35.8% |
+| Ubuntu | 6.02 µs | 628.2 µs | 430.8 µs | -31.4% |
+
+The fixture is a 2,000-iteration loop containing a constant scalar expression.
+Existing benchmark groups show only run-to-run noise (largest movement +11.3%
+and -10.0% in unrelated parser/runtime groups), not a systematic regression.
+
 `martite run` and `martite test` use the optimizer by default after the
 differential landed; `--no-optimize` remains the direct lowered-program escape
 hatch. `martite lower` stays a pure lowering command and `--optimize` prints the

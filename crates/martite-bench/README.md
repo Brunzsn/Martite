@@ -155,6 +155,20 @@ the next authorized benchmark run.
 | `runtime/plugin_snapshot` | 600.04 ns |
 | `runtime/plugin_restore` | 605.99 ns |
 
+### Optimizer delta
+
+Benchmark comparison
+[43628842207](https://github.com/Brunzsn/Martite/actions/runs/43628842207)
+on candidate `a63941c` against baseline `ba36546`:
+
+| Runner | `optimize/constant_fold_pass` | `optimize_runtime/constant_fold_lowered` | `optimize_runtime/constant_fold_optimized` | Runtime delta |
+| --- | ---: | ---: | ---: | ---: |
+| Windows | 9.97 µs | 754.0 µs | 484.2 µs | -35.8% |
+| Ubuntu | 6.02 µs | 628.2 µs | 430.8 µs | -31.4% |
+
+The pass timing includes cloning the IR for each iteration. The optimized
+fixture still consumes exactly the same fuel; the delta is fewer dispatches.
+
 The allocation report from the same run:
 
 | Benchmark | allocations | bytes | reallocations | deallocations |
