@@ -1357,7 +1357,7 @@ fn run_with_ir_runtime<'p, 'h, R>(
     (result, log, fuel_used)
 }
 
-fn outcome_from_result(
+pub(crate) fn outcome_from_result(
     result: Result<martite_runtime::MainResult, Trap>,
     sources: &SourceMap,
     types: &TypeTable,

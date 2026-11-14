@@ -363,7 +363,7 @@ Runs after lowering and, in tests and debug builds, after each pass. Checks:
 - **Add missing cases** found in the code review: `mut`-parameter and handler-state fuel; lambda traps across modules (to pin the source-file behavior); `for` over a list the body mutates; `Try` in lambdas; compound assignment versus the written-out form; fuel exactly at the limit.
 - **Verifier tests:** hand-built invalid IR per invariant, including read-before-write, loop first-iteration reads, guard-failed arm bindings, empty capture lists and slot reuse.
 - **Optimizer differential (when passes exist):** off versus on for every fixture and the fuzz corpus; under `Preserve`, fuel, trap and all three thresholds must match exactly.
-- **Property tests:** random well-typed programs (extend `fuzz_corpus`) through lower, verify, optimize, verify, execute, with limit sweeps.
+- **Property tests:** `crates/martite-conformance/tests/ir_property.rs` generates well-typed, host-free programs from a shrinkable opcode stream, then checks, lowers twice, verifies, rejects a deliberately corrupted IR clone, and executes with AST-vs-IR limit sweeps. The checked-in seeds live in `crates/martite-conformance/fixtures/property/` so failures replay without `cargo-fuzz`. Deadline traps and programs over the wall-clock cap are skipped. The AST comparison is transitional and is removed with the AST interpreter (#116); the IR determinism, exact fuel and verifier checks remain.
 - **Benchmarks:** lowering time and IR execution reported separately from parse and check; each pass lands with a benchmark delta.
 
 ## 14. Deliberate semantic changes (not part of migration)

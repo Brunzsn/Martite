@@ -6,6 +6,9 @@ license.workspace = true
 description = "Conformance fixture harness for Martite"
 publish = false
 
+[dev-dependencies]
+proptest.workspace = true
+
 [dependencies]
 martite.workspace = true
 martite-base.workspace = true
