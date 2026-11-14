@@ -81,20 +81,16 @@ impl<'a, 'p> FnLowerer<'a, 'p> {
     }
 
     fn lower_lambda_expr_body(&mut self, expr: &Expr) -> Result<IrId, LowerError> {
-        let value = self.lower_expr(expr)?;
-        let ty = self.node_ty(value);
-        let unit = self.unit();
-        // Expression-bodied lambdas evaluate the expression directly in the
-        // interpreter, with no memory check after it.
-        let stmt = self.push(
-            NodeKind::ExprStmt(value),
-            unit,
-            Charge::ZERO,
-            expr.span,
-            false,
-        );
-        let range = self.append_children(vec![stmt]);
-        Ok(self.push(NodeKind::Block(range), ty, Charge::ZERO, expr.span, true))
+        // Expression-bodied lambdas evaluate the expression directly, with no
+        // memory check after it. Keep the body as the expression node rather
+        // than wrapping it in a zero-charge block and statement, so the
+        // evaluator does not pay two extra dispatches per closure call.
+        let body = self.lower_expr(expr)?;
+        // The verifier's body contract marks the function body as a
+        // safepoint. The evaluator keeps performing the actual call-boundary
+        // check in `finish_lambda_call`.
+        self.function.safepoints[body.index()] = true;
+        Ok(body)
     }
 
     pub(crate) fn unit(&self) -> TyId {

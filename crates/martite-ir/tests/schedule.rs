@@ -559,16 +559,12 @@ fn main() {
         .iter()
         .find(|function| matches!(function.kind, martite_ir::FnKind::Lambda))
         .expect("expression-bodied lambda");
-    let NodeKind::Block(range) = lambda.node(lambda.body.expect("body")).expect("body").kind else {
-        panic!("expression lambda body must be a block");
-    };
-    let child = lambda.child_slice(range)[0];
+    let body = lambda.body.expect("body");
     assert!(matches!(
-        lambda.node(child).expect("child").kind,
-        NodeKind::ExprStmt(_)
+        lambda.node(body).expect("body").kind,
+        NodeKind::CallDirect { .. }
     ));
-    assert!(!lambda.is_safepoint(child));
-    assert!(lambda.is_safepoint(lambda.body.expect("body")));
+    assert!(lambda.is_safepoint(body));
 }
 
 #[test]
