@@ -384,8 +384,11 @@ snapshot fixture and every generated property case; any `Preserve` difference
 in result, trap, log, host calls, exact fuel or the three thresholds is a bug,
 not a snapshot update.
 
-Benchmark comparison [43628842207](https://github.com/Brunzsn/Martite/actions/runs/43628842207)
-compares `a63941c` against the frozen `ba36546` baseline on the `runtime` target:
+The pre-split benchmark comparison
+[43628842207](https://github.com/Brunzsn/Martite/actions/runs/43628842207)
+compares `a63941c` against the frozen `ba36546` baseline. The `optimizer`
+target and Optimizer Benchmarks Comparison workflow now isolate this measurement
+from parser/checker/lint/CLI groups:
 
 | Runner | Pass (clone + optimize) | Lowered fixture | Optimized fixture | Delta |
 | --- | ---: | ---: | ---: | ---: |
@@ -426,7 +429,7 @@ Runs after lowering and, in tests and debug builds, after each pass. Checks:
 - **Verifier tests:** hand-built invalid IR per invariant, including read-before-write, loop first-iteration reads, guard-failed arm bindings, empty capture lists and slot reuse.
 - **Optimizer differential:** `crates/martite-conformance/tests/ir_optimizer.rs` observes every executable snapshot case with passes off and on; under `Preserve`, the full observable record, exact fuel and all three thresholds must match. Plugin steps and host calls are included. The generated property corpus is an additional optimizer seed rather than a separate harness.
 - **Property tests:** `crates/martite-conformance/tests/ir_property.rs` generates well-typed, host-free programs from a shrinkable opcode stream, then checks, lowers twice, verifies, rejects a deliberately corrupted IR clone, and executes lowered and optimized IR with the same limit sweeps. The checked-in seeds live in `crates/martite-conformance/fixtures/property/` so failures replay without `cargo-fuzz`. Deadline traps and programs over the wall-clock cap are skipped. The AST comparison was removed with the interpreter (#116); the IR determinism, optimizer parity, exact fuel, verifier and low memory/depth checks remain.
-- **Benchmarks:** lowering time and IR execution reported separately from parse and check; each pass lands with a benchmark delta. The `runtime` target now includes `optimize/const-fold` pass time and an `optimize_runtime` lowered-versus-optimized execution pair.
+- **Benchmarks:** lowering time and IR execution reported separately from parse and check; each pass lands with a benchmark delta. The dedicated `optimizer` target times the `const-fold` pass and the lowered-versus-optimized execution pair without parser/checker/lint/CLI work.
 
 ## 14. Deliberate semantic changes (not part of migration)
 

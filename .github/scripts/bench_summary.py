@@ -27,6 +27,89 @@ def read_change(benchmark: Path) -> float | None:
     except (OSError, KeyError, ValueError):
         return None
 
+
+def read_estimate(path: Path) -> float | None:
+    if not path.is_file():
+        return None
+    try:
+        estimates = json.loads(path.read_text(encoding="utf-8"))
+        return estimates["median"]["point_estimate"]
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+def format_change(change: float | None) -> str:
+    return f"{change * 100:+.1f}%" if change is not None else "—"
+
+
+def optimizer_summary(criterion: Path) -> list[str]:
+    """Report the optimizer target's lowered-versus-optimized pair.
+
+    This is intentionally separate from the general runtime comparison. The
+    workflow saves a `before` directory for the baseline revision; a full
+    benchmark run has no baseline and only gets the normal table.
+    """
+    root = criterion / "optimizer"
+    if not root.is_dir():
+        return []
+
+    rows = {}
+    for benchmark in sorted(root.iterdir()):
+        if not benchmark.is_dir():
+            continue
+        before = read_estimate(benchmark / "before" / "estimates.json")
+        after = read_estimate(benchmark / "new" / "estimates.json")
+        if before is None and after is None:
+            continue
+        rows[benchmark.name] = (before, after)
+    if not rows or all(before is None for before, _ in rows.values()):
+        return []
+
+    lines = [
+        "",
+        "## Optimizer delta",
+        "",
+        "| Benchmark | Baseline | Candidate | Change |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    for name in sorted(rows):
+        before, after = rows[name]
+        change = None
+        if before is not None and after is not None and before:
+            change = (after - before) / before
+        lines.append(
+            "| `optimizer/{name}` | {before} | {after} | {change} |".format(
+                name=name,
+                before=human_time(before) if before is not None else "—",
+                after=human_time(after) if after is not None else "—",
+                change=format_change(change),
+            )
+        )
+
+    lowered = rows.get("runtime_lowered")
+    optimized = rows.get("runtime_optimized")
+    if lowered and optimized and all(
+        value is not None for value in (*lowered, *optimized)
+    ):
+        baseline_gain = (
+            (optimized[0] - lowered[0]) / lowered[0] if lowered[0] else None
+        )
+        candidate_gain = (
+            (optimized[1] - lowered[1]) / lowered[1] if lowered[1] else None
+        )
+        lines.extend(
+            [
+                "",
+                "| Optimizer gain | Baseline | Candidate |",
+                "| --- | ---: | ---: |",
+                "| lowered → optimized | {baseline} | {candidate} |".format(
+                    baseline=format_change(baseline_gain),
+                    candidate=format_change(candidate_gain),
+                ),
+            ]
+        )
+    return lines
+
 def read_allocations(path: Path) -> dict[str, int]:
     rows = {}
     try:
@@ -128,6 +211,7 @@ def main() -> None:
     else:
         lines.append("No Criterion results were found.")
 
+    lines.extend(optimizer_summary(criterion))
     lines.extend(allocation_summary(criterion))
 
     summary = "\n".join(lines) + "\n"

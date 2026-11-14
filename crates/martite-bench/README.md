@@ -1,8 +1,9 @@
 # Martite benchmarks
 
 Criterion benchmarks for the lexer, parser, load/check pipeline, linter,
-runtime, formatter, and CLI. The runtime also has a dedicated allocation target
-using a counting global allocator.
+runtime, formatter, CLI, and optimizer. The runtime also has a dedicated
+allocation target using a counting global allocator; the optimizer has its own
+target so optimizer work can be compared without parse/check/lint noise.
 
 The fixtures live in
 [`crates/martite-conformance/fixtures/bench`](../martite-conformance/fixtures/bench)
@@ -23,6 +24,7 @@ cargo bench -p martite-bench
 
 # Run one target or filter by benchmark name.
 cargo bench -p martite-bench --bench runtime
+cargo bench -p martite-bench --bench optimizer
 cargo bench -p martite-bench -- fib
 ```
 
@@ -32,9 +34,16 @@ cargo bench -p martite-bench -- fib
 builds `martite-cli` into `target/bench-cli` on first use.
 
 GitHub Actions runs this suite only via manual `workflow_dispatch`; it is not
-triggered by pushes, pull requests, or a schedule. The workflow writes the
+triggered by pushes, pull requests, or a schedule. The workflows write the
 timing table and allocation report to the Actions job summary using
 `.github/scripts/bench_summary.py`.
+
+- **Benchmarks**: the full suite.
+- **Benchmarks Comparison**: every general group (lexer, parser, load/check,
+  lint, runtime, formatter, CLI, allocations) against a baseline revision.
+- **Optimizer Benchmarks Comparison**: only the `optimizer` target, with
+  baseline and candidate lowered-versus-optimized execution in one summary.
+  It does not run parser, checker, lint or CLI benchmarks.
 
 ## Saving and comparing baselines
 
@@ -67,8 +76,7 @@ allocation deltas in the job summary.
 | `load` | single module, multi-module, plugin with an interface | `load/*` |
 | `lint` | full recommended and syntax-only, clean and noisy | `lint/*` |
 | `runtime` | arithmetic loop, `fib`, function calls, list/map/string ops, method dispatch, pattern matching, closures, captures, `mut` params, field/index assignment, `Option` lookups, map iteration, host calls, plugin handler, snapshot, restore. Fixtures lower once in setup and time the default IR evaluator. | `runtime/*` |
-| `optimize` | `const-fold` pass time on a lowered fixture (includes a clone per iteration) | `optimize/constant_fold.mt` |
-| `optimize_runtime` | the same fixture before and after `const-fold`, showing the execution delta under `Preserve` | `optimize/constant_fold.mt` |
+| `optimizer` | `const-fold` pass time (includes a clone per iteration), plus the same lowered fixture before and after optimization; no parse/check/lint/CLI work | `optimize/constant_fold.mt` |
 | `fmt` | medium, large, interface, whole golden corpus, idempotent reformat, check | `syntax/*`, `crates/martite-fmt/tests/fixtures` |
 | `cli` | cold `check`, `lint`, `run`, and `fmt --check` | `syntax/small.mt`, `lint/clean.mt`, formatter fixture |
 | allocation report | the runtime fixtures plus host calls and plugin handler/snapshot/restore, reported as allocations and bytes per iteration | `runtime/*` |
@@ -157,11 +165,12 @@ the next authorized benchmark run.
 
 ### Optimizer delta
 
-Benchmark comparison
+Pre-split comparison
 [43628842207](https://github.com/Brunzsn/Martite/actions/runs/43628842207)
-on candidate `a63941c` against baseline `ba36546`:
+on candidate `a63941c` against baseline `ba36546`. The dedicated optimizer
+workflow now reports this table automatically.
 
-| Runner | `optimize/constant_fold_pass` | `optimize_runtime/constant_fold_lowered` | `optimize_runtime/constant_fold_optimized` | Runtime delta |
+| Runner | `optimizer/pass_const_fold` | `optimizer/runtime_lowered` | `optimizer/runtime_optimized` | Runtime delta |
 | --- | ---: | ---: | ---: | ---: |
 | Windows | 9.97 µs | 754.0 µs | 484.2 µs | -35.8% |
 | Ubuntu | 6.02 µs | 628.2 µs | 430.8 µs | -31.4% |

@@ -1,0 +1,77 @@
+name: Optimizer Benchmarks Comparison
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: Baseline git ref or commit (must contain the optimizer benchmark target)
+        required: true
+        default: HEAD~1
+      candidate:
+        description: Candidate git ref or commit (must contain the optimizer benchmark target)
+        required: true
+        default: HEAD
+
+jobs:
+  benchmark:
+    name: compare (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: python3
+          - os: windows-latest
+            python: python
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-optimizer-compare
+
+      - name: Resolve revisions
+        shell: bash
+        run: |
+          echo "BASELINE_SHA=$(git rev-parse '${{ inputs.baseline }}')" >> "$GITHUB_ENV"
+          echo "CANDIDATE_SHA=$(git rev-parse '${{ inputs.candidate }}')" >> "$GITHUB_ENV"
+
+      - name: Save summary script
+        shell: bash
+        run: cp .github/scripts/bench_summary.py "${{ runner.temp }}/bench_summary.py"
+
+      - name: Check out baseline
+        shell: bash
+        run: git checkout --force "$BASELINE_SHA"
+
+      - name: Compile baseline optimizer benchmarks
+        run: cargo bench -p martite-bench --bench optimizer --no-run
+
+      - name: Clear stale Criterion results
+        run: ${{ matrix.python }} -c "import shutil; shutil.rmtree('target/criterion', ignore_errors=True)"
+
+      - name: Run baseline optimizer benchmarks
+        run: cargo bench -p martite-bench --bench optimizer -- --save-baseline before
+
+      - name: Check out candidate
+        shell: bash
+        run: git checkout --force "$CANDIDATE_SHA"
+
+      - name: Run candidate optimizer benchmarks
+        run: cargo bench -p martite-bench --bench optimizer -- --baseline-lenient before
+
+      - name: Write benchmark summary
+        if: always()
+        run: ${{ matrix.python }} "${{ runner.temp }}/bench_summary.py"
+
+      - name: Upload Criterion results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-optimizer-compare-${{ matrix.os }}
+          path: target/criterion
+          if-no-files-found: ignore

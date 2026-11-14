@@ -48,6 +48,10 @@ name = "runtime"
 harness = false
 
 [[bench]]
+name = "optimizer"
+harness = false
+
+[[bench]]
 name = "formatter"
 harness = false
 
