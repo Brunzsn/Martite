@@ -6,8 +6,9 @@
 
 use std::path::Path;
 
+use martite_conformance::Case;
 use martite_conformance::property::{
-    PROPERTY_CASES, PropertyOutcome, check_source, generate_program,
+    PROPERTY_CASES, PropertyOutcome, check_source, check_trapping_case, generate_program,
 };
 use proptest::prelude::*;
 
@@ -46,6 +47,18 @@ fn generator_only_emits_host_free_programs() {
             );
         }
     }
+}
+
+#[test]
+fn checked_in_trapping_lambda_reports_the_defining_source() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/property/trapping_lambda");
+    let main = std::fs::read_to_string(root.join("main.mt")).expect("read trap seed main.mt");
+    let util = std::fs::read_to_string(root.join("util.mt")).expect("read trap seed util.mt");
+    let case = Case::single(main).file("util.mt", util);
+    let trap = check_trapping_case(&case).expect("trapping lambda seed");
+    assert_eq!(trap.source.as_deref(), Some("util.mt"));
+    assert_eq!(trap.text.as_deref(), Some("panic(\"boom\")"));
+    assert_eq!(trap.trace, vec!["main".to_string(), "<lambda>".to_string()]);
 }
 
 #[test]

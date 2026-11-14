@@ -142,7 +142,7 @@ Complete for the current language (each kind has fixed arity and child roles):
 - A node is owned by one function's arena and referenced by `IrId`.
 - It is a **tree**: each node has one parent; no shared subtrees; a pass that wants to reuse a subtree clones it.
 - Lambdas are separate `IrFn`s named `<lambda>`. A closure value is `FnId + Rc<[Value]>` captures, copied by value at creation, matching today's semantics.
-- A lambda's `source` is the defining function's source. Lowering records that now; the pre-retirement caller-source trap behavior (#118) is preserved by the IR evaluator until #118 lands. The temporary inconsistency is deliberate and must stay until the separate fix.
+- A lambda's `source` is the defining function's source. Lowering records it, and the evaluator uses it for the lambda frame, so a trap inside a lambda reports the defining module (#118).
 - Capture layout: `CaptureInfo.source` is either a `Slot` in the frame creating the closure or one of the creating lambda's own capture indices. The latter is how a nested lambda captures an ancestor binding without a synthetic slot: `fn(a) => fn(b) => base + a + b` gives the outer lambda a slot capture for `base`, and the inner lambda a `Capture` source for `base` plus a slot source for `a`. A lambda body always reads captured bindings with `CaptureRead`, never `SlotRead`. Captures belong only to `FnKind::Lambda`.
 
 ### 6.3 Patterns and `match`
@@ -365,7 +365,7 @@ Runs after lowering and, in tests and debug builds, after each pass. Checks:
 - **Behavior snapshots first.** Before any IR code ran, the migration recorded from the then-current interpreter, for every conformance, e2e, host, plugin, limits, traps and bench fixture: result or trap (kind, message, source, span, trace), log, host call trace, **fuel used**, and **minimum fuel, memory and depth** at which it completes (binary search, as `limits.rs` already did for memory). Those records are checked in and outlive the AST interpreter.
 - **Differential, post-migration:** `crates/martite-conformance/tests/ir_differential.rs` enumerates every snapshot case automatically and compares the full observable record plus the IR at the recorded fuel, memory and depth thresholds (and one unit below each). The `LiveAst` mode was removed with the interpreter (#116); the snapshots are the only oracle.
 - **Golden fuel table:** the existing `FuelRow` cases run against the IR evaluator unchanged, including the copy-on-write rows.
-- **Add missing cases** found in the code review: `mut`-parameter and handler-state fuel; lambda traps across modules (to pin the source-file behavior); `for` over a list the body mutates; `Try` in lambdas; compound assignment versus the written-out form; fuel exactly at the limit.
+- **Add missing cases** found in the code review: `mut`-parameter and handler-state fuel; lambda traps across modules (pins that the defining module is reported, #118); `for` over a list the body mutates; `Try` in lambdas; compound assignment versus the written-out form; fuel exactly at the limit.
 - **Verifier tests:** hand-built invalid IR per invariant, including read-before-write, loop first-iteration reads, guard-failed arm bindings, empty capture lists and slot reuse.
 - **Optimizer differential (when passes exist):** off versus on for every fixture and the fuzz corpus; under `Preserve`, fuel, trap and all three thresholds must match exactly.
 - **Property tests:** `crates/martite-conformance/tests/ir_property.rs` generates well-typed, host-free programs from a shrinkable opcode stream, then checks, lowers twice, verifies, rejects a deliberately corrupted IR clone, and executes with IR-only limit sweeps. The checked-in seeds live in `crates/martite-conformance/fixtures/property/` so failures replay without `cargo-fuzz`. Deadline traps and programs over the wall-clock cap are skipped. The AST comparison was removed with the interpreter (#116); the IR determinism, exact fuel, verifier and low memory/depth checks remain.
@@ -378,7 +378,7 @@ Each is separate, edition-gated, and lands with updated goldens. **These items a
 1. **Fuel-based safepoint cadence** (8.4). Unblocks Coalesced charging.
 2. **`Take` for mutable arguments** (and handler state with a trap-safe copy). Removes the per-call container copy described in 6.4. Today's behavior is not pinned by a golden test and may be unintentional; confirm intent first.
 3. **`Kill` at scope exit** for dead locals. Today a value bound in a loop body stays live until the function returns, which can raise `OutOfMemory` for programs that logically free it.
-4. **Lambda source file** taken from the defining function, not the caller (existing bug, tracked as #118). Lowering already records the defining source; the IR evaluator keeps the caller-source behavior recorded by the snapshots until this change lands.
+4. **Lambda source file** taken from the defining function, not the caller. Fixed in #118 as an edition-1 bug fix: the migration-era trap was internally inconsistent (caller source plus lambda span), and the spec's edition guarantees do not cover trap file attribution. The affected snapshot record was re-recorded deliberately.
 5. **Per-invocation literal/constant accounting** instead of per-`Runtime` (6.7).
 
 ## 15. Migration plan
@@ -405,7 +405,7 @@ Each is separate, edition-gated, and lands with updated goldens. **These items a
 - **Aliasing in `mut` arguments:** E403 covers direct place arguments; the nested-call case `f(mut xs, g(mut xs))` is open (#117).
 - **Closure capture layout:** by-value snapshot, confirmed against `closures/lambdas_capture_by_value`.
 - **Stack depth:** the parser limit does not bound evaluator recursion. The IR enforces its own depth limit and the evaluator needs a recursion guard (#117).
-- **Edition gating:** every section 14 item and any `Reduce` pass is edition-gated; the IR shape itself is not.
+- **Edition gating:** every remaining section 14 item and any `Reduce` pass is edition-gated; the IR shape itself is not. Section 14 item 4 (#118) is the documented exception: it corrected an internally inconsistent trap payload and landed as an edition-1 bug fix.
 - **Two representations to maintain** (AST and IR): mitigated by keeping lint and fmt on the AST and the IR strictly downstream.
 
 ## Appendix: example text dump

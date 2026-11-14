@@ -20,7 +20,7 @@ use martite_ir::{FnId, IrProgram, LowerOptions, lower_with, verify};
 use martite_runtime::{ExecLimits, IrRuntime};
 
 use crate::Case;
-use crate::snapshot::{OutcomeRecord, outcome_from_result};
+use crate::snapshot::{OutcomeRecord, TrapRecord, outcome_from_result};
 
 /// Number of proptest cases in the normal workspace suite.
 pub const PROPERTY_CASES: u32 = 48;
@@ -240,6 +240,95 @@ pub fn check_source(source: &str) -> Result<PropertyOutcome, PropertyFailure> {
         fuel_used,
         limit_checks: checks,
     })
+}
+
+/// Check a checked-in program that is expected to trap.
+///
+/// Unlike generated programs, trap seeds deliberately fail execution. They
+/// still go through the same lowering, verification and determinism checks,
+/// and the trap must be identical on two runs. The recorded trap is returned
+/// so the caller can assert its source, span and trace.
+pub fn check_trapping_case(case: &Case) -> Result<TrapRecord, PropertyFailure> {
+    let source = case
+        .files
+        .iter()
+        .find(|(path, _)| path == &case.entry)
+        .map(|(_, text)| text.as_str())
+        .unwrap_or("<trap seed>");
+    let loaded = case.load();
+    if loaded
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == Severity::Error)
+    {
+        let rendered = loaded
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.render(&loaded.sources))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(PropertyFailure::new(
+            "check",
+            source,
+            format!("trap seed must check cleanly:\n{rendered}"),
+        ));
+    }
+    let Some(program) = loaded.program else {
+        return Err(PropertyFailure::new(
+            "check",
+            source,
+            "checker produced no program",
+        ));
+    };
+    let sources = loaded.sources;
+
+    let first = lower_once(&program, &sources, source)?;
+    if let Err(error) = verify(&first) {
+        return Err(PropertyFailure::new(
+            "verify",
+            source,
+            format!("valid lowered IR was rejected: {error}"),
+        )
+        .with_dump(print_ir(&first)));
+    }
+    let second = lower_once(&program, &sources, source)?;
+    if first != second {
+        return Err(PropertyFailure::new(
+            "lower determinism",
+            source,
+            "the same source lowered to different IR",
+        )
+        .with_dump(print_ir(&first)));
+    }
+
+    let limits = baseline_limits();
+    let first_run = observe_ir(&first, &sources, limits);
+    let second_run = observe_ir(&first, &sources, limits);
+    if first_run != second_run {
+        return Err(PropertyFailure::new(
+            "IR determinism",
+            source,
+            format!("two runs differ\nfirst:  {first_run:?}\nsecond: {second_run:?}"),
+        )
+        .with_dump(print_ir(&first)));
+    }
+    if non_limit_trap(&first_run).is_none() {
+        return Err(PropertyFailure::new(
+            "trap seed",
+            source,
+            format!("expected a non-limit trap, got {:?}", first_run.outcome),
+        )
+        .with_dump(print_ir(&first)));
+    }
+    let OutcomeRecord::Trap { trap } = first_run.outcome else {
+        return Err(PropertyFailure::new(
+            "trap seed",
+            source,
+            "expected a trap, but the program completed",
+        )
+        .with_dump(print_ir(&first)));
+    };
+    Ok(trap)
 }
 
 fn lower_once(

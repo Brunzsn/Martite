@@ -1,7 +1,8 @@
 //! Full-corpus IR-vs-snapshot differential (#112).
 //!
 //! The checked-in records were captured from the retired AST interpreter and
-//! remain the independent oracle for the IR evaluator.
+//! remain the independent oracle for the IR evaluator. The one record changed
+//! by #118 was re-recorded deliberately; see `src/snapshot.rs`.
 
 use std::path::{Path, PathBuf};
 

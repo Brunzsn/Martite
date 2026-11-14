@@ -3,7 +3,9 @@
 //! Snapshots are the permanent regression oracle for the IR evaluator. The
 //! checked-in v1 records were captured from the now-retired AST interpreter
 //! during the migration; they pin the observable result, trap, log, host
-//! calls, fuel and the minimum fuel, memory and depth budgets.
+//! calls, fuel and the minimum fuel, memory and depth budgets. A deliberate
+//! post-migration behavior fix re-records the affected record and documents
+//! the change; #118 did this for `traps/panic/lambda-across-modules`.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};

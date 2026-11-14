@@ -146,12 +146,7 @@ pub struct IrFn {
     pub id: FnId,
     pub name: Box<str>,
     /// The function's defining source. Kept per function so a lambda's traps
-    /// can name the defining file instead of the caller.
-    ///
-    /// Compatibility note: the retired AST interpreter named the caller's
-    /// source for lambda traps (#118). Lowering records the correct defining
-    /// source; until #118 lands, the IR evaluator must reproduce the recorded
-    /// caller-source behavior to keep snapshots green.
+    /// name the defining file instead of the caller (#118).
     pub source: SourceId,
     pub kind: FnKind,
     pub params: Vec<ParamInfo>,

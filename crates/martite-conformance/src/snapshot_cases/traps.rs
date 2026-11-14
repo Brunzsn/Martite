@@ -82,6 +82,8 @@ pub fn cases() -> Vec<SnapshotCase> {
         None,
         caps,
     ));
+    // The lambda is defined in `util.mt` and called from `main.mt`; a trap
+    // inside it names the defining module (#118).
     cases.push(main_case_files(
         "traps/panic/lambda-across-modules",
         vec![

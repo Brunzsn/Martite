@@ -371,15 +371,10 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     slots[param.slot.index()] = Some(value);
                 }
             }
-            let source = self
-                .frames
-                .last()
-                .map(|frame| frame.source)
-                .unwrap_or(SourceId(0));
             self.frames.push(Frame {
                 slots,
                 captures,
-                source,
+                source: function_info.source,
                 name: function_info.name.as_ref(),
             });
             for (pattern, value) in pattern_params {
@@ -394,15 +389,10 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             return self.finish_lambda_call(function_info);
         }
 
-        let source = self
-            .frames
-            .last()
-            .map(|frame| frame.source)
-            .unwrap_or(SourceId(0));
         self.frames.push(Frame {
             slots,
             captures,
-            source,
+            source: function_info.source,
             name: function_info.name.as_ref(),
         });
         self.finish_lambda_call(function_info)
@@ -576,21 +566,10 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             }
         }
 
-        // Until #118 lands, lambda traps name the caller's source file, as
-        // recorded by the snapshots. Lowering already records the defining
-        // source in `IrFn::source`.
-        let source = if matches!(function_info.kind, FnKind::Lambda) {
-            self.frames
-                .last()
-                .map(|frame| frame.source)
-                .unwrap_or(SourceId(0))
-        } else {
-            function_info.source
-        };
         let frame = Frame {
             slots,
             captures,
-            source,
+            source: function_info.source,
             name: function_info.name.as_ref(),
         };
         self.frames.push(frame);
@@ -3062,7 +3041,7 @@ mod tests {
     }
 
     #[test]
-    fn lambda_traps_use_the_callers_source_until_118() {
+    fn lambda_traps_use_the_defining_source() {
         let mut lambda = empty_function(0);
         lambda.id = FnId::new(1);
         lambda.name = "<lambda>".into();
@@ -3104,7 +3083,7 @@ mod tests {
             panic!("expected a panic trap, got {error:?}");
         };
         assert_eq!(message, "boom");
-        assert_eq!(source, Some(martite_base::SourceId(1)));
+        assert_eq!(source, Some(martite_base::SourceId(0)));
         assert_eq!(trace, vec!["main".to_string(), "<lambda>".to_string()]);
     }
 }
