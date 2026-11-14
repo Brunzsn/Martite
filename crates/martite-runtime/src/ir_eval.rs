@@ -24,7 +24,7 @@ use martite_base::{SourceId, Span};
 use martite_fuel as fuel;
 use martite_ir::{
     AccessMode, BuiltinFnId, BuiltinItemId, CaptureIndex, CaptureSource, ChildRange, ConstId,
-    ConstValue, FnId, FnKind, HostId, IrFn, IrId, IrProgram, MatchSetId, NodeKind, Pattern,
+    ConstValue, FnId, FnKind, HostId, IrFn, IrId, IrProgram, MatchSetId, Node, NodeKind, Pattern,
     PreludeVariant, Slot, StrId, StructLayoutId, Ty, TypeDefKind, TypeId,
 };
 use smallvec::SmallVec;
@@ -64,9 +64,8 @@ enum EvalError {
 }
 
 struct Frame<'p> {
-    function: FnId,
     /// One entry per declared local. `None` is a slot whose value was taken.
-    slots: Vec<Option<Value>>,
+    slots: SmallVec<[Option<Value>; 8]>,
     /// Dense capture values in the lambda's capture order.
     captures: Option<Rc<[Value]>>,
     source: SourceId,
@@ -93,6 +92,7 @@ pub struct IrRuntime<'p, 'h> {
     start: Instant,
     ticks: u64,
     frames: Vec<Frame<'p>>,
+    current: Option<&'p IrFn>,
     log: Vec<String>,
     host: Option<&'h mut dyn IrHostDispatcher>,
     /// Live bytes at the last exact scan.
@@ -117,6 +117,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             start: Instant::now(),
             ticks: 0,
             frames: Vec::new(),
+            current: None,
             log: Vec::new(),
             host: None,
             census_bytes: 0,
@@ -238,10 +239,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
     // ------------------------------------------------------------------
 
     fn current_function(&self) -> &'p IrFn {
-        let frame = self.frames.last().expect("evaluation frame");
-        self.program
-            .function(frame.function)
-            .expect("frame function exists")
+        self.current.expect("evaluation frame")
     }
 
     fn internal_panic(&self, message: impl Into<String>) -> Trap {
@@ -345,7 +343,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             None
         };
 
-        let mut slots = vec![None; function_info.locals as usize];
+        let mut slots = SmallVec::from_elem(None, function_info.locals as usize);
         let mut pattern_params: SmallVec<[(&Pattern, Value); 2]> = SmallVec::new();
         for (param, value) in function_info.params.iter().zip(args) {
             if let Some(pattern_id) = param.pattern {
@@ -373,7 +371,6 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             function_info.source
         };
         let frame = Frame {
-            function,
             slots,
             captures,
             source,
@@ -399,6 +396,8 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         }
 
         let body = function_info.body.expect("body checked above");
+        let previous = self.current;
+        self.current = Some(function_info);
         let result = match self.eval(body) {
             Ok(value) => Ok(value),
             Err(EvalError::Return(value)) => Ok(value),
@@ -407,6 +406,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 Err(self.internal_panic("`break`/`continue` escaped a loop"))
             }
         };
+        self.current = previous;
         let updated: Writebacks = if result.is_ok() {
             let frame = self.frames.last_mut().expect("evaluation frame");
             function_info
@@ -586,10 +586,11 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 
     fn eval(&mut self, id: IrId) -> EvalResult<Value> {
         let function = self.current_function();
-        let Some(node) = function.node(id).copied() else {
-            return self.trap(self.internal_panic("IR node id is out of range"));
-        };
-        let span = function.span(id).unwrap_or(Span::empty(0));
+        // The verifier guarantees every child id, span and side-vector entry
+        // is in range. Direct indexing keeps the interpreter's hottest path
+        // branch-free.
+        let node = function.nodes[id.index()];
+        let span = function.spans[id.index()];
         if node.charge.pre != 0 {
             self.charge(u64::from(node.charge.pre))?;
         }
@@ -925,20 +926,17 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
     }
 
     fn read_slot(&mut self, slot: Slot, mode: AccessMode) -> EvalResult<Value> {
-        let index = slot.index();
-        let some_frame = self
-            .frames
-            .last()
-            .is_some_and(|frame| index < frame.slots.len());
-        if !some_frame {
+        let Some(frame) = self.frames.last_mut() else {
             return self.trap(self.internal_panic("slot is out of range"));
-        }
-        let frame = self.frames.last_mut().expect("evaluation frame");
+        };
+        let Some(cell) = frame.slots.get_mut(slot.index()) else {
+            return self.trap(self.internal_panic("slot is out of range"));
+        };
         match mode {
-            AccessMode::Share => Ok(frame.slots[index]
+            AccessMode::Share => Ok(cell
                 .clone()
                 .expect("verifier guarantees every shared slot read is initialized")),
-            AccessMode::Take => Ok(frame.slots[index]
+            AccessMode::Take => Ok(cell
                 .take()
                 .expect("verifier guarantees every taken slot is initialized")),
         }
@@ -1314,13 +1312,20 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let function = self.current_function();
         let mut value = Value::Unit;
         for offset in 0..range.len {
-            let Some(child) = function
-                .children
-                .get(range.start as usize + offset as usize)
-                .copied()
-            else {
-                return self.trap(self.internal_panic("block child is out of range"));
-            };
+            let child = function.children[range.start as usize + offset as usize];
+            // A block's trailing expression statement has no charge and is not
+            // a safepoint, so evaluating its inner node directly avoids one
+            // dispatch without changing observable behavior.
+            let is_tail = offset + 1 == range.len;
+            if is_tail
+                && let Node {
+                    kind: NodeKind::ExprStmt(inner),
+                    ..
+                } = function.nodes[child.index()]
+            {
+                value = self.eval(inner)?;
+                continue;
+            }
             value = self.eval(child)?;
         }
         Ok(value)
@@ -1328,15 +1333,9 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 
     fn eval_if(&mut self, range: ChildRange) -> EvalResult<Value> {
         let function = self.current_function();
-        let Some(cond) = function.children.get(range.start as usize).copied() else {
-            return self.trap(self.internal_panic("if has no condition"));
-        };
-        let Some(then_branch) = function.children.get(range.start as usize + 1).copied() else {
-            return self.trap(self.internal_panic("if has no then branch"));
-        };
-        let else_branch = (range.len >= 3)
-            .then(|| function.children.get(range.start as usize + 2).copied())
-            .flatten();
+        let cond = function.children[range.start as usize];
+        let then_branch = function.children[range.start as usize + 1];
+        let else_branch = (range.len >= 3).then(|| function.children[range.start as usize + 2]);
         let cond = self.eval(cond)?;
         if matches!(cond, Value::Bool(true)) {
             self.eval(then_branch)
@@ -1806,18 +1805,14 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let Some(function_info) = program.function(target) else {
             return self.trap(self.internal_panic("call target is out of range"));
         };
-        let params = function_info.params.clone();
+        let params = &function_info.params;
         let function = self.current_function();
         let mut values = CallArgs::with_capacity(params.len());
         let mut writebacks: SmallVec<[(Place, usize); 2]> = SmallVec::new();
         for (index, param) in params.iter().enumerate() {
-            let Some(child) = function.children.get(first_child as usize + index).copied() else {
-                return self.trap(self.internal_panic("call argument is out of range"));
-            };
+            let child = function.children[first_child as usize + index];
             if param.mutable {
-                let Some(node) = function.node(child).copied() else {
-                    return self.trap(self.internal_panic("call argument is out of range"));
-                };
+                let node = function.nodes[child.index()];
                 let NodeKind::MutArg(place) = node.kind else {
                     return self
                         .trap(self.internal_panic("mutable parameter needs a place argument"));
@@ -2471,6 +2466,7 @@ mod tests {
         ConstValue, Effects, Entries, FnId, FnKind, IrFn, IrId, IrProgram, Node, NodeKind,
         ParamInfo, Pattern, PatternId, Slot, SlotInfo, StrId, TyId,
     };
+    use smallvec::SmallVec;
     use std::rc::Rc;
 
     fn expression(kind: NodeKind) -> Node {
@@ -2518,8 +2514,7 @@ mod tests {
     fn frames_allocate_exactly_the_declared_slots() {
         let function = empty_function(7);
         let frame = Frame {
-            function: function.id,
-            slots: vec![None; function.locals as usize],
+            slots: SmallVec::from_elem(None, function.locals as usize),
             captures: None,
             source: function.source,
             name: function.name.as_ref(),
@@ -2847,8 +2842,7 @@ mod tests {
         };
         let mut runtime = IrRuntime::new(&program, crate::interp::ExecLimits::default());
         runtime.frames.push(Frame {
-            function: FnId::new(0),
-            slots: vec![None],
+            slots: SmallVec::from_elem(None, 1),
             captures: None,
             source: martite_base::SourceId(1),
             name: "main",
