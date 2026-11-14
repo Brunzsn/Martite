@@ -602,6 +602,7 @@ dependencies = [
  "martite-config",
  "martite-driver",
  "martite-fmt",
+ "martite-ir",
  "martite-lint",
  "martite-resolve",
  "martite-runtime",
@@ -644,6 +645,7 @@ version = "0.1.0"
 dependencies = [
  "martite-base",
  "martite-check",
+ "martite-ir",
  "martite-resolve",
  "martite-syntax",
 ]

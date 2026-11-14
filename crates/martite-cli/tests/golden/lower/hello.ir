@@ -1,0 +1,89 @@
+ir-format 1
+sources:
+  #0 "std/env.mti"
+  #1 "std/io.mti"
+  #2 "hello.mt"
+grants:
+  "std.io"
+  "std.env"
+hosts:
+  #0 name="args" module="std.env" params=[] ret=ty#7 opaque=-
+  #1 name="get" module="std.env" params=[ty#2] ret=ty#8 opaque=-
+  #2 name="read_line" module="std.io" params=[] ret=ty#9 opaque=-
+  #3 name="read_file" module="std.io" params=[ty#2] ret=ty#10 opaque=-
+  #4 name="write_file" module="std.io" params=[ty#2, ty#2] ret=ty#11 opaque=-
+entries:
+  kind=script
+  main=fn#5
+  tests=[]
+  handlers=[]
+  hooks=[]
+  init=-
+  shutdown=-
+  state=-
+  json=type#0
+consts:
+  #0 int 1
+  #1 int 2
+  #2 int 3
+  #3 int 4
+  #4 int 0
+strings:
+  #0 "total = "
+
+fn #0 "args" kind=host(host#0) source=src#0("std/env.mti") slots=0 ret=ty#7 body=-
+
+fn #1 "get" kind=host(host#1) source=src#0("std/env.mti") slots=1 ret=ty#8 body=-
+  params:
+    slot=#0 name="name" ty=ty#2 mut=no self=no pattern=-
+  slots:
+    #0 ty=ty#2 mut=no name="name"
+
+fn #2 "read_line" kind=host(host#2) source=src#1("std/io.mti") slots=0 ret=ty#9 body=-
+
+fn #3 "read_file" kind=host(host#3) source=src#1("std/io.mti") slots=1 ret=ty#10 body=-
+  params:
+    slot=#0 name="path" ty=ty#2 mut=no self=no pattern=-
+  slots:
+    #0 ty=ty#2 mut=no name="path"
+
+fn #4 "write_file" kind=host(host#4) source=src#1("std/io.mti") slots=2 ret=ty#11 body=-
+  params:
+    slot=#0 name="path" ty=ty#2 mut=no self=no pattern=-
+    slot=#1 name="text" ty=ty#2 mut=no self=no pattern=-
+  slots:
+    #0 ty=ty#2 mut=no name="path"
+    #1 ty=ty#2 mut=no name="text"
+
+fn #5 "main" kind=free source=src#2("hello.mt") slots=3 ret=ty#6 body=#18
+  slots:
+    #0 ty=ty#13 mut=no name="values"
+    #1 ty=ty#12 mut=yes name="total"
+    #2 ty=ty#12 mut=no name="value"
+  patterns:
+    #0 bind(slot=#0 ty=ty#13)
+    #1 bind(slot=#1 ty=ty#12)
+    #2 bind(slot=#2 ty=ty#12)
+  str_parts:
+    #0 text str#0("total = ")
+    #1 expr #14
+  nodes:
+    #0 int const=#0 value=1 ty=ty#12 charge=1/0/0 effects=NONE span=src#2:30..31 safepoint=0 origin=-
+    #1 int const=#1 value=2 ty=ty#12 charge=1/0/0 effects=NONE span=src#2:33..34 safepoint=0 origin=-
+    #2 int const=#2 value=3 ty=ty#12 charge=1/0/0 effects=NONE span=src#2:36..37 safepoint=0 origin=-
+    #3 int const=#3 value=4 ty=ty#12 charge=1/0/0 effects=NONE span=src#2:39..40 safepoint=0 origin=-
+    #4 list items=[#0, #1, #2, #3] ty=ty#13 charge=1/4/0 effects=ALLOCATES span=src#2:29..41 safepoint=0 origin=-
+    #5 let pattern=#0 value=#4 ty=ty#6 charge=0/0/0 effects=WRITES_LOCAL|SHARES|ALLOCATES|SAFEPOINT span=src#2:16..41 safepoint=1 origin=-
+    #6 int const=#4 value=0 ty=ty#12 charge=1/0/0 effects=NONE span=src#2:58..59 safepoint=0 origin=-
+    #7 let pattern=#1 value=#6 ty=ty#6 charge=0/0/0 effects=WRITES_LOCAL|SAFEPOINT span=src#2:46..59 safepoint=1 origin=-
+    #8 slot_read slot=#0 mode=share ty=ty#13 charge=1/0/0 effects=READS_LOCAL|SHARES span=src#2:77..83 safepoint=0 origin=-
+    #9 slot_place slot=#1 ty=ty#12 charge=0/0/0 effects=NONE span=src#2:86..91 safepoint=0 origin=-
+    #10 slot_read slot=#2 mode=share ty=ty#12 charge=1/0/0 effects=READS_LOCAL span=src#2:95..100 safepoint=0 origin=-
+    #11 add_assign place=#9 value=#10 ty=ty#6 charge=0/0/0 effects=MAY_TRAP|READS_LOCAL|WRITES_LOCAL|SAFEPOINT|PANICS span=src#2:86..100 safepoint=1 origin=-
+    #12 block stmts=[#11] ty=ty#6 charge=0/0/0 effects=MAY_TRAP|READS_LOCAL|WRITES_LOCAL|SAFEPOINT|PANICS span=src#2:84..102 safepoint=0 origin=-
+    #13 for pattern=#2 iter=#8 body=#12 ty=ty#6 charge=0/0/1 effects=MAY_TRAP|READS_LOCAL|WRITES_LOCAL|SHARES|SAFEPOINT|PANICS span=src#2:64..102 safepoint=0 origin=-
+    #14 slot_read slot=#1 mode=share ty=ty#12 charge=1/0/0 effects=READS_LOCAL span=src#2:123..128 safepoint=0 origin=-
+    #15 str_interp parts=[text str#0("total = "), expr #14] ty=ty#2 charge=1/0/0 effects=READS_LOCAL|ALLOCATES|DYN_COST span=src#2:113..130 safepoint=0 origin=-
+    #16 call_builtin_fn builtin=#0 first_arg=7 ty=ty#6 charge=1/0/0 effects=READS_LOCAL|ALLOCATES|DYN_COST|SAFEPOINT|LOGS span=src#2:107..131 safepoint=1 origin=-
+    #17 expr_stmt value=#16 ty=ty#6 charge=0/0/0 effects=READS_LOCAL|ALLOCATES|DYN_COST|SAFEPOINT|LOGS span=src#2:107..131 safepoint=0 origin=-
+    #18 block stmts=[#5, #7, #13, #17] ty=ty#6 charge=0/0/0 effects=MAY_TRAP|READS_LOCAL|WRITES_LOCAL|SHARES|ALLOCATES|DYN_COST|SAFEPOINT|LOGS|PANICS span=src#2:10..133 safepoint=1 origin=-

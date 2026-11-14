@@ -1,9 +1,12 @@
-//! Load pipeline: sources → parse → resolve → check.
+//! Load pipeline: sources → parse → resolve → check → lower.
 
 use martite_base::{Code, Diagnostic, LoadLimits, Severity, SourceMap, SourceProvider};
 use martite_check::{CheckedProgram, check};
+use martite_ir::IrProgram;
 use martite_resolve::{InterfaceSource, ResolveOptions, resolve};
 use martite_syntax::ParseOptions;
+
+pub use martite_ir::LowerOptions;
 
 #[derive(Debug, Clone, Default)]
 pub struct LoadOptions {
@@ -83,5 +86,53 @@ pub fn load(provider: &dyn SourceProvider, options: &LoadOptions) -> LoadedProgr
         program,
         sources,
         diagnostics,
+    }
+}
+
+/// The result of lowering a checked program, in the same shape as
+/// [`LoadedProgram`]: a program on success, or diagnostics on failure.
+#[derive(Debug, Clone)]
+pub struct LoweredProgram {
+    pub program: Option<IrProgram>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+impl LoweredProgram {
+    pub fn has_errors(&self) -> bool {
+        self.diagnostics
+            .iter()
+            .any(|d| d.severity == Severity::Error)
+    }
+}
+
+/// Lower one checked program into self-contained IR.
+///
+/// Uses [`LowerOptions::default`], which verifies the result only in debug
+/// builds. Pass [`LowerOptions`] to [`lower_with`] to force or skip the
+/// verifier.
+pub fn lower(program: &CheckedProgram, sources: &SourceMap) -> LoweredProgram {
+    lower_with(program, sources, LowerOptions::default())
+}
+
+/// Lower one checked program with explicit [`LowerOptions`].
+pub fn lower_with(
+    program: &CheckedProgram,
+    sources: &SourceMap,
+    options: LowerOptions,
+) -> LoweredProgram {
+    match martite_ir::lower_with(program, sources, options) {
+        Ok(program) => LoweredProgram {
+            program: Some(program),
+            diagnostics: Vec::new(),
+        },
+        Err(error) => {
+            let mut diagnostic = Diagnostic::error(Code::E508, format!("lowering failed: {error}"));
+            diagnostic.source = error.source;
+            diagnostic.span = error.span;
+            LoweredProgram {
+                program: None,
+                diagnostics: vec![diagnostic],
+            }
+        }
     }
 }

@@ -7,8 +7,10 @@ use martite_base::{
     Applicability, Code, Diagnostic, FileSystemProvider, LoadLimits, Severity, SourceMap,
     SourceProvider, normalize_source,
 };
+use martite_check::CheckedProgram;
 use martite_config::{Manifest, ToolConfig, parse_manifest, parse_tool_config};
-use martite_driver::{LoadOptions, load};
+use martite_driver::{LoadOptions, LowerOptions, load, lower_with};
+use martite_ir::{IrProgram, Printer};
 use martite_lint::{LintInputs, ManifestInput, SettingsResolver, normalize_path, sort_diagnostics};
 use martite_resolve::InterfaceSource;
 use martite_runtime::{ExecLimits, Runtime, Trap, Value};
@@ -23,6 +25,7 @@ Usage:
 Commands:
     run <file>            Run a script
     check [options] <path> Parse and type-check
+    lower [options] <file> Lower a script and print the resolved IR
     lint [options] <path> Lint a project
     test [options] <path> Run test blocks
     fmt [options] [paths] Format sources
@@ -35,6 +38,7 @@ Options:
     --fuel <n>            Fuel for `run` and `test`
     --memory <n>          Memory limit in bytes for `run` and `test`
     --depth <n>           Call-depth limit for `run` and `test`
+    --dump-ir[=stage]     Dump IR for `run`/`test`: before, after, both
 
 Fmt options:
     --check               Print a unified diff; do not write
@@ -70,6 +74,7 @@ fn main() -> ExitCode {
     match command.as_str() {
         "run" => cmd_run(rest),
         "check" => cmd_check(rest, false),
+        "lower" => cmd_lower(rest),
         "lint" => cmd_lint(rest),
         "test" => cmd_test(rest),
         "fmt" => cmd_fmt(rest),
@@ -92,6 +97,14 @@ fn main() -> ExitCode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum DumpStage {
+    Before,
+    After,
+    #[default]
+    Both,
+}
+
 #[derive(Default)]
 struct Parsed {
     json: bool,
@@ -99,6 +112,7 @@ struct Parsed {
     fuel: Option<u64>,
     memory: Option<u64>,
     depth: Option<u32>,
+    dump_ir: Option<DumpStage>,
     path: Option<String>,
     /// Arguments after the script path, passed through to `std.env.args()`.
     script_args: Vec<String>,
@@ -152,6 +166,23 @@ fn parse_args(args: &[String], allow_trailing: bool) -> Result<Parsed, String> {
                         .parse()
                         .map_err(|_| "--depth requires a number")?,
                 );
+            }
+            Long("dump-ir") => {
+                out.dump_ir = Some(match parser.optional_value() {
+                    None => DumpStage::Both,
+                    Some(value) => {
+                        match value.string().map_err(|error| error.to_string())?.as_str() {
+                            "before" => DumpStage::Before,
+                            "after" => DumpStage::After,
+                            "both" => DumpStage::Both,
+                            _ => {
+                                return Err(
+                                    "--dump-ir requires `before`, `after`, or `both`".into()
+                                );
+                            }
+                        }
+                    }
+                });
             }
             Long("fix") => {
                 return Err("--fix is only supported by `martite lint`".into());
@@ -1340,6 +1371,12 @@ fn cmd_run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Some(stage) = parsed.dump_ir {
+        let Some(ir) = lower_for_dump(plugin.program(), plugin.sources(), parsed.json) else {
+            return ExitCode::from(1);
+        };
+        dump_ir(stage, &ir);
+    }
     let result = plugin.run_main();
     match result {
         Ok(main) => {
@@ -1369,6 +1406,10 @@ fn cmd_check(args: &[String], lint: bool) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if parsed.dump_ir.is_some() {
+        eprintln!("error: --dump-ir is only supported by `martite run` and `martite test`\n");
+        return ExitCode::from(2);
+    }
     let Some(path) = parsed.path else {
         eprintln!(
             "error: {} requires a path",
@@ -1462,6 +1503,95 @@ fn cmd_check(args: &[String], lint: bool) -> ExitCode {
     }
 }
 
+#[derive(Default)]
+struct LowerArgs {
+    json: bool,
+    interfaces: Vec<PathBuf>,
+    path: Option<String>,
+}
+
+fn parse_lower_args(args: &[String]) -> Result<LowerArgs, String> {
+    use lexopt::prelude::*;
+
+    let mut out = LowerArgs::default();
+    let mut parser = lexopt::Parser::from_args(args.iter().cloned());
+    while let Some(arg) = parser.next().map_err(|error| error.to_string())? {
+        match arg {
+            Long("json") => out.json = true,
+            Long("interface") => {
+                let path = parser
+                    .value()
+                    .map_err(|error| error.to_string())?
+                    .string()
+                    .map_err(|error| error.to_string())?;
+                out.interfaces.push(PathBuf::from(path));
+            }
+            Value(value) => {
+                if out.path.is_some() {
+                    return Err("expected a single file".into());
+                }
+                out.path = Some(value.string().map_err(|error| error.to_string())?);
+            }
+            _ => return Err(arg.unexpected().to_string()),
+        }
+    }
+    Ok(out)
+}
+
+fn cmd_lower(args: &[String]) -> ExitCode {
+    let parsed = match parse_lower_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("error: {message}\n");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(file) = parsed.path else {
+        eprintln!("error: lower requires a file\n");
+        return ExitCode::from(2);
+    };
+    let path = PathBuf::from(&file);
+    if !path.is_file() {
+        eprintln!("error: file not found: {file}");
+        return ExitCode::from(2);
+    }
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        eprintln!("error: invalid file path `{file}`");
+        return ExitCode::from(2);
+    };
+    let interfaces = script_interfaces(&parsed.interfaces, parent);
+    let grants = interface_paths(&interfaces);
+    let provider = FileSystemProvider::new(parent.to_path_buf());
+    let loaded = load(
+        &provider,
+        &LoadOptions {
+            entry: name.to_string(),
+            interfaces,
+            grants,
+            limits: LoadLimits::default(),
+            edition: LANG_EDITION.to_string(),
+            parse: ParseOptions::default(),
+        },
+    );
+    print_diagnostics(&loaded.diagnostics, &loaded.sources, parsed.json);
+    if loaded.has_errors() {
+        return ExitCode::from(1);
+    }
+    let Some(program) = loaded.program.as_ref() else {
+        eprintln!("error: no program");
+        return ExitCode::from(2);
+    };
+    let Some(ir) = lower_for_dump(program, &loaded.sources, parsed.json) else {
+        return ExitCode::from(1);
+    };
+    print!("{}", Printer::new(&ir).program());
+    ExitCode::SUCCESS
+}
+
 fn cmd_test(args: &[String]) -> ExitCode {
     let parsed = match parse_args(args, false) {
         Ok(p) => p,
@@ -1540,6 +1670,12 @@ fn cmd_test(args: &[String]) -> ExitCode {
         eprintln!("error: no program");
         return ExitCode::from(2);
     };
+    if let Some(stage) = parsed.dump_ir {
+        let Some(ir) = lower_for_dump(&program, &loaded.sources, parsed.json) else {
+            return ExitCode::from(1);
+        };
+        dump_ir(stage, &ir);
+    }
     let limits = ExecLimits {
         fuel: parsed.fuel.unwrap_or(1_000_000),
         memory: parsed.memory.unwrap_or(8 << 20),
@@ -1587,6 +1723,35 @@ fn print_diagnostics(diagnostics: &[Diagnostic], sources: &SourceMap, json: bool
             println!("{}", diagnostic.render_json(sources));
         } else {
             eprintln!("{}", diagnostic.render(sources));
+        }
+    }
+}
+
+fn dump_ir(stage: DumpStage, program: &IrProgram) {
+    let printer = Printer::new(program);
+    if matches!(stage, DumpStage::Before | DumpStage::Both) {
+        eprintln!("; IR before optimization");
+        eprint!("{}", printer.program());
+    }
+    // `martite-opt` does not exist yet (#123). Until it does, the after stage
+    // is the lowered program unchanged.
+    if matches!(stage, DumpStage::After | DumpStage::Both) {
+        eprintln!("; IR after optimization");
+        eprint!("{}", printer.program());
+    }
+}
+
+fn lower_for_dump(program: &CheckedProgram, sources: &SourceMap, json: bool) -> Option<IrProgram> {
+    let lowered = lower_with(program, sources, LowerOptions { verify: true });
+    if lowered.has_errors() {
+        print_diagnostics(&lowered.diagnostics, sources, json);
+        return None;
+    }
+    match lowered.program {
+        Some(program) => Some(program),
+        None => {
+            eprintln!("error: lowering produced no IR program");
+            None
         }
     }
 }

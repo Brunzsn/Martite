@@ -36,6 +36,8 @@ document stays a draft until the phase-3 performance gate is met.
 cargo run -p martite-cli -- run examples/hello.mt
 cargo run -p martite-cli -- check examples/bad.mt
 cargo run -p martite-cli -- check --json examples/bad.mt
+cargo run -p martite-cli -- lower examples/hello.mt
+cargo run -p martite-cli -- run --dump-ir examples/hello.mt
 cargo run -p martite-cli -- test examples/tests.mt
 cargo run -p martite-cli -- check --interface examples/plugin/app/editor.mti examples/plugin
 cargo run -p martite-cli -- lint examples/hello.mt
@@ -50,6 +52,11 @@ cargo run -p martite-cli -- fmt --verify examples/hello.mt
 cargo run -p martite-cli -- fmt --stdin < examples/hello.mt
 cargo bench -p martite-bench
 ```
+
+`martite lower <file>` prints the resolved IR without executing it.
+`martite run` and `martite test` accept `--dump-ir[=before|after|both]` and write
+the dump to stderr, so program output and exit codes are unchanged. The `after`
+stage is the lowered program until the optimizer lands.
 
 Benchmarks use the deterministic corpus in
 `crates/martite-conformance/fixtures/bench`. See

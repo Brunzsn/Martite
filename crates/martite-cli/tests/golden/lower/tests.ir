@@ -1,0 +1,127 @@
+ir-format 1
+sources:
+  #0 "std/env.mti"
+  #1 "std/io.mti"
+  #2 "tests.mt"
+grants:
+  "std.io"
+  "std.env"
+hosts:
+  #0 name="args" module="std.env" params=[] ret=ty#7 opaque=-
+  #1 name="get" module="std.env" params=[ty#2] ret=ty#8 opaque=-
+  #2 name="read_line" module="std.io" params=[] ret=ty#9 opaque=-
+  #3 name="read_file" module="std.io" params=[ty#2] ret=ty#10 opaque=-
+  #4 name="write_file" module="std.io" params=[ty#2, ty#2] ret=ty#11 opaque=-
+entries:
+  kind=script
+  main=fn#8
+  tests=[fn#6, fn#7]
+  handlers=[]
+  hooks=[]
+  init=-
+  shutdown=-
+  state=-
+  json=type#0
+consts:
+  #0 int 2
+  #1 int 3
+  #2 int 5
+  #3 int 3
+  #4 int 1
+  #5 int 2
+  #6 int 1
+  #7 int 2
+  #8 int 3
+  #9 int 20
+  #10 int 22
+strings:
+  #0 "2 + 3 should be 5"
+  #1 "list was not sorted"
+
+fn #0 "args" kind=host(host#0) source=src#0("std/env.mti") slots=0 ret=ty#7 body=-
+
+fn #1 "get" kind=host(host#1) source=src#0("std/env.mti") slots=1 ret=ty#8 body=-
+  params:
+    slot=#0 name="name" ty=ty#2 mut=no self=no pattern=-
+  slots:
+    #0 ty=ty#2 mut=no name="name"
+
+fn #2 "read_line" kind=host(host#2) source=src#1("std/io.mti") slots=0 ret=ty#9 body=-
+
+fn #3 "read_file" kind=host(host#3) source=src#1("std/io.mti") slots=1 ret=ty#10 body=-
+  params:
+    slot=#0 name="path" ty=ty#2 mut=no self=no pattern=-
+  slots:
+    #0 ty=ty#2 mut=no name="path"
+
+fn #4 "write_file" kind=host(host#4) source=src#1("std/io.mti") slots=2 ret=ty#11 body=-
+  params:
+    slot=#0 name="path" ty=ty#2 mut=no self=no pattern=-
+    slot=#1 name="text" ty=ty#2 mut=no self=no pattern=-
+  slots:
+    #0 ty=ty#2 mut=no name="path"
+    #1 ty=ty#2 mut=no name="text"
+
+fn #5 "add" kind=free source=src#2("tests.mt") slots=2 ret=ty#12 body=#4
+  params:
+    slot=#0 name="a" ty=ty#12 mut=no self=no pattern=-
+    slot=#1 name="b" ty=ty#12 mut=no self=no pattern=-
+  slots:
+    #0 ty=ty#12 mut=no name="a"
+    #1 ty=ty#12 mut=no name="b"
+  nodes:
+    #0 slot_read slot=#0 mode=share ty=ty#12 charge=1/0/0 effects=READS_LOCAL span=src#2:32..33 safepoint=0 origin=-
+    #1 slot_read slot=#1 mode=share ty=ty#12 charge=1/0/0 effects=READS_LOCAL span=src#2:36..37 safepoint=0 origin=-
+    #2 add lhs=#0 rhs=#1 ty=ty#12 charge=1/0/0 effects=MAY_TRAP|READS_LOCAL|PANICS span=src#2:32..37 safepoint=0 origin=-
+    #3 expr_stmt value=#2 ty=ty#6 charge=0/0/0 effects=MAY_TRAP|READS_LOCAL|PANICS span=src#2:32..37 safepoint=0 origin=-
+    #4 block stmts=[#3] ty=ty#12 charge=0/0/0 effects=MAY_TRAP|READS_LOCAL|SAFEPOINT|PANICS span=src#2:30..39 safepoint=1 origin=-
+
+fn #6 "adds numbers" kind=test source=src#2("tests.mt") slots=0 ret=ty#6 body=#8
+  nodes:
+    #0 int const=#0 value=2 ty=ty#12 charge=1/0/0 effects=NONE span=src#2:74..75 safepoint=0 origin=-
+    #1 int const=#1 value=3 ty=ty#12 charge=1/0/0 effects=NONE span=src#2:77..78 safepoint=0 origin=-
+    #2 call_direct target=fn#5 args=[#0, #1] ty=ty#12 charge=1/0/0 effects=MAY_TRAP|SAFEPOINT|CALLS|PANICS span=src#2:70..79 safepoint=0 origin=-
+    #3 int const=#2 value=5 ty=ty#12 charge=1/0/0 effects=NONE span=src#2:83..84 safepoint=0 origin=-
+    #4 eq lhs=#2 rhs=#3 ty=ty#0 charge=1/0/0 effects=MAY_TRAP|DYN_COST|SAFEPOINT|CALLS|PANICS span=src#2:70..84 safepoint=0 origin=-
+    #5 str#0("2 + 3 should be 5") ty=ty#2 charge=1/0/0 effects=ALLOCATES|DYN_COST span=src#2:86..105 safepoint=0 origin=-
+    #6 assert args=[#4, #5] ty=ty#6 charge=1/0/0 effects=MAY_TRAP|ALLOCATES|DYN_COST|SAFEPOINT|CALLS|PANICS span=src#2:63..106 safepoint=0 origin=-
+    #7 expr_stmt value=#6 ty=ty#6 charge=0/0/0 effects=MAY_TRAP|ALLOCATES|DYN_COST|SAFEPOINT|CALLS|PANICS span=src#2:63..106 safepoint=0 origin=-
+    #8 block stmts=[#7] ty=ty#6 charge=0/0/0 effects=MAY_TRAP|ALLOCATES|DYN_COST|SAFEPOINT|CALLS|PANICS span=src#2:61..108 safepoint=1 origin=-
+
+fn #7 "lists sort" kind=test source=src#2("tests.mt") slots=1 ret=ty#6 body=#18
+  slots:
+    #0 ty=ty#13 mut=yes name="xs"
+  patterns:
+    #0 bind(slot=#0 ty=ty#13)
+  nodes:
+    #0 int const=#3 value=3 ty=ty#12 charge=1/0/0 effects=NONE span=src#2:144..145 safepoint=0 origin=-
+    #1 int const=#4 value=1 ty=ty#12 charge=1/0/0 effects=NONE span=src#2:147..148 safepoint=0 origin=-
+    #2 int const=#5 value=2 ty=ty#12 charge=1/0/0 effects=NONE span=src#2:150..151 safepoint=0 origin=-
+    #3 list items=[#0, #1, #2] ty=ty#13 charge=1/3/0 effects=ALLOCATES span=src#2:143..152 safepoint=0 origin=-
+    #4 let pattern=#0 value=#3 ty=ty#6 charge=0/0/0 effects=WRITES_LOCAL|SHARES|ALLOCATES|SAFEPOINT span=src#2:134..152 safepoint=1 origin=-
+    #5 slot_place slot=#0 ty=ty#13 charge=0/0/0 effects=NONE span=src#2:157..159 safepoint=0 origin=-
+    #6 mut_arg place=#5 ty=ty#13 charge=0/0/0 effects=READS_LOCAL|WRITES_LOCAL|SHARES span=src#2:157..159 safepoint=0 origin=-
+    #7 call_builtin_method method=#17 receiver=#6 first_arg=4 ty=ty#6 charge=1/0/0 effects=MAY_TRAP|READS_LOCAL|WRITES_LOCAL|READS_HEAP|WRITES_HEAP|SHARES|ALLOCATES|DYN_COST|SAFEPOINT|PANICS span=src#2:157..166 safepoint=1 origin=-
+    #8 expr_stmt value=#7 ty=ty#6 charge=0/0/0 effects=MAY_TRAP|READS_LOCAL|WRITES_LOCAL|READS_HEAP|WRITES_HEAP|SHARES|ALLOCATES|DYN_COST|SAFEPOINT|PANICS span=src#2:157..166 safepoint=1 origin=-
+    #9 slot_read slot=#0 mode=share ty=ty#13 charge=1/0/0 effects=READS_LOCAL|SHARES span=src#2:178..180 safepoint=0 origin=-
+    #10 int const=#6 value=1 ty=ty#12 charge=1/0/0 effects=NONE span=src#2:185..186 safepoint=0 origin=-
+    #11 int const=#7 value=2 ty=ty#12 charge=1/0/0 effects=NONE span=src#2:188..189 safepoint=0 origin=-
+    #12 int const=#8 value=3 ty=ty#12 charge=1/0/0 effects=NONE span=src#2:191..192 safepoint=0 origin=-
+    #13 list items=[#10, #11, #12] ty=ty#13 charge=1/3/0 effects=ALLOCATES span=src#2:184..193 safepoint=0 origin=-
+    #14 eq lhs=#9 rhs=#13 ty=ty#0 charge=1/0/0 effects=READS_LOCAL|SHARES|ALLOCATES|DYN_COST span=src#2:178..193 safepoint=0 origin=-
+    #15 str#1("list was not sorted") ty=ty#2 charge=1/0/0 effects=ALLOCATES|DYN_COST span=src#2:195..216 safepoint=0 origin=-
+    #16 assert args=[#14, #15] ty=ty#6 charge=1/0/0 effects=MAY_TRAP|READS_LOCAL|SHARES|ALLOCATES|DYN_COST|PANICS span=src#2:171..217 safepoint=0 origin=-
+    #17 expr_stmt value=#16 ty=ty#6 charge=0/0/0 effects=MAY_TRAP|READS_LOCAL|SHARES|ALLOCATES|DYN_COST|PANICS span=src#2:171..217 safepoint=0 origin=-
+    #18 block stmts=[#4, #8, #17] ty=ty#6 charge=0/0/0 effects=MAY_TRAP|READS_LOCAL|WRITES_LOCAL|READS_HEAP|WRITES_HEAP|SHARES|ALLOCATES|DYN_COST|SAFEPOINT|PANICS span=src#2:128..219 safepoint=1 origin=-
+
+fn #8 "main" kind=free source=src#2("tests.mt") slots=0 ret=ty#6 body=#6
+  str_parts:
+    #0 expr #2
+  nodes:
+    #0 int const=#9 value=20 ty=ty#12 charge=1/0/0 effects=NONE span=src#2:245..247 safepoint=0 origin=-
+    #1 int const=#10 value=22 ty=ty#12 charge=1/0/0 effects=NONE span=src#2:249..251 safepoint=0 origin=-
+    #2 call_direct target=fn#5 args=[#0, #1] ty=ty#12 charge=1/0/0 effects=MAY_TRAP|SAFEPOINT|CALLS|PANICS span=src#2:241..252 safepoint=0 origin=-
+    #3 str_interp parts=[expr #2] ty=ty#2 charge=1/0/0 effects=MAY_TRAP|ALLOCATES|DYN_COST|SAFEPOINT|CALLS|PANICS span=src#2:239..254 safepoint=0 origin=-
+    #4 call_builtin_fn builtin=#0 first_arg=2 ty=ty#6 charge=1/0/0 effects=MAY_TRAP|ALLOCATES|DYN_COST|SAFEPOINT|CALLS|LOGS|PANICS span=src#2:233..255 safepoint=1 origin=-
+    #5 expr_stmt value=#4 ty=ty#6 charge=0/0/0 effects=MAY_TRAP|ALLOCATES|DYN_COST|SAFEPOINT|CALLS|LOGS|PANICS span=src#2:233..255 safepoint=0 origin=-
+    #6 block stmts=[#5] ty=ty#6 charge=0/0/0 effects=MAY_TRAP|ALLOCATES|DYN_COST|SAFEPOINT|CALLS|LOGS|PANICS span=src#2:231..257 safepoint=1 origin=-

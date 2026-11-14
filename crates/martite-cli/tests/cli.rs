@@ -355,6 +355,175 @@ fn fmt_is_stable_after_lint_fix() {
     assert!(checked.status.success(), "stderr: {}", stderr(&checked));
 }
 
+fn examples_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples")
+}
+
+fn lower_golden_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/lower")
+}
+
+const LOWER_EXAMPLES: &[&str] = &["hello", "env", "tests"];
+
+#[test]
+fn lower_prints_deterministic_ir() {
+    let dir = TempDir::new("lower");
+    let script = dir.file("main.mt", "fn main() { print(1 + 2) }\n");
+    let first = martite(&[s("lower"), script.as_os_str()]);
+    assert!(first.status.success(), "stderr: {}", stderr(&first));
+    let text = stdout(&first);
+    assert!(text.starts_with("ir-format 1\n"), "stdout: {text}");
+    assert!(text.contains("\"main\""), "stdout: {text}");
+    assert!(text.contains("span=src#"), "stdout: {text}");
+    assert!(stderr(&first).is_empty(), "stderr: {}", stderr(&first));
+
+    let second = martite(&[s("lower"), script.as_os_str()]);
+    assert!(second.status.success(), "stderr: {}", stderr(&second));
+    assert_eq!(text, stdout(&second));
+}
+
+#[test]
+fn lower_goldens_match_examples() {
+    for name in LOWER_EXAMPLES {
+        let example = examples_dir().join(format!("{name}.mt"));
+        let output = martite(&[s("lower"), example.as_os_str()]);
+        assert!(
+            output.status.success(),
+            "{name}: stderr: {}",
+            stderr(&output)
+        );
+        let path = lower_golden_root().join(format!("{name}.ir"));
+        let expected = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+            panic!(
+                "missing golden {}; run:\n  cargo test -p martite-cli --test cli -- --ignored update_lower_goldens",
+                path.display()
+            )
+        });
+        assert_eq!(stdout(&output), expected, "golden mismatch for {name}");
+    }
+}
+
+#[test]
+#[ignore = "regenerates the checked-in CLI lower goldens"]
+fn update_lower_goldens() {
+    let root = lower_golden_root();
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create golden directory");
+    for name in LOWER_EXAMPLES {
+        let example = examples_dir().join(format!("{name}.mt"));
+        let output = martite(&[s("lower"), example.as_os_str()]);
+        assert!(
+            output.status.success(),
+            "{name}: stderr: {}",
+            stderr(&output)
+        );
+        std::fs::write(root.join(format!("{name}.ir")), &output.stdout)
+            .expect("write lower golden");
+    }
+}
+
+#[test]
+fn lower_reports_load_diagnostics_without_dumping_ir() {
+    let output = martite(&[s("lower"), examples_dir().join("bad.mt").as_os_str()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty(), "stdout: {}", stdout(&output));
+    assert!(
+        stderr(&output).contains("E201"),
+        "stderr: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn lower_usage_errors_exit_two() {
+    let missing = martite(&[s("lower")]);
+    assert_eq!(missing.status.code(), Some(2));
+
+    let not_found = martite(&[s("lower"), s("does-not-exist.mt")]);
+    assert_eq!(not_found.status.code(), Some(2));
+
+    let dir = TempDir::new("lower-usage");
+    let first = dir.file("one.mt", "fn main() {}\n");
+    let second = dir.file("two.mt", "fn main() {}\n");
+    let two = martite(&[s("lower"), first.as_os_str(), second.as_os_str()]);
+    assert_eq!(two.status.code(), Some(2));
+
+    let irrelevant = martite(&[s("lower"), s("--fuel"), s("10"), first.as_os_str()]);
+    assert_eq!(irrelevant.status.code(), Some(2));
+}
+
+#[test]
+fn dump_ir_keeps_run_output_unchanged() {
+    let dir = TempDir::new("dump-run");
+    let script = dir.file("main.mt", "fn main() { print(\"hello\") }\n");
+    let plain = martite(&[s("run"), script.as_os_str()]);
+    assert!(plain.status.success(), "stderr: {}", stderr(&plain));
+
+    let dumped = martite(&[s("run"), s("--dump-ir"), script.as_os_str()]);
+    assert!(dumped.status.success(), "stderr: {}", stderr(&dumped));
+    assert_eq!(stdout(&plain), stdout(&dumped));
+    let error = stderr(&dumped);
+    assert!(
+        error.contains("; IR before optimization"),
+        "stderr: {error}"
+    );
+    assert!(error.contains("; IR after optimization"), "stderr: {error}");
+    assert_eq!(error.matches("ir-format 1").count(), 2, "stderr: {error}");
+
+    let before = martite(&[s("run"), s("--dump-ir=before"), script.as_os_str()]);
+    assert!(before.status.success(), "stderr: {}", stderr(&before));
+    assert_eq!(stdout(&plain), stdout(&before));
+    let error = stderr(&before);
+    assert!(
+        error.contains("; IR before optimization"),
+        "stderr: {error}"
+    );
+    assert!(
+        !error.contains("; IR after optimization"),
+        "stderr: {error}"
+    );
+    assert_eq!(error.matches("ir-format 1").count(), 1, "stderr: {error}");
+}
+
+#[test]
+fn dump_ir_keeps_test_output_unchanged() {
+    let dir = TempDir::new("dump-test");
+    let script = dir.file(
+        "main.mt",
+        "test \"works\" {\n    assert(1 + 1 == 2, \"math is broken\")\n}\n",
+    );
+    let plain = martite(&[s("test"), script.as_os_str()]);
+    assert!(plain.status.success(), "stderr: {}", stderr(&plain));
+
+    let dumped = martite(&[s("test"), s("--dump-ir=after"), script.as_os_str()]);
+    assert!(dumped.status.success(), "stderr: {}", stderr(&dumped));
+    assert_eq!(stdout(&plain), stdout(&dumped));
+    let error = stderr(&dumped);
+    assert!(error.contains("; IR after optimization"), "stderr: {error}");
+    assert!(
+        !error.contains("; IR before optimization"),
+        "stderr: {error}"
+    );
+    assert_eq!(error.matches("ir-format 1").count(), 1, "stderr: {error}");
+}
+
+#[test]
+fn dump_ir_rejects_unknown_stages_and_other_commands() {
+    let dir = TempDir::new("dump-usage");
+    let script = dir.file("main.mt", "fn main() {}\n");
+
+    let unknown = martite(&[s("run"), s("--dump-ir=sideways"), script.as_os_str()]);
+    assert_eq!(unknown.status.code(), Some(2));
+
+    let check = martite(&[s("check"), s("--dump-ir"), script.as_os_str()]);
+    assert_eq!(check.status.code(), Some(2));
+    assert!(
+        stderr(&check).contains("--dump-ir"),
+        "stderr: {}",
+        stderr(&check)
+    );
+}
+
 #[test]
 fn fmt_uses_martite_toml_settings_and_walks_projects() {
     let dir = TempDir::new("fmt-config");
