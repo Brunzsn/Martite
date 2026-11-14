@@ -301,25 +301,36 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 
     /// Calls a closure value. Lambda parameters cannot be `mut`, so a closure
     /// call never produces writeback values.
+    #[inline]
     fn call_closure(&mut self, closure: &Closure, args: CallArgs) -> Result<Value, Trap> {
         let program = self.program;
         let Some(function_info) = program.function(closure.target) else {
             return Err(self.internal_panic(format!("missing function #{:?}", closure.target)));
         };
+        self.call_closure_function(function_info, closure.captures.clone(), args)
+    }
+
+    /// Call a closure whose target function has already been resolved. The
+    /// higher-order builtins use this to hoist the target lookup out of their
+    /// per-element loops.
+    #[inline]
+    fn call_closure_function(
+        &mut self,
+        function_info: &'p IrFn,
+        captures: Option<Rc<[Value]>>,
+        args: CallArgs,
+    ) -> Result<Value, Trap> {
         if matches!(function_info.kind, FnKind::Lambda) {
-            return self.call_lambda(function_info, closure.captures.clone(), args);
+            return self.call_lambda(function_info, captures, args);
         }
-        self.call_function_with_writebacks_and_captures(
-            closure.target,
-            args,
-            closure.captures.clone(),
-        )
-        .map(|(value, _)| value)
+        self.call_function_with_writebacks_and_captures(function_info.id, args, captures)
+            .map(|(value, _)| value)
     }
 
     /// Specialized lambda call. It skips the mutable-writeback scan and the
     /// non-lambda capture checks that every higher-order builtin would
     /// otherwise repeat per element.
+    #[inline]
     fn call_lambda(
         &mut self,
         function_info: &'p IrFn,
@@ -399,6 +410,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 
     /// Fast path for plain functions with no mutable or destructured
     /// parameters. It avoids the generic writeback scan and capture checks.
+    #[inline]
     fn call_simple_function(
         &mut self,
         function_info: &'p IrFn,
@@ -457,6 +469,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         Ok(value)
     }
 
+    #[inline]
     fn finish_lambda_call(&mut self, function_info: &'p IrFn) -> Result<Value, Trap> {
         if let Err(trap) = self.maybe_check_memory() {
             self.frames.pop();

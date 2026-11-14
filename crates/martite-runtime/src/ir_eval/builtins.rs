@@ -293,10 +293,19 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 let mut out = Vec::with_capacity(snapshot.len());
                 match closure {
                     FnValue::Closure(closure) => {
+                        let program = self.program;
+                        let Some(function_info) = program.function(closure.target) else {
+                            return self
+                                .trap(self.internal_panic("closure target is out of range"));
+                        };
                         for item in snapshot.iter() {
                             out.push(
-                                self.call_closure(closure, smallvec![item.clone()])
-                                    .map_err(EvalError::Trap)?,
+                                self.call_closure_function(
+                                    function_info,
+                                    closure.captures.clone(),
+                                    smallvec![item.clone()],
+                                )
+                                .map_err(EvalError::Trap)?,
                             );
                         }
                     }
@@ -318,9 +327,18 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 let mut out = Vec::new();
                 match closure {
                     FnValue::Closure(closure) => {
+                        let program = self.program;
+                        let Some(function_info) = program.function(closure.target) else {
+                            return self
+                                .trap(self.internal_panic("closure target is out of range"));
+                        };
                         for item in snapshot.iter() {
                             let keep = self
-                                .call_closure(closure, smallvec![item.clone()])
+                                .call_closure_function(
+                                    function_info,
+                                    closure.captures.clone(),
+                                    smallvec![item.clone()],
+                                )
                                 .map_err(EvalError::Trap)?;
                             if matches!(keep, Value::Bool(true)) {
                                 out.push(item.clone());
@@ -352,9 +370,18 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 self.charge(fuel::slot_cost(snapshot.len() as u64))?;
                 match closure {
                     FnValue::Closure(closure) => {
+                        let program = self.program;
+                        let Some(function_info) = program.function(closure.target) else {
+                            return self
+                                .trap(self.internal_panic("closure target is out of range"));
+                        };
                         for item in snapshot.iter() {
                             init = self
-                                .call_closure(closure, smallvec![init, item.clone()])
+                                .call_closure_function(
+                                    function_info,
+                                    closure.captures.clone(),
+                                    smallvec![init, item.clone()],
+                                )
                                 .map_err(EvalError::Trap)?;
                         }
                     }
