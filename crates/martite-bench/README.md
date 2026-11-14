@@ -170,18 +170,19 @@ the next authorized benchmark run.
 
 ### Optimizer delta
 
-Pre-split comparison
-[43628842207](https://github.com/Brunzsn/Martite/actions/runs/43628842207)
-on candidate `a63941c` against baseline `ba36546`. The dedicated optimizer
-workflow now reports this table automatically.
+Clean optimizer comparison
+[43637336006](https://github.com/Brunzsn/Martite/actions/runs/43637336006)
+on candidate `2d6f75f` against baseline `7abd955`:
 
-| Runner | `optimizer/pass_const_fold` | `optimizer/runtime_lowered` | `optimizer/runtime_optimized` | Runtime delta |
-| --- | ---: | ---: | ---: | ---: |
-| Windows | 9.97 µs | 754.0 µs | 484.2 µs | -35.8% |
-| Ubuntu | 6.02 µs | 628.2 µs | 430.8 µs | -31.4% |
+| Runner | `lower_const_fold` | `lower_corpus` | `pass_const_fold` | `pass_corpus` | `runtime_lowered` | `runtime_optimized` | Runtime delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Windows | 7.465 µs | 234.985 µs | 8.730 µs | 51.990 µs | 759.585 µs | 485.884 µs | -36.0% |
+| Ubuntu | 3.706 µs | 172.303 µs | 3.954 µs | 20.583 µs | 564.093 µs | 382.374 µs | -32.2% |
 
-The pass timing includes cloning the IR for each iteration. The optimized
-fixture still consumes exactly the same fuel; the delta is fewer dispatches.
+`lower_*` times `CheckedProgram -> IrProgram` with verification disabled and
+checking excluded. `pass_*` excludes the IR clone via `iter_batched`. The
+corpus is the 14 runtime fixtures. The optimizer fixture still consumes exactly
+the same fuel; the execution delta is fewer dispatches.
 
 The allocation report from the same run:
 

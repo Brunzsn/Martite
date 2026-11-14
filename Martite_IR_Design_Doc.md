@@ -384,20 +384,22 @@ snapshot fixture and every generated property case; any `Preserve` difference
 in result, trap, log, host calls, exact fuel or the three thresholds is a bug,
 not a snapshot update.
 
-The pre-split benchmark comparison
-[43628842207](https://github.com/Brunzsn/Martite/actions/runs/43628842207)
-compares `a63941c` against the frozen `ba36546` baseline. The `optimizer`
-target and Optimizer Benchmarks Comparison workflow now isolate this measurement
-from parser/checker/lint/CLI groups:
+The clean optimizer comparison
+[43637336006](https://github.com/Brunzsn/Martite/actions/runs/43637336006)
+uses the dedicated `optimizer` target, which contains no parser, checker, lint
+or CLI work. Candidate `2d6f75f` against baseline `7abd955`:
 
-| Runner | Pass (clone + optimize) | Lowered fixture | Optimized fixture | Delta |
-| --- | ---: | ---: | ---: | ---: |
-| Windows | 9.97 µs | 754.0 µs | 484.2 µs | -35.8% |
-| Ubuntu | 6.02 µs | 628.2 µs | 430.8 µs | -31.4% |
+| Runner | Lower (one) | Lower (corpus) | Fold (one) | Fold (corpus) | Lowered run | Optimized run | Runtime delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Windows | 7.465 µs | 234.985 µs | 8.730 µs | 51.990 µs | 759.585 µs | 485.884 µs | -36.0% |
+| Ubuntu | 3.706 µs | 172.303 µs | 3.954 µs | 20.583 µs | 564.093 µs | 382.374 µs | -32.2% |
 
-The fixture is a 2,000-iteration loop containing a constant scalar expression.
-Existing benchmark groups show only run-to-run noise (largest movement +11.3%
-and -10.0% in unrelated parser/runtime groups), not a systematic regression.
+Lowering excludes checking and verification; pass timing excludes the IR clone.
+The corpus is the 14 runtime fixtures. The fixture is a 2,000-iteration loop
+containing a constant scalar expression, so the execution delta is fewer
+dispatches at identical fuel. The previous general comparison showed only
+run-to-run noise (largest movement +11.3% and -10.0% in unrelated parser/runtime
+groups), not a systematic regression.
 
 `martite run` and `martite test` use the optimizer by default after the
 differential landed; `--no-optimize` remains the direct lowered-program escape
