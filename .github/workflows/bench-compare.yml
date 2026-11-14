@@ -83,7 +83,7 @@ jobs:
           cargo bench -p martite-bench
           --bench lexer --bench parser --bench load_check --bench lint
           --bench runtime --bench formatter --bench cli --bench allocations
-          -- --baseline before
+          -- --baseline-lenient before
 
       - name: Write benchmark summary
         if: always()

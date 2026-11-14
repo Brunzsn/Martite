@@ -177,6 +177,7 @@ impl<'p> Rewriter<'p> {
             .position(|ty| matches!(ty, Ty::Unit))
             .map(|index| TyId::new(index as u32))
             .ok_or_else(|| self.error(&old, old.body, RewriteErrorKind::MissingUnitType))?;
+        let edit_count = self.edits.len();
         self.remap = vec![None; old.nodes.len()];
         self.states = vec![VisitState::Unvisited; old.nodes.len()];
 
@@ -198,9 +199,10 @@ impl<'p> Rewriter<'p> {
             ));
         };
         function.body = Some(new_body);
+        martite_ir::recompute_function_effects(self.program, function);
 
         let stats = RewriteStats {
-            rewrites: self.edits.len(),
+            rewrites: edit_count,
             nodes_added: function.nodes.len().saturating_sub(old.nodes.len()),
             nodes_removed: old.nodes.len().saturating_sub(function.nodes.len()),
         };
@@ -482,6 +484,11 @@ impl<'p> Rewriter<'p> {
             Charge::expression(),
             Effects::NONE,
         );
+        if anchor.is_none() {
+            // The function body has no surviving parent to point at; use the
+            // folded literal as the provenance anchor.
+            out.synthetic[root.index()] = Some(leaf);
+        }
         Ok(root)
     }
 

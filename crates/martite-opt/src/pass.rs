@@ -425,6 +425,9 @@ impl PassManager {
                             let (changed, error, pending, stats) = {
                                 let mut cx = PassCx::for_function(program, &self.options);
                                 let changed = pass.run(&mut function, &mut cx);
+                                if changed.is_changed() {
+                                    cx.invalidate_analyses();
+                                }
                                 (changed, cx.take_error(), cx.take_pending(), cx.stats())
                             };
                             if let Some(error) = error {
@@ -447,6 +450,9 @@ impl PassManager {
                         let (changed, error, stats) = {
                             let mut cx = PassCx::for_program(&self.options);
                             let changed = pass.run(program, &mut cx);
+                            if changed.is_changed() {
+                                cx.invalidate_analyses();
+                            }
                             (changed, cx.take_error(), cx.stats())
                         };
                         if let Some(error) = error {

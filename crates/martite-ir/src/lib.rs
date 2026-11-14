@@ -59,7 +59,9 @@ pub use builtin::{
     BuiltinFnDef, BuiltinItemDef, BuiltinItemKind, BuiltinMethodDef, BuiltinReceiver,
 };
 pub use charge::Charge;
-pub use effects::{Effects, recompute as recompute_effects};
+pub use effects::{
+    Effects, recompute as recompute_effects, recompute_function as recompute_function_effects,
+};
 pub use id::{
     BuiltinFnId, BuiltinItemId, BuiltinMethodId, CaptureIndex, ConstId, FnId, HostId, IrId,
     MatchSetId, PatternId, Slot, StrId, StructLayoutId,

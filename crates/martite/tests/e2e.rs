@@ -1,3 +1,4 @@
+use martite::Engine;
 use martite_base::{LoadLimits, MemoryProvider};
 use martite_driver::{LoadOptions, load};
 use martite_runtime::{ExecLimits, IrRuntime};
@@ -316,5 +317,38 @@ fn structs_and_show() {
             "#
         ),
         ["Point { x: 1, y: 2 }"]
+    );
+}
+
+#[test]
+fn engine_optimizes_by_default_and_can_opt_out() {
+    let source = r#"
+        fn main() {
+            let value = (1 + 2) * 3
+            print(value)
+        }
+    "#;
+    let mut provider = MemoryProvider::new();
+    provider.insert("main.mt", source);
+
+    let optimized_engine = Engine::new();
+    let optimized = optimized_engine
+        .load_script("main.mt", &provider)
+        .expect("optimized script loads");
+    let mut plain_engine = Engine::new();
+    plain_engine.set_optimize(false);
+    let plain = plain_engine
+        .load_script("main.mt", &provider)
+        .expect("plain script loads");
+
+    let optimized_nodes: usize = optimized.ir().fns.iter().map(|f| f.nodes.len()).sum();
+    let plain_nodes: usize = plain.ir().fns.iter().map(|f| f.nodes.len()).sum();
+    assert!(
+        optimized_nodes < plain_nodes,
+        "engine must optimize by default (optimized {optimized_nodes}, plain {plain_nodes})"
+    );
+    assert_eq!(
+        optimized.run_main().expect("optimized run").log,
+        plain.run_main().expect("plain run").log
     );
 }

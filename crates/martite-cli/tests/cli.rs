@@ -508,6 +508,18 @@ fn dump_ir_keeps_test_output_unchanged() {
 }
 
 #[test]
+fn lower_optimize_golden_matches() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/optimize/const_fold.mt");
+    let output = martite(&[s("lower"), s("--optimize"), fixture.as_os_str()]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/optimize/const_fold.ir");
+    let expected = std::fs::read_to_string(&golden)
+        .unwrap_or_else(|_| panic!("missing golden {}", golden.display()));
+    assert_eq!(stdout(&output), expected);
+}
+
+#[test]
 fn lower_optimize_prints_carried_charges() {
     let dir = TempDir::new("lower-optimize");
     let script = dir.file("main.mt", "fn main() { let value = 1 + 2 }\n");

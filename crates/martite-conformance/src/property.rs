@@ -197,8 +197,23 @@ pub fn check_source(source: &str) -> Result<PropertyOutcome, PropertyFailure> {
         let ir_first = observe_ir(&ir, &sources, limits);
         let ir_second = observe_ir(&ir, &sources, limits);
         let optimized_run = observe_ir(&optimized, &sources, limits);
-        if deadline(&ir_first) || deadline(&ir_second) || deadline(&optimized_run) {
+        let optimized_second = observe_ir(&optimized, &sources, limits);
+        if deadline(&ir_first)
+            || deadline(&ir_second)
+            || deadline(&optimized_run)
+            || deadline(&optimized_second)
+        {
             return Ok(skipped(format!("deadline during limit sweep at `{name}`")));
+        }
+        if optimized_run != optimized_second {
+            return Err(PropertyFailure::new(
+                "optimized IR determinism",
+                source,
+                format!(
+                    "`{name}` differs between two optimized runs\nfirst:  {optimized_run:?}\nsecond: {optimized_second:?}"
+                ),
+            )
+            .with_dump(dump));
         }
         if ir_first != optimized_run {
             return Err(PropertyFailure::new(

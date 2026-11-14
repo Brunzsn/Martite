@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use martite_ir::{ConstValue, Effects, IrFn, IrId, NodeKind, Ty, TyId};
+use martite_ir::{ConstValue, Effects, IrFn, IrId, NodeKind, Ty};
 
 use crate::error::RewriteError;
 use crate::pass::{Changed, CostPolicy, FnPass, PassCx};
@@ -239,9 +239,4 @@ fn foldable_effects(function: &IrFn, effects: Effects, kind: NodeKind, id: IrId)
             | NodeKind::Div { .. }
             | NodeKind::Rem { .. }
     )
-}
-
-#[allow(dead_code)]
-fn _type_is(cx: &PassCx<'_>, id: TyId, expected: Ty) -> bool {
-    matches!(cx.ty(id), Some(ty) if ty == expected)
 }

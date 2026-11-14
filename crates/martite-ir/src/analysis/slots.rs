@@ -3,7 +3,7 @@
 //! [`SlotSet`] is the domain of both analyses. [`check_slot_initialization`]
 //! enforces rule M2's static half: lowering assigns one slot per binding and
 //! no pass may reuse it. The dynamic half, "no pass may elide a heap-valued
-//! slot write under `Preserve`", belongs to the rewriter in #123.
+//! slot write under `Preserve`", is enforced by `martite-opt`'s rewriter.
 
 use std::fmt;
 

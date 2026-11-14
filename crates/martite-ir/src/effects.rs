@@ -111,7 +111,7 @@ pub const FLAGS: &[(&str, Effects)] = &[
 ///
 /// This is the shared implementation used by lowering and by the optimizer
 /// after a pass rewrites the tree. Leaf effects come from the verifier's
-/// [`EffectsCheck`]; parents union their children and their own safepoint flag.
+/// checker; parents union their children and their own safepoint flag.
 /// Call effects are read from a callee-summary snapshot, so the recomputation
 /// reaches a fixpoint once calls are represented.
 pub fn recompute(program: &mut IrProgram) {
@@ -143,6 +143,34 @@ pub fn recompute(program: &mut IrProgram) {
             break;
         }
         summaries = next;
+    }
+}
+
+/// Recompute one function's stored subtree effects from the current program's
+/// callee summaries.
+///
+/// This is the rewriter's immediate bottom-up update. The pass manager follows
+/// it with a program-wide [`recompute`] fixpoint so recursive and changed call
+/// summaries settle.
+pub fn recompute_function(program: &IrProgram, function: &mut IrFn) {
+    let summaries: Vec<Effects> = program
+        .fns
+        .iter()
+        .map(|function| {
+            function
+                .body
+                .and_then(|body| function.node(body))
+                .map(|node| node.effects)
+                .unwrap_or(Effects::NONE)
+        })
+        .collect();
+    let check = EffectsCheck::with_summaries(program, summaries);
+    let mut node_effects = vec![Effects::NONE; function.nodes.len()];
+    if let Some(body) = function.body {
+        recompute_node(program, function, body, &check, &mut node_effects);
+    }
+    for (node, effects) in function.nodes.iter_mut().zip(node_effects) {
+        node.effects = effects;
     }
 }
 

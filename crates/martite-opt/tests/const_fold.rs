@@ -89,6 +89,10 @@ fn main() {
         baseline_run,
         "fuel, log and value must match"
     );
+
+    let mut again = baseline.clone();
+    optimize(&mut again, OptimizeOptions::default()).expect("optimize again");
+    assert_eq!(again, optimized, "optimization must be deterministic");
 }
 
 #[test]
@@ -124,7 +128,10 @@ fn pick(value: int) -> int {
 fn main() {
     let pair = Pair { left: pick(0), right: pick(2) }
     let label = "sum {1 + 2} {pair.left + pair.right} {add(1 + 2, 3 + 4)}"
+    let with_arg = fn(value: int) => (1 + 2) + value
+    let no_arg = fn() => 3 * 4
     print(label)
+    print(with_arg(1) + no_arg())
 }
 "#,
     );
