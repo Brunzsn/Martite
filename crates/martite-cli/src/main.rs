@@ -38,7 +38,11 @@ Options:
     --fuel <n>            Fuel for `run` and `test`
     --memory <n>          Memory limit in bytes for `run` and `test`
     --depth <n>           Call-depth limit for `run` and `test`
+    --no-optimize         Skip optimizer passes for `run` and `test`
     --dump-ir[=stage]     Dump IR for `run`/`test`: before, after, both
+
+Lower options:
+    --optimize            Print the optimized IR instead of the lowered IR
 
 Fmt options:
     --check               Print a unified diff; do not write
@@ -113,6 +117,7 @@ struct Parsed {
     memory: Option<u64>,
     depth: Option<u32>,
     dump_ir: Option<DumpStage>,
+    no_optimize: bool,
     path: Option<String>,
     /// Arguments after the script path, passed through to `std.env.args()`.
     script_args: Vec<String>,
@@ -167,6 +172,7 @@ fn parse_args(args: &[String], allow_trailing: bool) -> Result<Parsed, String> {
                         .map_err(|_| "--depth requires a number")?,
                 );
             }
+            Long("no-optimize") => out.no_optimize = true,
             Long("dump-ir") => {
                 out.dump_ir = Some(match parser.optional_value() {
                     None => DumpStage::Both,
@@ -1361,6 +1367,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     // `martite run` is the standalone host: it is intentionally unrestricted.
     let provider = FileSystemProvider::unrestricted(parent);
     let mut engine = Engine::new();
+    engine.set_optimize(!parsed.no_optimize);
     register_std(&mut engine, parsed.script_args.clone());
     apply_limits(&mut engine, &parsed);
     let plugin = match engine.load_script(name, &provider) {
@@ -1371,7 +1378,8 @@ fn cmd_run(args: &[String]) -> ExitCode {
         }
     };
     if let Some(stage) = parsed.dump_ir {
-        dump_ir(stage, plugin.ir());
+        let before = plugin.lowered_ir();
+        dump_ir(stage, before.as_ref(), plugin.ir());
     }
     let result = plugin.run_main();
     match result {
@@ -1404,6 +1412,10 @@ fn cmd_check(args: &[String], lint: bool) -> ExitCode {
     };
     if parsed.dump_ir.is_some() {
         eprintln!("error: --dump-ir is only supported by `martite run` and `martite test`\n");
+        return ExitCode::from(2);
+    }
+    if parsed.no_optimize {
+        eprintln!("error: --no-optimize is only supported by `martite run` and `martite test`\n");
         return ExitCode::from(2);
     }
     let Some(path) = parsed.path else {
@@ -1500,6 +1512,7 @@ fn cmd_check(args: &[String], lint: bool) -> ExitCode {
 #[derive(Default)]
 struct LowerArgs {
     json: bool,
+    optimize: bool,
     interfaces: Vec<PathBuf>,
     path: Option<String>,
 }
@@ -1512,6 +1525,7 @@ fn parse_lower_args(args: &[String]) -> Result<LowerArgs, String> {
     while let Some(arg) = parser.next().map_err(|error| error.to_string())? {
         match arg {
             Long("json") => out.json = true,
+            Long("optimize") => out.optimize = true,
             Long("interface") => {
                 let path = parser
                     .value()
@@ -1579,11 +1593,25 @@ fn cmd_lower(args: &[String]) -> ExitCode {
         eprintln!("error: no program");
         return ExitCode::from(2);
     };
-    let Some(ir) = lower_for_dump(program, &loaded.sources, parsed.json) else {
+    let Some(mut ir) = lower_for_dump(program, &loaded.sources, parsed.json) else {
         return ExitCode::from(1);
     };
+    if parsed.optimize && !optimize_ir(&mut ir, parsed.json) {
+        return ExitCode::from(1);
+    }
     print!("{}", Printer::new(&ir).program());
     ExitCode::SUCCESS
+}
+
+fn optimize_ir(ir: &mut IrProgram, json: bool) -> bool {
+    match martite_opt::optimize(ir, martite_opt::OptimizeOptions::default()) {
+        Ok(_) => true,
+        Err(error) => {
+            let diagnostic = Diagnostic::error(Code::E508, format!("optimization failed: {error}"));
+            print_diagnostics(&[diagnostic], &SourceMap::new(), json);
+            false
+        }
+    }
 }
 
 fn cmd_test(args: &[String]) -> ExitCode {
@@ -1664,11 +1692,15 @@ fn cmd_test(args: &[String]) -> ExitCode {
         eprintln!("error: no program");
         return ExitCode::from(2);
     };
-    let Some(ir) = lower_for_dump(&program, &loaded.sources, parsed.json) else {
+    let Some(mut ir) = lower_for_dump(&program, &loaded.sources, parsed.json) else {
         return ExitCode::from(1);
     };
+    let lowered = ir.clone();
+    if !parsed.no_optimize && !optimize_ir(&mut ir, parsed.json) {
+        return ExitCode::from(1);
+    }
     if let Some(stage) = parsed.dump_ir {
-        dump_ir(stage, &ir);
+        dump_ir(stage, Some(&lowered), &ir);
     }
     let limits = ExecLimits {
         fuel: parsed.fuel.unwrap_or(1_000_000),
@@ -1719,17 +1751,15 @@ fn print_diagnostics(diagnostics: &[Diagnostic], sources: &SourceMap, json: bool
     }
 }
 
-fn dump_ir(stage: DumpStage, program: &IrProgram) {
-    let printer = Printer::new(program);
+fn dump_ir(stage: DumpStage, lowered: Option<&IrProgram>, executing: &IrProgram) {
     if matches!(stage, DumpStage::Before | DumpStage::Both) {
+        let before = lowered.unwrap_or(executing);
         eprintln!("; IR before optimization");
-        eprint!("{}", printer.program());
+        eprint!("{}", Printer::new(before).program());
     }
-    // `martite-opt` does not exist yet (#123). Until it does, the after stage
-    // is the lowered program unchanged.
     if matches!(stage, DumpStage::After | DumpStage::Both) {
         eprintln!("; IR after optimization");
-        eprint!("{}", printer.program());
+        eprint!("{}", Printer::new(executing).program());
     }
 }
 

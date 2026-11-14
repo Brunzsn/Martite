@@ -12,8 +12,9 @@ The workspace is split along the compiler pipeline:
 - `martite-config` — `plugin.toml` and `martite.toml`
 - `martite-resolve` — module graph, imports, grants, top-level names
 - `martite-check` — bidirectional type checker, patterns, constants, handlers
-- `martite-ir` — resolved, self-contained tree IR, lowering (`lower` feature), verifier and text dumps
-- `martite-runtime` — IR evaluator, values, standard library, limits and traps; it does not depend on the checker or syntax tree
+- `martite-ir` - resolved, self-contained tree IR, lowering (`lower` feature), verifier and text dumps
+- `martite-opt` - ordered pass manager, `Preserve` rewriter and the first constant-folding pass
+- `martite-runtime` - IR evaluator, values, standard library, limits and traps; it does not depend on the checker or syntax tree
 - `martite-driver` — load orchestration
 - `martite` — embedding and plugin host API
 - `martite-cli` — `martite` binary and standalone `std.io`/`std.env` host
@@ -58,11 +59,15 @@ cargo run -p martite-cli -- fmt --stdin < examples/hello.mt
 cargo bench -p martite-bench
 ```
 
-`martite lower <file>` prints the resolved IR without executing it.
-`martite run` and `martite test` accept `--dump-ir[=before|after|both]` and write
-the dump to stderr, so program output and exit codes are unchanged. The dump is
-the lowered program that the run/test command executes; the `after` stage is the
-same program until the optimizer lands.
+`martite lower <file>` prints the resolved IR without executing it;
+`martite lower --optimize <file>` prints the optimized IR instead.
+
+`martite run` and `martite test` run optimizer passes by default. The first pass
+is constant folding under the `Preserve` policy, so fuel, traps and limits are
+unchanged. `--no-optimize` executes the lowered program directly. Both commands
+accept `--dump-ir[=before|after|both]` and write the dump to stderr, so program
+output and exit codes are unchanged. `before` is the lowered program and `after`
+is the program that executes.
 
 Benchmarks use the deterministic corpus in
 `crates/martite-conformance/fixtures/bench`. See

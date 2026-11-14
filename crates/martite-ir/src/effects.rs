@@ -7,6 +7,10 @@
 use std::fmt;
 use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
+use crate::id::IrId;
+use crate::program::{IrFn, IrProgram};
+use crate::verify::{EffectsCheck, children_of};
+
 /// A set of effect flags.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct Effects(u32);
@@ -102,6 +106,70 @@ pub const FLAGS: &[(&str, Effects)] = &[
     ("PANICS", Effects::PANICS),
     ("NONLOCAL_EXIT", Effects::NONLOCAL_EXIT),
 ];
+
+/// Recompute every stored subtree effect summary in `program`.
+///
+/// This is the shared implementation used by lowering and by the optimizer
+/// after a pass rewrites the tree. Leaf effects come from the verifier's
+/// [`EffectsCheck`]; parents union their children and their own safepoint flag.
+/// Call effects are read from a callee-summary snapshot, so the recomputation
+/// reaches a fixpoint once calls are represented.
+pub fn recompute(program: &mut IrProgram) {
+    let mut summaries = vec![Effects::NONE; program.fns.len()];
+    loop {
+        let snapshot = summaries.clone();
+        let outputs = {
+            let check = EffectsCheck::with_summaries(program, snapshot);
+            let mut outputs = Vec::with_capacity(program.fns.len());
+            let mut next = summaries.clone();
+            for function in &program.fns {
+                let mut node_effects = vec![Effects::NONE; function.nodes.len()];
+                if let Some(body) = function.body {
+                    let summary =
+                        recompute_node(program, function, body, &check, &mut node_effects);
+                    next[function.id.index()] = summary;
+                }
+                outputs.push(node_effects);
+            }
+            (outputs, next)
+        };
+        let (outputs, next) = outputs;
+        for (function, node_effects) in program.fns.iter_mut().zip(outputs) {
+            for (node, effects) in function.nodes.iter_mut().zip(node_effects) {
+                node.effects = effects;
+            }
+        }
+        if next == summaries {
+            break;
+        }
+        summaries = next;
+    }
+}
+
+fn recompute_node(
+    program: &IrProgram,
+    function: &IrFn,
+    id: IrId,
+    check: &EffectsCheck<'_>,
+    out: &mut [Effects],
+) -> Effects {
+    stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
+        let Some(node) = function.node(id).copied() else {
+            return Effects::NONE;
+        };
+        let mut effects = check.leaf_effects(function, node);
+        for child in children_of(program, function, node) {
+            effects |= recompute_node(program, function, child, check, out);
+        }
+        if function.is_safepoint(id) {
+            effects |= Effects::SAFEPOINT;
+        }
+        if let Some(slot) = out.get_mut(id.index()) {
+            *slot = effects;
+        }
+        effects
+    })
+}
 
 impl fmt::Debug for Effects {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

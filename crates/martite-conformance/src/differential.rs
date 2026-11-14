@@ -9,8 +9,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use martite_ir::{lower, verify};
+use martite_opt::{OptimizeOptions, optimize};
 
-use crate::snapshot::{SnapshotCase, SnapshotRecord};
+use crate::snapshot::{ProgramStage, SnapshotCase, SnapshotRecord};
 use crate::snapshot_cases;
 
 /// One differing field in a snapshot record or threshold check.
@@ -116,7 +117,7 @@ pub fn run_all(expected: &BTreeMap<String, SnapshotRecord>) -> CorpusReport {
                 id: case.id().to_owned(),
                 note: None,
                 differences,
-                ir_dump: Some(ir_dump(&case)),
+                ir_dump: Some(ir_dump(&case, ProgramStage::Lowered)),
             });
         }
     }
@@ -128,15 +129,78 @@ pub fn run_all(expected: &BTreeMap<String, SnapshotRecord>) -> CorpusReport {
     }
 }
 
-fn ir_dump(case: &SnapshotCase) -> String {
+/// Run passes off versus on for every executable fixture.
+///
+/// The lowered observation is the oracle for the optimized observation: under
+/// `Preserve`, every observable field, exact fuel and all three thresholds
+/// must match. The checked-in snapshot is also checked against the optimized
+/// record so a pass cannot quietly replace the oracle.
+pub fn run_optimized(expected: &BTreeMap<String, SnapshotRecord>) -> CorpusReport {
+    let cases = snapshot_cases::all_cases();
+    let mut covered = 0;
+    let mut skipped = 0;
+    let mut failures = Vec::new();
+
+    for case in cases {
+        let Some(expected) = expected.get(case.id()) else {
+            panic!(
+                "missing snapshot for {}; run:\n  cargo test -p martite-conformance --test snapshots -- --ignored update_snapshots",
+                case.id()
+            );
+        };
+        if case.checked_program().is_none() {
+            skipped += 1;
+            continue;
+        }
+        covered += 1;
+
+        let lowered = case.observe_with(ProgramStage::Lowered);
+        let optimized = case.observe_with(ProgramStage::Optimized);
+        let mut differences = observable_differences(&lowered, &optimized);
+        differences.extend(observable_differences(expected, &optimized));
+        match case.verify_ir_thresholds_with(expected, ProgramStage::Optimized) {
+            Ok(()) => {}
+            Err(mismatches) => {
+                differences.extend(mismatches.into_iter().map(|mismatch| FieldDifference {
+                    field: mismatch.field.into(),
+                    expected: mismatch.expected,
+                    actual: mismatch.actual,
+                }));
+            }
+        }
+        if !differences.is_empty() {
+            failures.push(CaseFailure {
+                id: case.id().to_owned(),
+                note: Some("optimizer differential".into()),
+                differences,
+                ir_dump: Some(ir_dump(&case, ProgramStage::Optimized)),
+            });
+        }
+    }
+
+    CorpusReport {
+        covered,
+        skipped,
+        failures,
+    }
+}
+
+fn ir_dump(case: &SnapshotCase, stage: ProgramStage) -> String {
     let Some((program, sources)) = case.checked_program() else {
         return "<not executable>".into();
     };
     match lower(&program, &sources) {
-        Ok(ir) => match verify(&ir) {
-            Ok(()) => ir.print(),
-            Err(error) => format!("<IR verifier rejected the fixture: {error}>"),
-        },
+        Ok(mut ir) => {
+            if stage == ProgramStage::Optimized
+                && let Err(error) = optimize(&mut ir, OptimizeOptions::default())
+            {
+                return format!("<IR optimization failed: {error}>");
+            }
+            match verify(&ir) {
+                Ok(()) => ir.print(),
+                Err(error) => format!("<IR verifier rejected the fixture: {error}>"),
+            }
+        }
         Err(error) => format!("<IR lowering failed: {error}>"),
     }
 }

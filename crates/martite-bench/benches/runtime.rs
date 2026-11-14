@@ -2,6 +2,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use martite_bench::{BENCH_LIMITS, HOST_CALLS_COUNT, fixture, host_calls_plugin};
+use martite_opt::{OptimizeOptions, optimize};
 use martite_runtime::{IrRuntime, Value};
 
 fn runtime_benches(c: &mut Criterion) {
@@ -53,6 +54,40 @@ fn runtime_benches(c: &mut Criterion) {
         })
     });
     group.finish();
+
+    optimize_benches(c);
+}
+
+fn optimize_benches(c: &mut Criterion) {
+    let lowered = fixture("optimize/constant_fold.mt").lowered();
+    let unoptimized = lowered.program.expect("optimize fixture lowers");
+    let mut optimized = unoptimized.clone();
+    optimize(&mut optimized, OptimizeOptions::default()).expect("optimize fixture optimizes");
+
+    let mut pass_group = c.benchmark_group("optimize");
+    pass_group.bench_function("constant_fold_pass", |b| {
+        b.iter(|| {
+            let mut ir = unoptimized.clone();
+            optimize(&mut ir, OptimizeOptions::default()).expect("optimize");
+            black_box(ir)
+        })
+    });
+    pass_group.finish();
+
+    let mut runtime_group = c.benchmark_group("optimize_runtime");
+    let mut lowered_runtime = IrRuntime::new(&unoptimized, BENCH_LIMITS);
+    lowered_runtime.run_main().expect("lowered fixture runs");
+    runtime_group.bench_function("constant_fold_lowered", |b| {
+        b.iter(|| black_box(lowered_runtime.run_main()))
+    });
+    let mut optimized_runtime = IrRuntime::new(&optimized, BENCH_LIMITS);
+    optimized_runtime
+        .run_main()
+        .expect("optimized fixture runs");
+    runtime_group.bench_function("constant_fold_optimized", |b| {
+        b.iter(|| black_box(optimized_runtime.run_main()))
+    });
+    runtime_group.finish();
 }
 
 criterion_group!(benches, runtime_benches);

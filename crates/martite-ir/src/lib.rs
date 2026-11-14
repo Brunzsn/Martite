@@ -5,7 +5,8 @@
 //! ([`Printer`]) for dumps and golden tests, the verifier ([`verify`]) that
 //! enforces the contract between lowering and every pass, the on-demand slot
 //! analyses in [`analysis`], and lowering ([`lower`]). Calls, patterns and
-//! lambdas all lower here; there is no evaluator or optimizer yet.
+//! lambdas all lower here. The runtime lives in `martite-runtime`; passes and
+//! the rewriter live in `martite-opt`.
 //!
 //! Dependency direction: the default `lower` feature may depend on
 //! `martite-base`, `martite-syntax` and `martite-check` for lowering inputs,
@@ -58,7 +59,7 @@ pub use builtin::{
     BuiltinFnDef, BuiltinItemDef, BuiltinItemKind, BuiltinMethodDef, BuiltinReceiver,
 };
 pub use charge::Charge;
-pub use effects::Effects;
+pub use effects::{Effects, recompute as recompute_effects};
 pub use id::{
     BuiltinFnId, BuiltinItemId, BuiltinMethodId, CaptureIndex, ConstId, FnId, HostId, IrId,
     MatchSetId, PatternId, Slot, StrId, StructLayoutId,
@@ -76,4 +77,4 @@ pub use program::{
     IrProgram, ParamInfo, PreludeVariant, SlotInfo,
 };
 pub use types::{FieldDef, Ty, TyId, TypeDef, TypeDefKind, TypeId, TypeTable, VariantDef};
-pub use verify::{VerifyError, VerifyErrorKind, verify, verify_after_pass};
+pub use verify::{VerifyError, VerifyErrorKind, children_of, verify, verify_after_pass};

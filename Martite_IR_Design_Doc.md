@@ -345,6 +345,51 @@ pub trait ProgramPass { /* same shape over IrProgram */ }
 
 Starter passes that are safe under `Preserve` (they do not touch sharing or safepoints): constant folding of scalar operators, branch folding on literal conditions, trivial dead-code removal of literal-only expression statements with their charge carried. Anything involving heap values needs the S1/M2 argument first.
 
+### 11.1 First pass: constant folding
+
+`martite-opt` now provides `FnPass`, `ProgramPass`, `CostPolicy`, `PassCx`,
+`PassManager`, `OptimizeOptions` and the `const-fold` pass. The pass manager is
+deterministic, supports fixpoint mode with an iteration cap, disables passes by
+name, and verifies after every pass in debug builds (tests force verification
+explicitly).
+
+The rewriter is the only mutation path. It rebuilds the function arena, remaps
+every child reference, call argument range, struct layout, match set and
+interpolation part, sets provenance for pass-created nodes, and recomputes
+stored effects bottom-up through `martite_ir::recompute_effects`. Under
+`Preserve` it rejects dynamic or control-flow charges, multi-unit charge calls,
+shared heap reads, and safepoints below the rewritten root. A safepoint on the
+root is transferred to the replacement, which covers expression-bodied lambdas.
+
+`const-fold` folds `Neg` and `Not` plus integer and finite-float
+`Add`/`Sub`/`Mul`/`Div`/`Rem` when every operand is a literal. It uses checked
+integer arithmetic and skips division/remainder by zero, overflow and
+non-finite float results. Comparisons and strings are deferred because their
+charges are dynamic.
+
+Carrying fuel uses the existing `Charge(n)` statement inside an `ExprBlock`:
+
+```text
+expr_block [
+  charge units=N,
+  expr_stmt literal,
+]
+```
+
+The wrapper adds one entry charge and the literal adds one, so
+`N = old_static_charge - 2`. `Charge(n)` charges `n` individual units, which
+preserves the tick cadence of the removed scalar nodes (and therefore the
+safepoint schedule) as well as exact fuel. The differential covers every
+snapshot fixture and every generated property case; any `Preserve` difference
+in result, trap, log, host calls, exact fuel or the three thresholds is a bug,
+not a snapshot update.
+
+`martite run` and `martite test` use the optimizer by default after the
+differential landed; `--no-optimize` remains the direct lowered-program escape
+hatch. `martite lower` stays a pure lowering command and `--optimize` prints the
+optimized dump. Branch folding and literal-only statement removal remain
+follow-ups because they need explicit safepoint-preservation arguments.
+
 ## 12. Verifier
 
 Runs after lowering and, in tests and debug builds, after each pass. Checks:

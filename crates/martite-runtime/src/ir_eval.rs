@@ -1016,7 +1016,12 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 self.trap(self.internal_panic("mutable argument used as a value"))
             }
             NodeKind::Charge(units) => {
-                self.charge(u64::from(units))?;
+                // Charging one unit at a time preserves the per-charge tick
+                // cadence (and therefore safepoint timing) of the nodes a
+                // `Preserve` pass removed. Lowering never emits this node.
+                for _ in 0..units {
+                    self.charge(1)?;
+                }
                 Ok(Value::Unit)
             }
         }

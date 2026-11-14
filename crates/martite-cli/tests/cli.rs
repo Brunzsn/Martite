@@ -508,6 +508,64 @@ fn dump_ir_keeps_test_output_unchanged() {
 }
 
 #[test]
+fn lower_optimize_prints_carried_charges() {
+    let dir = TempDir::new("lower-optimize");
+    let script = dir.file("main.mt", "fn main() { let value = 1 + 2 }\n");
+
+    let lowered = martite(&[s("lower"), script.as_os_str()]);
+    assert!(lowered.status.success(), "stderr: {}", stderr(&lowered));
+    let lowered_text = stdout(&lowered);
+    assert!(lowered_text.contains(" add "), "stdout: {lowered_text}");
+    assert!(
+        !lowered_text.contains("charge units="),
+        "stdout: {lowered_text}"
+    );
+
+    let optimized = martite(&[s("lower"), s("--optimize"), script.as_os_str()]);
+    assert!(optimized.status.success(), "stderr: {}", stderr(&optimized));
+    let optimized_text = stdout(&optimized);
+    assert!(
+        optimized_text.contains("charge units=1"),
+        "stdout: {optimized_text}"
+    );
+    assert!(
+        optimized_text.contains("value=3"),
+        "stdout: {optimized_text}"
+    );
+    assert!(
+        !optimized_text.contains(" add "),
+        "stdout: {optimized_text}"
+    );
+}
+
+#[test]
+fn run_optimizes_by_default_and_no_optimize_opts_out() {
+    let dir = TempDir::new("run-optimize");
+    let script = dir.file("main.mt", "fn main() { print(1 + 2) }\n");
+
+    let optimized = martite(&[s("run"), s("--dump-ir=after"), script.as_os_str()]);
+    assert!(optimized.status.success(), "stderr: {}", stderr(&optimized));
+    let error = stderr(&optimized);
+    assert!(error.contains("charge units=1"), "stderr: {error}");
+    assert!(!error.contains(" add "), "stderr: {error}");
+
+    let plain = martite(&[s("run"), s("--no-optimize"), script.as_os_str()]);
+    assert!(plain.status.success(), "stderr: {}", stderr(&plain));
+    assert_eq!(stdout(&plain), "3\n");
+    let lowered = martite(&[
+        s("run"),
+        s("--no-optimize"),
+        s("--dump-ir=after"),
+        script.as_os_str(),
+    ]);
+    assert!(lowered.status.success(), "stderr: {}", stderr(&lowered));
+    let error = stderr(&lowered);
+    assert!(!error.contains("charge units="), "stderr: {error}");
+    assert!(error.contains(" add "), "stderr: {error}");
+    assert_eq!(stdout(&optimized), stdout(&plain));
+}
+
+#[test]
 fn dump_ir_rejects_unknown_stages_and_other_commands() {
     let dir = TempDir::new("dump-usage");
     let script = dir.file("main.mt", "fn main() {}\n");

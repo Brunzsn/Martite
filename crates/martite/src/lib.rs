@@ -109,6 +109,7 @@ pub struct Engine {
     load_limits: LoadLimits,
     max_limits: ExecLimits,
     default_limits: ExecLimits,
+    optimize: bool,
 }
 
 impl Default for Engine {
@@ -130,6 +131,7 @@ impl Engine {
                 deadline: None,
             },
             default_limits: ExecLimits::default(),
+            optimize: true,
         }
     }
 
@@ -140,6 +142,29 @@ impl Engine {
 
     pub fn set_load_limits(&mut self, limits: LoadLimits) {
         self.load_limits = limits;
+    }
+
+    /// Enable or disable the default `Preserve` optimizer.
+    ///
+    /// Enabled by default. The optimizer only removes nodes while carrying
+    /// their exact fuel charge, so observable behavior is unchanged.
+    pub fn set_optimize(&mut self, enabled: bool) -> &mut Self {
+        self.optimize = enabled;
+        self
+    }
+
+    fn optimize_ir(&self, ir: &mut IrProgram) -> Result<(), Vec<Diagnostic>> {
+        if !self.optimize {
+            return Ok(());
+        }
+        martite_opt::optimize(ir, martite_opt::OptimizeOptions::default())
+            .map(|_| ())
+            .map_err(|error| {
+                vec![Diagnostic::error(
+                    Code::E508,
+                    format!("optimization failed: {error}"),
+                )]
+            })
     }
 
     /// Register an `.mti` interface module, for example `app.editor`.
@@ -328,9 +353,10 @@ impl Engine {
         if lowered.has_errors() {
             return Err(lowered.diagnostics);
         }
-        let ir = lowered
+        let mut ir = lowered
             .program
             .ok_or_else(|| vec![Diagnostic::error(Code::E508, "program failed to lower")])?;
+        self.optimize_ir(&mut ir)?;
         let host_by_id = self.host_map(&ir);
         Ok(Plugin {
             program,
@@ -431,9 +457,10 @@ impl Engine {
         if lowered.has_errors() {
             return Err(lowered.diagnostics);
         }
-        let ir = lowered
+        let mut ir = lowered
             .program
             .ok_or_else(|| vec![Diagnostic::error(Code::E508, "program failed to lower")])?;
+        self.optimize_ir(&mut ir)?;
         let host_by_id = self.host_map(&ir);
         Ok(Plugin {
             program,
@@ -530,6 +557,14 @@ impl Plugin {
     /// The lowered, self-contained program executed by the IR evaluator.
     pub fn ir(&self) -> &IrProgram {
         &self.ir
+    }
+
+    /// Re-lower the checked program without running optimizer passes.
+    ///
+    /// Used by the CLI's `--dump-ir=before` stage; normal execution uses
+    /// [`Self::ir`].
+    pub fn lowered_ir(&self) -> Option<IrProgram> {
+        lower(&self.program, &self.sources).program
     }
 
     /// IR-owned type definitions for this program.

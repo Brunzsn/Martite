@@ -5481,16 +5481,15 @@ impl<'a> EffectsCheck<'a> {
         }
     }
 
-    /// Build a checker over an explicit callee-summary snapshot. Lowering uses
-    /// this to fill stored effects without duplicating the leaf-effect rules.
-    #[cfg(feature = "lower")]
+    /// Build a checker over an explicit callee-summary snapshot. Lowering and
+    /// the optimizer use this to fill stored effects without duplicating the
+    /// leaf-effect rules.
     pub(crate) fn with_summaries(program: &'a IrProgram, summaries: Vec<Effects>) -> Self {
         Self { program, summaries }
     }
 
     /// Leaf effects of one node, using the summaries supplied to
     /// [`Self::with_summaries`]. Children are not included.
-    #[cfg(feature = "lower")]
     pub(crate) fn leaf_effects(&self, function: &IrFn, node: Node) -> Effects {
         self.own_effects(function, node, &self.summaries)
     }
@@ -5986,7 +5985,13 @@ fn method_calls_closure(name: &str) -> bool {
     )
 }
 
-pub(crate) fn children_of(program: &IrProgram, function: &IrFn, node: Node) -> Vec<IrId> {
+/// Returns the semantic children of `node` in evaluation order.
+///
+/// Child ids stored inline in [`NodeKind`] and child ids stored in per-node
+/// payload arenas are both returned. Call nodes return their arguments (and
+/// receiver, when present); `Match` returns its scrutinee plus every arm guard
+/// and body; `StrInterp` returns only its expression parts.
+pub fn children_of(program: &IrProgram, function: &IrFn, node: Node) -> Vec<IrId> {
     let mut children = Vec::new();
     match node.kind {
         NodeKind::Field { base, .. }

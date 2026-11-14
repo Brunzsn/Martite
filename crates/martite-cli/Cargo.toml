@@ -18,6 +18,7 @@ martite-syntax.workspace = true
 martite-resolve.workspace = true
 martite-check.workspace = true
 martite-ir.workspace = true
+martite-opt.workspace = true
 martite-runtime.workspace = true
 martite-driver.workspace = true
 martite-lint.workspace = true

@@ -9,6 +9,7 @@ const CRATES: &[&str] = &[
     "martite-resolve",
     "martite-check",
     "martite-ir",
+    "martite-opt",
     "martite-runtime",
     "martite-driver",
     "martite-lint",
@@ -50,6 +51,33 @@ fn benchmarks_are_isolated_from_production_crates() {
             "{name} must not depend on benchmark-only tooling"
         );
     }
+}
+
+#[test]
+fn optimizer_stays_above_the_ir() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let manifest = fs::read_to_string(root.join("crates/martite-opt/Cargo.toml"))
+        .expect("read optimizer manifest");
+    let dependencies = manifest
+        .split("[dev-dependencies]")
+        .next()
+        .expect("dependency section");
+    for forbidden in [
+        "martite-runtime",
+        "martite-check",
+        "martite-syntax",
+        "martite-driver",
+        "martite-bench",
+    ] {
+        assert!(
+            !dependencies.contains(forbidden),
+            "martite-opt production dependencies must not include {forbidden}"
+        );
+    }
+    assert!(
+        dependencies.contains("martite-ir.workspace = true"),
+        "martite-opt must depend on martite-ir"
+    );
 }
 
 #[test]

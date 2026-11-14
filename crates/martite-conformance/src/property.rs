@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use martite_base::{Severity, SourceMap};
 use martite_check::CheckedProgram;
 use martite_ir::{FnId, IrProgram, LowerOptions, lower_with, verify};
+use martite_opt::{OptimizeOptions, optimize};
 use martite_runtime::{ExecLimits, IrRuntime};
 
 use crate::Case;
@@ -151,6 +152,7 @@ pub fn check_source(source: &str) -> Result<PropertyOutcome, PropertyFailure> {
         .with_dump(dump));
     }
     let ir = first;
+    let optimized = optimize_once(&ir, source, dump.clone())?;
 
     verifier_rejects_corrupted_ir(&ir, source, dump.clone())?;
     if timed_out(start) {
@@ -159,8 +161,19 @@ pub fn check_source(source: &str) -> Result<PropertyOutcome, PropertyFailure> {
 
     let baseline = baseline_limits();
     let first_ir = observe_ir(&ir, &sources, baseline);
-    if deadline(&first_ir) {
+    let optimized_baseline = observe_ir(&optimized, &sources, baseline);
+    if deadline(&first_ir) || deadline(&optimized_baseline) {
         return Ok(skipped("deadline at baseline limits"));
+    }
+    if optimized_baseline != first_ir {
+        return Err(PropertyFailure::new(
+            "optimizer differential",
+            source,
+            format!(
+                "optimized baseline differs\nlowered:   {first_ir:?}\noptimized: {optimized_baseline:?}"
+            ),
+        )
+        .with_dump(dump));
     }
     let baseline_outcome = first_ir.outcome.clone();
     if !matches!(baseline_outcome, OutcomeRecord::Value { .. }) {
@@ -183,8 +196,19 @@ pub fn check_source(source: &str) -> Result<PropertyOutcome, PropertyFailure> {
         }
         let ir_first = observe_ir(&ir, &sources, limits);
         let ir_second = observe_ir(&ir, &sources, limits);
-        if deadline(&ir_first) || deadline(&ir_second) {
+        let optimized_run = observe_ir(&optimized, &sources, limits);
+        if deadline(&ir_first) || deadline(&ir_second) || deadline(&optimized_run) {
             return Ok(skipped(format!("deadline during limit sweep at `{name}`")));
+        }
+        if ir_first != optimized_run {
+            return Err(PropertyFailure::new(
+                "optimizer differential",
+                source,
+                format!(
+                    "`{name}` differs after optimization\nlimits: {limits:?}\nlowered:   {ir_first:?}\noptimized: {optimized_run:?}"
+                ),
+            )
+            .with_dump(dump));
         }
         if ir_first != ir_second {
             return Err(PropertyFailure::new(
@@ -301,9 +325,11 @@ pub fn check_trapping_case(case: &Case) -> Result<TrapRecord, PropertyFailure> {
         .with_dump(print_ir(&first)));
     }
 
+    let optimized = optimize_once(&first, source, print_ir(&first))?;
     let limits = baseline_limits();
     let first_run = observe_ir(&first, &sources, limits);
     let second_run = observe_ir(&first, &sources, limits);
+    let optimized_run = observe_ir(&optimized, &sources, limits);
     if first_run != second_run {
         return Err(PropertyFailure::new(
             "IR determinism",
@@ -311,6 +337,16 @@ pub fn check_trapping_case(case: &Case) -> Result<TrapRecord, PropertyFailure> {
             format!("two runs differ\nfirst:  {first_run:?}\nsecond: {second_run:?}"),
         )
         .with_dump(print_ir(&first)));
+    }
+    if optimized_run != first_run {
+        return Err(PropertyFailure::new(
+            "optimizer differential",
+            source,
+            format!(
+                "trap seed differs after optimization\nlowered:   {first_run:?}\noptimized: {optimized_run:?}"
+            ),
+        )
+        .with_dump(print_ir(&optimized)));
     }
     if non_limit_trap(&first_run).is_none() {
         return Err(PropertyFailure::new(
@@ -351,6 +387,27 @@ fn lower_once(
             format!("lowering panicked: {}", panic_message(&payload)),
         )),
     }
+}
+
+fn optimize_once(ir: &IrProgram, source: &str, dump: String) -> Result<IrProgram, PropertyFailure> {
+    let mut optimized = ir.clone();
+    if let Err(error) = optimize(&mut optimized, OptimizeOptions::default()) {
+        return Err(PropertyFailure::new(
+            "optimize",
+            source,
+            format!("optimization failed: {error}"),
+        )
+        .with_dump(dump));
+    }
+    if let Err(error) = verify(&optimized) {
+        return Err(PropertyFailure::new(
+            "optimized verify",
+            source,
+            format!("optimized IR was rejected: {error}"),
+        )
+        .with_dump(print_ir(&optimized)));
+    }
+    Ok(optimized)
 }
 
 fn verifier_rejects_corrupted_ir(

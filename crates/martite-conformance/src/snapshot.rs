@@ -16,6 +16,7 @@ use martite_base::{MemoryProvider, SourceId, SourceMap, Span};
 use martite_check::CheckedProgram;
 use martite_config::parse_manifest;
 use martite_ir::{HostId, IrProgram, TypeTable, lower, verify};
+use martite_opt::{OptimizeOptions, optimize};
 use martite_runtime::{
     ExecLimits, HostContext, HostFault, IrHostDispatcher, IrRuntime, Trap, Value,
 };
@@ -333,6 +334,13 @@ pub enum PluginStep {
     Shutdown,
 }
 
+/// Which pipeline stage a snapshot observation should execute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgramStage {
+    Lowered,
+    Optimized,
+}
+
 pub enum SnapshotCase {
     Main {
         id: String,
@@ -376,6 +384,14 @@ impl SnapshotCase {
     }
 
     pub fn observe(&self) -> SnapshotRecord {
+        self.observe_with(ProgramStage::Lowered)
+    }
+
+    pub fn observe_optimized(&self) -> SnapshotRecord {
+        self.observe_with(ProgramStage::Optimized)
+    }
+
+    pub fn observe_with(&self, stage: ProgramStage) -> SnapshotRecord {
         match self {
             Self::Main {
                 id,
@@ -384,7 +400,7 @@ impl SnapshotCase {
                 caps,
             } => {
                 let limits = caps_to_limits(*caps);
-                let observation = run_main(case, hosts.as_ref(), limits);
+                let observation = run_main(case, hosts.as_ref(), limits, stage);
                 SnapshotRecord {
                     schema: SNAPSHOT_SCHEMA,
                     id: id.clone(),
@@ -400,7 +416,7 @@ impl SnapshotCase {
             }
             Self::Plugin { id, scenario, caps } => {
                 let limits = caps_to_limits(*caps);
-                let plugin = load_plugin(scenario);
+                let plugin = load_plugin_stage(scenario, stage);
                 let observation = run_plugin(&plugin, scenario, limits);
                 SnapshotRecord {
                     schema: SNAPSHOT_SCHEMA,
@@ -483,6 +499,14 @@ impl SnapshotCase {
         &self,
         expected: &SnapshotRecord,
     ) -> Result<(), Vec<ThresholdMismatch>> {
+        self.verify_ir_thresholds_with(expected, ProgramStage::Lowered)
+    }
+
+    pub fn verify_ir_thresholds_with(
+        &self,
+        expected: &SnapshotRecord,
+        stage: ProgramStage,
+    ) -> Result<(), Vec<ThresholdMismatch>> {
         if expected.thresholds.note.is_some() {
             return Ok(());
         }
@@ -514,6 +538,7 @@ impl SnapshotCase {
                 depth: caps.depth,
                 deadline: None,
             }),
+            stage,
             &mut mismatches,
         );
         self.check_boundary(
@@ -531,6 +556,7 @@ impl SnapshotCase {
                 depth: caps.depth,
                 deadline: None,
             }),
+            stage,
             &mut mismatches,
         );
         self.check_boundary(
@@ -548,6 +574,7 @@ impl SnapshotCase {
                 depth: depth - 1,
                 deadline: None,
             }),
+            stage,
             &mut mismatches,
         );
 
@@ -564,9 +591,10 @@ impl SnapshotCase {
         outcomes: &[OutcomeRecord],
         at: ExecLimits,
         below: Option<ExecLimits>,
+        stage: ProgramStage,
         mismatches: &mut Vec<ThresholdMismatch>,
     ) {
-        let actual = self.outcomes_at(at);
+        let actual = self.outcomes_at_with(at, stage);
         if actual != outcomes {
             mismatches.push(ThresholdMismatch {
                 field,
@@ -575,7 +603,7 @@ impl SnapshotCase {
             });
         }
         if let Some(below) = below {
-            let actual_below = self.outcomes_at(below);
+            let actual_below = self.outcomes_at_with(below, stage);
             if actual_below == outcomes {
                 mismatches.push(ThresholdMismatch {
                     field,
@@ -593,12 +621,16 @@ impl SnapshotCase {
     }
 
     fn outcomes_at(&self, limits: ExecLimits) -> Vec<OutcomeRecord> {
+        self.outcomes_at_with(limits, ProgramStage::Lowered)
+    }
+
+    fn outcomes_at_with(&self, limits: ExecLimits, stage: ProgramStage) -> Vec<OutcomeRecord> {
         match self {
             Self::Main { case, hosts, .. } => {
-                vec![run_main(case, hosts.as_ref(), limits).outcome]
+                vec![run_main(case, hosts.as_ref(), limits, stage).outcome]
             }
             Self::Plugin { scenario, .. } => {
-                let plugin = load_plugin(scenario);
+                let plugin = load_plugin_stage(scenario, stage);
                 run_plugin(&plugin, scenario, limits)
                     .steps
                     .into_iter()
@@ -723,7 +755,12 @@ struct PluginObservation {
     fuel_used: u64,
 }
 
-fn run_main(case: &Case, hosts: Option<&HostSet>, limits: ExecLimits) -> MainObservation {
+fn run_main(
+    case: &Case,
+    hosts: Option<&HostSet>,
+    limits: ExecLimits,
+    stage: ProgramStage,
+) -> MainObservation {
     if let Some(hosts) = hosts {
         hosts.clear_trace();
     }
@@ -743,7 +780,10 @@ fn run_main(case: &Case, hosts: Option<&HostSet>, limits: ExecLimits) -> MainObs
     );
     let sources = loaded.sources;
     let program = loaded.program.expect("snapshot program");
-    let ir = lower(&program, &sources).expect("snapshot fixture lowers");
+    let mut ir = lower(&program, &sources).expect("snapshot fixture lowers");
+    if stage == ProgramStage::Optimized {
+        optimize(&mut ir, OptimizeOptions::default()).expect("snapshot fixture optimizes");
+    }
     verify(&ir).expect("snapshot fixture verifies");
     let mut dispatcher = hosts.map(|hosts| hosts.dispatcher(&ir));
     let mut runtime = match dispatcher.as_mut() {
@@ -770,8 +810,13 @@ fn run_main(case: &Case, hosts: Option<&HostSet>, limits: ExecLimits) -> MainObs
 }
 
 fn load_plugin(scenario: &PluginScenario) -> Plugin {
+    load_plugin_stage(scenario, ProgramStage::Lowered)
+}
+
+fn load_plugin_stage(scenario: &PluginScenario, stage: ProgramStage) -> Plugin {
     let mut provider = MemoryProvider::new();
     let mut engine = Engine::new();
+    engine.set_optimize(stage == ProgramStage::Optimized);
     for (path, text) in &scenario.files {
         provider.insert(path.clone(), text.clone());
         if let Some(name) = path.strip_suffix(".mti") {
@@ -805,7 +850,7 @@ fn load_plugin(scenario: &PluginScenario) -> Plugin {
 
 fn run_plugin(plugin: &Plugin, scenario: &PluginScenario, limits: ExecLimits) -> PluginObservation {
     let sources = plugin.sources();
-    let ir = lower(plugin.program(), sources).expect("plugin fixture lowers");
+    let ir = plugin.ir().clone();
     verify(&ir).expect("plugin fixture verifies");
     let types = &ir.types;
     let mut state: Option<Value> = None;

@@ -549,6 +549,7 @@ dependencies = [
  "martite-config",
  "martite-driver",
  "martite-ir",
+ "martite-opt",
  "martite-resolve",
  "martite-runtime",
  "martite-syntax",
@@ -574,6 +575,7 @@ dependencies = [
  "martite-driver",
  "martite-fmt",
  "martite-lint",
+ "martite-opt",
  "martite-resolve",
  "martite-runtime",
  "martite-syntax",
@@ -604,6 +606,7 @@ dependencies = [
  "martite-fmt",
  "martite-ir",
  "martite-lint",
+ "martite-opt",
  "martite-resolve",
  "martite-runtime",
  "martite-syntax",
@@ -630,6 +633,7 @@ dependencies = [
  "martite-fmt",
  "martite-ir",
  "martite-lint",
+ "martite-opt",
  "martite-resolve",
  "martite-runtime",
  "martite-syntax",
@@ -686,6 +690,18 @@ dependencies = [
  "martite-resolve",
  "martite-syntax",
  "toml",
+]
+
+[[package]]
+name = "martite-opt"
+version = "0.1.0"
+dependencies = [
+ "martite-base",
+ "martite-driver",
+ "martite-ir",
+ "martite-runtime",
+ "martite-syntax",
+ "stacker",
 ]
 
 [[package]]
