@@ -62,10 +62,15 @@ machines. Keep the machine idle and run the same target on the same OS and
 toolchain when comparing. `--baseline` is forwarded to every Criterion target;
 the allocation target ignores Criterion flags and always prints its table.
 
-For a same-runner CI comparison, dispatch the **Benchmarks Comparison** workflow
-with a baseline and candidate ref. It checks out both revisions in the same job,
-runs the suite once per revision, and reports Criterion change percentages plus
-allocation deltas in the job summary.
+For a same-runner CI comparison, dispatch one of the comparison workflows with a
+baseline and candidate ref. Both check out both revisions in the same job, run
+once per revision, and write Criterion change percentages to the job summary.
+
+- **Benchmarks Comparison** runs the general suite (lexer, parser, load/check,
+  lint, runtime, formatter, CLI, allocations).
+- **Optimizer Benchmarks Comparison** runs only the `optimizer` target and adds
+  a lowered-versus-optimized table for both revisions. It deliberately skips
+  parser/checker/lint/CLI work.
 
 ## Groups and fixtures
 
@@ -76,7 +81,7 @@ allocation deltas in the job summary.
 | `load` | single module, multi-module, plugin with an interface | `load/*` |
 | `lint` | full recommended and syntax-only, clean and noisy | `lint/*` |
 | `runtime` | arithmetic loop, `fib`, function calls, list/map/string ops, method dispatch, pattern matching, closures, captures, `mut` params, field/index assignment, `Option` lookups, map iteration, host calls, plugin handler, snapshot, restore. Fixtures lower once in setup and time the default IR evaluator. | `runtime/*` |
-| `optimizer` | `const-fold` pass time (includes a clone per iteration), plus the same lowered fixture before and after optimization; no parse/check/lint/CLI work | `optimize/constant_fold.mt` |
+| `optimizer` | lowering `CheckedProgram -> IrProgram` on one fixture and the runtime corpus; `const-fold` pass time (clone excluded via `iter_batched`) on the same inputs; lowered-versus-optimized execution on the fold fixture; no parse/check/lint/CLI work | `optimize/constant_fold.mt`, `runtime/*` |
 | `fmt` | medium, large, interface, whole golden corpus, idempotent reformat, check | `syntax/*`, `crates/martite-fmt/tests/fixtures` |
 | `cli` | cold `check`, `lint`, `run`, and `fmt --check` | `syntax/small.mt`, `lint/clean.mt`, formatter fixture |
 | allocation report | the runtime fixtures plus host calls and plugin handler/snapshot/restore, reported as allocations and bytes per iteration | `runtime/*` |
