@@ -221,7 +221,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 return self
                     .trap(self.internal_panic("builtin method arguments cannot be mutable"));
             }
-            args.push(self.eval_child(child)?);
+            args.push(self.eval(child)?);
         }
         Ok(args)
     }
