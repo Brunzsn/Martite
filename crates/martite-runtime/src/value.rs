@@ -724,6 +724,7 @@ pub const MAX_VALUE_DEPTH: usize = 128;
 /// Depth is cached in every container payload, so this check does not walk the
 /// value. The `limit == 0` case matches the historical rule that any value is
 /// rejected at a zero ceiling.
+#[inline]
 pub fn value_depth_exceeds(value: &Value, limit: usize) -> bool {
     limit == 0 || value.meta().depth as usize > limit
 }

@@ -327,6 +327,34 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             .map(|(value, _)| value)
     }
 
+    #[inline]
+    fn build_simple_slots(
+        &self,
+        function_info: &'p IrFn,
+        args: CallArgs,
+    ) -> SmallVec<[Option<Value>; 8]> {
+        let params = &function_info.params;
+        let locals = function_info.locals as usize;
+        let direct = locals == params.len()
+            && params
+                .iter()
+                .enumerate()
+                .all(|(index, param)| param.slot.index() == index);
+        if direct {
+            let mut slots = SmallVec::with_capacity(params.len());
+            for value in args {
+                slots.push(Some(value));
+            }
+            slots
+        } else {
+            let mut slots = SmallVec::from_elem(None, locals);
+            for (param, value) in params.iter().zip(args) {
+                slots[param.slot.index()] = Some(value);
+            }
+            slots
+        }
+    }
+
     /// Specialized lambda call. It skips the mutable-writeback scan and the
     /// non-lambda capture checks that every higher-order builtin would
     /// otherwise repeat per element.
@@ -354,12 +382,10 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             "lambda capture count"
         );
 
-        let mut slots = SmallVec::from_elem(None, function_info.locals as usize);
-        if self.simple_params[function_info.id.index()] {
-            for (param, value) in function_info.params.iter().zip(args) {
-                slots[param.slot.index()] = Some(value);
-            }
+        let slots = if self.simple_params[function_info.id.index()] {
+            self.build_simple_slots(function_info, args)
         } else {
+            let mut slots = SmallVec::from_elem(None, function_info.locals as usize);
             let mut pattern_params: SmallVec<[(&Pattern, Value); 2]> = SmallVec::new();
             for (param, value) in function_info.params.iter().zip(args) {
                 if let Some(pattern_id) = param.pattern {
@@ -392,7 +418,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 }
             }
             return self.finish_lambda_call(function_info);
-        }
+        };
 
         let source = self
             .frames
@@ -427,10 +453,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 args.len()
             )));
         }
-        let mut slots = SmallVec::from_elem(None, function_info.locals as usize);
-        for (param, value) in function_info.params.iter().zip(args) {
-            slots[param.slot.index()] = Some(value);
-        }
+        let slots = self.build_simple_slots(function_info, args);
         self.frames.push(Frame {
             slots,
             captures: None,
@@ -735,6 +758,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         }
     }
 
+    #[inline]
     fn maybe_check_memory(&mut self) -> EvalResult<()> {
         if self.census_bytes.saturating_add(self.pending_bytes) > self.limits.memory {
             self.refresh_memory(None)
@@ -743,6 +767,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         }
     }
 
+    #[inline]
     fn maybe_check_returned_value(&mut self, value: &Value) -> EvalResult<()> {
         if self.census_bytes.saturating_add(self.pending_bytes) > self.limits.memory {
             self.refresh_memory(Some(value))
