@@ -7,7 +7,7 @@ use martite_driver::{LoadOptions, LoadedProgram, load};
 use martite_fmt::{format_interface, format_source, structurally_equal};
 use martite_lint::{LintInputs, SettingsResolver, lint};
 use martite_resolve::InterfaceSource;
-use martite_runtime::{ExecLimits, Runtime, Value};
+use martite_runtime::{ExecLimits, IrRuntime, Runtime, Value, show};
 use martite_syntax::{parse_interface, parse_source, parse_source_with};
 
 fn bench_root() -> PathBuf {
@@ -277,6 +277,59 @@ fn runtime_fixtures_run_and_plugins_round_trip_state() {
         runtime
             .run_main()
             .unwrap_or_else(|trap| panic!("{} trapped: {trap:?}", path.display()));
+    }
+}
+
+#[test]
+fn runtime_fixtures_match_ir_fuel_and_results() {
+    let root = bench_root().join("runtime");
+    for path in walk(&root) {
+        if path.extension().and_then(|ext| ext.to_str()) != Some("mt") {
+            continue;
+        }
+        if is_plugin_fixture(&root, &path) {
+            continue;
+        }
+        let loaded = load_single(&path);
+        assert_clean(&loaded);
+        let program = loaded.program.expect("program");
+        let limits = ExecLimits {
+            fuel: 100_000_000,
+            memory: 64 << 20,
+            depth: 200,
+            deadline: None,
+        };
+        let mut ast = Runtime::new(&program, limits);
+        let ast_result = ast.run_main().expect("AST fixture runs");
+        let ast_fuel = ast.fuel_used();
+        let ast_value = show(
+            &ast_result.value,
+            &martite_ir::TypeTable::from_checker(&program),
+            true,
+        );
+
+        let lowered = martite_driver::lower(&program, &loaded.sources);
+        let ir = lowered.program.expect("fixture lowers");
+        let mut runtime = IrRuntime::new(&ir, limits);
+        let ir_result = runtime.run_main().expect("IR fixture runs");
+        assert_eq!(
+            runtime.fuel_used(),
+            ast_fuel,
+            "{}: IR fuel differs from AST",
+            path.display()
+        );
+        assert_eq!(
+            show(&ir_result.value, &ir.types, true),
+            ast_value,
+            "{}: IR result differs from AST",
+            path.display()
+        );
+        assert_eq!(
+            ir_result.log,
+            ast_result.log,
+            "{}: IR log differs from AST",
+            path.display()
+        );
     }
 }
 

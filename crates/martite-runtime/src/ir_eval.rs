@@ -827,7 +827,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             NodeKind::CaptureRead(index) => self.read_capture(index),
             NodeKind::SlotPlace(_) => self.trap(self.internal_panic("slot place used as a value")),
             NodeKind::SlotWrite { slot, value } | NodeKind::SlotInit { slot, value } => {
-                let value = self.eval(value)?;
+                let value = self.eval_child(value)?;
                 self.set_slot(slot, value);
                 Ok(Value::Unit)
             }
@@ -841,7 +841,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 
             NodeKind::Neg(inner) => self.eval_neg(inner, span),
             NodeKind::Not(inner) => {
-                let value = self.eval(inner)?;
+                let value = self.eval_child(inner)?;
                 match value {
                     Value::Bool(value) => Ok(Value::Bool(!value)),
                     _ => self.trap(self.internal_panic("invalid unary operand")),
@@ -935,7 +935,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             NodeKind::Continue => Err(EvalError::Continue),
             NodeKind::Return(value) => {
                 let value = match value {
-                    Some(value) => self.eval(value)?,
+                    Some(value) => self.eval_child(value)?,
                     None => Value::Unit,
                 };
                 Err(EvalError::Return(value))
@@ -947,7 +947,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             NodeKind::Try(inner) => self.eval_try(inner),
 
             NodeKind::Let { pattern, value } => {
-                let value = self.eval(value)?;
+                let value = self.eval_child(value)?;
                 let function = self.current_function();
                 let Some(pattern) = function.pattern(pattern) else {
                     return self.trap(self.internal_panic("let has no binding pattern"));
@@ -958,7 +958,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             }
             NodeKind::Assign { place, value } => {
                 let place = self.eval_place(place)?;
-                let value = self.eval(value)?;
+                let value = self.eval_child(value)?;
                 self.write_place(place, value)?;
                 self.safepoint(id)?;
                 Ok(Value::Unit)
@@ -978,7 +978,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 };
                 let place = self.eval_place(place)?;
                 let lhs = self.read_place(&place)?;
-                let rhs = self.eval(value)?;
+                let rhs = self.eval_child(value)?;
                 let op = match kind {
                     NodeKind::AddAssign { .. } => BinaryKind::Add,
                     NodeKind::SubAssign { .. } => BinaryKind::Sub,
@@ -1184,7 +1184,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
     }
 
     fn eval_neg(&mut self, inner: IrId, span: Span) -> EvalResult<Value> {
-        let value = self.eval(inner)?;
+        let value = self.eval_child(inner)?;
         match value {
             Value::Int(value) => value
                 .checked_neg()
@@ -1192,6 +1192,66 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 .ok_or_else(|| EvalError::Trap(self.panic("integer overflow", span))),
             Value::Float(value) => Ok(Value::Float(-value)),
             _ => self.trap(self.internal_panic("invalid unary operand")),
+        }
+    }
+
+    /// Evaluate a child that is usually a leaf. Handling slot reads and
+    /// literal constants here avoids a recursive trip through the large node
+    /// dispatch, which dominates tiny closure bodies.
+    #[inline]
+    fn eval_child(&mut self, id: IrId) -> EvalResult<Value> {
+        let function = self.current_function();
+        let node = &function.nodes[id.index()];
+        if node.charge.post != 0 {
+            return self.eval(id);
+        }
+        match node.kind {
+            NodeKind::SlotRead { slot, mode } => {
+                if node.charge.pre != 0 {
+                    self.charge(u64::from(node.charge.pre))?;
+                }
+                let frame = self.frames.last_mut().expect("evaluation frame");
+                let cell = &mut frame.slots[slot.index()];
+                match mode {
+                    AccessMode::Share => Ok(cell
+                        .clone()
+                        .expect("verifier guarantees every shared slot read is initialized")),
+                    AccessMode::Take => Ok(cell
+                        .take()
+                        .expect("verifier guarantees every taken slot read is initialized")),
+                }
+            }
+            NodeKind::Int(constant) => {
+                if node.charge.pre != 0 {
+                    self.charge(u64::from(node.charge.pre))?;
+                }
+                self.eval_int_constant(constant)
+            }
+            NodeKind::Float(constant) => {
+                if node.charge.pre != 0 {
+                    self.charge(u64::from(node.charge.pre))?;
+                }
+                self.eval_float_constant(constant)
+            }
+            NodeKind::CaptureRead(index) => {
+                if node.charge.pre != 0 {
+                    self.charge(u64::from(node.charge.pre))?;
+                }
+                self.read_capture(index)
+            }
+            NodeKind::Bool(value) => {
+                if node.charge.pre != 0 {
+                    self.charge(u64::from(node.charge.pre))?;
+                }
+                Ok(Value::Bool(value))
+            }
+            NodeKind::Unit => {
+                if node.charge.pre != 0 {
+                    self.charge(u64::from(node.charge.pre))?;
+                }
+                Ok(Value::Unit)
+            }
+            _ => self.eval(id),
         }
     }
 
@@ -1203,8 +1263,8 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         rhs: IrId,
         span: Span,
     ) -> EvalResult<Value> {
-        let lhs = self.eval(lhs)?;
-        let rhs = self.eval(rhs)?;
+        let lhs = self.eval_child(lhs)?;
+        let rhs = self.eval_child(rhs)?;
         self.binary_values(op, lhs, rhs, span)
     }
 
@@ -1568,7 +1628,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let cond = function.children[range.start as usize];
         let then_branch = function.children[range.start as usize + 1];
         let else_branch = (range.len >= 3).then(|| function.children[range.start as usize + 2]);
-        let cond = self.eval(cond)?;
+        let cond = self.eval_child(cond)?;
         if matches!(cond, Value::Bool(true)) {
             self.eval_body(then_branch)
         } else if let Some(else_branch) = else_branch {
@@ -1581,7 +1641,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
     fn eval_while(&mut self, cond: IrId, body: IrId, per_iter: u64) -> EvalResult<Value> {
         loop {
             self.charge(per_iter)?;
-            let condition = self.eval(cond)?;
+            let condition = self.eval_child(cond)?;
             if !matches!(condition, Value::Bool(true)) {
                 break;
             }
@@ -2052,7 +2112,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 values.push(value);
                 writebacks.push((place, index));
             } else {
-                values.push(self.eval(child)?);
+                values.push(self.eval_child(child)?);
             }
         }
         let (value, mut updated) = self
@@ -2088,7 +2148,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 return self
                     .trap(self.internal_panic("function values have no mutable parameters"));
             }
-            values.push(self.eval(child)?);
+            values.push(self.eval_child(child)?);
         }
         match callee {
             Value::Fn(function) => self
@@ -2113,7 +2173,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             if matches!(node.kind, NodeKind::MutArg(_)) {
                 return self.trap(self.internal_panic("mutable argument on a value-only call"));
             }
-            values.push(self.eval(child)?);
+            values.push(self.eval_child(child)?);
         }
         Ok(values)
     }
