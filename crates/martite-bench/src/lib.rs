@@ -157,6 +157,16 @@ impl Fixture {
         load(&self.provider(), &self.load_options())
     }
 
+    /// Lower a checked fixture to the IR.
+    ///
+    /// The runtime benchmarks time the IR evaluator, so lowering and
+    /// verification happen once in setup and stay outside the measured
+    /// region.
+    pub fn lowered(&self) -> martite_driver::LoweredProgram {
+        let (program, sources) = self.checked();
+        martite_driver::lower(&program, &sources)
+    }
+
     /// Load and check a fixture, panicking if it has compile errors.
     pub fn checked(&self) -> (CheckedProgram, SourceMap) {
         self.checked_with_parse(ParseOptions::default())

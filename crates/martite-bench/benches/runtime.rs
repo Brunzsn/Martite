@@ -2,7 +2,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use martite_bench::{BENCH_LIMITS, HOST_CALLS_COUNT, fixture, host_calls_plugin};
-use martite_runtime::{Runtime, Value};
+use martite_runtime::{IrRuntime, Value};
 
 fn runtime_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("runtime");
@@ -22,8 +22,9 @@ fn runtime_benches(c: &mut Criterion) {
         "option_ops",
         "map_iteration",
     ] {
-        let (program, _) = fixture(&format!("runtime/{name}.mt")).checked();
-        let mut runtime = Runtime::new(&program, BENCH_LIMITS);
+        let lowered = fixture(&format!("runtime/{name}.mt")).lowered();
+        let ir = lowered.program.expect("runtime fixture lowers");
+        let mut runtime = IrRuntime::new(&ir, BENCH_LIMITS);
         runtime.run_main().expect("runtime fixture must run");
         group.bench_function(name, |b| b.iter(|| black_box(runtime.run_main())));
     }

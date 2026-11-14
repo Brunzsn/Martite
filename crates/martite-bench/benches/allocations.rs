@@ -4,7 +4,7 @@ use std::fs;
 use std::hint::black_box;
 
 use martite_bench::{BENCH_LIMITS, HOST_CALLS_COUNT, criterion_dir, fixture, host_calls_plugin};
-use martite_runtime::{Runtime, Value};
+use martite_runtime::{IrRuntime, Value};
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 
 #[global_allocator]
@@ -38,8 +38,9 @@ where
 }
 
 fn runtime_alloc(table: &mut String, name: &str, fixture_name: &str, iterations: u64) {
-    let (program, _) = fixture(fixture_name).checked();
-    let mut runtime = Runtime::new(&program, BENCH_LIMITS);
+    let lowered = fixture(fixture_name).lowered();
+    let ir = lowered.program.expect("runtime fixture lowers");
+    let mut runtime = IrRuntime::new(&ir, BENCH_LIMITS);
     runtime.run_main().expect("runtime fixture must run");
     measure(table, name, iterations, || {
         let _ = black_box(runtime.run_main());
