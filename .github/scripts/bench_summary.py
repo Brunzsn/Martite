@@ -6,7 +6,11 @@ import json
 import os
 import platform
 import subprocess
+import sys
 from pathlib import Path
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 def human_time(nanoseconds: float) -> str:
     if nanoseconds < 1_000:
@@ -102,7 +106,7 @@ def optimizer_summary(criterion: Path) -> list[str]:
                 "",
                 "| Optimizer gain | Baseline | Candidate |",
                 "| --- | ---: | ---: |",
-                "| lowered → optimized | {baseline} | {candidate} |".format(
+                "| lowered -> optimized | {baseline} | {candidate} |".format(
                     baseline=format_change(baseline_gain),
                     candidate=format_change(candidate_gain),
                 ),
