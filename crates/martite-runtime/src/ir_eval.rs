@@ -93,6 +93,9 @@ pub struct IrRuntime<'p, 'h> {
     ticks: u64,
     frames: Vec<Frame<'p>>,
     current: Option<&'p IrFn>,
+    /// Per-function parameter shape, computed once from the IR.
+    simple_params: Vec<bool>,
+    mutable_params: Vec<bool>,
     log: Vec<String>,
     host: Option<&'h mut dyn IrHostDispatcher>,
     /// Live bytes at the last exact scan.
@@ -118,6 +121,16 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             ticks: 0,
             frames: Vec::new(),
             current: None,
+            simple_params: program
+                .fns
+                .iter()
+                .map(|function| function.params.iter().all(|param| param.pattern.is_none()))
+                .collect(),
+            mutable_params: program
+                .fns
+                .iter()
+                .map(|function| function.params.iter().any(|param| param.mutable))
+                .collect(),
             log: Vec::new(),
             host: None,
             census_bytes: 0,
@@ -324,22 +337,14 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 args.len()
             )));
         }
-        let provided = captures.as_ref().map_or(0, |captures| captures.len());
-        if provided != function_info.captures.len() {
-            return Err(self.internal_panic(format!(
-                "lambda `{}` expected {} captures, got {}",
-                function_info.name,
-                function_info.captures.len(),
-                provided
-            )));
-        }
+        debug_assert_eq!(
+            captures.as_ref().map_or(0, |captures| captures.len()),
+            function_info.captures.len(),
+            "lambda capture count"
+        );
 
         let mut slots = SmallVec::from_elem(None, function_info.locals as usize);
-        if function_info
-            .params
-            .iter()
-            .all(|param| param.pattern.is_none())
-        {
+        if self.simple_params[function_info.id.index()] {
             for (param, value) in function_info.params.iter().zip(args) {
                 slots[param.slot.index()] = Some(value);
             }
@@ -534,10 +539,8 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 
         if !matches!(function_info.kind, FnKind::Lambda)
             && function_info.body.is_some()
-            && function_info
-                .params
-                .iter()
-                .all(|param| !param.mutable && param.pattern.is_none())
+            && self.simple_params[function.index()]
+            && !self.mutable_params[function.index()]
         {
             return self
                 .call_simple_function(function_info, args)
@@ -608,26 +611,25 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             }
         };
         self.current = previous;
-        let updated: Writebacks =
-            if result.is_ok() && function_info.params.iter().any(|param| param.mutable) {
-                let frame = self.frames.last_mut().expect("evaluation frame");
-                function_info
-                    .params
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, param)| param.mutable)
-                    .map(|(index, param)| {
-                        let value = frame
-                            .slots
-                            .get_mut(param.slot.index())
-                            .and_then(|slot| slot.take())
-                            .unwrap_or(Value::Unit);
-                        (index, value)
-                    })
-                    .collect()
-            } else {
-                Writebacks::new()
-            };
+        let updated: Writebacks = if result.is_ok() && self.mutable_params[function.index()] {
+            let frame = self.frames.last_mut().expect("evaluation frame");
+            function_info
+                .params
+                .iter()
+                .enumerate()
+                .filter(|(_, param)| param.mutable)
+                .map(|(index, param)| {
+                    let value = frame
+                        .slots
+                        .get_mut(param.slot.index())
+                        .and_then(|slot| slot.take())
+                        .unwrap_or(Value::Unit);
+                    (index, value)
+                })
+                .collect()
+        } else {
+            Writebacks::new()
+        };
         self.frames.pop();
         let value = result?;
         self.maybe_check_returned_value(&value)
@@ -793,7 +795,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         // The verifier guarantees every child id, span and side-vector entry
         // is in range. Direct indexing keeps the interpreter's hottest path
         // branch-free.
-        let node = function.nodes[id.index()];
+        let node = &function.nodes[id.index()];
         let span = function.spans[id.index()];
         if node.charge.pre != 0 {
             self.charge(u64::from(node.charge.pre))?;
@@ -810,7 +812,18 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             NodeKind::BuiltinFnRef(function) => Ok(Value::Builtin(function)),
             NodeKind::BuiltinModuleRef(item) => self.builtin_item_value(item),
 
-            NodeKind::SlotRead { slot, mode } => self.read_slot(slot, mode),
+            NodeKind::SlotRead { slot, mode } => {
+                let frame = self.frames.last_mut().expect("evaluation frame");
+                let cell = &mut frame.slots[slot.index()];
+                match mode {
+                    AccessMode::Share => Ok(cell
+                        .clone()
+                        .expect("verifier guarantees every shared slot read is initialized")),
+                    AccessMode::Take => Ok(cell
+                        .take()
+                        .expect("verifier guarantees every taken slot read is initialized")),
+                }
+            }
             NodeKind::CaptureRead(index) => self.read_capture(index),
             NodeKind::SlotPlace(_) => self.trap(self.internal_panic("slot place used as a value")),
             NodeKind::SlotWrite { slot, value } | NodeKind::SlotInit { slot, value } => {
@@ -1017,6 +1030,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         }
     }
 
+    #[inline]
     fn eval_int_constant(&mut self, id: ConstId) -> EvalResult<Value> {
         match self.program.constant(id) {
             Some(ConstValue::Int(value)) => Ok(Value::Int(*value)),
@@ -1024,6 +1038,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         }
     }
 
+    #[inline]
     fn eval_float_constant(&mut self, id: ConstId) -> EvalResult<Value> {
         match self.program.constant(id) {
             Some(ConstValue::Float(value)) => Ok(Value::Float(*value)),
@@ -1131,12 +1146,8 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 
     #[inline]
     fn read_slot(&mut self, slot: Slot, mode: AccessMode) -> EvalResult<Value> {
-        let Some(frame) = self.frames.last_mut() else {
-            return self.trap(self.internal_panic("slot is out of range"));
-        };
-        let Some(cell) = frame.slots.get_mut(slot.index()) else {
-            return self.trap(self.internal_panic("slot is out of range"));
-        };
+        let frame = self.frames.last_mut().expect("evaluation frame");
+        let cell = &mut frame.slots[slot.index()];
         match mode {
             AccessMode::Share => Ok(cell
                 .clone()
@@ -1149,15 +1160,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 
     #[inline]
     fn set_slot(&mut self, slot: Slot, value: Value) {
-        if let Some(cell) = self
-            .frames
-            .last_mut()
-            .expect("evaluation frame")
-            .slots
-            .get_mut(slot.index())
-        {
-            *cell = Some(value);
-        }
+        self.frames.last_mut().expect("evaluation frame").slots[slot.index()] = Some(value);
     }
 
     fn eval_field(&mut self, base: IrId, index: u32) -> EvalResult<Value> {
@@ -1679,6 +1682,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         Ok(Value::Unit)
     }
 
+    #[inline]
     fn eval_make_closure(&mut self, target: FnId) -> EvalResult<Value> {
         let program = self.program;
         let Some(function) = program.function(target) else {
@@ -1706,17 +1710,14 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         )))))
     }
 
+    #[inline]
     fn read_capture(&self, index: CaptureIndex) -> EvalResult<Value> {
-        let Some(value) = self
-            .frames
-            .last()
-            .and_then(|frame| frame.captures.as_ref())
-            .and_then(|captures| captures.get(index.index()))
-            .cloned()
-        else {
-            return self.trap(self.internal_panic("capture index is out of range"));
-        };
-        Ok(value)
+        let frame = self.frames.last().expect("evaluation frame");
+        let captures = frame
+            .captures
+            .as_ref()
+            .expect("verifier guarantees lambda captures are present");
+        Ok(captures[index.index()].clone())
     }
 
     fn eval_match(&mut self, match_set: MatchSetId, scrutinee: IrId) -> EvalResult<Value> {

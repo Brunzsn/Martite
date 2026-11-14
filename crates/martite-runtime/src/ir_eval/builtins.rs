@@ -291,11 +291,23 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 let snapshot = items.clone();
                 self.charge(fuel::slot_cost(snapshot.len() as u64))?;
                 let mut out = Vec::with_capacity(snapshot.len());
-                for item in snapshot.iter() {
-                    out.push(
-                        self.call_closure_value(closure, smallvec![item.clone()])
-                            .map_err(EvalError::Trap)?,
-                    );
+                match closure {
+                    FnValue::Closure(closure) => {
+                        for item in snapshot.iter() {
+                            out.push(
+                                self.call_closure(closure, smallvec![item.clone()])
+                                    .map_err(EvalError::Trap)?,
+                            );
+                        }
+                    }
+                    FnValue::Def(function) => {
+                        for item in snapshot.iter() {
+                            out.push(
+                                self.call_function(*function, smallvec![item.clone()])
+                                    .map_err(EvalError::Trap)?,
+                            );
+                        }
+                    }
                 }
                 Ok(Value::list(out))
             }
@@ -304,12 +316,26 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 let snapshot = items.clone();
                 self.charge(fuel::slot_cost(snapshot.len() as u64))?;
                 let mut out = Vec::new();
-                for item in snapshot.iter() {
-                    let keep = self
-                        .call_closure_value(closure, smallvec![item.clone()])
-                        .map_err(EvalError::Trap)?;
-                    if matches!(keep, Value::Bool(true)) {
-                        out.push(item.clone());
+                match closure {
+                    FnValue::Closure(closure) => {
+                        for item in snapshot.iter() {
+                            let keep = self
+                                .call_closure(closure, smallvec![item.clone()])
+                                .map_err(EvalError::Trap)?;
+                            if matches!(keep, Value::Bool(true)) {
+                                out.push(item.clone());
+                            }
+                        }
+                    }
+                    FnValue::Def(function) => {
+                        for item in snapshot.iter() {
+                            let keep = self
+                                .call_function(*function, smallvec![item.clone()])
+                                .map_err(EvalError::Trap)?;
+                            if matches!(keep, Value::Bool(true)) {
+                                out.push(item.clone());
+                            }
+                        }
                     }
                 }
                 Ok(Value::list(out))
@@ -324,10 +350,21 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
                 self.charge(fuel::slot_cost(snapshot.len() as u64))?;
-                for item in snapshot.iter() {
-                    init = self
-                        .call_closure_value(closure, smallvec![init, item.clone()])
-                        .map_err(EvalError::Trap)?;
+                match closure {
+                    FnValue::Closure(closure) => {
+                        for item in snapshot.iter() {
+                            init = self
+                                .call_closure(closure, smallvec![init, item.clone()])
+                                .map_err(EvalError::Trap)?;
+                        }
+                    }
+                    FnValue::Def(function) => {
+                        for item in snapshot.iter() {
+                            init = self
+                                .call_function(*function, smallvec![init, item.clone()])
+                                .map_err(EvalError::Trap)?;
+                        }
+                    }
                 }
                 Ok(init)
             }
