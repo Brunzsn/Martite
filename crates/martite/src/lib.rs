@@ -12,14 +12,10 @@ use martite_check::{
 use martite_config::{Manifest, parse_manifest};
 use martite_driver::{LoadOptions, load, lower};
 use martite_ir::{HostId, IrProgram, TypeDefKind, TypeId, TypeTable};
-#[cfg(feature = "ast-eval")]
-use martite_resolve::DefId;
 use martite_resolve::InterfaceSource;
 use martite_runtime::{
     ExecLimits, HostContext, HostFault, IrHostDispatcher, IrRuntime, MAX_VALUE_DEPTH, Trap, Value,
 };
-#[cfg(feature = "ast-eval")]
-use martite_runtime::{HostDispatcher, Runtime};
 use martite_syntax::ParseOptions;
 
 pub use martite_base::{SourceId, Span};
@@ -283,8 +279,6 @@ impl Engine {
         let program = loaded
             .program
             .ok_or_else(|| vec![Diagnostic::error(Code::E508, "program failed to load")])?;
-        #[cfg(feature = "ast-eval")]
-        let mut host_by_def = HashMap::new();
         let mut missing = Vec::new();
         for module in &program.resolved.modules {
             if !module.is_interface {
@@ -318,8 +312,6 @@ impl Engine {
                             ));
                         }
                     }
-                    #[cfg(feature = "ast-eval")]
-                    host_by_def.insert(def, registered.clone());
                 }
             }
         }
@@ -345,8 +337,6 @@ impl Engine {
             ir,
             sources: loaded.sources,
             host_by_id,
-            #[cfg(feature = "ast-eval")]
-            host_by_def,
             settings: manifest.settings.clone(),
             limits: clamp_limits(
                 ExecLimits {
@@ -401,8 +391,6 @@ impl Engine {
         let program = loaded
             .program
             .ok_or_else(|| vec![Diagnostic::error(Code::E508, "program failed to load")])?;
-        #[cfg(feature = "ast-eval")]
-        let mut host_by_def = HashMap::new();
         let mut diagnostics = Vec::new();
         for module in &program.resolved.modules {
             if !module.is_interface {
@@ -413,29 +401,25 @@ impl Engine {
                     let qualified = format!("{}.{}", module.path, f.name);
                     if let Some(def) = program.resolved.node_to_def.get(&f.id).copied()
                         && let Some(registered) = self.host_fns.get(&qualified)
-                    {
-                        if let (Some(want), Some(sig)) =
+                        && let (Some(want), Some(sig)) =
                             (&registered.signature, program.fn_sig(def))
-                        {
-                            if sig.params.iter().any(|param| param.mutable) {
-                                diagnostics.push(Diagnostic::error(
-                                    Code::E509,
-                                    format!(
-                                        "host function `{qualified}` may not take `mut` parameters"
-                                    ),
-                                ));
-                            }
-                            if !want.matches(sig, &program) {
-                                diagnostics.push(Diagnostic::error(
-                                    Code::E509,
-                                    format!(
-                                        "host function `{qualified}` has a mismatched Rust signature"
-                                    ),
-                                ));
-                            }
+                    {
+                        if sig.params.iter().any(|param| param.mutable) {
+                            diagnostics.push(Diagnostic::error(
+                                Code::E509,
+                                format!(
+                                    "host function `{qualified}` may not take `mut` parameters"
+                                ),
+                            ));
                         }
-                        #[cfg(feature = "ast-eval")]
-                        host_by_def.insert(def, registered.clone());
+                        if !want.matches(sig, &program) {
+                            diagnostics.push(Diagnostic::error(
+                                Code::E509,
+                                format!(
+                                    "host function `{qualified}` has a mismatched Rust signature"
+                                ),
+                            ));
+                        }
                     }
                 }
             }
@@ -456,8 +440,6 @@ impl Engine {
             ir,
             sources: loaded.sources,
             host_by_id,
-            #[cfg(feature = "ast-eval")]
-            host_by_def,
             settings: toml::Value::Table(Default::default()),
             limits: clamp_limits(self.default_limits, self.max_limits),
             manifest: Manifest {
@@ -504,24 +486,9 @@ pub struct Plugin {
     ir: IrProgram,
     sources: SourceMap,
     host_by_id: HashMap<HostId, RegisteredFn>,
-    #[cfg(feature = "ast-eval")]
-    host_by_def: HashMap<DefId, RegisteredFn>,
     settings: toml::Value,
     limits: ExecLimits,
     manifest: Manifest,
-}
-
-/// Which evaluator runs a plugin call.
-///
-/// The IR evaluator is the default. [`Evaluator::Ast`] exists only with the
-/// temporary `ast-eval` feature and is the documented `martite --ast` escape
-/// hatch until #116.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Evaluator {
-    #[default]
-    Ir,
-    #[cfg(feature = "ast-eval")]
-    Ast,
 }
 
 /// The result of [`Engine::reload`].
@@ -535,13 +502,9 @@ pub struct Reload {
 
 impl Reload {
     pub fn instantiate(&self) -> Result<Instance<'_>, Trap> {
-        self.instantiate_with(Evaluator::Ir)
-    }
-
-    pub fn instantiate_with(&self, evaluator: Evaluator) -> Result<Instance<'_>, Trap> {
         match &self.snapshot {
-            Some(snapshot) => self.plugin.instantiate_restored_with(snapshot, evaluator),
-            None => self.plugin.instantiate_with(evaluator),
+            Some(snapshot) => self.plugin.instantiate_restored(snapshot),
+            None => self.plugin.instantiate(),
         }
     }
 }
@@ -633,45 +596,18 @@ impl Plugin {
 
     /// Run `fn main` in a script, using the registered host functions.
     pub fn run_main(&self) -> Result<martite_runtime::MainResult, Trap> {
-        self.run_main_with(Evaluator::Ir)
-    }
-
-    /// Run `fn main` with an explicit evaluator.
-    pub fn run_main_with(&self, evaluator: Evaluator) -> Result<martite_runtime::MainResult, Trap> {
-        match evaluator {
-            Evaluator::Ir => {
-                let mut dispatcher = IrDispatch {
-                    fns: &self.host_by_id,
-                };
-                let mut runtime = IrRuntime::with_host(&self.ir, self.limits, &mut dispatcher);
-                runtime.run_main()
-            }
-            #[cfg(feature = "ast-eval")]
-            Evaluator::Ast => {
-                let mut dispatcher = Dispatch {
-                    fns: &self.host_by_def,
-                };
-                let mut runtime = Runtime::with_host(&self.program, self.limits, &mut dispatcher);
-                runtime.run_main()
-            }
-        }
+        let mut dispatcher = IrDispatch {
+            fns: &self.host_by_id,
+        };
+        let mut runtime = IrRuntime::with_host(&self.ir, self.limits, &mut dispatcher);
+        runtime.run_main()
     }
 
     /// Instantiate by restoring a snapshot instead of running `init`.
     pub fn instantiate_restored(&self, snapshot: &Snapshot) -> Result<Instance<'_>, Trap> {
-        self.instantiate_restored_with(snapshot, Evaluator::Ir)
-    }
-
-    /// Instantiate by restoring a snapshot with an explicit evaluator.
-    pub fn instantiate_restored_with(
-        &self,
-        snapshot: &Snapshot,
-        evaluator: Evaluator,
-    ) -> Result<Instance<'_>, Trap> {
         let mut instance = Instance {
             plugin: self,
             state: None,
-            evaluator,
         };
         instance.restore(snapshot).map_err(|message| Trap::Panic {
             message,
@@ -685,79 +621,39 @@ impl Plugin {
     /// Run every `test` block using the registered host functions as test
     /// doubles. Tests that call an unregistered host function fail with a trap.
     pub fn run_tests(&self) -> Vec<TestReport> {
-        self.run_tests_with(Evaluator::Ir)
-    }
-
-    /// Run every `test` block with an explicit evaluator.
-    pub fn run_tests_with(&self, evaluator: Evaluator) -> Vec<TestReport> {
         let mut reports = Vec::new();
         for (def, function) in self.program.tests.iter().zip(&self.ir.entries.tests) {
             let name = self.program.resolved.def(*def).name.clone();
-            let (outcome, log) = match evaluator {
-                Evaluator::Ir => {
-                    let mut dispatcher = IrDispatch {
-                        fns: &self.host_by_id,
-                    };
-                    let mut runtime = IrRuntime::with_host(&self.ir, self.limits, &mut dispatcher);
-                    let outcome = runtime
-                        .invoke(*function, Vec::new())
-                        .map(|result| result.value);
-                    (outcome, runtime.take_log())
-                }
-                #[cfg(feature = "ast-eval")]
-                Evaluator::Ast => {
-                    let mut dispatcher = Dispatch {
-                        fns: &self.host_by_def,
-                    };
-                    let mut runtime =
-                        Runtime::with_host(&self.program, self.limits, &mut dispatcher);
-                    let outcome = runtime.invoke(*def, Vec::new()).map(|result| result.value);
-                    (outcome, runtime.take_log())
-                }
+            let mut dispatcher = IrDispatch {
+                fns: &self.host_by_id,
             };
-            reports.push(TestReport { name, outcome, log });
+            let mut runtime = IrRuntime::with_host(&self.ir, self.limits, &mut dispatcher);
+            let outcome = runtime
+                .invoke(*function, Vec::new())
+                .map(|result| result.value);
+            reports.push(TestReport {
+                name,
+                outcome,
+                log: runtime.take_log(),
+            });
         }
         reports
     }
 
     pub fn instantiate(&self) -> Result<Instance<'_>, Trap> {
-        self.instantiate_with(Evaluator::Ir)
-    }
-
-    /// Instantiate with an explicit evaluator.
-    pub fn instantiate_with(&self, evaluator: Evaluator) -> Result<Instance<'_>, Trap> {
-        let state = match evaluator {
-            Evaluator::Ir => {
-                if let Some(init) = self.ir.entries.init {
-                    let args = self.init_args();
-                    let mut dispatcher = IrDispatch {
-                        fns: &self.host_by_id,
-                    };
-                    let mut runtime = IrRuntime::with_host(&self.ir, self.limits, &mut dispatcher);
-                    Some(runtime.invoke(init, args)?.value)
-                } else {
-                    None
-                }
-            }
-            #[cfg(feature = "ast-eval")]
-            Evaluator::Ast => {
-                if let Some(init) = self.program.init {
-                    let args = self.init_args();
-                    let mut dispatcher = Dispatch {
-                        fns: &self.host_by_def,
-                    };
-                    let mut runtime =
-                        Runtime::with_host(&self.program, self.limits, &mut dispatcher);
-                    Some(runtime.invoke(init, args)?.value)
-                } else {
-                    None
-                }
-            }
+        let state = if let Some(init) = self.ir.entries.init {
+            let args = self.init_args();
+            let mut dispatcher = IrDispatch {
+                fns: &self.host_by_id,
+            };
+            let mut runtime = IrRuntime::with_host(&self.ir, self.limits, &mut dispatcher);
+            Some(runtime.invoke(init, args)?.value)
+        } else {
+            None
         };
         Ok(Instance {
             plugin: self,
             state,
-            evaluator,
         })
     }
 
@@ -770,7 +666,6 @@ impl Plugin {
 pub struct Instance<'p> {
     plugin: &'p Plugin,
     state: Option<Value>,
-    evaluator: Evaluator,
 }
 
 #[derive(Debug, Clone)]
@@ -784,21 +679,7 @@ impl<'p> Instance<'p> {
         self.state.as_ref()
     }
 
-    /// The evaluator this instance was created with.
-    pub fn evaluator(&self) -> Evaluator {
-        self.evaluator
-    }
-
     pub fn call(&mut self, hook: &str, args: Vec<Value>) -> Result<Outcome, Trap> {
-        self.call_with(self.evaluator, hook, args)
-    }
-
-    pub fn call_with(
-        &mut self,
-        evaluator: Evaluator,
-        hook: &str,
-        args: Vec<Value>,
-    ) -> Result<Outcome, Trap> {
         if !self
             .plugin
             .ir
@@ -809,34 +690,16 @@ impl<'p> Instance<'p> {
         {
             return Ok(Outcome::NoHandler);
         }
-        match evaluator {
-            Evaluator::Ir => {
-                let mut dispatcher = IrDispatch {
-                    fns: &self.plugin.host_by_id,
-                };
-                let mut runtime =
-                    IrRuntime::with_host(&self.plugin.ir, self.plugin.limits, &mut dispatcher);
-                let value = runtime.invoke_handler(hook, &mut self.state, args)?;
-                Ok(value.map(Outcome::Handled).unwrap_or(Outcome::NoHandler))
-            }
-            #[cfg(feature = "ast-eval")]
-            Evaluator::Ast => {
-                let mut dispatcher = Dispatch {
-                    fns: &self.plugin.host_by_def,
-                };
-                let mut runtime =
-                    Runtime::with_host(&self.plugin.program, self.plugin.limits, &mut dispatcher);
-                let value = runtime.invoke_handler(hook, &mut self.state, args)?;
-                Ok(value.map(Outcome::Handled).unwrap_or(Outcome::NoHandler))
-            }
-        }
+        let mut dispatcher = IrDispatch {
+            fns: &self.plugin.host_by_id,
+        };
+        let mut runtime =
+            IrRuntime::with_host(&self.plugin.ir, self.plugin.limits, &mut dispatcher);
+        let value = runtime.invoke_handler(hook, &mut self.state, args)?;
+        Ok(value.map(Outcome::Handled).unwrap_or(Outcome::NoHandler))
     }
 
     pub fn shutdown(&mut self) -> Result<(), Trap> {
-        self.shutdown_with(self.evaluator)
-    }
-
-    pub fn shutdown_with(&mut self, evaluator: Evaluator) -> Result<(), Trap> {
         if !self
             .plugin
             .ir
@@ -847,27 +710,13 @@ impl<'p> Instance<'p> {
         {
             return Ok(());
         }
-        match evaluator {
-            Evaluator::Ir => {
-                let mut dispatcher = IrDispatch {
-                    fns: &self.plugin.host_by_id,
-                };
-                let mut runtime =
-                    IrRuntime::with_host(&self.plugin.ir, self.plugin.limits, &mut dispatcher);
-                let _ = runtime.invoke_handler("shutdown", &mut self.state, Vec::new())?;
-                Ok(())
-            }
-            #[cfg(feature = "ast-eval")]
-            Evaluator::Ast => {
-                let mut dispatcher = Dispatch {
-                    fns: &self.plugin.host_by_def,
-                };
-                let mut runtime =
-                    Runtime::with_host(&self.plugin.program, self.plugin.limits, &mut dispatcher);
-                let _ = runtime.invoke_handler("shutdown", &mut self.state, Vec::new())?;
-                Ok(())
-            }
-        }
+        let mut dispatcher = IrDispatch {
+            fns: &self.plugin.host_by_id,
+        };
+        let mut runtime =
+            IrRuntime::with_host(&self.plugin.ir, self.plugin.limits, &mut dispatcher);
+        let _ = runtime.invoke_handler("shutdown", &mut self.state, Vec::new())?;
+        Ok(())
     }
 
     /// A deterministic snapshot of the state and a fingerprint of its type.
@@ -931,28 +780,6 @@ impl IrHostDispatcher for IrDispatch<'_> {
         let function = self
             .fns
             .get(&host)
-            .map(|r| r.function.clone())
-            .ok_or_else(|| HostFault::new("host function is not registered"))?;
-        function(cx, args)
-    }
-}
-
-#[cfg(feature = "ast-eval")]
-struct Dispatch<'a> {
-    fns: &'a HashMap<DefId, RegisteredFn>,
-}
-
-#[cfg(feature = "ast-eval")]
-impl HostDispatcher for Dispatch<'_> {
-    fn call(
-        &mut self,
-        def: DefId,
-        args: &[Value],
-        cx: &mut HostContext,
-    ) -> Result<Value, HostFault> {
-        let function = self
-            .fns
-            .get(&def)
             .map(|r| r.function.clone())
             .ok_or_else(|| HostFault::new("host function is not registered"))?;
         function(cx, args)

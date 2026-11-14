@@ -1,8 +1,8 @@
-# AST interpreter snapshots
+# Behavior snapshots
 
-These files are the behavior oracle for the IR migration. Each line is a
-deterministic record produced by the AST interpreter. The IR evaluator must
-produce the same record for the same case.
+These files are the permanent behavior oracle for the IR evaluator. Each line is
+a deterministic record captured from the retired AST interpreter during the IR
+migration. The IR evaluator must produce the same record for the same case.
 
 The snapshots record:
 
@@ -33,33 +33,29 @@ records are fixture-relative and use `/`.
 
 ## Regenerating
 
-Only regenerate when the AST interpreter behavior intentionally changes, or
-when adding a case:
+Only regenerate after an intentional semantic change, or when adding a case:
 
 ```sh
 cargo test -p martite-conformance --test snapshots -- --ignored update_snapshots
 ```
 
-The normal test compares the current interpreter against the checked-in files
+The normal test compares the current IR evaluator against the checked-in files
 and verifies each threshold at its boundary:
 
 ```sh
 cargo test -p martite-conformance --test snapshots
 ```
 
-Do not edit the JSONL files by hand.
+Do not edit the JSONL files by hand, and do not regenerate them just to make a
+failing test pass. A diff here is a behavior change to justify.
 
 ## Differential harness
 
 `tests/ir_differential.rs` enumerates every snapshot case automatically. It
 compares the full observable record (result or trap, log, host calls, exact
-fuel, plugin steps and state), then runs the IR at the AST record's fuel,
-memory and depth thresholds and one unit below each.
-
-- `LiveAst` also runs the AST interpreter and requires it to reproduce the
-  recorded oracle before comparing the IR.
-- `Snapshots` compares the IR directly with the checked-in records. This is the
-  mode that stays valid after the AST interpreter is retired.
+fuel, plugin steps and state), then runs the IR at the recorded fuel, memory and
+depth thresholds and one unit below each. There is no `LiveAst` mode; the
+snapshots are the only oracle.
 
 There is no fixture allowlist: a new case in `snapshot_cases` is covered as soon
 as its snapshot record exists.

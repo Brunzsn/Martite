@@ -1,8 +1,10 @@
 use std::time::Duration;
 
-use martite_base::Code;
-use martite_conformance::{Case, run_case_with_limits, trap};
-use martite_runtime::{ExecLimits, HostContext, HostDispatcher, HostFault, Runtime, Trap, Value};
+use martite_conformance::{Case, lower_case_ir, run_case_with_limits, trap};
+use martite_ir::HostId;
+use martite_runtime::{
+    ExecLimits, HostContext, HostFault, IrHostDispatcher, IrRuntime, Trap, Value,
+};
 
 fn assert_panic(source: &str, expected: &str) {
     match trap(source) {
@@ -146,10 +148,10 @@ fn limits_and_host_faults_are_distinct_traps() {
 
 struct FaultyHost;
 
-impl HostDispatcher for FaultyHost {
+impl IrHostDispatcher for FaultyHost {
     fn call(
         &mut self,
-        _def: martite_check::DefId,
+        _host: HostId,
         _args: &[Value],
         _cx: &mut HostContext,
     ) -> Result<Value, HostFault> {
@@ -162,12 +164,10 @@ fn host_errors_become_host_fault_traps() {
     let case = Case::single("use app.api\nfn main() { api.work() }")
         .interface("app.api", "fn work()\n")
         .grant("app.api");
-    let loaded = case.load();
-    assert!(!loaded.diagnostics.iter().any(|d| d.code == Code::E508));
-    let program = loaded.program.expect("program");
+    let ir = lower_case_ir(&case);
     let mut host = FaultyHost;
-    let mut runtime = Runtime::with_host(
-        &program,
+    let mut runtime = IrRuntime::with_host(
+        &ir,
         ExecLimits {
             fuel: 1_000_000,
             memory: 8 << 20,

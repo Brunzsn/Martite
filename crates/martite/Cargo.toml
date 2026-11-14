@@ -6,12 +6,6 @@ license.workspace = true
 description = "Embedding API for the Martite language"
 publish = false
 
-[features]
-default = []
-# Temporary #115 escape hatch: keep the frozen AST evaluator available for
-# `martite --ast` until #116 retires it.
-ast-eval = ["martite-runtime/ast-eval"]
-
 [dependencies]
 martite-base.workspace = true
 martite-config.workspace = true

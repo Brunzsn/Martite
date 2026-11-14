@@ -13,7 +13,7 @@ The workspace is split along the compiler pipeline:
 - `martite-resolve` — module graph, imports, grants, top-level names
 - `martite-check` — bidirectional type checker, patterns, constants, handlers
 - `martite-ir` — resolved, self-contained tree IR, lowering (`lower` feature), verifier and text dumps
-- `martite-runtime` — IR evaluator, values, standard library, limits and traps; the frozen AST evaluator is behind the temporary `ast-eval` feature
+- `martite-runtime` — IR evaluator, values, standard library, limits and traps; it does not depend on the checker or syntax tree
 - `martite-driver` — load orchestration
 - `martite` — embedding and plugin host API
 - `martite-cli` — `martite` binary and standalone `std.io`/`std.env` host
@@ -31,15 +31,14 @@ optimizer. The design is in
 [`Martite_IR_Design_Doc.md`](Martite_IR_Design_Doc.md); its phase-3 performance
 gate was met before the default switch.
 
-`martite run` and `martite test` accept `--ast` as a temporary escape hatch that
-selects the frozen AST evaluator. The flag, the `ast-eval` feature and the AST
-evaluation paths are removed in #116.
+The AST interpreter has been retired. The IR evaluator is the only runtime;
+the checked-in behavior snapshots are the regression oracle, and tooling stays
+on the AST.
 
 ## Commands
 
 ```sh
 cargo run -p martite-cli -- run examples/hello.mt
-cargo run -p martite-cli -- run --ast examples/hello.mt
 cargo run -p martite-cli -- check examples/bad.mt
 cargo run -p martite-cli -- check --json examples/bad.mt
 cargo run -p martite-cli -- lower examples/hello.mt
@@ -136,8 +135,8 @@ cargo test --workspace
   syntax-only behavior, documented exemptions, primary spans, and suppression;
 - golden preset/group/severity/threshold/option/override and glob tests;
 - golden `Show`, fuel, memory, depth, deadline, panic, and trap tests;
-- the full AST-vs-IR differential over every snapshot case, including exact
-  fuel and the minimum fuel, memory and depth thresholds;
+- the full IR-vs-snapshot differential over every snapshot case, including
+  exact fuel and the minimum fuel, memory and depth thresholds;
 - grammar fixtures for the section 10 parser notes;
 - plugin state, snapshots, handles, grants, settings, and test doubles;
 - formatter idempotence, AST equality, comment survival, and suppression

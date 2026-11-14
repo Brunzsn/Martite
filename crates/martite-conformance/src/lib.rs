@@ -12,10 +12,10 @@ use martite_base::{
 };
 use martite_config::ToolConfig;
 use martite_driver::{LoadOptions, LoadedProgram, load};
-use martite_ir::{IrProgram, TypeTable, lower, verify};
+use martite_ir::{IrProgram, lower, verify};
 use martite_lint::{LintInputs, ManifestInput, SettingsResolver, lint};
 use martite_resolve::InterfaceSource;
-use martite_runtime::{ExecLimits, IrRuntime, MainResult, Runtime, Trap, Value};
+use martite_runtime::{ExecLimits, IrRuntime, MainResult, Trap, Value};
 use martite_syntax::ParseOptions;
 
 #[derive(Debug, Clone)]
@@ -181,14 +181,14 @@ pub fn assert_diagnostic(
                 continue;
             }
         }
-        if let Some(expected) = message_contains {
-            if !diagnostic.message.contains(expected) {
-                failures.push(format!(
-                    "message mismatch: expected substring {expected:?}, got {:?}",
-                    diagnostic.message
-                ));
-                continue;
-            }
+        if let Some(expected) = message_contains
+            && !diagnostic.message.contains(expected)
+        {
+            failures.push(format!(
+                "message mismatch: expected substring {expected:?}, got {:?}",
+                diagnostic.message
+            ));
+            continue;
         }
         if let Some(expected) = help_contains {
             match &diagnostic.help {
@@ -338,12 +338,13 @@ pub fn run_case_with_limits(case: &Case, limits: ExecLimits) -> Result<MainResul
         );
     }
     let program = loaded.program.expect("program");
-    let types = TypeTable::from_checker(&program);
-    let mut runtime = Runtime::new(&program, limits);
+    let ir = lower(&program, &loaded.sources).expect("fixture lowers");
+    verify(&ir).expect("fixture verifies");
+    let mut runtime = IrRuntime::new(&ir, limits);
     let main = runtime.run_main()?;
     if let Value::Result(Err(error)) = &main.value {
         return Err(Trap::Panic {
-            message: martite_runtime::show(error, &types, true),
+            message: martite_runtime::show(error, &ir.types, true),
             source: None,
             span: None,
             trace: Vec::new(),
@@ -354,24 +355,6 @@ pub fn run_case_with_limits(case: &Case, limits: ExecLimits) -> Result<MainResul
 
 pub fn trap(source: &str) -> Trap {
     run_case(Case::single(source)).expect_err("program should trap")
-}
-
-fn checked_program(case: &Case) -> martite_check::CheckedProgram {
-    let loaded = case.load();
-    assert!(
-        !loaded
-            .diagnostics
-            .iter()
-            .any(|d| d.severity == Severity::Error),
-        "program must load cleanly:\n{}",
-        loaded
-            .diagnostics
-            .iter()
-            .map(|d| d.render(&loaded.sources))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    loaded.program.expect("program")
 }
 
 /// Upper bounds used when binary-searching a fixture's thresholds.
@@ -392,15 +375,8 @@ impl Default for ProbeCaps {
     }
 }
 
-fn run_with_limits(
-    program: &martite_check::CheckedProgram,
-    limits: ExecLimits,
-) -> Result<(), Trap> {
-    let mut runtime = Runtime::new(program, limits);
-    runtime.run_main().map(|_| ())
-}
-
-fn lower_case_ir(case: &Case) -> IrProgram {
+/// Lower and verify a fixture once for direct evaluator tests.
+pub fn lower_case_ir(case: &Case) -> IrProgram {
     let loaded = case.load();
     assert!(
         !loaded
@@ -421,7 +397,7 @@ fn lower_case_ir(case: &Case) -> IrProgram {
     ir
 }
 
-fn run_with_limits_ir(program: &IrProgram, limits: ExecLimits) -> Result<(), Trap> {
+fn run_with_limits(program: &IrProgram, limits: ExecLimits) -> Result<(), Trap> {
     let mut runtime = IrRuntime::new(program, limits);
     runtime.run_main().map(|_| ())
 }
@@ -434,7 +410,7 @@ pub fn min_fuel(case: &Case) -> u64 {
 }
 
 pub fn min_fuel_with(case: &Case, caps: ProbeCaps) -> u64 {
-    let program = checked_program(case);
+    let program = lower_case_ir(case);
     let mut low = 1u64;
     let mut high = caps.fuel.max(1);
     assert!(
@@ -448,7 +424,7 @@ pub fn min_fuel_with(case: &Case, caps: ProbeCaps) -> u64 {
             },
         )
         .is_ok(),
-        "fixture needs more than the probe cap"
+        "fixture needs more than the fuel probe cap"
     );
     while low < high {
         let mid = low + (high - low) / 2;
@@ -476,7 +452,7 @@ pub fn min_memory(case: &Case) -> u64 {
 }
 
 pub fn min_memory_with(case: &Case, caps: ProbeCaps) -> u64 {
-    let program = checked_program(case);
+    let program = lower_case_ir(case);
     let mut low = 0u64;
     let mut high = caps.memory;
     assert!(
@@ -490,7 +466,7 @@ pub fn min_memory_with(case: &Case, caps: ProbeCaps) -> u64 {
             },
         )
         .is_ok(),
-        "fixture needs more than the probe cap"
+        "fixture needs more than the memory probe cap"
     );
     while low < high {
         let mid = low + (high - low) / 2;
@@ -517,7 +493,7 @@ pub fn min_depth(case: &Case) -> u32 {
 }
 
 pub fn min_depth_with(case: &Case, caps: ProbeCaps) -> u32 {
-    let program = checked_program(case);
+    let program = lower_case_ir(case);
     let mut low = 0u32;
     let mut high = caps.depth;
     assert!(
@@ -531,7 +507,7 @@ pub fn min_depth_with(case: &Case, caps: ProbeCaps) -> u32 {
             },
         )
         .is_ok(),
-        "fixture needs more than the probe cap"
+        "fixture needs more than the depth probe cap"
     );
     while low < high {
         let mid = low + (high - low) / 2;
@@ -547,129 +523,6 @@ pub fn min_depth_with(case: &Case, caps: ProbeCaps) -> u32 {
             Ok(()) => high = mid,
             Err(Trap::DepthExceeded) => low = mid + 1,
             Err(trap) => panic!("unexpected trap while probing depth: {trap:?}"),
-        }
-    }
-    low
-}
-
-/// Smallest fuel budget that lets the IR evaluator finish.
-pub fn min_fuel_ir(case: &Case) -> u64 {
-    min_fuel_ir_with(case, ProbeCaps::default())
-}
-
-pub fn min_fuel_ir_with(case: &Case, caps: ProbeCaps) -> u64 {
-    let program = lower_case_ir(case);
-    let mut low = 1u64;
-    let mut high = caps.fuel.max(1);
-    assert!(
-        run_with_limits_ir(
-            &program,
-            ExecLimits {
-                fuel: high,
-                memory: caps.memory,
-                depth: caps.depth,
-                deadline: None,
-            },
-        )
-        .is_ok(),
-        "IR fixture needs more than the fuel probe cap"
-    );
-    while low < high {
-        let mid = low + (high - low) / 2;
-        match run_with_limits_ir(
-            &program,
-            ExecLimits {
-                fuel: mid,
-                memory: caps.memory,
-                depth: caps.depth,
-                deadline: None,
-            },
-        ) {
-            Ok(()) => high = mid,
-            Err(Trap::OutOfFuel) => low = mid + 1,
-            Err(trap) => panic!("unexpected IR trap while probing fuel: {trap:?}"),
-        }
-    }
-    low
-}
-
-/// Smallest memory budget that lets the IR evaluator finish.
-pub fn min_memory_ir(case: &Case) -> u64 {
-    min_memory_ir_with(case, ProbeCaps::default())
-}
-
-pub fn min_memory_ir_with(case: &Case, caps: ProbeCaps) -> u64 {
-    let program = lower_case_ir(case);
-    let mut low = 0u64;
-    let mut high = caps.memory;
-    assert!(
-        run_with_limits_ir(
-            &program,
-            ExecLimits {
-                fuel: caps.fuel,
-                memory: high,
-                depth: caps.depth,
-                deadline: None,
-            },
-        )
-        .is_ok(),
-        "IR fixture needs more than the memory probe cap"
-    );
-    while low < high {
-        let mid = low + (high - low) / 2;
-        match run_with_limits_ir(
-            &program,
-            ExecLimits {
-                fuel: caps.fuel,
-                memory: mid,
-                depth: caps.depth,
-                deadline: None,
-            },
-        ) {
-            Ok(()) => high = mid,
-            Err(Trap::OutOfMemory) => low = mid + 1,
-            Err(trap) => panic!("unexpected IR trap while probing memory: {trap:?}"),
-        }
-    }
-    low
-}
-
-/// Smallest call-depth budget that lets the IR evaluator finish.
-pub fn min_depth_ir(case: &Case) -> u32 {
-    min_depth_ir_with(case, ProbeCaps::default())
-}
-
-pub fn min_depth_ir_with(case: &Case, caps: ProbeCaps) -> u32 {
-    let program = lower_case_ir(case);
-    let mut low = 0u32;
-    let mut high = caps.depth;
-    assert!(
-        run_with_limits_ir(
-            &program,
-            ExecLimits {
-                fuel: caps.fuel,
-                memory: caps.memory,
-                depth: high,
-                deadline: None,
-            },
-        )
-        .is_ok(),
-        "IR fixture needs more than the depth probe cap"
-    );
-    while low < high {
-        let mid = low + (high - low) / 2;
-        match run_with_limits_ir(
-            &program,
-            ExecLimits {
-                fuel: caps.fuel,
-                memory: caps.memory,
-                depth: mid,
-                deadline: None,
-            },
-        ) {
-            Ok(()) => high = mid,
-            Err(Trap::DepthExceeded) => low = mid + 1,
-            Err(trap) => panic!("unexpected IR trap while probing depth: {trap:?}"),
         }
     }
     low

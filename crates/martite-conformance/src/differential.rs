@@ -1,9 +1,9 @@
-//! AST-vs-IR differential harness for the conformance corpus (#112).
+//! IR-vs-snapshot differential harness (#112).
 //!
 //! The harness enumerates every snapshot case, compares the full observable
-//! record and checks the IR at the AST oracle's exact fuel, memory and depth
-//! thresholds. The same comparison runs against recorded snapshots only, which
-//! is the oracle that survives the AST interpreter (#116).
+//! record and checks the IR at the recorded fuel, memory and depth thresholds.
+//! The checked-in records were captured from the retired AST interpreter, so
+//! they remain the independent oracle for the IR evaluator.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -12,15 +12,6 @@ use martite_ir::{lower, verify};
 
 use crate::snapshot::{SnapshotCase, SnapshotRecord};
 use crate::snapshot_cases;
-
-/// Where the expected record comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Oracle {
-    /// Run the AST interpreter and compare it with the recorded oracle first.
-    LiveAst,
-    /// Compare the IR directly with the recorded snapshots.
-    Snapshots,
-}
 
 /// One differing field in a snapshot record or threshold check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +33,6 @@ pub struct CaseFailure {
 /// Aggregate result for the whole corpus.
 #[derive(Debug)]
 pub struct CorpusReport {
-    pub oracle: Oracle,
     pub covered: usize,
     pub skipped: usize,
     pub failures: Vec<CaseFailure>,
@@ -51,8 +41,8 @@ pub struct CorpusReport {
 impl CorpusReport {
     pub fn assert_ok(self) {
         eprintln!(
-            "IR differential ({:?}): covered {}, skipped {}",
-            self.oracle, self.covered, self.skipped
+            "IR differential: covered {}, skipped {}",
+            self.covered, self.skipped
         );
         if self.failures.is_empty() {
             return;
@@ -60,8 +50,7 @@ impl CorpusReport {
         let mut message = String::new();
         writeln!(
             message,
-            "IR differential ({:?}) failed for {} of {} fixtures:",
-            self.oracle,
+            "IR differential failed for {} of {} fixtures:",
             self.failures.len(),
             self.covered
         )
@@ -91,7 +80,7 @@ impl CorpusReport {
 }
 
 /// Run the full corpus against `expected`.
-pub fn run_all(oracle: Oracle, expected: &BTreeMap<String, SnapshotRecord>) -> CorpusReport {
+pub fn run_all(expected: &BTreeMap<String, SnapshotRecord>) -> CorpusReport {
     let cases = snapshot_cases::all_cases();
     let mut covered = 0;
     let mut skipped = 0;
@@ -110,21 +99,7 @@ pub fn run_all(oracle: Oracle, expected: &BTreeMap<String, SnapshotRecord>) -> C
         }
         covered += 1;
 
-        if oracle == Oracle::LiveAst {
-            let ast = case.observe();
-            let differences = observable_differences(expected, &ast);
-            if !differences.is_empty() {
-                failures.push(CaseFailure {
-                    id: case.id().to_owned(),
-                    note: Some("live AST did not reproduce the recorded oracle".into()),
-                    differences,
-                    ir_dump: Some(ir_dump(&case)),
-                });
-                continue;
-            }
-        }
-
-        let ir = case.observe_ir();
+        let ir = case.observe();
         let mut differences = observable_differences(expected, &ir);
         match case.verify_ir_thresholds(expected) {
             Ok(()) => {}
@@ -147,7 +122,6 @@ pub fn run_all(oracle: Oracle, expected: &BTreeMap<String, SnapshotRecord>) -> C
     }
 
     CorpusReport {
-        oracle,
         covered,
         skipped,
         failures,

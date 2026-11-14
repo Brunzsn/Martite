@@ -83,8 +83,8 @@ enum Accessor {
     Index(Value),
 }
 
-/// Executes one [`IrProgram`] with the same limits and observable accounting
-/// rules as the AST interpreter.
+/// Executes one [`IrProgram`] with the limits and observable accounting rules
+/// pinned by the conformance snapshots.
 pub struct IrRuntime<'p, 'h> {
     program: &'p IrProgram,
     limits: ExecLimits,
@@ -576,8 +576,8 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             }
         }
 
-        // Until #118 lands, lambda traps name the caller's source file exactly
-        // like the AST interpreter. Lowering already records the defining
+        // Until #118 lands, lambda traps name the caller's source file, as
+        // recorded by the snapshots. Lowering already records the defining
         // source in `IrFn::source`.
         let source = if matches!(function_info.kind, FnKind::Lambda) {
             self.frames
@@ -1756,8 +1756,8 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 self.rollback_bindings(&mut undo)?;
                 continue;
             }
-            // Drop the pre-arm values before the body, exactly like the AST's
-            // `commit_locals`; retaining them would add observable references.
+            // Drop the pre-arm values before the body, as the snapshots pin;
+            // retaining them would add observable references.
             drop(undo);
             return self.eval(arm.body);
         }

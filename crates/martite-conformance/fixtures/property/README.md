@@ -2,7 +2,7 @@
 
 These programs are replayed by `crates/martite-conformance/tests/ir_property.rs`
 without `cargo-fuzz`. Each file is a complete `fn main` script and is checked,
-lowered, verified and executed with the AST-vs-IR limit sweep.
+lowered, verified and executed with the IR-only limit sweep.
 
 When the proptest finds a failure:
 

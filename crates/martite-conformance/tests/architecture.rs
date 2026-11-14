@@ -55,13 +55,29 @@ fn benchmarks_are_isolated_from_production_crates() {
 #[test]
 fn runtime_values_use_the_ir_vocabulary() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for name in ["value.rs", "ops.rs", "json.rs", "exec.rs"] {
+    for name in [
+        "lib.rs",
+        "value.rs",
+        "ops.rs",
+        "json.rs",
+        "exec.rs",
+        "ir_eval.rs",
+        "ir_eval/builtins.rs",
+    ] {
         let path = root.join("crates/martite-runtime/src").join(name);
         let source = fs::read_to_string(&path).expect("read runtime source");
-        assert!(
-            !source.contains("martite_check"),
-            "{name} must use the IR vocabulary, not martite-check"
-        );
+        for forbidden in [
+            "martite_check",
+            "CheckedProgram",
+            "BindingId",
+            "DefId",
+            "NodeId",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{name} must use the IR vocabulary, not {forbidden}"
+            );
+        }
     }
     let value = fs::read_to_string(root.join("crates/martite-runtime/src/value.rs"))
         .expect("read runtime value source");
@@ -87,18 +103,16 @@ fn ir_stays_above_the_runtime() {
 }
 
 #[test]
-fn default_runtime_build_is_ir_only() {
+fn runtime_is_ir_only() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let manifest = fs::read_to_string(root.join("crates/martite-runtime/Cargo.toml"))
         .expect("read runtime manifest");
-    assert!(
-        manifest.contains("ast-eval = [\"dep:martite-check\", \"dep:martite-syntax\"]"),
-        "the AST evaluator and checker must be opt-in"
-    );
-    assert!(
-        manifest.contains("martite-check = { workspace = true, optional = true }"),
-        "martite-check must be optional in the runtime manifest"
-    );
+    for forbidden in ["ast-eval", "martite-check", "martite-syntax"] {
+        assert!(
+            !manifest.contains(forbidden),
+            "martite-runtime must not reference {forbidden}"
+        );
+    }
 
     let lib = fs::read_to_string(root.join("crates/martite-runtime/src/lib.rs"))
         .expect("read runtime lib");
@@ -107,8 +121,23 @@ fn default_runtime_build_is_ir_only() {
         "IR evaluator must be built"
     );
     assert!(
-        lib.contains("#[cfg(feature = \"ast-eval\")]\npub mod interp;"),
-        "the AST evaluator must only build with ast-eval"
+        !lib.contains("interp"),
+        "the AST evaluator must be removed from the runtime"
+    );
+    assert!(
+        !root.join("crates/martite-runtime/src/interp.rs").exists(),
+        "interp.rs must be deleted"
+    );
+    assert!(
+        !root.join("crates/martite-runtime/src/builtins.rs").exists(),
+        "the AST builtin include must be deleted"
+    );
+
+    let cli =
+        fs::read_to_string(root.join("crates/martite-cli/Cargo.toml")).expect("read CLI manifest");
+    assert!(
+        !cli.contains("ast-eval"),
+        "the temporary CLI evaluator feature must be removed"
     );
 }
 

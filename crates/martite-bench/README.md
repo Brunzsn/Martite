@@ -85,7 +85,7 @@ allocator and writes a Markdown table to stdout and
 | --- | ---: | ---: | ---: | ---: |
 
 Values are per iteration after a short warmup. They are useful for seeing
-AST/environment/parameter clones even when the timing signal is noisy. Treat
+temporary value/environment clones even when the timing signal is noisy. Treat
 them as absolute counters to compare across commits, not as pass/fail limits.
 
 ## Results
@@ -93,6 +93,10 @@ them as absolute counters to compare across commits, not as pass/fail limits.
 No thresholds are enforced. These numbers are one GitHub Actions
 `windows-latest` run and are only useful for comparing against a baseline on
 the same runner class. Record a fresh row when landing performance work.
+
+The table below predates the #116 AST-interpreter retirement. The runtime
+benches already executed the IR before that change, but refresh the report on
+the next authorized benchmark run.
 
 - Machine: GitHub Actions `windows-latest` (Windows Server 2025)
 - Rust: `rustc 1.99.1 (58cf8f9c3 2026-10-13)`

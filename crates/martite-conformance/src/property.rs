@@ -7,9 +7,8 @@
 //!
 //! For each source, the harness checks the program, lowers it twice, verifies
 //! the result, proves that a deliberately corrupted clone is rejected, and
-//! executes the AST oracle and the IR at a limit sweep. The AST comparison is
-//! temporary: #116 retires the AST interpreter, and the IR-only invariants
-//! remain valid afterwards.
+//! executes the IR at a limit sweep. Two-run determinism, exact fuel
+//! boundaries and the low memory/depth sweep are the permanent invariants.
 
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -17,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use martite_base::{Severity, SourceMap};
 use martite_check::CheckedProgram;
-use martite_ir::{FnId, IrProgram, LowerOptions, TypeTable, lower_with, verify};
-use martite_runtime::{ExecLimits, IrRuntime, Runtime};
+use martite_ir::{FnId, IrProgram, LowerOptions, lower_with, verify};
+use martite_runtime::{ExecLimits, IrRuntime};
 
 use crate::Case;
 use crate::snapshot::{OutcomeRecord, outcome_from_result};
@@ -158,20 +157,10 @@ pub fn check_source(source: &str) -> Result<PropertyOutcome, PropertyFailure> {
         return Ok(skipped("wall-clock cap after lowering and verification"));
     }
 
-    let ast_types = TypeTable::from_checker(&program);
     let baseline = baseline_limits();
-    let first_ast = observe_ast(&program, &sources, &ast_types, baseline);
     let first_ir = observe_ir(&ir, &sources, baseline);
-    if deadline(&first_ast) || deadline(&first_ir) {
+    if deadline(&first_ir) {
         return Ok(skipped("deadline at baseline limits"));
-    }
-    if first_ast != first_ir {
-        return Err(PropertyFailure::new(
-            "baseline AST-vs-IR",
-            source,
-            format!("baseline observations differ\nAST: {first_ast:?}\nIR:  {first_ir:?}"),
-        )
-        .with_dump(dump));
     }
     let baseline_outcome = first_ir.outcome.clone();
     if !matches!(baseline_outcome, OutcomeRecord::Value { .. }) {
@@ -192,19 +181,10 @@ pub fn check_source(source: &str) -> Result<PropertyOutcome, PropertyFailure> {
                 "wall-clock cap during limit sweep at `{name}`"
             )));
         }
-        let ast = observe_ast(&program, &sources, &ast_types, limits);
         let ir_first = observe_ir(&ir, &sources, limits);
         let ir_second = observe_ir(&ir, &sources, limits);
-        if deadline(&ast) || deadline(&ir_first) || deadline(&ir_second) {
+        if deadline(&ir_first) || deadline(&ir_second) {
             return Ok(skipped(format!("deadline during limit sweep at `{name}`")));
-        }
-        if ast != ir_first {
-            return Err(PropertyFailure::new(
-                "AST-vs-IR limit sweep",
-                source,
-                format!("`{name}` differs\nlimits: {limits:?}\nAST: {ast:?}\nIR:  {ir_first:?}"),
-            )
-            .with_dump(dump));
         }
         if ir_first != ir_second {
             return Err(PropertyFailure::new(
@@ -440,26 +420,6 @@ struct RunObservation {
     outcome: OutcomeRecord,
     log: Vec<String>,
     fuel_used: u64,
-}
-
-fn observe_ast(
-    program: &CheckedProgram,
-    sources: &SourceMap,
-    types: &TypeTable,
-    limits: ExecLimits,
-) -> RunObservation {
-    let mut runtime = Runtime::new(program, limits);
-    let result = runtime.run_main();
-    let log = match &result {
-        Ok(main) => main.log.clone(),
-        Err(_) => runtime.take_log(),
-    };
-    let fuel_used = runtime.fuel_used();
-    RunObservation {
-        outcome: outcome_from_result(result, sources, types),
-        log,
-        fuel_used,
-    }
 }
 
 fn observe_ir(ir: &IrProgram, sources: &SourceMap, limits: ExecLimits) -> RunObservation {

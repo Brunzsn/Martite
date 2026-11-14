@@ -5,9 +5,10 @@ use martite_base::{LoadLimits, MemoryProvider};
 use martite_config::{FmtConfig, ToolConfig, parse_manifest};
 use martite_driver::{LoadOptions, LoadedProgram, load};
 use martite_fmt::{format_interface, format_source, structurally_equal};
+use martite_ir::lower;
 use martite_lint::{LintInputs, SettingsResolver, lint};
 use martite_resolve::InterfaceSource;
-use martite_runtime::{ExecLimits, Runtime, Value};
+use martite_runtime::{ExecLimits, IrRuntime, Value};
 use martite_syntax::{parse_interface, parse_source, parse_source_with};
 
 fn bench_root() -> PathBuf {
@@ -265,8 +266,9 @@ fn runtime_fixtures_run_and_plugins_round_trip_state() {
         let loaded = load_single(&path);
         assert_clean(&loaded);
         let program = loaded.program.expect("program");
-        let mut runtime = Runtime::new(
-            &program,
+        let ir = lower(&program, &loaded.sources).expect("benchmark fixture lowers");
+        let mut runtime = IrRuntime::new(
+            &ir,
             ExecLimits {
                 fuel: 100_000_000,
                 memory: 64 << 20,

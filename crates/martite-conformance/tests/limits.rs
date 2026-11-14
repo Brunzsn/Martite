@@ -1,12 +1,11 @@
 use std::time::Duration;
 
-use martite_base::Code;
 use martite_conformance::{
-    Case, min_depth, min_depth_ir, min_fuel, min_fuel_ir, min_memory, min_memory_ir, run_case,
-    run_case_with_limits,
+    Case, lower_case_ir, min_depth, min_fuel, min_memory, run_case, run_case_with_limits,
 };
+use martite_ir::HostId;
 use martite_runtime::{
-    ExecLimits, HostContext, HostDispatcher, HostFault, MAX_VALUE_DEPTH, Trap, Value,
+    ExecLimits, HostContext, HostFault, IrHostDispatcher, IrRuntime, MAX_VALUE_DEPTH, Trap, Value,
     value_depth_exceeds,
 };
 
@@ -179,7 +178,6 @@ fn fuel_table_costs_are_golden() {
     for row in FUEL_ROWS {
         let case = Case::single(row.source);
         assert_eq!(min_fuel(&case), row.expected, "fuel for {}", row.name);
-        assert_eq!(min_fuel_ir(&case), row.expected, "IR fuel for {}", row.name);
     }
 }
 
@@ -202,7 +200,6 @@ fn memory_costs_are_golden() {
     ] {
         let case = Case::single(source);
         assert_eq!(min_memory(&case), expected, "memory for {name}");
-        assert_eq!(min_memory_ir(&case), expected, "IR memory for {name}");
     }
 }
 
@@ -216,8 +213,6 @@ fn repeated_small_allocations_do_not_inflate_memory() {
     let long = min_memory(&long_case);
     assert_eq!(long, short);
     assert_eq!(long, 32);
-    assert_eq!(min_memory_ir(&short_case), short);
-    assert_eq!(min_memory_ir(&long_case), long);
 }
 
 #[test]
@@ -234,8 +229,6 @@ fn shared_const_values_are_counted_once() {
         shared < rebuilt,
         "cached constants must share one payload: shared {shared}, rebuilt {rebuilt}"
     );
-    assert_eq!(min_memory_ir(&shared_case), shared);
-    assert_eq!(min_memory_ir(&rebuilt_case), rebuilt);
 }
 
 #[test]
@@ -252,8 +245,6 @@ fn shared_string_literals_are_counted_once() {
         shared < rebuilt,
         "cached literals must share one payload: shared {shared}, rebuilt {rebuilt}"
     );
-    assert_eq!(min_memory_ir(&shared_case), shared);
-    assert_eq!(min_memory_ir(&rebuilt_case), rebuilt);
 }
 
 #[test]
@@ -318,7 +309,6 @@ fn depth_cost_is_golden() {
     let recursive = "fn down(n: int) -> int {\n    if n == 0 { 0 } else { down(n - 1) }\n}\nfn main() { print(down(10)) }";
     let case = Case::single(recursive);
     assert_eq!(min_depth(&case), 12);
-    assert_eq!(min_depth_ir(&case), 12);
 }
 
 #[test]
@@ -398,15 +388,18 @@ fn runtime_value_nesting_is_capped_at_128() {
         "#;
     let trap = run_case(Case::single(source)).expect_err("depth trap");
     assert!(matches!(trap, Trap::DepthExceeded), "{trap:?}");
-    assert!(value_depth_exceeds(&Value::list(vec![Value::Int(1)]), MAX_VALUE_DEPTH) == false);
+    assert!(!value_depth_exceeds(
+        &Value::list(vec![Value::Int(1)]),
+        MAX_VALUE_DEPTH
+    ));
 }
 
 struct ChargingHost;
 
-impl HostDispatcher for ChargingHost {
+impl IrHostDispatcher for ChargingHost {
     fn call(
         &mut self,
-        _def: martite_check::DefId,
+        _host: HostId,
         _args: &[Value],
         cx: &mut HostContext,
     ) -> Result<Value, HostFault> {
@@ -420,15 +413,13 @@ fn host_calls_charge_one_plus_the_host_amount() {
     let case = Case::single("use app.api\nfn main() { api.work() }")
         .interface("app.api", "fn work()\n")
         .grant("app.api");
-    let loaded = case.load();
-    assert!(!loaded.diagnostics.iter().any(|d| d.code == Code::E508));
-    let program = loaded.program.expect("program");
+    let ir = lower_case_ir(&case);
 
     let mut minimum = None;
     for fuel in 1..=20 {
         let mut host = ChargingHost;
-        let mut runtime = martite_runtime::Runtime::with_host(
-            &program,
+        let mut runtime = IrRuntime::with_host(
+            &ir,
             ExecLimits {
                 fuel,
                 memory: 8 << 20,

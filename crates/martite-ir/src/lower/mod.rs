@@ -414,8 +414,8 @@ impl<'p> Lowerer<'p> {
 
     /// The opaque type `HostContext::make_handle` may construct for this host.
     ///
-    /// Mirrors the AST interpreter: only a direct opaque interface return, its
-    /// `Option` payload, or the success payload of a `Result` is a handle.
+    /// Mirrors the recorded behavior: only a direct opaque interface return,
+    /// its `Option` payload, or the success payload of a `Result` is a handle.
     /// Hosts that merely mention an opaque type elsewhere (a list element, a
     /// tuple member, a function parameter or the `Err` payload) cannot create
     /// handles.

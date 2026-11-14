@@ -1,6 +1,6 @@
 use martite_base::Code;
-use martite_conformance::{Case, assert_code, codes, run, trap};
-use martite_runtime::{ExecLimits, Runtime, Trap, Value};
+use martite_conformance::{Case, assert_code, codes, run, run_case_with_limits, trap};
+use martite_runtime::{ExecLimits, Trap, Value};
 
 #[test]
 fn lexical_errors() {
@@ -265,10 +265,8 @@ fn runtime_panics() {
 
 #[test]
 fn fuel_limit() {
-    let loaded = Case::single("fn main() { var i = 0\nwhile i < 1000 { i += 1 } }").load();
-    let program = loaded.program.expect("program");
-    let mut runtime = Runtime::new(
-        &program,
+    let result = run_case_with_limits(
+        &Case::single("fn main() { var i = 0\nwhile i < 1000 { i += 1 } }"),
         ExecLimits {
             fuel: 10,
             memory: 8 << 20,
@@ -276,15 +274,13 @@ fn fuel_limit() {
             deadline: None,
         },
     );
-    assert!(matches!(runtime.run_main(), Err(Trap::OutOfFuel)));
+    assert!(matches!(result, Err(Trap::OutOfFuel)));
 }
 
 #[test]
 fn memory_limit_is_enforced() {
-    let loaded = Case::single("fn main() { let xs = [1, 2, 3, 4, 5, 6, 7, 8] }").load();
-    let program = loaded.program.expect("program");
-    let mut runtime = Runtime::new(
-        &program,
+    let result = run_case_with_limits(
+        &Case::single("fn main() { let xs = [1, 2, 3, 4, 5, 6, 7, 8] }"),
         ExecLimits {
             fuel: 1_000_000,
             memory: 4,
@@ -292,7 +288,7 @@ fn memory_limit_is_enforced() {
             deadline: None,
         },
     );
-    assert!(matches!(runtime.run_main(), Err(Trap::OutOfMemory)));
+    assert!(matches!(result, Err(Trap::OutOfMemory)));
 }
 
 #[test]

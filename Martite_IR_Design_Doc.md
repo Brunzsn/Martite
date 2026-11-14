@@ -1,18 +1,22 @@
 # Martite IR: Design Doc
 
-**Status:** Accepted. The phase-3 performance gate in section 15 was measured
-before the default-executor switch (#96, #115).
-**Scope:** a resolved, self-contained tree IR between the type checker and the runtime. It must (1) execute faster than the AST interpreter with identical observable behavior, and (2) give a future optimizer a semantics contract it can actually be held to.
+**Status:** Accepted and complete. The phase-3 performance gate in section 15 was
+measured before the default-executor switch (#96, #115), and the AST
+interpreter was retired in #116. The IR evaluator is the only runtime; the
+checked-in snapshots are the behavior oracle.
+**Scope:** a resolved, self-contained tree IR between the type checker and the runtime. It must (1) execute faster than the retired AST interpreter with identical observable behavior, and (2) give a future optimizer a semantics contract it can actually be held to.
 
 ## 1. Summary
 
-Today the interpreter walks the checked AST and consults `NodeId`-keyed side tables (`expr_types`, `resolutions`, `pattern_resolutions`, `LambdaInfo`). This document proposes a new crate, `martite-ir`, holding a small **tree IR**. `CheckedProgram` is lowered into it and the runtime executes it. The IR is plain data, still evaluated by a recursive evaluator, and not bytecode.
+Before migration, the interpreter walked the checked AST and consulted `NodeId`-keyed side tables (`expr_types`, `resolutions`, `pattern_resolutions`, `LambdaInfo`). This document proposed a new crate, `martite-ir`, holding a small **tree IR**. `CheckedProgram` is lowered into it and the runtime executes it. The IR is plain data, still evaluated by a recursive evaluator, and not bytecode.
 
 Fuel, memory and trap behavior depend on details of the current interpreter that the IR must preserve: per-site charge ordering, copy-on-write charging keyed to reference counts, memory-check placement, and dead-local retention. The IR makes these first-class: a **charge schedule** per node, an explicit **sharing rule**, **safepoints**, and **slot-liveness rules**. The work is ordered so the IR pays for itself as a faster evaluator *before* any optimizer exists.
 
 ## 2. Motivation
 
-- **Execution cost that an IR removes** (from reading the code; confirm with a baseline, section 15):
+This section records the pre-migration baseline that motivated the IR.
+
+- **Execution cost that an IR removes** (from reading the code; confirmed with the baseline in section 15):
   - `Locals` is a linear scan by `BindingId`; cost grows with live bindings.
   - Captures live in `Rc<HashMap<BindingId, Value>>`; each lambda call does an `FxHashMap` lookup for its body.
   - String literals and constants go through per-use `HashMap` lookups.
@@ -50,7 +54,7 @@ sources -> parse -> resolve -> check -> lower -> [optimize] -> runtime
 
 | Crate | Role | Depends on |
 | --- | --- | --- |
-| `martite-fuel` | **Single fuel table**: static charge constants and dynamic cost functions (`sort_cost`, string bytes `div_ceil(8)`, comparison cost, ...). Every charge site in `interp.rs` and `builtins.rs` calls it. Helpers take counts, not `Value`, so the IR can use the table without the runtime | none |
+| `martite-fuel` | **Single fuel table**: static charge constants and dynamic cost functions (`sort_cost`, string bytes `div_ceil(8)`, comparison cost, ...). Every charge site in the IR evaluator calls it. Helpers take counts, not `Value`, so the IR can use the table without the runtime | none |
 | `martite-ir` | IR types, printer, verifier, lowering from `CheckedProgram` | base, fuel, syntax, check |
 | `martite-opt` | passes, pass manager (created with the first pass, section 11) | ir |
 | `martite-runtime` | executes `IrProgram` | base, fuel, ir |
@@ -61,7 +65,7 @@ Notes:
 
 - `TypeTable`/`Ty`/`TypeId` are needed by `Value`, `show`, and the embedder. Either (a) move them into a crate below `martite-check` that both depend on, or (b) lower them into an IR-owned `TypeTable` with variant and field names. The preferred option is (b): the IR stays independent of checker internals and the runtime no longer depends on `martite-check`.
 - `martite-conformance/tests/architecture.rs` gains `martite-ir` (and `martite-opt` when it exists) in `CRATES`. The bench-isolation rule applies to both.
-- The AST interpreter stays until the IR evaluator passes all differential and threshold tests (section 13), then is retired in favor of recorded snapshots.
+- The AST interpreter was retired in #116 after the IR evaluator passed all differential and threshold tests (section 13). The recorded snapshots remain the behavior oracle; tooling stays on the AST.
 
 ## 5. Design principles
 
@@ -138,7 +142,7 @@ Complete for the current language (each kind has fixed arity and child roles):
 - A node is owned by one function's arena and referenced by `IrId`.
 - It is a **tree**: each node has one parent; no shared subtrees; a pass that wants to reuse a subtree clones it.
 - Lambdas are separate `IrFn`s named `<lambda>`. A closure value is `FnId + Rc<[Value]>` captures, copied by value at creation, matching today's semantics.
-- A lambda's `source` is the defining function's source. Lowering records that now; the AST interpreter's caller-source trap behavior (#118) must be preserved by the IR evaluator until #118 lands. The temporary inconsistency is deliberate and must stay until the separate fix.
+- A lambda's `source` is the defining function's source. Lowering records that now; the pre-retirement caller-source trap behavior (#118) is preserved by the IR evaluator until #118 lands. The temporary inconsistency is deliberate and must stay until the separate fix.
 - Capture layout: `CaptureInfo.source` is either a `Slot` in the frame creating the closure or one of the creating lambda's own capture indices. The latter is how a nested lambda captures an ancestor binding without a synthetic slot: `fn(a) => fn(b) => base + a + b` gives the outer lambda a slot capture for `base`, and the inner lambda a `Capture` source for `base` plus a slot source for `a`. A lambda body always reads captured bindings with `CaptureRead`, never `SlotRead`. Captures belong only to `FnKind::Lambda`.
 
 ### 6.3 Patterns and `match`
@@ -252,7 +256,7 @@ Rules that lowering must follow, all derived from the interpreter:
 4. `while` charges `per_iter = 1` before every condition check, including the final failing one. `for` charges 1 per element, before binding.
 5. Post-charges fire after children evaluate; lowering must not hoist them.
 
-The authoritative test is differential: every fixture's exact fuel used must match the AST interpreter, and the golden `FuelRow` table in `limits.rs` must pass against the IR evaluator.
+The authoritative test is differential: every fixture's exact fuel used must match the recorded snapshot oracle, and the golden `FuelRow` table in `limits.rs` must pass against the IR evaluator.
 
 ### 8.2 Charging strategies
 
@@ -358,13 +362,13 @@ Runs after lowering and, in tests and debug builds, after each pass. Checks:
 
 ## 13. Testing strategy
 
-- **Behavior snapshots first.** Before any IR code runs, record from the current interpreter, for every conformance, e2e, host, plugin, limits, traps and bench fixture: result or trap (kind, message, source, span, trace), log, host call trace, **fuel used**, and **minimum fuel, memory and depth** at which it completes (binary search, as `limits.rs` already does for memory). Check these in. They outlive the AST interpreter.
-- **Differential, migration:** `crates/martite-conformance/tests/ir_differential.rs` enumerates every snapshot case automatically and compares the full observable record plus the IR at the AST fuel, memory and depth thresholds (and one unit below each). `LiveAst` runs both evaluators; `Snapshots` is the IR-vs-recorded-oracle mode that remains after the AST interpreter is retired.
+- **Behavior snapshots first.** Before any IR code ran, the migration recorded from the then-current interpreter, for every conformance, e2e, host, plugin, limits, traps and bench fixture: result or trap (kind, message, source, span, trace), log, host call trace, **fuel used**, and **minimum fuel, memory and depth** at which it completes (binary search, as `limits.rs` already did for memory). Those records are checked in and outlive the AST interpreter.
+- **Differential, post-migration:** `crates/martite-conformance/tests/ir_differential.rs` enumerates every snapshot case automatically and compares the full observable record plus the IR at the recorded fuel, memory and depth thresholds (and one unit below each). The `LiveAst` mode was removed with the interpreter (#116); the snapshots are the only oracle.
 - **Golden fuel table:** the existing `FuelRow` cases run against the IR evaluator unchanged, including the copy-on-write rows.
 - **Add missing cases** found in the code review: `mut`-parameter and handler-state fuel; lambda traps across modules (to pin the source-file behavior); `for` over a list the body mutates; `Try` in lambdas; compound assignment versus the written-out form; fuel exactly at the limit.
 - **Verifier tests:** hand-built invalid IR per invariant, including read-before-write, loop first-iteration reads, guard-failed arm bindings, empty capture lists and slot reuse.
 - **Optimizer differential (when passes exist):** off versus on for every fixture and the fuzz corpus; under `Preserve`, fuel, trap and all three thresholds must match exactly.
-- **Property tests:** `crates/martite-conformance/tests/ir_property.rs` generates well-typed, host-free programs from a shrinkable opcode stream, then checks, lowers twice, verifies, rejects a deliberately corrupted IR clone, and executes with AST-vs-IR limit sweeps. The checked-in seeds live in `crates/martite-conformance/fixtures/property/` so failures replay without `cargo-fuzz`. Deadline traps and programs over the wall-clock cap are skipped. The AST comparison is transitional and is removed with the AST interpreter (#116); the IR determinism, exact fuel and verifier checks remain.
+- **Property tests:** `crates/martite-conformance/tests/ir_property.rs` generates well-typed, host-free programs from a shrinkable opcode stream, then checks, lowers twice, verifies, rejects a deliberately corrupted IR clone, and executes with IR-only limit sweeps. The checked-in seeds live in `crates/martite-conformance/fixtures/property/` so failures replay without `cargo-fuzz`. Deadline traps and programs over the wall-clock cap are skipped. The AST comparison was removed with the interpreter (#116); the IR determinism, exact fuel, verifier and low memory/depth checks remain.
 - **Benchmarks:** lowering time and IR execution reported separately from parse and check; each pass lands with a benchmark delta.
 
 ## 14. Deliberate semantic changes (not part of migration)
@@ -374,7 +378,7 @@ Each is separate, edition-gated, and lands with updated goldens. **These items a
 1. **Fuel-based safepoint cadence** (8.4). Unblocks Coalesced charging.
 2. **`Take` for mutable arguments** (and handler state with a trap-safe copy). Removes the per-call container copy described in 6.4. Today's behavior is not pinned by a golden test and may be unintentional; confirm intent first.
 3. **`Kill` at scope exit** for dead locals. Today a value bound in a loop body stays live until the function returns, which can raise `OutOfMemory` for programs that logically free it.
-4. **Lambda source file** taken from the defining function, not the caller (existing bug, `interp.rs:616`). Lowering already records the defining source; the IR evaluator keeps the caller-source behavior until this change lands.
+4. **Lambda source file** taken from the defining function, not the caller (existing bug, tracked as #118). Lowering already records the defining source; the IR evaluator keeps the caller-source behavior recorded by the snapshots until this change lands.
 5. **Per-invocation literal/constant accounting** instead of per-`Runtime` (6.7).
 
 ## 15. Migration plan
@@ -383,7 +387,7 @@ Each is separate, edition-gated, and lands with updated goldens. **These items a
 1. **Fuel table extraction.** Move all charge formulas into one module; golden rows stay green. No behavior change.
 2. **Foundations:** IR types, printer, verifier in `martite-ir`.
 3. **Lowering and IR evaluator** behind a flag, **Exact** charging and the same tick cadence. Differential and threshold tests green on all fixtures.
-4. **Switch default** to the IR evaluator; runtime stops reading `NodeTable`s and drops `martite-check`; retire the AST interpreter once snapshots pass.
+4. **Switch default and retire the AST interpreter.** Done: the IR evaluator is the default and the only runtime, `martite-runtime` no longer depends on `martite-check` or the AST, and the snapshots are the behavior oracle (#115, #116).
 5. **Section 14 decisions**, one at a time, each with golden updates.
 6. **First pass**, with the pass manager built alongside it; then further passes one at a time, each with a benchmark delta and an explicit cost policy.
 7. **Optional:** bytecode lowering from the IR as a second backend, validated against the tree backend.

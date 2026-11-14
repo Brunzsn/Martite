@@ -2,12 +2,9 @@
 //!
 //! Values and the standard library use the IR-owned vocabulary in
 //! [`martite_ir`]: `FnId`, `TypeId`, `BuiltinFnId` and `BuiltinItemId`.
-//! [`IrRuntime`] executes [`martite_ir::IrProgram`] and is the default
-//! execution path.
-//!
-//! The frozen AST evaluator lives behind the temporary `ast-eval` feature for
-//! #115's `--ast` escape hatch, the conformance oracle and #116's retirement
-//! window. A default build does not depend on `martite-check`.
+//! [`IrRuntime`] executes [`martite_ir::IrProgram`] and is the only execution
+//! path. The runtime does not depend on `martite-check` or `martite-syntax`;
+//! behavior is pinned by the snapshots in `martite-conformance`.
 
 pub mod exec;
 pub mod ir_eval;
@@ -15,12 +12,7 @@ pub mod json;
 pub mod ops;
 pub mod value;
 
-#[cfg(feature = "ast-eval")]
-pub mod interp;
-
 pub use exec::{CallResult, ExecLimits, HostContext, HostFault, MainResult, Trap};
-#[cfg(feature = "ast-eval")]
-pub use interp::{HostDispatcher, Runtime};
 pub use ir_eval::{IrHostDispatcher, IrRuntime};
 pub use ops::{show, value_eq, value_ord};
 pub use value::{

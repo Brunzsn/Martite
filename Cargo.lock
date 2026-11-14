@@ -704,10 +704,8 @@ dependencies = [
  "indexmap",
  "libm",
  "martite-base",
- "martite-check",
  "martite-fuel",
  "martite-ir",
- "martite-syntax",
  "serde_json",
  "smallvec",
 ]

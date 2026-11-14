@@ -1,22 +1,19 @@
-//! Focused AST-vs-IR regression tests for the evaluator (#108, #109, #110,
-//! #111). The full-corpus gate lives in `tests/ir_differential.rs`.
+//! Focused IR evaluator regression tests.
 //!
-//! The cases here cover invariants that are not represented by a snapshot
-//! fixture: tick cadence, per-site literal accounting, trailing expression
-//! statements, value depth and host dispatch ordering.
+//! The full-corpus gate lives in `tests/ir_differential.rs` and the checked-in
+//! snapshots. The cases here cover invariants that are not represented by a
+//! snapshot fixture: host dispatch ordering, exact fuel boundaries, per-site
+//! literal accounting and copy-on-write memory behavior.
 
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
 use martite_base::Severity;
-use martite_conformance::{
-    Case, min_depth, min_depth_ir, min_fuel, min_fuel_ir, min_memory, min_memory_ir,
-};
-use martite_ir::{TypeTable, lower, verify};
+use martite_conformance::{Case, lower_case_ir, min_depth, min_fuel, min_memory};
+use martite_ir::{HostId, IrProgram, lower, verify};
 use martite_runtime::{
-    ExecLimits, HostContext, HostDispatcher, HostFault, IrHostDispatcher, IrRuntime, Runtime, Trap,
-    Value, show,
+    ExecLimits, HostContext, HostFault, IrHostDispatcher, IrRuntime, Trap, Value, show,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -44,29 +41,15 @@ fn checked(case: &Case) -> (martite_check::CheckedProgram, martite_base::SourceM
     (loaded.program.expect("checked program"), loaded.sources)
 }
 
-fn observe_ast(case: &Case, limits: ExecLimits) -> Observation {
-    let (program, _sources) = checked(case);
-    let types = TypeTable::from_checker(&program);
-    let mut runtime = Runtime::new(&program, limits);
-    let result = runtime.run_main();
-    let log = match &result {
-        Ok(main) => main.log.clone(),
-        Err(_) => runtime.take_log(),
-    };
-    let fuel = runtime.fuel_used();
-    let outcome = match result {
-        Ok(main) => Ok(show(&main.value, &types, true)),
-        Err(trap) => Err(format!("{trap:?}")),
-    };
-    Observation { outcome, log, fuel }
-}
-
-fn observe_ir(case: &Case, limits: ExecLimits) -> Observation {
+fn observe(case: &Case, limits: ExecLimits) -> Observation {
     let (program, sources) = checked(case);
     let ir = lower(&program, &sources).expect("fixture lowers");
     verify(&ir).expect("fixture verifies");
-    let types = &ir.types;
-    let mut runtime = IrRuntime::new(&ir, limits);
+    observe_ir(&ir, limits)
+}
+
+fn observe_ir(ir: &IrProgram, limits: ExecLimits) -> Observation {
+    let mut runtime = IrRuntime::new(ir, limits);
     let result = runtime.run_main();
     let log = match &result {
         Ok(main) => main.log.clone(),
@@ -74,207 +57,32 @@ fn observe_ir(case: &Case, limits: ExecLimits) -> Observation {
     };
     let fuel = runtime.fuel_used();
     let outcome = match result {
-        Ok(main) => Ok(show(&main.value, types, true)),
+        Ok(main) => Ok(show(&main.value, &ir.types, true)),
         Err(trap) => Err(format!("{trap:?}")),
     };
     Observation { outcome, log, fuel }
 }
 
-fn assert_matches(id: &str, source: &str) {
-    assert_matches_limits(id, source, ExecLimits::default());
-}
-
-fn assert_matches_limits(id: &str, source: &str, limits: ExecLimits) {
-    let case = Case::single(source);
-    let ast = observe_ast(&case, limits);
-    let ir = observe_ir(&case, limits);
-    assert_eq!(ir.outcome, ast.outcome, "{id}: outcome");
-    assert_eq!(ir.log, ast.log, "{id}: log");
-    assert_eq!(ir.fuel, ast.fuel, "{id}: fuel used");
-}
-
-#[test]
-fn core_fixtures_match_the_ast_interpreter() {
-    for (id, source) in [
-        ("hello", r#"fn main() { print("hello") }"#),
-        (
-            "arithmetic_and_interpolation",
-            r#"fn main() { print("one plus two = {1 + 2}") }"#,
-        ),
-        (
-            "let_and_if",
-            r#"
-            fn main() {
-                let x = 4
-                if x > 3 { print("big") } else { print("small") }
-            }
-            "#,
-        ),
-        (
-            "while_break_continue",
-            r#"
-            fn main() {
-                var i = 0
-                var total = 0
-                while i < 5 {
-                    i += 1
-                    if i == 2 { continue }
-                    if i == 4 { break }
-                    total += i
-                }
-                print("{total}")
-            }
-            "#,
-        ),
-        (
-            "for_list",
-            r#"
-            fn main() {
-                var total = 0
-                for x in [1, 2, 3] { total += x }
-                print("{total}")
-            }
-            "#,
-        ),
-        (
-            "for_map_str_and_ranges",
-            r#"
-            fn main() {
-                var total = 0
-                for (key, value) in {"a": 1, "b": 2} {
-                    if key == "a" { continue }
-                    total += value
-                }
-                for ch in "ab" { total += 1 }
-                for i in 0..3 { total += i }
-                for i in 1..=2 { total += i }
-                print("{total}")
-            }
-            "#,
-        ),
-        (
-            "tuples_lists_maps_ranges",
-            r#"
-            fn main() {
-                let xs = [1, 2, 3, 4]
-                let ys = xs[1..3]
-                let pair = (1, "x", true)
-                let table = {"a": 1, "b": 2}
-                let span = 1..4
-                let a = table["a"]
-                print("{ys}:{pair.1}:{a}:{span}")
-            }
-            "#,
-        ),
-        (
-            "structs_and_nested_assignment",
-            r#"
-            struct Box { xs: list[int] }
-            struct Point { xs: Box, y: int }
-            fn main() {
-                var point = Point { xs: Box { xs: [1, 2] }, y: 3 }
-                let keep = point
-                point.xs.xs[0] = 9
-                point.y = 7
-                print("{keep.xs.xs[0]}:{point.xs.xs[0]}:{point.y}")
-            }
-            "#,
-        ),
-        (
-            "struct_update",
-            r#"
-            struct Point { x: int, y: int }
-            fn main() {
-                let base = Point { x: 1, y: 2 }
-                let updated = Point { ..base, y: 9 }
-                print("{updated}")
-            }
-            "#,
-        ),
-        (
-            "enum_variants",
-            r#"
-            enum Shape { Circle(float), Empty }
-            fn main() {
-                let circle = Shape.Circle(2.5)
-                let empty = Shape.Empty
-                print("{circle}:{empty}")
-            }
-            "#,
-        ),
-        (
-            "prelude_and_coalesce",
-            r#"
-            fn main() {
-                let some: int? = Some(1)
-                let none: int? = None
-                print("{some ?? 2}:{none ?? 3}")
-            }
-            "#,
-        ),
-        (
-            "try_success",
-            r#"
-            fn main() -> Result[(), str] {
-                let result: Result[int, str] = Ok(3)
-                let value: int = result?
-                print("{value + 1}")
-                Ok(())
-            }
-            "#,
-        ),
-        (
-            "try_error",
-            r#"
-            fn main() -> Result[(), str] {
-                let result: Result[int, str] = Err("bad")
-                let value: int = result?
-                print("{value}")
-                Ok(())
-            }
-            "#,
-        ),
-        (
-            "conversions",
-            r#"
-            fn main() {
-                print("{int(2.9)}:{float(2)}:{str(true)}")
-            }
-            "#,
-        ),
-        (
-            "constants_and_repeated_literal",
-            r#"
-            const BASE: int = 7
-            fn main() {
-                var i = 0
-                var text = ""
-                while i < 3 {
-                    let literal = "abcd"
-                    text = text + literal
-                    i += 1
-                }
-                print("{BASE + 1}:{text}")
-            }
-            "#,
-        ),
-    ] {
-        assert_matches(id, source);
+fn limits(fuel: u64, depth: u32) -> ExecLimits {
+    ExecLimits {
+        fuel,
+        memory: 8 << 20,
+        depth,
+        deadline: None,
     }
 }
 
 #[test]
-fn zero_payload_variant_value_keeps_the_ast_tick_cadence() {
-    // The value form takes no charge; the constructor form takes a zero-unit
-    // slot charge. Sweep enough loop iterations to cross the 1024-tick
-    // deadline check, where a one-tick difference becomes observable.
+fn zero_payload_variant_value_keeps_the_tick_cadence() {
+    // Sweep enough loop iterations to cross the 1024-tick deadline check.
+    let mut first_deadline = None;
     for iterations in 0..=260 {
         let source = format!(
             "enum Shape {{ Empty }}\nfn main() {{\n    var i = 0\n    while i < {iterations} {{ i += 1 }}\n    let _ = Shape.Empty\n    let _ = Shape.Empty()\n}}"
         );
-        assert_matches_limits(
-            &format!("zero_payload_variant/{iterations}"),
-            &source,
+        let case = Case::single(source);
+        let observation = observe(
+            &case,
             ExecLimits {
                 fuel: 1_000_000,
                 memory: 8 << 20,
@@ -282,7 +90,12 @@ fn zero_payload_variant_value_keeps_the_ast_tick_cadence() {
                 deadline: Some(Duration::ZERO),
             },
         );
+        let deadline = matches!(&observation.outcome, Err(message) if message.contains("Deadline"));
+        if deadline {
+            first_deadline.get_or_insert(iterations);
+        }
     }
+    assert_eq!(first_deadline, Some(170), "deadline boundary changed");
 }
 
 #[test]
@@ -291,9 +104,9 @@ fn identical_static_literals_at_distinct_nodes_account_separately() {
         "fn main() {\n    let a = \"abcd\"\n    let b = \"abcd\"\n    let _ = (a, b)\n}",
     );
     assert_eq!(
-        min_memory_ir(&case),
         min_memory(&case),
-        "each literal site has its own first-use cache"
+        40,
+        "each literal site must have its own first-use cache"
     );
 }
 
@@ -302,14 +115,14 @@ fn trailing_expression_statement_skips_its_memory_check() {
     let case =
         Case::single("fn main() {\n    var xs = [1, 2, 3]\n    let keep = xs\n    xs.push(4)\n}");
     assert_eq!(
-        min_memory_ir(&case),
         min_memory(&case),
-        "the AST skips the memory check after a block's trailing expression statement"
+        40,
+        "the evaluator must skip the memory check after a block's trailing expression statement"
     );
 }
 
 #[test]
-fn value_depth_checks_match_the_ast_interpreter() {
+fn value_depth_checks_match_the_snapshot_oracle() {
     let build = r#"
         enum Nested { Leaf, Next(Nested) }
         fn build(n: int) -> Nested {
@@ -322,18 +135,27 @@ fn value_depth_checks_match_the_ast_interpreter() {
             value
         }
     "#;
-    for source in [
-        format!("{build}\nfn main() {{ print(\"{{build(129)}}\") }}"),
-        format!("{build}\nfn main() {{ var xs: list[Nested] = []\n    xs.push(build(127))\n}}"),
-        format!(
-            "{build}\nfn main() {{ var xs: list[Nested] = []\n    xs.push(build(126))\n    xs.insert(1, build(126))\n}}"
+    for (source, expected) in [
+        (
+            format!("{build}\nfn main() {{ print(\"{{build(129)}}\") }}"),
+            Err("DepthExceeded".into()),
+        ),
+        (
+            format!("{build}\nfn main() {{ var xs: list[Nested] = []\n    xs.push(build(127))\n}}"),
+            Err("DepthExceeded".into()),
+        ),
+        (
+            format!(
+                "{build}\nfn main() {{ var xs: list[Nested] = []\n    xs.push(build(126))\n    xs.insert(1, build(126))\n}}"
+            ),
+            Ok("()".into()),
         ),
     ] {
-        let case = Case::single(&source);
-        let ast = observe_ast(&case, ExecLimits::default());
-        let ir = observe_ir(&case, ExecLimits::default());
-        assert_eq!(ir.outcome, ast.outcome);
-        assert_eq!(ir.fuel, ast.fuel);
+        let observation = observe(&Case::single(&source), ExecLimits::default());
+        assert_eq!(
+            observation.outcome, expected,
+            "value-depth boundary changed"
+        );
     }
 }
 
@@ -342,11 +164,11 @@ fn closure_call_depth_through_builtins_matches() {
     let case = Case::single(
         "fn main() {\n    let xs = [1, 2, 3]\n    let ys = xs.map(fn(x) => x + 1)\n    print(\"{ys}\")\n}",
     );
-    assert_eq!(min_depth_ir(&case), min_depth(&case));
+    assert_eq!(min_depth(&case), 2);
 }
 
 #[test]
-fn fuel_limit_edge_matches_the_ast_interpreter() {
+fn fuel_limit_edges_are_exact() {
     for source in [
         "fn main() {}",
         "fn main() { let x = 1 }",
@@ -355,124 +177,48 @@ fn fuel_limit_edge_matches_the_ast_interpreter() {
     ] {
         let case = Case::single(source);
         let fuel = min_fuel(&case);
-        assert_eq!(min_fuel_ir(&case), fuel);
-        for limit in [fuel.saturating_sub(1), fuel] {
-            let limits = ExecLimits {
-                fuel: limit,
+        let at = observe(
+            &case,
+            ExecLimits {
+                fuel,
                 memory: 8 << 20,
                 depth: 200,
                 deadline: None,
-            };
-            let ast = observe_ast(&case, limits);
-            let ir = observe_ir(&case, limits);
-            assert_eq!(ir.outcome, ast.outcome, "fuel {limit}: outcome");
-            assert_eq!(ir.fuel, ast.fuel, "fuel {limit}: fuel used");
+            },
+        );
+        assert!(
+            at.outcome.is_ok(),
+            "{source:?} must complete at fuel {fuel}: {at:?}"
+        );
+        if fuel > 1 {
+            let below = observe(
+                &case,
+                ExecLimits {
+                    fuel: fuel - 1,
+                    memory: 8 << 20,
+                    depth: 200,
+                    deadline: None,
+                },
+            );
+            assert!(
+                matches!(&below.outcome, Err(message) if message.contains("OutOfFuel")),
+                "{source:?} must trap OutOfFuel at fuel {}: {below:?}",
+                fuel - 1
+            );
         }
     }
 }
 
 #[test]
-fn compound_and_written_out_assignment_match_their_ast_costs() {
-    for source in [
-        "fn main() { var value = 1\nvalue += 2 }",
+fn compound_assignment_costs_less_than_the_written_out_form() {
+    let compound = min_fuel(&Case::single("fn main() { var value = 1\nvalue += 2 }"));
+    let written = min_fuel(&Case::single(
         "fn main() { var value = 1\nvalue = value + 2 }",
-    ] {
-        let case = Case::single(source);
-        assert_eq!(min_fuel_ir(&case), min_fuel(&case));
-    }
-}
-
-#[test]
-fn match_patterns_and_guards_match_the_ast_interpreter() {
-    for (id, source) in [
-        (
-            "enum_or_patterns",
-            r#"
-            enum Shape { Pair(int, int), Single(int), Empty }
-            fn main() {
-                let value = Shape.Pair(2, 3)
-                match value {
-                    Pair(x, 1) | Pair(x, 2) => print("early {x}"),
-                    Pair(x, y) => print("pair {x}:{y}"),
-                    Single(x) => print("single {x}"),
-                    Empty => print("empty"),
-                }
-                match Shape.Pair(2, 2) {
-                    Pair(x, 1) | Pair(x, 2) => print("or {x}"),
-                    _ => print("other"),
-                }
-            }
-            "#,
-        ),
-        (
-            "nested_prelude_and_failed_guard",
-            r#"
-            fn main() {
-                let nested: (int?, int) = (Some(4), 5)
-                match nested {
-                    (Some(x), y) if x > 10 => print("big {x}:{y}"),
-                    (Some(x), y) => print("nested {x}:{y}"),
-                    (None, _) => print("none"),
-                }
-            }
-            "#,
-        ),
-        (
-            "struct_patterns",
-            r#"
-            struct Point { x: int, y: int }
-            fn main() {
-                let point = Point { x: 1, y: 2 }
-                match point {
-                    Point { x, y } => print("{x}:{y}"),
-                }
-            }
-            "#,
-        ),
-        (
-            "literal_patterns_and_wildcards",
-            r#"
-            fn main() {
-                match "b" {
-                    "a" => print("a"),
-                    "b" => print("b"),
-                    _ => print("other"),
-                }
-                match true {
-                    true => print("yes"),
-                    false => print("no"),
-                }
-                match 3 {
-                    1 | 2 => print("small"),
-                    n if n > 2 => print("big {n}"),
-                    _ => print("other"),
-                }
-                let none: int? = None
-                match none {
-                    None => print("none"),
-                    Some(value) => print("{value}"),
-                }
-            }
-            "#,
-        ),
-        (
-            "match_block_arms",
-            r#"
-            fn main() {
-                match 1 {
-                    1 => { print("one") },
-                    _ => {},
-                }
-                match 2 {
-                    value if value > 1 => { print("{value}") },
-                    _ => {},
-                }
-            }
-            "#,
-        ),
-    ] {
-        assert_matches(id, source);
-    }
+    ));
+    assert!(
+        compound < written,
+        "compound assignment {compound} must cost less than the written-out form {written}"
+    );
 }
 
 #[test]
@@ -492,15 +238,12 @@ fn failed_guards_restore_the_previous_binding_for_copy_on_write() {
         }
         "#,
     );
-    let limits = ExecLimits::default();
-    let ast = observe_ast(&case, limits);
-    let ir = observe_ir(&case, limits);
-    assert_eq!(ir.outcome, ast.outcome, "outcome");
-    assert_eq!(ir.log, ast.log, "log");
-    assert_eq!(ir.fuel, ast.fuel, "fuel used");
+    let observation = observe(&case, ExecLimits::default());
+    assert_eq!(observation.outcome, Ok("()".into()));
+    assert_eq!(observation.log, ["1", "9"]);
     assert_eq!(
-        min_memory_ir(&case),
         min_memory(&case),
+        80,
         "a failed guard must restore the previous binding, not clear the slot"
     );
 }
@@ -513,289 +256,14 @@ fn failed_guard_bindings_do_not_leak_a_reference_in_ir() {
     let with_failed_guard = Case::single(
         "fn main() {\n    var items = [1, 2, 3]\n    match Some(items) {\n        Some(bound) if false => print(\"{bound.len()}\"),\n        _ => {}\n    }\n    items.push(4)\n    print(\"{items.len()}\")\n}",
     );
-    let limits = ExecLimits::default();
-    let ast = observe_ast(&with_failed_guard, limits);
-    let ir = observe_ir(&with_failed_guard, limits);
-    assert_eq!(ir.outcome, ast.outcome, "outcome");
-    assert_eq!(ir.log, ast.log, "log");
-    assert_eq!(ir.fuel, ast.fuel, "fuel used");
+    let observation = observe(&with_failed_guard, ExecLimits::default());
+    assert_eq!(observation.outcome, Ok("()".into()));
+    assert_eq!(observation.log, ["4"]);
     assert_eq!(
-        min_memory_ir(&with_failed_guard),
         min_memory(&with_failed_guard),
-        "IR must match the AST failed-guard memory oracle"
-    );
-    assert_eq!(
-        min_memory_ir(&with_failed_guard),
-        min_memory_ir(&baseline),
+        min_memory(&baseline),
         "a failed guard must not keep its binding slot live into later copy-on-write"
     );
-}
-
-#[test]
-fn panic_and_assert_traps_match_the_ast_interpreter() {
-    for (id, source) in [
-        ("panic", r#"fn main() { panic("boom") }"#),
-        ("assert", r#"fn main() { assert(false, "boom") }"#),
-        (
-            "integer_overflow",
-            r#"fn main() { let big = 9223372036854775807
-print("{big + 1}") }"#,
-        ),
-        ("division_by_zero", r#"fn main() { let value = 1 / 0 }"#),
-        (
-            "list_index_out_of_bounds",
-            r#"fn main() { let xs = [1, 2]
-let value = xs[5] }"#,
-        ),
-        (
-            "string_slice_out_of_bounds",
-            r#"fn main() { let text = "abc"
-let part = text[1..9] }"#,
-        ),
-    ] {
-        assert_matches(id, source);
-    }
-}
-
-#[test]
-fn call_dispatch_and_try_match_the_ast_interpreter() {
-    for (id, source) in [
-        (
-            "try_across_calls",
-            r#"
-            fn ok(x: int) -> Result[int, str] { Ok(x) }
-            fn fail() -> Result[int, str] { Err("bad") }
-            fn chain() -> Result[int, str] {
-                let a = ok(1)?
-                let b = ok(2)?
-                Ok(a + b)
-            }
-            fn chain_err() -> Result[int, str] {
-                let a = ok(1)?
-                let b = fail()?
-                Ok(a + b)
-            }
-            fn main() {
-                print("{chain()}")
-                print("{chain_err()}")
-            }
-            "#,
-        ),
-        (
-            "call_values",
-            r#"
-            use std.math.sin
-
-            fn double(x: int) -> int { x * 2 }
-
-            fn main() {
-                let function = double
-                print("{function(3)}")
-                let sine = sin
-                print("{sine(0.0)}")
-                let check = assert
-                check(true, "ok")
-            }
-            "#,
-        ),
-        (
-            "panic_builtin_value",
-            r#"
-            fn main() {
-                let fail = panic
-                fail("boom")
-            }
-            "#,
-        ),
-        (
-            "json_and_try_across_calls",
-            r#"
-            use std.json
-
-            fn main() -> Result[(), str] {
-                let value = json.parse("[1, 2, 3]")?
-                print(json.stringify(value))
-                print("12".parse_int())
-                print("12.5".parse_float())
-                Ok(())
-            }
-            "#,
-        ),
-        (
-            "builtin_list_methods",
-            r#"
-            fn inc(x: int) -> int { x + 1 }
-            fn even(x: int) -> bool { x % 2 == 0 }
-            fn add(acc: int, x: int) -> int { acc + x }
-            fn negate(x: int) -> int { -x }
-
-            fn main() {
-                var xs = [3, 1, 2]
-                xs.push(4)
-                xs.insert(1, 9)
-                let popped = xs.pop()
-                let first = xs.first()
-                let last = xs.last()
-                let removed = xs.remove_at(0)
-                xs.sort()
-                let got = xs.get(0)
-                let mapped = xs.map(inc)
-                let filtered = mapped.filter(even)
-                let folded = filtered.fold(0, add)
-                let any = xs.any(even)
-                let all = xs.all(even)
-                let enumerated = xs.enumerate()
-                let reversed = xs.reversed()
-                let sorted = xs.sorted_by(negate)
-                let joined = ["a", "b"].join("-")
-                let contains = xs.contains(4)
-                xs.extend([5, 6])
-                let length = xs.len()
-                xs.clear()
-                print("{got}:{popped}:{first}:{last}:{removed}:{mapped}:{filtered}:{folded}")
-                print("{any}:{all}:{enumerated}:{reversed}:{sorted}")
-                print("{joined}:{contains}:{length}:{xs.len()}")
-            }
-            "#,
-        ),
-        (
-            "builtin_map_methods",
-            r#"
-            fn main() {
-                var table = {"a": 1, "b": 2}
-                let got = table.get("a")
-                let has = table.has("b")
-                let keys = table.keys()
-                let values = table.values()
-                let entries = table.entries()
-                let removed = table.remove("a")
-                let length = table.len()
-                table.clear()
-                print("{got}:{has}:{keys}:{values}:{entries}:{removed}:{length}:{table.len()}")
-            }
-            "#,
-        ),
-        (
-            "builtin_str_methods",
-            r#"
-            fn main() {
-                let text = "  a,b  "
-                let chars = text.chars()
-                let parts = text.split(",")
-                let trimmed = text.trim()
-                let contains = text.contains("a")
-                let found = text.find("a")
-                let starts = text.starts_with(" ")
-                let ends = text.ends_with(" ")
-                let replaced = text.replace("a", "A")
-                let upper = text.to_upper()
-                let lower = text.to_lower()
-                let integer = trimmed.parse_int()
-                let decimal_trimmed = trimmed.parse_float()
-                let small = "12".parse_int()
-                let decimal = "12.5".parse_float()
-                print("{text.len()}:{chars}:{parts}")
-                print("{trimmed}:{contains}:{found}:{starts}:{ends}")
-                print("{replaced}:{upper}:{lower}")
-                print("{integer}:{decimal_trimmed}:{small}:{decimal}")
-            }
-            "#,
-        ),
-        (
-            "builtin_scalar_and_range_methods",
-            r#"
-            fn main() {
-                let negative = -3
-                let base = 2
-                let negative_float = -4.5
-                let four = 4.0
-                let fraction = 4.9
-                let two = 2.0
-                let rounded = 1.55
-                let zero = 0.0
-                let one = 1.0
-                let numbers = 1..3
-                let inclusive_numbers = 1..=3
-                print("{negative.abs()}:{base.pow(3)}")
-                print("{negative_float.abs()}:{four.floor()}:{four.ceil()}:{fraction.trunc()}")
-                print("{four.sqrt()}:{two.pow(3.0)}:{rounded.round(1)}")
-                print("{zero.is_nan()}:{one.is_finite()}")
-                print("{numbers.len()}:{numbers.contains(2)}:{inclusive_numbers.to_list()}")
-            }
-            "#,
-        ),
-        (
-            "builtin_option_result_methods",
-            r#"
-            fn inc(x: int) -> int { x + 1 }
-            fn maybe(x: int) -> int? { Some(x + 1) }
-            fn checked(x: int) -> Result[int, str] {
-                if x > 0 { Ok(x) } else { Err("negative") }
-            }
-            fn shout(x: str) -> str { x.to_upper() }
-
-            fn main() {
-                let some: int? = Some(3)
-                let none: int? = None
-                let ok_or_some = some.ok_or("missing")
-                let ok_or_none = none.ok_or("missing")
-                let expect_some = some.expect("some")
-                print("{some.is_some()}:{none.is_none()}")
-                print("{some.map(inc)}:{some.and_then(maybe)}:{some.unwrap_or(0)}:{none.unwrap_or(7)}")
-                print("{ok_or_some}:{ok_or_none}:{expect_some}")
-
-                let ok: Result[int, str] = Ok(3)
-                let err: Result[int, str] = Err("bad")
-                let expect_ok = ok.expect("ok")
-                print("{ok.is_ok()}:{err.is_err()}")
-                print("{ok.map(inc)}:{err.map(inc)}:{err.map_err(shout)}")
-                print("{ok.and_then(checked)}:{err.and_then(checked)}")
-                print("{ok.unwrap_or(0)}:{err.unwrap_or(7)}:{ok.ok()}:{err.ok()}:{expect_ok}")
-            }
-            "#,
-        ),
-        (
-            "mut_writeback_places",
-            r#"
-            struct Box { value: int }
-
-            impl Box {
-                fn bump(mut self, amount: int) { self.value += amount }
-                fn swap(mut self, mut other: int) {
-                    let temp = self.value
-                    self.value = other
-                    other = temp
-                }
-            }
-
-            fn add_one(mut value: int) { value += 1 }
-
-            fn main() {
-                var box = Box { value: 1 }
-                let keep = box
-                box.bump(2)
-                print("{keep.value}:{box.value}")
-                var other = 9
-                box.swap(mut other)
-                print("{box.value}:{other}")
-                add_one(mut box.value)
-                print("{box.value}")
-
-                var numbers = [3, 1]
-                let numbers_keep = numbers
-                numbers.sort()
-                numbers.push(2)
-                print("{numbers_keep}:{numbers}")
-
-                var table = {"a": [3, 1]}
-                table["a"].sort()
-                print("{table}")
-            }
-            "#,
-        ),
-    ] {
-        assert_matches(id, source);
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -843,21 +311,10 @@ impl TestHost {
     }
 }
 
-impl HostDispatcher for TestHost {
-    fn call(
-        &mut self,
-        _def: martite_check::DefId,
-        _args: &[Value],
-        cx: &mut HostContext,
-    ) -> Result<Value, HostFault> {
-        self.dispatch(cx)
-    }
-}
-
 impl IrHostDispatcher for TestHost {
     fn call(
         &mut self,
-        _host: martite_ir::HostId,
+        _host: HostId,
         _args: &[Value],
         cx: &mut HostContext,
     ) -> Result<Value, HostFault> {
@@ -865,17 +322,8 @@ impl IrHostDispatcher for TestHost {
     }
 }
 
-fn lowered(
-    case: &Case,
-) -> (
-    martite_check::CheckedProgram,
-    martite_base::SourceMap,
-    martite_ir::IrProgram,
-) {
-    let (program, sources) = checked(case);
-    let ir = lower(&program, &sources).expect("fixture lowers");
-    verify(&ir).expect("fixture verifies");
-    (program, sources, ir)
+fn lowered(case: &Case) -> IrProgram {
+    lower_case_ir(case)
 }
 
 fn host_case() -> Case {
@@ -884,94 +332,55 @@ fn host_case() -> Case {
         .grant("app.api")
 }
 
-fn limits(fuel: u64, depth: u32) -> ExecLimits {
-    ExecLimits {
-        fuel,
-        memory: 8 << 20,
-        depth,
-        deadline: None,
-    }
-}
-
 #[test]
 fn host_fuel_is_charged_after_the_call() {
     let case = host_case();
-    let (program, _sources, ir) = lowered(&case);
+    let ir = lowered(&case);
 
     for (fuel, completes) in [(7, false), (8, true)] {
-        let (mut ast_host, ast_calls) = TestHost::new(5, HostOutcome::Unit);
-        let mut ast = Runtime::with_host(&program, limits(fuel, 200), &mut ast_host);
-        let ast_result = ast.run_main();
-        assert_eq!(ast_calls.get(), 1, "AST host ran before the fuel trap");
-        assert_eq!(ast_result.is_ok(), completes, "AST result at fuel {fuel}");
-
-        let (mut ir_host, ir_calls) = TestHost::new(5, HostOutcome::Unit);
-        let mut ir_runtime = IrRuntime::with_host(&ir, limits(fuel, 200), &mut ir_host);
-        let ir_result = ir_runtime.run_main();
-        assert_eq!(ir_calls.get(), 1, "IR host ran before the fuel trap");
-        assert_eq!(ir_result.is_ok(), completes, "IR result at fuel {fuel}");
-        assert_eq!(
-            format!("{ast_result:?}"),
-            format!("{ir_result:?}"),
-            "host fuel trap at {fuel}"
-        );
-        assert_eq!(ast.fuel_used(), ir_runtime.fuel_used());
+        let (mut host, calls) = TestHost::new(5, HostOutcome::Unit);
+        let mut runtime = IrRuntime::with_host(&ir, limits(fuel, 200), &mut host);
+        let result = runtime.run_main();
+        assert_eq!(calls.get(), 1, "host ran before the fuel trap");
+        assert_eq!(result.is_ok(), completes, "result at fuel {fuel}");
     }
 }
 
 #[test]
 fn host_depth_is_checked_before_dispatch() {
     let case = host_case();
-    let (program, _sources, ir) = lowered(&case);
+    let ir = lowered(&case);
 
     for (depth, calls, completes) in [(1, 0, false), (2, 1, true)] {
-        let (mut ast_host, ast_calls) = TestHost::new(0, HostOutcome::Unit);
-        let mut ast = Runtime::with_host(&program, limits(100, depth), &mut ast_host);
-        let ast_result = ast.run_main();
-        assert_eq!(ast_calls.get(), calls, "AST host calls at depth {depth}");
-        assert_eq!(ast_result.is_ok(), completes, "AST result at depth {depth}");
-
-        let (mut ir_host, ir_calls) = TestHost::new(0, HostOutcome::Unit);
-        let mut ir_runtime = IrRuntime::with_host(&ir, limits(100, depth), &mut ir_host);
-        let ir_result = ir_runtime.run_main();
-        assert_eq!(ir_calls.get(), calls, "IR host calls at depth {depth}");
-        assert_eq!(ir_result.is_ok(), completes, "IR result at depth {depth}");
-        assert_eq!(
-            format!("{ast_result:?}"),
-            format!("{ir_result:?}"),
-            "host depth trap at {depth}"
-        );
+        let (mut host, call_count) = TestHost::new(0, HostOutcome::Unit);
+        let mut runtime = IrRuntime::with_host(&ir, limits(100, depth), &mut host);
+        let result = runtime.run_main();
+        assert_eq!(call_count.get(), calls, "host calls at depth {depth}");
+        assert_eq!(result.is_ok(), completes, "result at depth {depth}");
     }
 }
 
 #[test]
-fn host_faults_and_missing_dispatchers_match() {
+fn host_faults_and_missing_dispatchers_are_reported() {
     let case = host_case();
-    let (program, _sources, ir) = lowered(&case);
+    let ir = lowered(&case);
 
-    let (mut ast_host, _) = TestHost::new(0, HostOutcome::Fault);
-    let ast = Runtime::with_host(&program, limits(100, 200), &mut ast_host).run_main();
-    let (mut ir_host, _) = TestHost::new(0, HostOutcome::Fault);
-    let ir_result = IrRuntime::with_host(&ir, limits(100, 200), &mut ir_host).run_main();
-    match (ast, ir_result) {
-        (Err(Trap::HostFault(left)), Err(Trap::HostFault(right))) => {
-            assert_eq!(left, right);
-            assert_eq!(left, "host failed");
-        }
-        (left, right) => panic!("expected host faults, got {left:?} and {right:?}"),
+    let (mut host, _) = TestHost::new(0, HostOutcome::Fault);
+    let result = IrRuntime::with_host(&ir, limits(100, 200), &mut host).run_main();
+    match result {
+        Err(Trap::HostFault(message)) => assert_eq!(message, "host failed"),
+        other => panic!("expected a host fault, got {other:?}"),
     }
 
-    let ast = Runtime::new(&program, limits(100, 200)).run_main();
-    let ir_result = IrRuntime::new(&ir, limits(100, 200)).run_main();
-    assert_eq!(format!("{ast:?}"), format!("{ir_result:?}"));
+    let result = IrRuntime::new(&ir, limits(100, 200)).run_main();
     assert!(matches!(
-        ir_result,
+        result,
         Err(Trap::Panic { ref message, .. }) if message == "no test double"
     ));
 }
 
 #[test]
-fn opaque_handle_return_types_match() {
+fn opaque_handle_return_types_are_enforced() {
     let interface = "struct Doc\nfn good() -> Result[Doc, str]\nfn bad() -> Result[str, Doc]\n";
     for (function, succeeds) in [("good", true), ("bad", false)] {
         let case = Case::single(format!(
@@ -979,67 +388,29 @@ fn opaque_handle_return_types_match() {
         ))
         .interface("app.api", interface)
         .grant("app.api");
-        let (program, _sources, ir) = lowered(&case);
+        let ir = lowered(&case);
 
-        let (mut ast_host, _) = TestHost::new(0, HostOutcome::HandleResult);
-        let ast = Runtime::with_host(&program, limits(100, 200), &mut ast_host).run_main();
-        let (mut ir_host, _) = TestHost::new(0, HostOutcome::HandleResult);
-        let ir_result = IrRuntime::with_host(&ir, limits(100, 200), &mut ir_host).run_main();
-
-        assert_eq!(ast.is_ok(), succeeds, "AST handle result for {function}");
-        assert_eq!(
-            ir_result.is_ok(),
-            succeeds,
-            "IR handle result for {function}"
-        );
-        match (ast, ir_result) {
-            (Ok(ast), Ok(ir_result)) => assert_eq!(
-                show(&ast.value, &TypeTable::from_checker(&program), true),
-                show(&ir_result.value, &ir.types, true)
-            ),
-            (Err(ast), Err(ir_result)) => assert_eq!(format!("{ast:?}"), format!("{ir_result:?}")),
-            (ast, ir_result) => {
-                panic!("handle results differ for {function}: {ast:?} and {ir_result:?}")
-            }
-        }
+        let (mut host, _) = TestHost::new(0, HostOutcome::HandleResult);
+        let result = IrRuntime::with_host(&ir, limits(100, 200), &mut host).run_main();
+        assert_eq!(result.is_ok(), succeeds, "handle result for {function}");
     }
 }
 
 #[test]
 fn invoke_returns_mutable_parameters_in_declaration_order() {
     let case = Case::single("fn bump(mut x: int) -> int { x += 1\nx }");
-    let (program, _sources, ir) = lowered(&case);
-    let ast_def = program
-        .functions
-        .iter()
-        .enumerate()
-        .find_map(|(index, sig)| {
-            sig.as_ref()
-                .filter(|sig| sig.name == "bump")
-                .map(|_| martite_check::DefId(index as u32))
-        })
-        .expect("bump definition");
-    let ir_fn = ir
+    let ir = lowered(&case);
+    let function = ir
         .fns
         .iter()
         .find(|function| function.name.as_ref() == "bump")
         .expect("bump IR function")
         .id;
 
-    let ast = Runtime::new(&program, limits(100, 200))
-        .invoke(ast_def, vec![Value::Int(1)])
-        .expect("AST bump");
-    let ir_result = IrRuntime::new(&ir, limits(100, 200))
-        .invoke(ir_fn, vec![Value::Int(1)])
-        .expect("IR bump");
-    let ast_types = TypeTable::from_checker(&program);
-    assert_eq!(show(&ast.value, &ast_types, true), "2");
-    assert_eq!(show(&ir_result.value, &ir.types, true), "2");
-    assert_eq!(ast.params.len(), 1);
-    assert_eq!(ir_result.params.len(), 1);
-    assert_eq!(
-        show(&ast.params[0], &ast_types, true),
-        show(&ir_result.params[0], &ir.types, true)
-    );
-    assert_eq!(show(&ir_result.params[0], &ir.types, true), "2");
+    let result = IrRuntime::new(&ir, limits(100, 200))
+        .invoke(function, vec![Value::Int(1)])
+        .expect("bump");
+    assert_eq!(show(&result.value, &ir.types, true), "2");
+    assert_eq!(result.params.len(), 1);
+    assert_eq!(show(&result.params[0], &ir.types, true), "2");
 }

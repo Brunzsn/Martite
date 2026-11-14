@@ -1,8 +1,9 @@
-//! Deterministic behavior snapshots for the AST interpreter.
+//! Deterministic behavior snapshots for the runtime.
 //!
-//! Snapshots are the regression oracle for the IR migration. They record the
-//! observable result, trap, log, host calls, fuel and the minimum fuel,
-//! memory and depth budgets at which the AST interpreter produces that result.
+//! Snapshots are the permanent regression oracle for the IR evaluator. The
+//! checked-in v1 records were captured from the now-retired AST interpreter
+//! during the migration; they pin the observable result, trap, log, host
+//! calls, fuel and the minimum fuel, memory and depth budgets.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -10,14 +11,12 @@ use std::rc::Rc;
 
 use martite::{Engine, HostSignature, Plugin};
 use martite_base::{MemoryProvider, SourceId, SourceMap, Span};
-use martite_check::{CheckedProgram, DefId};
+use martite_check::CheckedProgram;
 use martite_config::parse_manifest;
 use martite_ir::{HostId, IrProgram, TypeTable, lower, verify};
 use martite_runtime::{
-    ExecLimits, HostContext, HostDispatcher, HostFault, IrHostDispatcher, IrRuntime, Runtime, Trap,
-    Value,
+    ExecLimits, HostContext, HostFault, IrHostDispatcher, IrRuntime, Trap, Value,
 };
-use martite_syntax::Item;
 use serde::{Deserialize, Serialize};
 
 use crate::{Case, ProbeCaps};
@@ -143,11 +142,13 @@ pub struct HostSet {
     trace: Rc<RefCell<Vec<RawHostCall>>>,
 }
 
+type HostFunction = dyn Fn(&mut HostContext, &[Value]) -> Result<Value, HostFault>;
+
 #[derive(Clone)]
 struct HostFn {
     name: String,
     signature: HostSignature,
-    function: Rc<dyn Fn(&mut HostContext, &[Value]) -> Result<Value, HostFault>>,
+    function: Rc<HostFunction>,
 }
 
 struct RawHostCall {
@@ -231,11 +232,11 @@ impl HostSet {
             .collect()
     }
 
-    /// IR-side dispatcher for the lowered program.
+    /// Dispatcher for the lowered program.
     ///
     /// Registered host names are qualified (`module.function`); the IR host
     /// table carries the module and function name separately.
-    fn ir_dispatcher(&self, program: &IrProgram) -> IrRecordingDispatcher<'_> {
+    fn dispatcher(&self, program: &IrProgram) -> RecordingDispatcher<'_> {
         let mut by_name = HashMap::new();
         for host in &self.fns {
             by_name.insert(host.name.as_str(), host);
@@ -248,36 +249,6 @@ impl HostSet {
                 by_name.get(name.as_str()).copied()
             })
             .collect();
-        IrRecordingDispatcher {
-            fns,
-            trace: self.trace.clone(),
-        }
-    }
-
-    fn dispatcher(&self, program: &CheckedProgram) -> RecordingDispatcher {
-        let mut by_name = HashMap::new();
-        for module in &program.resolved.modules {
-            if !module.is_interface {
-                continue;
-            }
-            for item in &module.ast.items {
-                if let Item::Fn(function) = item {
-                    if let Some(def) = program.resolved.node_to_def.get(&function.id) {
-                        by_name.insert(format!("{}.{}", module.path, function.name), *def);
-                    }
-                }
-            }
-        }
-        let mut fns = HashMap::new();
-        for host in &self.fns {
-            let Some(def) = by_name.get(&host.name).copied() else {
-                panic!(
-                    "host function `{}` is not present in the program",
-                    host.name
-                );
-            };
-            fns.insert(def, (host.name.clone(), host.function.clone()));
-        }
         RecordingDispatcher {
             fns,
             trace: self.trace.clone(),
@@ -285,53 +256,15 @@ impl HostSet {
     }
 }
 
-struct RecordingDispatcher {
-    fns: HashMap<
-        DefId,
-        (
-            String,
-            Rc<dyn Fn(&mut HostContext, &[Value]) -> Result<Value, HostFault>>,
-        ),
-    >,
-    trace: Rc<RefCell<Vec<RawHostCall>>>,
-}
-
-impl HostDispatcher for RecordingDispatcher {
-    fn call(
-        &mut self,
-        def: DefId,
-        args: &[Value],
-        cx: &mut HostContext,
-    ) -> Result<Value, HostFault> {
-        let Some((name, function)) = self.fns.get(&def) else {
-            return Err(HostFault::new("host function is not registered"));
-        };
-        let index = {
-            let mut trace = self.trace.borrow_mut();
-            trace.push(RawHostCall {
-                name: name.clone(),
-                args: args.to_vec(),
-                charged: 0,
-            });
-            trace.len() - 1
-        };
-        let result = function(cx, args);
-        if let Some(call) = self.trace.borrow_mut().get_mut(index) {
-            call.charged = cx.charged;
-        }
-        result
-    }
-}
-
-/// IR-side adapter over a [`HostSet`]. The IR dispatches by [`HostId`]; the
-/// mapping from the program's host table to the registered functions is built
-/// once when the dispatcher is created.
-struct IrRecordingDispatcher<'a> {
+/// Adapter over a [`HostSet`]. The IR dispatches by [`HostId`]; the mapping
+/// from the program's host table to the registered functions is built once
+/// when the dispatcher is created.
+struct RecordingDispatcher<'a> {
     fns: Vec<Option<&'a HostFn>>,
     trace: Rc<RefCell<Vec<RawHostCall>>>,
 }
 
-impl IrHostDispatcher for IrRecordingDispatcher<'_> {
+impl IrHostDispatcher for RecordingDispatcher<'_> {
     fn call(
         &mut self,
         host: HostId,
@@ -489,54 +422,6 @@ impl SnapshotCase {
         record
     }
 
-    /// Observe the same scenario through the IR evaluator.
-    ///
-    /// This is the seed for the full AST-vs-IR differential harness (#112):
-    /// it records the same outcome, log, host calls, fuel and plugin steps as
-    /// [`Self::observe`], so a test can compare the two records directly.
-    pub fn observe_ir(&self) -> SnapshotRecord {
-        match self {
-            Self::Main {
-                id,
-                case,
-                hosts,
-                caps,
-            } => {
-                let limits = caps_to_limits(*caps);
-                let observation = run_main_ir(case, hosts.as_ref(), limits);
-                SnapshotRecord {
-                    schema: SNAPSHOT_SCHEMA,
-                    id: id.clone(),
-                    kind: "main".into(),
-                    limits: limits.into(),
-                    outcome: Some(observation.outcome),
-                    log: observation.log,
-                    host_calls: observation.host_calls,
-                    fuel_used: observation.fuel_used,
-                    thresholds: ThresholdsRecord::default(),
-                    steps: Vec::new(),
-                }
-            }
-            Self::Plugin { id, scenario, caps } => {
-                let limits = caps_to_limits(*caps);
-                let plugin = load_plugin(scenario);
-                let observation = run_plugin_ir(&plugin, scenario, limits);
-                SnapshotRecord {
-                    schema: SNAPSHOT_SCHEMA,
-                    id: id.clone(),
-                    kind: "plugin".into(),
-                    limits: limits.into(),
-                    outcome: None,
-                    log: Vec::new(),
-                    host_calls: Vec::new(),
-                    fuel_used: observation.fuel_used,
-                    thresholds: ThresholdsRecord::default(),
-                    steps: observation.steps,
-                }
-            }
-        }
-    }
-
     fn thresholds(&self, baseline: &SnapshotRecord) -> ThresholdsRecord {
         if let Some(note) = limit_note(baseline) {
             return ThresholdsRecord {
@@ -571,90 +456,27 @@ impl SnapshotCase {
     }
 
     fn verify_thresholds(&self, expected: &SnapshotRecord) {
-        if expected.thresholds.note.is_some() {
-            return;
-        }
-        let caps = self.caps();
-        let outcomes = expected_outcomes(expected);
-        let fuel = expected
-            .thresholds
-            .fuel
-            .unwrap_or_else(|| panic!("{}: missing fuel threshold", expected.id));
-        let memory = expected
-            .thresholds
-            .memory
-            .unwrap_or_else(|| panic!("{}: missing memory threshold", expected.id));
-        let depth = expected
-            .thresholds
-            .depth
-            .unwrap_or_else(|| panic!("{}: missing depth threshold", expected.id));
-        let at_fuel = self.outcomes_at(ExecLimits {
-            fuel,
-            memory: caps.memory,
-            depth: caps.depth,
-            deadline: None,
-        });
-        assert_eq!(at_fuel, outcomes, "{}: fuel threshold", expected.id);
-        if fuel > 1 {
-            assert_ne!(
-                self.outcomes_at(ExecLimits {
-                    fuel: fuel - 1,
-                    memory: caps.memory,
-                    depth: caps.depth,
-                    deadline: None,
-                }),
-                outcomes,
-                "{}: fuel threshold is not minimal",
-                expected.id
-            );
-        }
-        let at_memory = self.outcomes_at(ExecLimits {
-            fuel: caps.fuel,
-            memory,
-            depth: caps.depth,
-            deadline: None,
-        });
-        assert_eq!(at_memory, outcomes, "{}: memory threshold", expected.id);
-        if memory > 0 {
-            assert_ne!(
-                self.outcomes_at(ExecLimits {
-                    fuel: caps.fuel,
-                    memory: memory - 1,
-                    depth: caps.depth,
-                    deadline: None,
-                }),
-                outcomes,
-                "{}: memory threshold is not minimal",
-                expected.id
-            );
-        }
-        let at_depth = self.outcomes_at(ExecLimits {
-            fuel: caps.fuel,
-            memory: caps.memory,
-            depth,
-            deadline: None,
-        });
-        assert_eq!(at_depth, outcomes, "{}: depth threshold", expected.id);
-        if depth > 0 {
-            assert_ne!(
-                self.outcomes_at(ExecLimits {
-                    fuel: caps.fuel,
-                    memory: caps.memory,
-                    depth: depth - 1,
-                    deadline: None,
-                }),
-                outcomes,
-                "{}: depth threshold is not minimal",
-                expected.id
-            );
+        if let Err(mismatches) = self.verify_ir_thresholds(expected) {
+            let details = mismatches
+                .iter()
+                .map(|mismatch| {
+                    format!(
+                        "{}: expected {}, got {}",
+                        mismatch.field, mismatch.expected, mismatch.actual
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!("{}: threshold mismatch\n{details}", expected.id);
         }
     }
 
-    /// Check the IR evaluator at the AST oracle's minimum thresholds.
+    /// Check the evaluator at the recorded minimum thresholds.
     ///
-    /// The AST record already proves that each threshold is minimal. The IR
-    /// must complete at the threshold and differ one unit below it, which
-    /// makes its minimum equal to the oracle's without a second binary search.
+    /// The snapshot record already proves that each threshold is minimal. The
+    /// evaluator must complete at the threshold and differ one unit below it,
+    /// which makes its minimum equal to the oracle's without a second binary
+    /// search.
     pub fn verify_ir_thresholds(
         &self,
         expected: &SnapshotRecord,
@@ -675,7 +497,7 @@ impl SnapshotCase {
         };
 
         let mut mismatches = Vec::new();
-        self.check_ir_boundary(
+        self.check_boundary(
             "thresholds.fuel",
             &outcomes,
             ExecLimits {
@@ -692,7 +514,7 @@ impl SnapshotCase {
             }),
             &mut mismatches,
         );
-        self.check_ir_boundary(
+        self.check_boundary(
             "thresholds.memory",
             &outcomes,
             ExecLimits {
@@ -709,7 +531,7 @@ impl SnapshotCase {
             }),
             &mut mismatches,
         );
-        self.check_ir_boundary(
+        self.check_boundary(
             "thresholds.depth",
             &outcomes,
             ExecLimits {
@@ -734,7 +556,7 @@ impl SnapshotCase {
         }
     }
 
-    fn check_ir_boundary(
+    fn check_boundary(
         &self,
         field: &'static str,
         outcomes: &[OutcomeRecord],
@@ -742,7 +564,7 @@ impl SnapshotCase {
         below: Option<ExecLimits>,
         mismatches: &mut Vec<ThresholdMismatch>,
     ) {
-        let actual = self.outcomes_at_ir(at);
+        let actual = self.outcomes_at(at);
         if actual != outcomes {
             mismatches.push(ThresholdMismatch {
                 field,
@@ -751,7 +573,7 @@ impl SnapshotCase {
             });
         }
         if let Some(below) = below {
-            let actual_below = self.outcomes_at_ir(below);
+            let actual_below = self.outcomes_at(below);
             if actual_below == outcomes {
                 mismatches.push(ThresholdMismatch {
                     field,
@@ -776,22 +598,6 @@ impl SnapshotCase {
             Self::Plugin { scenario, .. } => {
                 let plugin = load_plugin(scenario);
                 run_plugin(&plugin, scenario, limits)
-                    .steps
-                    .into_iter()
-                    .filter_map(|step| step.outcome)
-                    .collect()
-            }
-        }
-    }
-
-    fn outcomes_at_ir(&self, limits: ExecLimits) -> Vec<OutcomeRecord> {
-        match self {
-            Self::Main { case, hosts, .. } => {
-                vec![run_main_ir(case, hosts.as_ref(), limits).outcome]
-            }
-            Self::Plugin { scenario, .. } => {
-                let plugin = load_plugin(scenario);
-                run_plugin_ir(&plugin, scenario, limits)
                     .steps
                     .into_iter()
                     .filter_map(|step| step.outcome)
@@ -910,6 +716,11 @@ struct MainObservation {
     fuel_used: u64,
 }
 
+struct PluginObservation {
+    steps: Vec<StepRecord>,
+    fuel_used: u64,
+}
+
 fn run_main(case: &Case, hosts: Option<&HostSet>, limits: ExecLimits) -> MainObservation {
     if let Some(hosts) = hosts {
         hosts.clear_trace();
@@ -930,59 +741,9 @@ fn run_main(case: &Case, hosts: Option<&HostSet>, limits: ExecLimits) -> MainObs
     );
     let sources = loaded.sources;
     let program = loaded.program.expect("snapshot program");
-    let types = TypeTable::from_checker(&program);
-    let mut dispatcher = hosts.map(|hosts| hosts.dispatcher(&program));
-    let mut runtime = match dispatcher.as_mut() {
-        Some(dispatcher) => {
-            Runtime::with_host(&program, limits, dispatcher as &mut dyn HostDispatcher)
-        }
-        None => Runtime::new(&program, limits),
-    };
-    let result = runtime.run_main();
-    let log = match &result {
-        Ok(main) => main.log.clone(),
-        Err(_) => runtime.take_log(),
-    };
-    let fuel_used = runtime.fuel_used();
-    let host_calls = hosts
-        .map(|hosts| hosts.take_calls(&types))
-        .unwrap_or_default();
-    MainObservation {
-        outcome: outcome_from_result(result, &sources, &types),
-        log,
-        host_calls,
-        fuel_used,
-    }
-}
-
-struct PluginObservation {
-    steps: Vec<StepRecord>,
-    fuel_used: u64,
-}
-
-fn run_main_ir(case: &Case, hosts: Option<&HostSet>, limits: ExecLimits) -> MainObservation {
-    if let Some(hosts) = hosts {
-        hosts.clear_trace();
-    }
-    let loaded = case.load();
-    assert!(
-        !loaded
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.severity == martite_base::Severity::Error),
-        "IR snapshot fixture must load cleanly:\n{}",
-        loaded
-            .diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.render(&loaded.sources))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    let sources = loaded.sources;
-    let program = loaded.program.expect("IR snapshot program");
-    let ir = lower(&program, &sources).expect("IR snapshot fixture lowers");
-    verify(&ir).expect("IR snapshot fixture verifies");
-    let mut dispatcher = hosts.map(|hosts| hosts.ir_dispatcher(&ir));
+    let ir = lower(&program, &sources).expect("snapshot fixture lowers");
+    verify(&ir).expect("snapshot fixture verifies");
+    let mut dispatcher = hosts.map(|hosts| hosts.dispatcher(&ir));
     let mut runtime = match dispatcher.as_mut() {
         Some(dispatcher) => {
             IrRuntime::with_host(&ir, limits, dispatcher as &mut dyn IrHostDispatcher)
@@ -1041,147 +802,9 @@ fn load_plugin(scenario: &PluginScenario) -> Plugin {
 }
 
 fn run_plugin(plugin: &Plugin, scenario: &PluginScenario, limits: ExecLimits) -> PluginObservation {
-    let program = plugin.program();
-    let types = plugin.types();
-    let mut state: Option<Value> = None;
-    let mut steps = Vec::new();
-    let mut total_fuel = 0u64;
-    for step in &scenario.steps {
-        if let Some(hosts) = &scenario.hosts {
-            hosts.clear_trace();
-        }
-        let mut dispatcher = scenario
-            .hosts
-            .as_ref()
-            .map(|hosts| hosts.dispatcher(program));
-        match step {
-            PluginStep::Init => {
-                let Some(init) = program.init else {
-                    steps.push(StepRecord {
-                        action: "init".into(),
-                        hook: None,
-                        args: Vec::new(),
-                        state: None,
-                        outcome: Some(OutcomeRecord::NoHandler),
-                        log: Vec::new(),
-                        host_calls: Vec::new(),
-                        fuel_used: 0,
-                    });
-                    continue;
-                };
-                let args = plugin.init_args();
-                let (result, log, fuel_used) = run_with_runtime(
-                    program,
-                    limits,
-                    dispatcher
-                        .as_mut()
-                        .map(|dispatcher| dispatcher as &mut dyn HostDispatcher),
-                    |runtime| runtime.invoke(init, args),
-                );
-                if let Ok(result) = &result {
-                    state = Some(result.value.clone());
-                }
-                let host_calls = scenario
-                    .hosts
-                    .as_ref()
-                    .map(|hosts| hosts.take_calls(types))
-                    .unwrap_or_default();
-                total_fuel = total_fuel.saturating_add(fuel_used);
-                steps.push(StepRecord {
-                    action: "init".into(),
-                    hook: None,
-                    args: Vec::new(),
-                    state: state.as_ref().map(|value| value_repr(value, types, true)),
-                    outcome: Some(match result {
-                        Ok(result) => outcome_from_value(&result.value, types),
-                        Err(trap) => outcome_from_trap(&trap, plugin.sources()),
-                    }),
-                    log,
-                    host_calls,
-                    fuel_used,
-                });
-            }
-            PluginStep::Call { hook, args } => {
-                let args = resolve_args(plugin, args);
-                let rendered = args
-                    .iter()
-                    .map(|value| value_repr(value, types, false))
-                    .collect();
-                let (result, log, fuel_used) = run_with_runtime(
-                    program,
-                    limits,
-                    dispatcher
-                        .as_mut()
-                        .map(|dispatcher| dispatcher as &mut dyn HostDispatcher),
-                    |runtime| runtime.invoke_handler(hook, &mut state, args),
-                );
-                let host_calls = scenario
-                    .hosts
-                    .as_ref()
-                    .map(|hosts| hosts.take_calls(types))
-                    .unwrap_or_default();
-                total_fuel = total_fuel.saturating_add(fuel_used);
-                steps.push(StepRecord {
-                    action: "call".into(),
-                    hook: Some((*hook).into()),
-                    args: rendered,
-                    state: state.as_ref().map(|value| value_repr(value, types, true)),
-                    outcome: Some(match result {
-                        Ok(Some(value)) => outcome_from_value(&value, types),
-                        Ok(None) => OutcomeRecord::NoHandler,
-                        Err(trap) => outcome_from_trap(&trap, plugin.sources()),
-                    }),
-                    log,
-                    host_calls,
-                    fuel_used,
-                });
-            }
-            PluginStep::Shutdown => {
-                let (result, log, fuel_used) = run_with_runtime(
-                    program,
-                    limits,
-                    dispatcher
-                        .as_mut()
-                        .map(|dispatcher| dispatcher as &mut dyn HostDispatcher),
-                    |runtime| runtime.invoke_handler("shutdown", &mut state, Vec::new()),
-                );
-                let host_calls = scenario
-                    .hosts
-                    .as_ref()
-                    .map(|hosts| hosts.take_calls(types))
-                    .unwrap_or_default();
-                total_fuel = total_fuel.saturating_add(fuel_used);
-                steps.push(StepRecord {
-                    action: "shutdown".into(),
-                    hook: Some("shutdown".into()),
-                    args: Vec::new(),
-                    state: state.as_ref().map(|value| value_repr(value, types, true)),
-                    outcome: Some(match result {
-                        Ok(Some(value)) => outcome_from_value(&value, types),
-                        Ok(None) => OutcomeRecord::NoHandler,
-                        Err(trap) => outcome_from_trap(&trap, plugin.sources()),
-                    }),
-                    log,
-                    host_calls,
-                    fuel_used,
-                });
-            }
-        }
-    }
-    PluginObservation {
-        steps,
-        fuel_used: total_fuel,
-    }
-}
-
-fn run_plugin_ir(
-    plugin: &Plugin,
-    scenario: &PluginScenario,
-    limits: ExecLimits,
-) -> PluginObservation {
     let sources = plugin.sources();
-    let ir = lower(plugin.program(), sources).expect("IR plugin fixture lowers");
-    verify(&ir).expect("IR plugin fixture verifies");
+    let ir = lower(plugin.program(), sources).expect("plugin fixture lowers");
+    verify(&ir).expect("plugin fixture verifies");
     let types = &ir.types;
     let mut state: Option<Value> = None;
     let mut steps = Vec::new();
@@ -1190,10 +813,7 @@ fn run_plugin_ir(
         if let Some(hosts) = &scenario.hosts {
             hosts.clear_trace();
         }
-        let mut dispatcher = scenario
-            .hosts
-            .as_ref()
-            .map(|hosts| hosts.ir_dispatcher(&ir));
+        let mut dispatcher = scenario.hosts.as_ref().map(|hosts| hosts.dispatcher(&ir));
         match step {
             PluginStep::Init => {
                 let Some(init) = ir.entries.init else {
@@ -1210,7 +830,7 @@ fn run_plugin_ir(
                     continue;
                 };
                 let args = plugin.init_args();
-                let (result, log, fuel_used) = run_with_ir_runtime(
+                let (result, log, fuel_used) = run_with_runtime(
                     &ir,
                     limits,
                     dispatcher
@@ -1247,7 +867,7 @@ fn run_plugin_ir(
                     .iter()
                     .map(|value| value_repr(value, types, false))
                     .collect();
-                let (result, log, fuel_used) = run_with_ir_runtime(
+                let (result, log, fuel_used) = run_with_runtime(
                     &ir,
                     limits,
                     dispatcher
@@ -1277,7 +897,7 @@ fn run_plugin_ir(
                 });
             }
             PluginStep::Shutdown => {
-                let (result, log, fuel_used) = run_with_ir_runtime(
+                let (result, log, fuel_used) = run_with_runtime(
                     &ir,
                     limits,
                     dispatcher
@@ -1326,22 +946,6 @@ fn resolve_args(plugin: &Plugin, args: &[ArgSpec]) -> Vec<Value> {
 }
 
 fn run_with_runtime<'p, 'h, R>(
-    program: &'p CheckedProgram,
-    limits: ExecLimits,
-    dispatcher: Option<&'h mut dyn HostDispatcher>,
-    run: impl FnOnce(&mut Runtime<'p, 'h>) -> R,
-) -> (R, Vec<String>, u64) {
-    let mut runtime = match dispatcher {
-        Some(dispatcher) => Runtime::with_host(program, limits, dispatcher),
-        None => Runtime::new(program, limits),
-    };
-    let result = run(&mut runtime);
-    let log = runtime.take_log();
-    let fuel_used = runtime.fuel_used();
-    (result, log, fuel_used)
-}
-
-fn run_with_ir_runtime<'p, 'h, R>(
     program: &'p IrProgram,
     limits: ExecLimits,
     dispatcher: Option<&'h mut dyn IrHostDispatcher>,

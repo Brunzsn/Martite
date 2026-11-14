@@ -9,7 +9,7 @@ fn snapshot_root() -> PathBuf {
 }
 
 #[test]
-fn snapshots_match_ast_interpreter() {
+fn snapshots_match_the_ir_evaluator() {
     let snapshots = read_snapshot_dir(&snapshot_root());
     for case in snapshot_cases::all_cases() {
         let Some(expected) = snapshots.get(case.id()) else {
@@ -34,7 +34,7 @@ fn snapshots_match_ast_interpreter() {
 }
 
 #[test]
-#[ignore = "regenerates the checked-in AST interpreter snapshots"]
+#[ignore = "regenerates the checked-in behavior snapshots"]
 fn update_snapshots() {
     let root = snapshot_root();
     let _ = std::fs::remove_dir_all(&root);

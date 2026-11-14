@@ -10,11 +10,6 @@ publish = false
 name = "martite"
 path = "src/main.rs"
 
-[features]
-default = ["ast-eval"]
-# Temporary #115 escape hatch. Remove with the AST evaluator in #116.
-ast-eval = ["martite/ast-eval", "martite-runtime/ast-eval"]
-
 [dependencies]
 martite.workspace = true
 martite-base.workspace = true

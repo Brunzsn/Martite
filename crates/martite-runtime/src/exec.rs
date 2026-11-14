@@ -1,9 +1,7 @@
-//! Shared execution types for both evaluators.
+//! Shared execution types for the IR evaluator.
 //!
-//! The IR evaluator is the default runtime path. The frozen AST evaluator,
-//! retained behind the temporary `ast-eval` feature for #115's escape hatch,
-//! uses these same limits, traps and host types so observable behavior does
-//! not depend on which evaluator ran.
+//! Limits, traps and host types are runtime-owned and are not tied to the
+//! checker or syntax tree.
 
 use std::rc::Rc;
 use std::time::Duration;

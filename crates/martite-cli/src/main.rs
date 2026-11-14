@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use martite::{Engine, Evaluator, HostSignature, HostType, LANG_EDITION};
+use martite::{Engine, HostSignature, HostType, LANG_EDITION};
 use martite_base::{
     Applicability, Code, Diagnostic, FileSystemProvider, LoadLimits, Severity, SourceMap,
     SourceProvider, normalize_source,
@@ -13,8 +13,6 @@ use martite_driver::{LoadOptions, LowerOptions, load, lower_with};
 use martite_ir::{IrProgram, Printer};
 use martite_lint::{LintInputs, ManifestInput, SettingsResolver, normalize_path, sort_diagnostics};
 use martite_resolve::InterfaceSource;
-#[cfg(feature = "ast-eval")]
-use martite_runtime::Runtime;
 use martite_runtime::{ExecLimits, IrRuntime, Trap, Value};
 use martite_syntax::{ParseOptions, parse_interface_with, parse_source_with};
 
@@ -40,7 +38,6 @@ Options:
     --fuel <n>            Fuel for `run` and `test`
     --memory <n>          Memory limit in bytes for `run` and `test`
     --depth <n>           Call-depth limit for `run` and `test`
-    --ast                 Use the legacy AST evaluator (temporary)
     --dump-ir[=stage]     Dump IR for `run`/`test`: before, after, both
 
 Fmt options:
@@ -100,18 +97,6 @@ fn main() -> ExitCode {
     }
 }
 
-fn selected_evaluator(ast: bool) -> Evaluator {
-    #[cfg(feature = "ast-eval")]
-    {
-        if ast { Evaluator::Ast } else { Evaluator::Ir }
-    }
-    #[cfg(not(feature = "ast-eval"))]
-    {
-        let _ = ast;
-        Evaluator::Ir
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum DumpStage {
     Before,
@@ -127,7 +112,6 @@ struct Parsed {
     fuel: Option<u64>,
     memory: Option<u64>,
     depth: Option<u32>,
-    ast: bool,
     dump_ir: Option<DumpStage>,
     path: Option<String>,
     /// Arguments after the script path, passed through to `std.env.args()`.
@@ -182,13 +166,6 @@ fn parse_args(args: &[String], allow_trailing: bool) -> Result<Parsed, String> {
                         .parse()
                         .map_err(|_| "--depth requires a number")?,
                 );
-            }
-            Long("ast") => {
-                if cfg!(feature = "ast-eval") {
-                    out.ast = true;
-                } else {
-                    return Err("this build does not include the AST evaluator".into());
-                }
             }
             Long("dump-ir") => {
                 out.dump_ir = Some(match parser.optional_value() {
@@ -1396,7 +1373,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     if let Some(stage) = parsed.dump_ir {
         dump_ir(stage, plugin.ir());
     }
-    let result = plugin.run_main_with(selected_evaluator(parsed.ast));
+    let result = plugin.run_main();
     match result {
         Ok(main) => {
             for line in main.log {
@@ -1427,10 +1404,6 @@ fn cmd_check(args: &[String], lint: bool) -> ExitCode {
     };
     if parsed.dump_ir.is_some() {
         eprintln!("error: --dump-ir is only supported by `martite run` and `martite test`\n");
-        return ExitCode::from(2);
-    }
-    if parsed.ast {
-        eprintln!("error: --ast is only supported by `martite run` and `martite test`\n");
         return ExitCode::from(2);
     }
     let Some(path) = parsed.path else {
@@ -1703,27 +1676,16 @@ fn cmd_test(args: &[String]) -> ExitCode {
         depth: parsed.depth.unwrap_or(200),
         deadline: None,
     };
-    let evaluator = selected_evaluator(parsed.ast);
     let mut failed = 0usize;
     let mut total = 0usize;
     for (def, function) in program.tests.iter().zip(&ir.entries.tests) {
         total += 1;
         let name = program.resolved.def(*def).name.clone();
-        let (outcome, log) = match evaluator {
-            Evaluator::Ir => {
-                let mut runtime = IrRuntime::new(&ir, limits);
-                let outcome = runtime
-                    .invoke(*function, Vec::new())
-                    .map(|result| result.value);
-                (outcome, runtime.take_log())
-            }
-            #[cfg(feature = "ast-eval")]
-            Evaluator::Ast => {
-                let mut runtime = Runtime::new(&program, limits);
-                let outcome = runtime.invoke(*def, Vec::new()).map(|result| result.value);
-                (outcome, runtime.take_log())
-            }
-        };
+        let mut runtime = IrRuntime::new(&ir, limits);
+        let outcome = runtime
+            .invoke(*function, Vec::new())
+            .map(|result| result.value);
+        let log = runtime.take_log();
         for line in log {
             println!("{line}");
         }

@@ -1,8 +1,7 @@
 //! Builtin execution for the IR evaluator (#109).
 //!
-//! The method bodies mirror `builtins.rs` exactly. That file belongs to the
-//! frozen AST interpreter; #116 removes it. Calls to user functions and
-//! closures go through `call_closure_value`.
+//! The method bodies implement the edition's standard library. Calls to user
+//! functions and closures go through `call_closure_value`.
 
 use super::*;
 use crate::ops::{int_arg, parse_float, parse_int, range_len};
