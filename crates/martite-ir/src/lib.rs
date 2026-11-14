@@ -7,9 +7,11 @@
 //! analyses in [`analysis`], and lowering ([`lower`]). Calls, patterns and
 //! lambdas all lower here; there is no evaluator or optimizer yet.
 //!
-//! Dependency direction: `martite-ir` may depend on `martite-base`,
-//! `martite-fuel`, `martite-syntax` and `martite-check` for lowering inputs,
-//! but never on `martite-runtime` or `martite-bench`.
+//! Dependency direction: the default `lower` feature may depend on
+//! `martite-base`, `martite-syntax` and `martite-check` for lowering inputs,
+//! but never on `martite-runtime` or `martite-bench`. The model, verifier,
+//! analyses and printer build without the `lower` feature; the runtime uses
+//! that dependency graph.
 //!
 //! # Layout
 //!
@@ -37,6 +39,7 @@ pub mod builtin;
 pub mod charge;
 pub mod effects;
 pub mod id;
+#[cfg(feature = "lower")]
 pub mod lower;
 pub mod node;
 pub mod pattern;
@@ -60,6 +63,7 @@ pub use id::{
     BuiltinFnId, BuiltinItemId, BuiltinMethodId, CaptureIndex, ConstId, FnId, HostId, IrId,
     MatchSetId, PatternId, Slot, StrId, StructLayoutId,
 };
+#[cfg(feature = "lower")]
 pub use lower::{LowerError, LowerErrorKind, LowerOptions, lower, lower_with};
 pub use martite_base::{SourceId, Span};
 pub use node::{

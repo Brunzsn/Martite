@@ -17,7 +17,7 @@ martite-syntax.workspace = true
 martite-config.workspace = true
 martite-resolve.workspace = true
 martite-check.workspace = true
-martite-runtime = { workspace = true, features = ["ir-eval"] }
+martite-runtime.workspace = true
 martite-driver.workspace = true
 martite-lint.workspace = true
 martite-fmt.workspace = true

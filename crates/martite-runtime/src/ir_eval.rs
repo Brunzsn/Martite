@@ -1,12 +1,12 @@
-//! Recursive evaluator for the resolved tree IR.
+//! Recursive evaluator for the resolved tree IR and the default runtime path.
 //!
-//! This is the third evaluator slice (#110): values, places, scalar
-//! operators, aggregates, control flow, calls, builtins, hosts, mutable
-//! writeback, closures, captures, `match` and pattern binding.
+//! It executes values, places, scalar operators, aggregates, control flow,
+//! calls, builtins, hosts, mutable writeback, closures, captures, `match` and
+//! pattern binding.
 //!
 //! The evaluator only reads [`martite_ir::IrProgram`]. Frame slots are a dense
-//! `Vec<Option<Value>>` sized by `IrFn::locals`; there are no binding-id scans
-//! and no per-frame hash maps. `None` marks a slot taken by `SlotRead` with
+//! inline `SmallVec` sized by `IrFn::locals`; there are no binding-id scans and
+//! no per-frame hash maps. `None` marks a slot taken by `SlotRead` with
 //! [`martite_ir::AccessMode::Take`], which is a `Reduce`-class feature and not
 //! emitted by migration lowering.
 //!
@@ -29,7 +29,7 @@ use martite_ir::{
 };
 use smallvec::SmallVec;
 
-use crate::interp::{CallResult, ExecLimits, HostContext, HostFault, MainResult, Trap};
+use crate::exec::{CallResult, ExecLimits, HostContext, HostFault, MainResult, Trap};
 use crate::ops::{show, value_eq, value_ord, write_show};
 use crate::value::{
     Closure, EnumValue, FnValue, MAX_VALUE_DEPTH, MapValue, OrderedMap, SeqValue, StructValue,
@@ -238,6 +238,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
     // Frames and traps
     // ------------------------------------------------------------------
 
+    #[inline]
     fn current_function(&self) -> &'p IrFn {
         self.current.expect("evaluation frame")
     }
@@ -288,12 +289,200 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
     /// Calls a closure value. Lambda parameters cannot be `mut`, so a closure
     /// call never produces writeback values.
     fn call_closure(&mut self, closure: &Closure, args: CallArgs) -> Result<Value, Trap> {
+        let program = self.program;
+        let Some(function_info) = program.function(closure.target) else {
+            return Err(self.internal_panic(format!("missing function #{:?}", closure.target)));
+        };
+        if matches!(function_info.kind, FnKind::Lambda) {
+            return self.call_lambda(function_info, closure.captures.clone(), args);
+        }
         self.call_function_with_writebacks_and_captures(
             closure.target,
             args,
             closure.captures.clone(),
         )
         .map(|(value, _)| value)
+    }
+
+    /// Specialized lambda call. It skips the mutable-writeback scan and the
+    /// non-lambda capture checks that every higher-order builtin would
+    /// otherwise repeat per element.
+    fn call_lambda(
+        &mut self,
+        function_info: &'p IrFn,
+        captures: Option<Rc<[Value]>>,
+        args: CallArgs,
+    ) -> Result<Value, Trap> {
+        if self.frames.len() >= self.limits.depth as usize {
+            return Err(Trap::DepthExceeded);
+        }
+        if args.len() != function_info.params.len() {
+            return Err(self.internal_panic(format!(
+                "lambda `{}` expected {} arguments, got {}",
+                function_info.name,
+                function_info.params.len(),
+                args.len()
+            )));
+        }
+        let provided = captures.as_ref().map_or(0, |captures| captures.len());
+        if provided != function_info.captures.len() {
+            return Err(self.internal_panic(format!(
+                "lambda `{}` expected {} captures, got {}",
+                function_info.name,
+                function_info.captures.len(),
+                provided
+            )));
+        }
+
+        let mut slots = SmallVec::from_elem(None, function_info.locals as usize);
+        if function_info
+            .params
+            .iter()
+            .all(|param| param.pattern.is_none())
+        {
+            for (param, value) in function_info.params.iter().zip(args) {
+                slots[param.slot.index()] = Some(value);
+            }
+        } else {
+            let mut pattern_params: SmallVec<[(&Pattern, Value); 2]> = SmallVec::new();
+            for (param, value) in function_info.params.iter().zip(args) {
+                if let Some(pattern_id) = param.pattern {
+                    let Some(pattern) = function_info.pattern(pattern_id) else {
+                        return Err(self.internal_panic("lambda parameter pattern is out of range"));
+                    };
+                    pattern_params.push((pattern, value));
+                } else {
+                    slots[param.slot.index()] = Some(value);
+                }
+            }
+            let source = self
+                .frames
+                .last()
+                .map(|frame| frame.source)
+                .unwrap_or(SourceId(0));
+            self.frames.push(Frame {
+                slots,
+                captures,
+                source,
+                name: function_info.name.as_ref(),
+            });
+            for (pattern, value) in pattern_params {
+                if let Err(error) = self.bind_pattern(pattern, &value) {
+                    self.frames.pop();
+                    return Err(match error {
+                        EvalError::Trap(trap) => trap,
+                        _ => self.internal_panic("lambda parameter binding failed"),
+                    });
+                }
+            }
+            return self.finish_lambda_call(function_info);
+        }
+
+        let source = self
+            .frames
+            .last()
+            .map(|frame| frame.source)
+            .unwrap_or(SourceId(0));
+        self.frames.push(Frame {
+            slots,
+            captures,
+            source,
+            name: function_info.name.as_ref(),
+        });
+        self.finish_lambda_call(function_info)
+    }
+
+    /// Fast path for plain functions with no mutable or destructured
+    /// parameters. It avoids the generic writeback scan and capture checks.
+    fn call_simple_function(
+        &mut self,
+        function_info: &'p IrFn,
+        args: CallArgs,
+    ) -> Result<Value, Trap> {
+        if self.frames.len() >= self.limits.depth as usize {
+            return Err(Trap::DepthExceeded);
+        }
+        if args.len() != function_info.params.len() {
+            return Err(self.internal_panic(format!(
+                "`{}` expected {} arguments, got {}",
+                function_info.name,
+                function_info.params.len(),
+                args.len()
+            )));
+        }
+        let mut slots = SmallVec::from_elem(None, function_info.locals as usize);
+        for (param, value) in function_info.params.iter().zip(args) {
+            slots[param.slot.index()] = Some(value);
+        }
+        self.frames.push(Frame {
+            slots,
+            captures: None,
+            source: function_info.source,
+            name: function_info.name.as_ref(),
+        });
+        if let Err(trap) = self.maybe_check_memory() {
+            self.frames.pop();
+            return Err(match trap {
+                EvalError::Trap(trap) => trap,
+                _ => Trap::OutOfMemory,
+            });
+        }
+        let body = function_info.body.expect("simple function body");
+        let previous = self.current;
+        self.current = Some(function_info);
+        let result = match self.eval(body) {
+            Ok(value) => Ok(value),
+            Err(EvalError::Return(value)) => Ok(value),
+            Err(EvalError::Trap(trap)) => Err(trap),
+            Err(EvalError::Break) | Err(EvalError::Continue) => {
+                Err(self.internal_panic("`break`/`continue` escaped a loop"))
+            }
+        };
+        self.current = previous;
+        self.frames.pop();
+        let value = result?;
+        self.maybe_check_returned_value(&value)
+            .map_err(|error| match error {
+                EvalError::Trap(trap) => trap,
+                _ => Trap::OutOfMemory,
+            })?;
+        if value_depth_exceeds(&value, MAX_VALUE_DEPTH) {
+            return Err(Trap::DepthExceeded);
+        }
+        Ok(value)
+    }
+
+    fn finish_lambda_call(&mut self, function_info: &'p IrFn) -> Result<Value, Trap> {
+        if let Err(trap) = self.maybe_check_memory() {
+            self.frames.pop();
+            return Err(match trap {
+                EvalError::Trap(trap) => trap,
+                _ => Trap::OutOfMemory,
+            });
+        }
+        let body = function_info.body.expect("lambda body");
+        let previous = self.current;
+        self.current = Some(function_info);
+        let result = match self.eval(body) {
+            Ok(value) => Ok(value),
+            Err(EvalError::Return(value)) => Ok(value),
+            Err(EvalError::Trap(trap)) => Err(trap),
+            Err(EvalError::Break) | Err(EvalError::Continue) => {
+                Err(self.internal_panic("loop control escaped a lambda"))
+            }
+        };
+        self.current = previous;
+        self.frames.pop();
+        let value = result?;
+        self.maybe_check_returned_value(&value)
+            .map_err(|error| match error {
+                EvalError::Trap(trap) => trap,
+                _ => Trap::OutOfMemory,
+            })?;
+        if value_depth_exceeds(&value, MAX_VALUE_DEPTH) {
+            return Err(Trap::DepthExceeded);
+        }
+        Ok(value)
     }
 
     fn call_function_with_writebacks_and_captures(
@@ -342,6 +531,18 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             }
             None
         };
+
+        if !matches!(function_info.kind, FnKind::Lambda)
+            && function_info.body.is_some()
+            && function_info
+                .params
+                .iter()
+                .all(|param| !param.mutable && param.pattern.is_none())
+        {
+            return self
+                .call_simple_function(function_info, args)
+                .map(|value| (value, Writebacks::new()));
+        }
 
         let mut slots = SmallVec::from_elem(None, function_info.locals as usize);
         let mut pattern_params: SmallVec<[(&Pattern, Value); 2]> = SmallVec::new();
@@ -407,25 +608,26 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             }
         };
         self.current = previous;
-        let updated: Writebacks = if result.is_ok() {
-            let frame = self.frames.last_mut().expect("evaluation frame");
-            function_info
-                .params
-                .iter()
-                .enumerate()
-                .filter(|(_, param)| param.mutable)
-                .map(|(index, param)| {
-                    let value = frame
-                        .slots
-                        .get_mut(param.slot.index())
-                        .and_then(|slot| slot.take())
-                        .unwrap_or(Value::Unit);
-                    (index, value)
-                })
-                .collect()
-        } else {
-            Writebacks::new()
-        };
+        let updated: Writebacks =
+            if result.is_ok() && function_info.params.iter().any(|param| param.mutable) {
+                let frame = self.frames.last_mut().expect("evaluation frame");
+                function_info
+                    .params
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, param)| param.mutable)
+                    .map(|(index, param)| {
+                        let value = frame
+                            .slots
+                            .get_mut(param.slot.index())
+                            .and_then(|slot| slot.take())
+                            .unwrap_or(Value::Unit);
+                        (index, value)
+                    })
+                    .collect()
+            } else {
+                Writebacks::new()
+            };
         self.frames.pop();
         let value = result?;
         self.maybe_check_returned_value(&value)
@@ -439,6 +641,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         Ok((value, updated))
     }
 
+    #[inline]
     fn call_closure_value(&mut self, function: &FnValue, args: CallArgs) -> Result<Value, Trap> {
         match function {
             FnValue::Def(id) => self.call_function(*id, args),
@@ -572,6 +775,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         }
     }
 
+    #[inline]
     fn safepoint(&mut self, id: IrId) -> EvalResult<()> {
         if self.current_function().is_safepoint(id) {
             self.maybe_check_memory()
@@ -925,6 +1129,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         }
     }
 
+    #[inline]
     fn read_slot(&mut self, slot: Slot, mode: AccessMode) -> EvalResult<Value> {
         let Some(frame) = self.frames.last_mut() else {
             return self.trap(self.internal_panic("slot is out of range"));
@@ -942,6 +1147,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         }
     }
 
+    #[inline]
     fn set_slot(&mut self, slot: Slot, value: Value) {
         if let Some(cell) = self
             .frames
@@ -986,6 +1192,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         }
     }
 
+    #[inline]
     fn eval_binary_values(
         &mut self,
         op: BinaryKind,
@@ -998,6 +1205,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         self.binary_values(op, lhs, rhs, span)
     }
 
+    #[inline]
     fn binary_values(
         &mut self,
         op: BinaryKind,
@@ -2459,7 +2667,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 #[cfg(test)]
 mod tests {
     use super::{CallArgs, Frame, IrRuntime};
-    use crate::interp::Trap;
+    use crate::exec::{ExecLimits, Trap};
     use crate::value::{Closure, FnValue, Value};
     use martite_ir::{
         AccessMode, CaptureIndex, CaptureInfo, CaptureSource, Charge, ChildRange, ConstId,
@@ -2526,7 +2734,7 @@ mod tests {
     #[test]
     fn new_runtime_sizes_the_pools() {
         let program = IrProgram::default();
-        let runtime = IrRuntime::new(&program, crate::interp::ExecLimits::default());
+        let runtime = IrRuntime::new(&program, ExecLimits::default());
         assert!(runtime.const_values.is_empty());
         assert!(runtime.literal_values.is_empty());
     }
@@ -2618,7 +2826,7 @@ mod tests {
             },
             ..IrProgram::default()
         };
-        let mut runtime = IrRuntime::new(&program, crate::interp::ExecLimits::default());
+        let mut runtime = IrRuntime::new(&program, ExecLimits::default());
         let result = runtime.run_main().expect("slot test runs");
         assert_eq!(result.value, crate::value::Value::Int(8));
     }
@@ -2667,7 +2875,7 @@ mod tests {
             },
             ..IrProgram::default()
         };
-        let mut runtime = IrRuntime::new(&program, crate::interp::ExecLimits::default());
+        let mut runtime = IrRuntime::new(&program, ExecLimits::default());
         let result = runtime.run_main().expect("closure creation runs");
         let Value::Fn(FnValue::Closure(closure)) = result.value else {
             panic!("main must return a closure");
@@ -2747,7 +2955,7 @@ mod tests {
             fns: vec![lambda],
             ..IrProgram::default()
         };
-        let mut runtime = IrRuntime::new(&program, crate::interp::ExecLimits::default());
+        let mut runtime = IrRuntime::new(&program, ExecLimits::default());
         let closure = Closure::new(FnId::new(0), None);
         let value = runtime
             .call_closure(
@@ -2796,7 +3004,7 @@ mod tests {
             fns: vec![outer, inner],
             ..IrProgram::default()
         };
-        let mut runtime = IrRuntime::new(&program, crate::interp::ExecLimits::default());
+        let mut runtime = IrRuntime::new(&program, ExecLimits::default());
         let captures: Rc<[Value]> = Rc::from(vec![Value::Int(11)]);
         let outer = Closure::new(FnId::new(0), Some(captures));
         let value = runtime
@@ -2840,7 +3048,7 @@ mod tests {
             strs: vec!["boom".into()],
             ..IrProgram::default()
         };
-        let mut runtime = IrRuntime::new(&program, crate::interp::ExecLimits::default());
+        let mut runtime = IrRuntime::new(&program, ExecLimits::default());
         runtime.frames.push(Frame {
             slots: SmallVec::from_elem(None, 1),
             captures: None,

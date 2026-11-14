@@ -1,6 +1,7 @@
 # Martite IR: Design Doc
 
-**Status:** Draft (until the phase-3 performance gate in section 15 is met)
+**Status:** Accepted. The phase-3 performance gate in section 15 was measured
+before the default-executor switch (#96, #115).
 **Scope:** a resolved, self-contained tree IR between the type checker and the runtime. It must (1) execute faster than the AST interpreter with identical observable behavior, and (2) give a future optimizer a semantics contract it can actually be held to.
 
 ## 1. Summary

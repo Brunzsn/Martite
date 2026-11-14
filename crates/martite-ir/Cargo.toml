@@ -6,10 +6,17 @@ license.workspace = true
 description = "Resolved, self-contained tree IR for Martite"
 publish = false
 
+[features]
+default = ["lower"]
+# Lowering is the only IR feature that needs the checker and parser. The
+# runtime depends on this crate with default features off, so its dependency
+# graph stays free of `martite-check`.
+lower = ["dep:martite-check", "dep:martite-syntax"]
+
 [dependencies]
 martite-base.workspace = true
-martite-check.workspace = true
-martite-syntax.workspace = true
+martite-check = { workspace = true, optional = true }
+martite-syntax = { workspace = true, optional = true }
 stacker.workspace = true
 
 [dev-dependencies]

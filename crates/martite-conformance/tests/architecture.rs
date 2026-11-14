@@ -55,7 +55,7 @@ fn benchmarks_are_isolated_from_production_crates() {
 #[test]
 fn runtime_values_use_the_ir_vocabulary() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for name in ["value.rs", "ops.rs", "json.rs"] {
+    for name in ["value.rs", "ops.rs", "json.rs", "exec.rs"] {
         let path = root.join("crates/martite-runtime/src").join(name);
         let source = fs::read_to_string(&path).expect("read runtime source");
         assert!(
@@ -83,6 +83,48 @@ fn ir_stays_above_the_runtime() {
     assert!(
         !manifest.contains("martite-bench"),
         "martite-ir must not depend on the benchmark crate"
+    );
+}
+
+#[test]
+fn default_runtime_build_is_ir_only() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let manifest = fs::read_to_string(root.join("crates/martite-runtime/Cargo.toml"))
+        .expect("read runtime manifest");
+    assert!(
+        manifest.contains("ast-eval = [\"dep:martite-check\", \"dep:martite-syntax\"]"),
+        "the AST evaluator and checker must be opt-in"
+    );
+    assert!(
+        manifest.contains("martite-check = { workspace = true, optional = true }"),
+        "martite-check must be optional in the runtime manifest"
+    );
+
+    let lib = fs::read_to_string(root.join("crates/martite-runtime/src/lib.rs"))
+        .expect("read runtime lib");
+    assert!(
+        lib.contains("pub mod ir_eval;"),
+        "IR evaluator must be built"
+    );
+    assert!(
+        lib.contains("#[cfg(feature = \"ast-eval\")]\npub mod interp;"),
+        "the AST evaluator must only build with ast-eval"
+    );
+}
+
+#[test]
+fn ir_lowering_is_an_opt_in_dependency() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let manifest =
+        fs::read_to_string(root.join("crates/martite-ir/Cargo.toml")).expect("read IR manifest");
+    assert!(
+        manifest.contains("lower = [\"dep:martite-check\", \"dep:martite-syntax\"]"),
+        "lowering and the checker must be opt-in"
+    );
+    let workspace = fs::read_to_string(root.join("Cargo.toml")).expect("read workspace manifest");
+    assert!(
+        workspace.contains("martite-ir = { path = \"crates/martite-ir\", version = \"0.1.0\", default-features = false }"),
+        "the workspace IR dependency must not enable lowering by default"
     );
 }
 

@@ -8,16 +8,18 @@ publish = false
 
 [features]
 default = []
-# Opt-in IR evaluator (#108). The AST interpreter stays the default path until
-# the differential and threshold suites are green (#112, #111, #115).
-ir-eval = []
+# Temporary escape hatch for #115. The IR evaluator is the default; this
+# feature keeps the frozen AST evaluator and its checker/parser inputs
+# available to `martite --ast`, the conformance oracle and #116's retirement
+# window.
+ast-eval = ["dep:martite-check", "dep:martite-syntax"]
 
 [dependencies]
 martite-base.workspace = true
 martite-fuel.workspace = true
 martite-ir.workspace = true
-martite-syntax.workspace = true
-martite-check.workspace = true
+martite-syntax = { workspace = true, optional = true }
+martite-check = { workspace = true, optional = true }
 libm.workspace = true
 serde_json.workspace = true
 indexmap.workspace = true

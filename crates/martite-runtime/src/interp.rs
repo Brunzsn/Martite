@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use martite_base::{SourceId, Span};
 use martite_check::{
@@ -15,30 +15,14 @@ use martite_syntax::{
 };
 use smallvec::{SmallVec, smallvec};
 
-use crate::ops::{show, value_eq, value_ord, write_show};
-use crate::value::{
-    Closure, EnumValue, FnValue, HandleValue, MAX_VALUE_DEPTH, MapValue, OrderedMap, SeqValue,
-    StructValue, Value, key_from_value, key_to_value, key_value_size, value_depth_exceeds,
+use crate::exec::{CallResult, ExecLimits, HostContext, HostFault, MainResult, Trap};
+use crate::ops::{
+    int_arg, parse_float, parse_int, range_len, show, value_eq, value_ord, write_show,
 };
-
-#[derive(Debug, Clone, Copy)]
-pub struct ExecLimits {
-    pub fuel: u64,
-    pub memory: u64,
-    pub depth: u32,
-    pub deadline: Option<Duration>,
-}
-
-impl Default for ExecLimits {
-    fn default() -> Self {
-        Self {
-            fuel: 1_000_000,
-            memory: 8 << 20,
-            depth: 200,
-            deadline: None,
-        }
-    }
-}
+use crate::value::{
+    Closure, EnumValue, FnValue, MAX_VALUE_DEPTH, MapValue, OrderedMap, SeqValue, StructValue,
+    Value, key_from_value, key_to_value, key_value_size, value_depth_exceeds,
+};
 
 /// Temporary bridge between checker ids and IR ids.
 ///
@@ -115,60 +99,6 @@ fn ir_builtin_item(item: &BuiltinItem) -> BuiltinItemId {
     })
 }
 
-#[derive(Debug, Clone)]
-pub struct HostFault {
-    pub message: String,
-}
-
-impl HostFault {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-/// Per-call context passed to a host function.
-///
-/// The runtime constructs this value. `handle_type` records the opaque type
-/// the host function is allowed to create, if any.
-#[derive(Debug, Clone)]
-pub struct HostContext {
-    pub charged: u64,
-    handle_type: Option<TypeId>,
-}
-
-impl HostContext {
-    pub(crate) fn new(handle_type: Option<TypeId>) -> Self {
-        Self {
-            charged: 0,
-            handle_type,
-        }
-    }
-
-    pub fn charge(&mut self, units: u64) {
-        self.charged = self.charged.saturating_add(units);
-    }
-
-    /// Create an opaque handle of the host function's declared return type.
-    ///
-    /// The runtime enables this when the host function returns a direct
-    /// opaque interface type, or an `Option` or `Result` whose success
-    /// payload is one. Calling it from any other host function is a host
-    /// bug and returns a [`HostFault`].
-    pub fn make_handle(&self, token: impl Into<String>) -> Result<Value, HostFault> {
-        let Some(type_id) = self.handle_type else {
-            return Err(HostFault::new(
-                "make_handle requires the host function to return an opaque handle type",
-            ));
-        };
-        Ok(Value::Handle(Rc::new(HandleValue {
-            type_id,
-            token: token.into(),
-        })))
-    }
-}
-
 fn opaque_handle_type(ty: &Ty, program: &CheckedProgram) -> Option<TypeId> {
     match ty {
         Ty::Named(id, args) if args.is_empty() => {
@@ -189,48 +119,6 @@ pub trait HostDispatcher {
         args: &[Value],
         cx: &mut HostContext,
     ) -> Result<Value, HostFault>;
-}
-
-#[derive(Debug, Clone)]
-pub enum Trap {
-    Panic {
-        message: String,
-        source: Option<SourceId>,
-        span: Option<Span>,
-        trace: Vec<String>,
-    },
-    OutOfFuel,
-    OutOfMemory,
-    DepthExceeded,
-    Deadline,
-    HostFault(String),
-}
-
-impl Trap {
-    pub fn panic_message(&self) -> String {
-        match self {
-            Trap::Panic { message, .. } => message.clone(),
-            Trap::OutOfFuel => "out of fuel".into(),
-            Trap::OutOfMemory => "out of memory".into(),
-            Trap::DepthExceeded => "maximum call depth exceeded".into(),
-            Trap::Deadline => "deadline exceeded".into(),
-            Trap::HostFault(message) => format!("host fault: {message}"),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct CallResult {
-    pub value: Value,
-    /// Values of the `mut` parameters after the call, in declaration order.
-    /// Immutable parameters are not copied out.
-    pub params: Vec<Value>,
-}
-
-#[derive(Debug, Clone)]
-pub struct MainResult {
-    pub value: Value,
-    pub log: Vec<String>,
 }
 
 pub struct Runtime<'p, 'h> {

@@ -66,7 +66,7 @@ allocation deltas in the job summary.
 | `parser` | source small/medium/large, `.mti` interface, deeply nested expression, malformed error recovery | `syntax/*`, `parser/*` |
 | `load` | single module, multi-module, plugin with an interface | `load/*` |
 | `lint` | full recommended and syntax-only, clean and noisy | `lint/*` |
-| `runtime` | arithmetic loop, `fib`, function calls, list/map/string ops, method dispatch, pattern matching, closures, captures, `mut` params, field/index assignment, `Option` lookups, map iteration, host calls, plugin handler, snapshot, restore | `runtime/*` |
+| `runtime` | arithmetic loop, `fib`, function calls, list/map/string ops, method dispatch, pattern matching, closures, captures, `mut` params, field/index assignment, `Option` lookups, map iteration, host calls, plugin handler, snapshot, restore. Fixtures lower once in setup and time the default IR evaluator. | `runtime/*` |
 | `fmt` | medium, large, interface, whole golden corpus, idempotent reformat, check | `syntax/*`, `crates/martite-fmt/tests/fixtures` |
 | `cli` | cold `check`, `lint`, `run`, and `fmt --check` | `syntax/small.mt`, `lint/clean.mt`, formatter fixture |
 | allocation report | the runtime fixtures plus host calls and plugin handler/snapshot/restore, reported as allocations and bytes per iteration | `runtime/*` |

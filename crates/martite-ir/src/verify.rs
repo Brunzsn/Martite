@@ -5483,12 +5483,14 @@ impl<'a> EffectsCheck<'a> {
 
     /// Build a checker over an explicit callee-summary snapshot. Lowering uses
     /// this to fill stored effects without duplicating the leaf-effect rules.
+    #[cfg(feature = "lower")]
     pub(crate) fn with_summaries(program: &'a IrProgram, summaries: Vec<Effects>) -> Self {
         Self { program, summaries }
     }
 
     /// Leaf effects of one node, using the summaries supplied to
     /// [`Self::with_summaries`]. Children are not included.
+    #[cfg(feature = "lower")]
     pub(crate) fn leaf_effects(&self, function: &IrFn, node: Node) -> Effects {
         self.own_effects(function, node, &self.summaries)
     }

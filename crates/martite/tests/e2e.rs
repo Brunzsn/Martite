@@ -1,6 +1,6 @@
 use martite_base::{LoadLimits, MemoryProvider};
 use martite_driver::{LoadOptions, load};
-use martite_runtime::{ExecLimits, Runtime};
+use martite_runtime::{ExecLimits, IrRuntime};
 
 fn run_source(source: &str) -> Vec<String> {
     let mut provider = MemoryProvider::new();
@@ -29,7 +29,9 @@ fn run_source(source: &str) -> Vec<String> {
         panic!("diagnostics:\n{}", rendered.join("\n"));
     }
     let program = loaded.program.expect("program");
-    let mut runtime = Runtime::new(&program, ExecLimits::default());
+    let lowered = martite_driver::lower(&program, &loaded.sources);
+    let ir = lowered.program.expect("lowered program");
+    let mut runtime = IrRuntime::new(&ir, ExecLimits::default());
     let result = runtime.run_main().expect("runtime");
     result.log
 }

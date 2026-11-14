@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use martite::{Engine, HostSignature, HostType, LANG_EDITION};
+use martite::{Engine, Evaluator, HostSignature, HostType, LANG_EDITION};
 use martite_base::{
     Applicability, Code, Diagnostic, FileSystemProvider, LoadLimits, Severity, SourceMap,
     SourceProvider, normalize_source,
@@ -13,7 +13,9 @@ use martite_driver::{LoadOptions, LowerOptions, load, lower_with};
 use martite_ir::{IrProgram, Printer};
 use martite_lint::{LintInputs, ManifestInput, SettingsResolver, normalize_path, sort_diagnostics};
 use martite_resolve::InterfaceSource;
-use martite_runtime::{ExecLimits, Runtime, Trap, Value};
+#[cfg(feature = "ast-eval")]
+use martite_runtime::Runtime;
+use martite_runtime::{ExecLimits, IrRuntime, Trap, Value};
 use martite_syntax::{ParseOptions, parse_interface_with, parse_source_with};
 
 const USAGE: &str = "\
@@ -38,6 +40,7 @@ Options:
     --fuel <n>            Fuel for `run` and `test`
     --memory <n>          Memory limit in bytes for `run` and `test`
     --depth <n>           Call-depth limit for `run` and `test`
+    --ast                 Use the legacy AST evaluator (temporary)
     --dump-ir[=stage]     Dump IR for `run`/`test`: before, after, both
 
 Fmt options:
@@ -97,6 +100,18 @@ fn main() -> ExitCode {
     }
 }
 
+fn selected_evaluator(ast: bool) -> Evaluator {
+    #[cfg(feature = "ast-eval")]
+    {
+        if ast { Evaluator::Ast } else { Evaluator::Ir }
+    }
+    #[cfg(not(feature = "ast-eval"))]
+    {
+        let _ = ast;
+        Evaluator::Ir
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum DumpStage {
     Before,
@@ -112,6 +127,7 @@ struct Parsed {
     fuel: Option<u64>,
     memory: Option<u64>,
     depth: Option<u32>,
+    ast: bool,
     dump_ir: Option<DumpStage>,
     path: Option<String>,
     /// Arguments after the script path, passed through to `std.env.args()`.
@@ -166,6 +182,13 @@ fn parse_args(args: &[String], allow_trailing: bool) -> Result<Parsed, String> {
                         .parse()
                         .map_err(|_| "--depth requires a number")?,
                 );
+            }
+            Long("ast") => {
+                if cfg!(feature = "ast-eval") {
+                    out.ast = true;
+                } else {
+                    return Err("this build does not include the AST evaluator".into());
+                }
             }
             Long("dump-ir") => {
                 out.dump_ir = Some(match parser.optional_value() {
@@ -315,7 +338,7 @@ fn render_all(diagnostics: &[Diagnostic], sources: &SourceMap, out: &mut Vec<Ren
     }
 }
 
-fn print_rendered(diagnostics: &mut Vec<RenderedDiagnostic>, json: bool) {
+fn print_rendered(diagnostics: &mut [RenderedDiagnostic], json: bool) {
     diagnostics.sort_by(|left, right| {
         left.file
             .cmp(&right.file)
@@ -593,11 +616,11 @@ fn format_stdin(
         return ExitCode::from(1);
     }
     let formatted = output.text.unwrap();
-    if args.verify {
-        if let Err(message) = verify_format(source, &formatted, false) {
-            eprintln!("error: formatter bug in {name}: {message}");
-            return ExitCode::from(2);
-        }
+    if args.verify
+        && let Err(message) = verify_format(source, &formatted, false)
+    {
+        eprintln!("error: formatter bug in {name}: {message}");
+        return ExitCode::from(2);
     }
     if args.check {
         if source != formatted {
@@ -786,9 +809,8 @@ fn collect_projects(
             );
         };
         if root.join("plugin.toml").is_file() {
-            match plugin_spec(&root, args, diagnostics) {
-                Some(spec) => specs.push(spec),
-                None => {}
+            if let Some(spec) = plugin_spec(&root, args, diagnostics) {
+                specs.push(spec);
             }
         } else {
             for file in scan_martite_files(&root) {
@@ -994,7 +1016,7 @@ fn fix_project(
             _ => LintInputs::default(),
         };
         let prefix = relative_to(config_dir, &spec.root);
-        let output = martite_lint::lint(program, &loaded.sources, &resolver, &prefix, &inputs);
+        let output = martite_lint::lint(program, &loaded.sources, resolver, &prefix, &inputs);
         render_all(&output.diagnostics, &loaded.sources, &mut last);
 
         if pass == 5 {
@@ -1012,12 +1034,12 @@ fn fix_project(
     let mut failed = false;
     for (path, text) in &overlay {
         let full = spec.root.join(path);
-        if let Some(parent) = full.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                eprintln!("error: cannot create {}: {error}", parent.display());
-                failed = true;
-                continue;
-            }
+        if let Some(parent) = full.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("error: cannot create {}: {error}", parent.display());
+            failed = true;
+            continue;
         }
         if let Err(error) = std::fs::write(&full, text) {
             eprintln!("error: cannot write {}: {error}", full.display());
@@ -1372,12 +1394,9 @@ fn cmd_run(args: &[String]) -> ExitCode {
         }
     };
     if let Some(stage) = parsed.dump_ir {
-        let Some(ir) = lower_for_dump(plugin.program(), plugin.sources(), parsed.json) else {
-            return ExitCode::from(1);
-        };
-        dump_ir(stage, &ir);
+        dump_ir(stage, plugin.ir());
     }
-    let result = plugin.run_main();
+    let result = plugin.run_main_with(selected_evaluator(parsed.ast));
     match result {
         Ok(main) => {
             for line in main.log {
@@ -1408,6 +1427,10 @@ fn cmd_check(args: &[String], lint: bool) -> ExitCode {
     };
     if parsed.dump_ir.is_some() {
         eprintln!("error: --dump-ir is only supported by `martite run` and `martite test`\n");
+        return ExitCode::from(2);
+    }
+    if parsed.ast {
+        eprintln!("error: --ast is only supported by `martite run` and `martite test`\n");
         return ExitCode::from(2);
     }
     let Some(path) = parsed.path else {
@@ -1496,8 +1519,6 @@ fn cmd_check(args: &[String], lint: bool) -> ExitCode {
         .any(|d| d.severity == Severity::Error);
     if has_errors {
         ExitCode::from(1)
-    } else if lint && loaded.diagnostics.is_empty() {
-        ExitCode::SUCCESS
     } else {
         ExitCode::SUCCESS
     }
@@ -1670,10 +1691,10 @@ fn cmd_test(args: &[String]) -> ExitCode {
         eprintln!("error: no program");
         return ExitCode::from(2);
     };
+    let Some(ir) = lower_for_dump(&program, &loaded.sources, parsed.json) else {
+        return ExitCode::from(1);
+    };
     if let Some(stage) = parsed.dump_ir {
-        let Some(ir) = lower_for_dump(&program, &loaded.sources, parsed.json) else {
-            return ExitCode::from(1);
-        };
         dump_ir(stage, &ir);
     }
     let limits = ExecLimits {
@@ -1682,24 +1703,33 @@ fn cmd_test(args: &[String]) -> ExitCode {
         depth: parsed.depth.unwrap_or(200),
         deadline: None,
     };
+    let evaluator = selected_evaluator(parsed.ast);
     let mut failed = 0usize;
     let mut total = 0usize;
-    for def in &program.tests {
+    for (def, function) in program.tests.iter().zip(&ir.entries.tests) {
         total += 1;
         let name = program.resolved.def(*def).name.clone();
-        let mut runtime = Runtime::new(&program, limits);
-        match runtime.invoke(*def, Vec::new()) {
-            Ok(result) => {
-                for line in runtime.take_log() {
-                    println!("{line}");
-                }
-                println!("test {name} ... ok");
-                let _ = result;
+        let (outcome, log) = match evaluator {
+            Evaluator::Ir => {
+                let mut runtime = IrRuntime::new(&ir, limits);
+                let outcome = runtime
+                    .invoke(*function, Vec::new())
+                    .map(|result| result.value);
+                (outcome, runtime.take_log())
             }
+            #[cfg(feature = "ast-eval")]
+            Evaluator::Ast => {
+                let mut runtime = Runtime::new(&program, limits);
+                let outcome = runtime.invoke(*def, Vec::new()).map(|result| result.value);
+                (outcome, runtime.take_log())
+            }
+        };
+        for line in log {
+            println!("{line}");
+        }
+        match outcome {
+            Ok(_) => println!("test {name} ... ok"),
             Err(trap) => {
-                for line in runtime.take_log() {
-                    println!("{line}");
-                }
                 failed += 1;
                 println!("test {name} ... FAILED: {}", trap.panic_message());
             }

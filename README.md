@@ -12,8 +12,8 @@ The workspace is split along the compiler pipeline:
 - `martite-config` — `plugin.toml` and `martite.toml`
 - `martite-resolve` — module graph, imports, grants, top-level names
 - `martite-check` — bidirectional type checker, patterns, constants, handlers
-- `martite-ir` — resolved, self-contained tree IR, first-half lowering and text dumps
-- `martite-runtime` — tree-walking interpreter, IR-owned values, standard library, limits, traps
+- `martite-ir` — resolved, self-contained tree IR, lowering (`lower` feature), verifier and text dumps
+- `martite-runtime` — IR evaluator, values, standard library, limits and traps; the frozen AST evaluator is behind the temporary `ast-eval` feature
 - `martite-driver` — load orchestration
 - `martite` — embedding and plugin host API
 - `martite-cli` — `martite` binary and standalone `std.io`/`std.env` host
@@ -24,16 +24,22 @@ The workspace is split along the compiler pipeline:
 
 ## Architecture
 
-The compiler pipeline is `syntax → resolve → check → runtime`; tooling (`lint`,
-`fmt`, diagnostics) stays on the AST. Execution is moving from the checked-AST
-tree-walker to a resolved tree IR (`martite-ir`). The design and its semantics
-contract are in [`Martite_IR_Design_Doc.md`](Martite_IR_Design_Doc.md); the
-document stays a draft until the phase-3 performance gate is met.
+The compiler pipeline is `syntax → resolve → check → lower → IR execution`;
+tooling (`lint`, `fmt`, diagnostics) stays on the AST. The resolved tree IR in
+`martite-ir` is the default evaluator and the semantics contract for the
+optimizer. The design is in
+[`Martite_IR_Design_Doc.md`](Martite_IR_Design_Doc.md); its phase-3 performance
+gate was met before the default switch.
+
+`martite run` and `martite test` accept `--ast` as a temporary escape hatch that
+selects the frozen AST evaluator. The flag, the `ast-eval` feature and the AST
+evaluation paths are removed in #116.
 
 ## Commands
 
 ```sh
 cargo run -p martite-cli -- run examples/hello.mt
+cargo run -p martite-cli -- run --ast examples/hello.mt
 cargo run -p martite-cli -- check examples/bad.mt
 cargo run -p martite-cli -- check --json examples/bad.mt
 cargo run -p martite-cli -- lower examples/hello.mt
@@ -55,8 +61,9 @@ cargo bench -p martite-bench
 
 `martite lower <file>` prints the resolved IR without executing it.
 `martite run` and `martite test` accept `--dump-ir[=before|after|both]` and write
-the dump to stderr, so program output and exit codes are unchanged. The `after`
-stage is the lowered program until the optimizer lands.
+the dump to stderr, so program output and exit codes are unchanged. The dump is
+the lowered program that the run/test command executes; the `after` stage is the
+same program until the optimizer lands.
 
 Benchmarks use the deterministic corpus in
 `crates/martite-conformance/fixtures/bench`. See

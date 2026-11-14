@@ -1,26 +1,26 @@
-//! Runtime values, standard library and the AST interpreter for Martite.
+//! Runtime values, standard library and the IR evaluator for Martite.
 //!
 //! Values and the standard library use the IR-owned vocabulary in
 //! [`martite_ir`]: `FnId`, `TypeId`, `BuiltinFnId` and `BuiltinItemId`.
-//! `interp` is the remaining transitional `martite-check` consumer; it is
-//! replaced by the IR evaluator in #108-#115 and removed in #116.
+//! [`IrRuntime`] executes [`martite_ir::IrProgram`] and is the default
+//! execution path.
 //!
-//! The opt-in `ir-eval` feature adds [`IrRuntime`], the recursive evaluator for
-//! [`martite_ir::IrProgram`]. The AST interpreter remains the default until the
-//! migration switches it in #115.
+//! The frozen AST evaluator lives behind the temporary `ast-eval` feature for
+//! #115's `--ast` escape hatch, the conformance oracle and #116's retirement
+//! window. A default build does not depend on `martite-check`.
 
-pub mod interp;
+pub mod exec;
+pub mod ir_eval;
 pub mod json;
 pub mod ops;
 pub mod value;
 
-#[cfg(feature = "ir-eval")]
-pub mod ir_eval;
+#[cfg(feature = "ast-eval")]
+pub mod interp;
 
-pub use interp::{
-    CallResult, ExecLimits, HostContext, HostDispatcher, HostFault, MainResult, Runtime, Trap,
-};
-#[cfg(feature = "ir-eval")]
+pub use exec::{CallResult, ExecLimits, HostContext, HostFault, MainResult, Trap};
+#[cfg(feature = "ast-eval")]
+pub use interp::{HostDispatcher, Runtime};
 pub use ir_eval::{IrHostDispatcher, IrRuntime};
 pub use ops::{show, value_eq, value_ord};
 pub use value::{

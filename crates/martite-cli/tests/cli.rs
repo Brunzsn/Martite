@@ -174,6 +174,45 @@ fn test_runs_passing_and_failing_blocks() {
 }
 
 #[test]
+fn ast_flag_runs_the_legacy_evaluator() {
+    let dir = TempDir::new("ast-run");
+    let script = dir.file(
+        "main.mt",
+        "fn main() {\n    let xs = [1, 2, 3]\n    print(\"{xs.fold(0, fn(acc, x) => acc + x)}\")\n}\n",
+    );
+    let output = martite(&[s("run"), s("--ast"), script.as_os_str()]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "6");
+}
+
+#[test]
+fn ast_flag_runs_tests_and_keeps_dump_ir_available() {
+    let dir = TempDir::new("ast-test");
+    let script = dir.file(
+        "main.mt",
+        "test \"works\" {\n    assert(1 + 1 == 2, \"math is broken\")\n}\n",
+    );
+    let output = martite(&[
+        s("test"),
+        s("--ast"),
+        s("--dump-ir=before"),
+        script.as_os_str(),
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("1/1 tests passed"));
+    assert!(stderr(&output).contains("ir-format"));
+}
+
+#[test]
+fn ast_flag_is_rejected_by_tooling_commands() {
+    let dir = TempDir::new("ast-tooling");
+    let script = dir.file("main.mt", "fn main() { print(\"ok\") }\n");
+    let output = martite(&[s("check"), s("--ast"), script.as_os_str()]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr(&output).contains("--ast"));
+}
+
+#[test]
 fn check_loads_a_plugin_directory_with_an_interface() {
     let dir = TempDir::new("plugin");
     dir.file(

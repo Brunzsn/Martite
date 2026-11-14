@@ -10,8 +10,10 @@
 //! [`TypeTable::from_checker`] is the migration bridge. It copies definitions
 //! in checker declaration order, so a checker `TypeId(i)` and the IR
 //! `TypeId(i)` name the same definition. Tooling keeps using the checker ids;
-//! only values and lowered programs use the IR table.
+//! only values and lowered programs use the IR table. The bridge is part of
+//! the default `lower` feature; runtime builds use the IR table directly.
 
+#[cfg(feature = "lower")]
 use martite_check::{CheckedProgram, Ty as CheckTy, TypeDefKind as CheckTypeDefKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -175,6 +177,7 @@ impl TypeTable {
     /// The ids are stable by construction: definition `i` in the checker table
     /// becomes definition `i` here. Recursive and generic references are
     /// resolved after the placeholder definitions have been added.
+    #[cfg(feature = "lower")]
     pub fn from_checker(program: &CheckedProgram) -> Self {
         let mut table = Self::default();
         for def in &program.types.defs {
@@ -226,6 +229,7 @@ impl TypeTable {
         table
     }
 
+    #[cfg(feature = "lower")]
     pub(crate) fn ty_from_checker(&mut self, ty: &CheckTy) -> TyId {
         let converted = match ty {
             CheckTy::Int => Ty::Int,

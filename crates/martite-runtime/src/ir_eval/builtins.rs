@@ -5,7 +5,7 @@
 //! closures go through `call_closure_value`.
 
 use super::*;
-use crate::interp::{int_arg, parse_float, parse_int, range_len};
+use crate::ops::{int_arg, parse_float, parse_int, range_len};
 use crate::value::{OrderedMap, key_to_value};
 use martite_ir::{BuiltinMethodId, BuiltinReceiver};
 use smallvec::smallvec;
