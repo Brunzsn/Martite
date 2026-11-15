@@ -1,5 +1,7 @@
 //! Embedding API and plugin host for Martite.
 
+mod snapshot;
+
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -12,10 +14,10 @@ use martite_driver::{LoadOptions, LoadedProgram, LowerOptions, load, lower_with}
 use martite_ir::{HostId, IrProgram, TypeDefKind, TypeId, TypeTable};
 use martite_resolve::InterfaceSource;
 use martite_runtime::{
-    ExecLimits, HostCaller, HostContext, HostFault, IrHostDispatcher, IrRuntime, MAX_VALUE_DEPTH,
-    Trap, Value,
+    ExecLimits, HostCaller, HostContext, HostFault, IrHostDispatcher, IrRuntime, Trap, Value,
 };
 use martite_syntax::ParseOptions;
+use snapshot::{SNAPSHOT_FORMAT_VERSION, ValueCodec};
 
 pub use martite_base::{Code, Diagnostic, SourceId, SourceMap, Span};
 pub use martite_ir::VerifyMode;
@@ -1039,7 +1041,7 @@ impl Instance {
         let bytes = self
             .state
             .as_ref()
-            .map(|state| encode_value(state, self.plugin.program()))
+            .map(|state| ValueCodec::new(self.plugin.types()).encode(state))
             .unwrap_or_default();
         Snapshot {
             format_version: SNAPSHOT_FORMAT_VERSION,
@@ -1060,23 +1062,24 @@ impl Instance {
             self.state = None;
             return Ok(());
         }
-        let mut pos = 0;
-        let value = decode_value(&snapshot.bytes, &mut pos, self.plugin.program(), 0)?;
-        if pos != snapshot.bytes.len() {
-            return Err("trailing bytes in snapshot".into());
-        }
-        validate_snapshot_value(&value, self.plugin.types(), 0)?;
+        let value = ValueCodec::new(self.plugin.types()).decode(&snapshot.bytes)?;
         self.state = Some(value);
         Ok(())
     }
 }
 
-const SNAPSHOT_FORMAT_VERSION: u32 = 1;
-
+/// A snapshot of an instance's state plus a fingerprint of its type.
+///
+/// The `bytes` layout is internal and session-scoped, not a stable interchange
+/// format. The language is pre-0.1.0, so the map-key schema was unified with
+/// the value tags without bumping [`Snapshot::format_version`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
+    /// Wire-format version. Snapshots from another version are rejected.
     pub format_version: u32,
+    /// BLAKE3 fingerprint of the state type.
     pub type_fingerprint: [u8; 32],
+    /// Encoded state; empty for a stateless instance.
     pub bytes: Vec<u8>,
 }
 
@@ -1271,546 +1274,6 @@ fn fingerprint_into(
     }
 }
 
-fn encode_value(value: &Value, program: &CheckedProgram) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode_into(&mut out, value, program);
-    out
-}
-
-// `program` is kept for symmetry with `decode_value` and future tagged
-// encoding; the current format only needs the value.
-#[allow(clippy::only_used_in_recursion)]
-fn encode_into(out: &mut Vec<u8>, value: &Value, program: &CheckedProgram) {
-    use Value::*;
-    match value {
-        Unit => out.push(0),
-        Int(v) => {
-            out.push(1);
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        Float(v) => {
-            out.push(2);
-            out.extend_from_slice(&v.to_bits().to_le_bytes());
-        }
-        Bool(v) => {
-            out.push(3);
-            out.push(*v as u8);
-        }
-        Str(v) => {
-            out.push(4);
-            write_bytes(out, v.as_bytes());
-        }
-        List(items) | Tuple(items) => {
-            out.push(if matches!(value, List(_)) { 5 } else { 6 });
-            write_len(out, items.len());
-            for item in items.iter() {
-                encode_into(out, item, program);
-            }
-        }
-        Map(map) => {
-            out.push(7);
-            write_len(out, map.len());
-            for (key, value) in map.entries() {
-                encode_key(out, key);
-                encode_into(out, value, program);
-            }
-        }
-        Range {
-            start,
-            end,
-            inclusive,
-        } => {
-            out.push(8);
-            out.extend_from_slice(&start.to_le_bytes());
-            out.extend_from_slice(&end.to_le_bytes());
-            out.push(*inclusive as u8);
-        }
-        Struct(value) => {
-            out.push(9);
-            write_len(out, value.type_id.0 as usize);
-            write_len(out, value.fields.len());
-            for field in &value.fields {
-                encode_into(out, field, program);
-            }
-        }
-        Enum(value) => {
-            out.push(10);
-            write_len(out, value.type_id.0 as usize);
-            write_len(out, value.variant);
-            write_len(out, value.payload.len());
-            for field in &value.payload {
-                encode_into(out, field, program);
-            }
-        }
-        Option(value) => {
-            out.push(11);
-            match value {
-                None => out.push(0),
-                Some(value) => {
-                    out.push(1);
-                    encode_into(out, value, program);
-                }
-            }
-        }
-        Result(result) => {
-            out.push(12);
-            match result {
-                Ok(value) => {
-                    out.push(0);
-                    encode_into(out, value, program);
-                }
-                Err(value) => {
-                    out.push(1);
-                    encode_into(out, value, program);
-                }
-            }
-        }
-        Handle(value) => {
-            out.push(13);
-            write_len(out, value.type_id.0 as usize);
-            write_bytes(out, value.token.as_bytes());
-        }
-        Fn(_) | Builtin(_) | BuiltinModuleFn(_) => out.push(14),
-    }
-}
-
-fn write_len(out: &mut Vec<u8>, value: usize) {
-    out.extend_from_slice(&(value as u64).to_le_bytes());
-}
-
-fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    write_len(out, bytes.len());
-    out.extend_from_slice(bytes);
-}
-
-fn encode_key(out: &mut Vec<u8>, key: &martite_runtime::KeyValue) {
-    let value = martite_runtime::key_to_value(key);
-    encode_scalar_key(out, &value);
-}
-
-fn encode_scalar_key(out: &mut Vec<u8>, value: &Value) {
-    match value {
-        Value::Int(v) => {
-            out.push(0);
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        Value::Bool(v) => {
-            out.push(1);
-            out.push(*v as u8);
-        }
-        Value::Str(v) => {
-            out.push(2);
-            write_bytes(out, v.as_bytes());
-        }
-        Value::Tuple(items) => {
-            out.push(3);
-            write_len(out, items.len());
-            for item in items.iter() {
-                encode_scalar_key(out, item);
-            }
-        }
-        Value::Struct(value) => {
-            out.push(4);
-            write_len(out, value.type_id.0 as usize);
-            write_len(out, value.fields.len());
-            for field in &value.fields {
-                encode_scalar_key(out, field);
-            }
-        }
-        Value::Enum(value) => {
-            out.push(5);
-            write_len(out, value.type_id.0 as usize);
-            write_len(out, value.variant);
-            write_len(out, value.payload.len());
-            for field in &value.payload {
-                encode_scalar_key(out, field);
-            }
-        }
-        Value::Option(value) => {
-            out.push(6);
-            match value {
-                None => out.push(0),
-                Some(value) => {
-                    out.push(1);
-                    encode_scalar_key(out, value);
-                }
-            }
-        }
-        Value::Result(result) => {
-            out.push(7);
-            match result {
-                Ok(value) => {
-                    out.push(0);
-                    encode_scalar_key(out, value);
-                }
-                Err(value) => {
-                    out.push(1);
-                    encode_scalar_key(out, value);
-                }
-            }
-        }
-        Value::Handle(value) => {
-            out.push(8);
-            write_len(out, value.type_id.0 as usize);
-            write_bytes(out, value.token.as_bytes());
-        }
-        _ => out.push(9),
-    }
-}
-
-// `program` is threaded through the recursive walk so future tagged values
-// can validate against the checker table without changing the signature.
-#[allow(clippy::only_used_in_recursion)]
-fn decode_value(
-    bytes: &[u8],
-    pos: &mut usize,
-    program: &CheckedProgram,
-    depth: usize,
-) -> Result<Value, String> {
-    if depth > MAX_VALUE_DEPTH {
-        return Err("snapshot value nesting is too deep".into());
-    }
-    let tag = read_u8(bytes, pos)?;
-    Ok(match tag {
-        0 => Value::Unit,
-        1 => Value::Int(read_i64(bytes, pos)?),
-        2 => Value::Float(f64::from_bits(read_u64(bytes, pos)?)),
-        3 => Value::Bool(read_u8(bytes, pos)? != 0),
-        4 => Value::str(read_string(bytes, pos)?),
-        5 => {
-            let len = read_collection_len(bytes, pos, 1)?;
-            let mut items = Vec::new();
-            for _ in 0..len {
-                items.push(decode_value(bytes, pos, program, depth + 1)?);
-            }
-            Value::list(items)
-        }
-        6 => {
-            let len = read_collection_len(bytes, pos, 1)?;
-            let mut items = Vec::new();
-            for _ in 0..len {
-                items.push(decode_value(bytes, pos, program, depth + 1)?);
-            }
-            Value::tuple(items)
-        }
-        7 => {
-            let len = read_collection_len(bytes, pos, 2)?;
-            let mut map = martite_runtime::OrderedMap::new();
-            for _ in 0..len {
-                let key = decode_key(bytes, pos, depth + 1)?;
-                let value = decode_value(bytes, pos, program, depth + 1)?;
-                map.insert(key, value);
-            }
-            Value::map(map)
-        }
-        8 => Value::Range {
-            start: read_i64(bytes, pos)?,
-            end: read_i64(bytes, pos)?,
-            inclusive: read_u8(bytes, pos)? != 0,
-        },
-        9 => {
-            let type_id = TypeId(read_u32(bytes, pos)?);
-            let len = read_collection_len(bytes, pos, 1)?;
-            let mut fields = Vec::new();
-            for _ in 0..len {
-                fields.push(decode_value(bytes, pos, program, depth + 1)?);
-            }
-            Value::Struct(Rc::new(martite_runtime::StructValue::new(type_id, fields)))
-        }
-        10 => {
-            let type_id = TypeId(read_u32(bytes, pos)?);
-            let variant = read_len(bytes, pos)?;
-            let len = read_collection_len(bytes, pos, 1)?;
-            let mut payload = Vec::new();
-            for _ in 0..len {
-                payload.push(decode_value(bytes, pos, program, depth + 1)?);
-            }
-            Value::Enum(Rc::new(martite_runtime::EnumValue::new(
-                type_id, variant, payload,
-            )))
-        }
-        11 => match read_u8(bytes, pos)? {
-            0 => Value::Option(None),
-            _ => Value::Option(Some(Box::new(decode_value(
-                bytes,
-                pos,
-                program,
-                depth + 1,
-            )?))),
-        },
-        12 => match read_u8(bytes, pos)? {
-            0 => Value::Result(Ok(Box::new(decode_value(bytes, pos, program, depth + 1)?))),
-            _ => Value::Result(Err(Box::new(decode_value(bytes, pos, program, depth + 1)?))),
-        },
-        13 => {
-            let type_id = TypeId(read_u32(bytes, pos)?);
-            let token = read_string(bytes, pos)?;
-            Value::Handle(Rc::new(martite_runtime::HandleValue { type_id, token }))
-        }
-        _ => return Err("snapshot contains a non-data value".into()),
-    })
-}
-
-fn decode_key(
-    bytes: &[u8],
-    pos: &mut usize,
-    depth: usize,
-) -> Result<martite_runtime::KeyValue, String> {
-    use martite_runtime::KeyValue;
-    if depth > MAX_VALUE_DEPTH {
-        return Err("snapshot key nesting is too deep".into());
-    }
-    let tag = read_u8(bytes, pos)?;
-    Ok(match tag {
-        0 => KeyValue::Int(read_i64(bytes, pos)?),
-        1 => KeyValue::Bool(read_u8(bytes, pos)? != 0),
-        2 => KeyValue::Str(read_string(bytes, pos)?),
-        3 => {
-            let len = read_collection_len(bytes, pos, 1)?;
-            let mut items = Vec::new();
-            for _ in 0..len {
-                items.push(decode_key(bytes, pos, depth + 1)?);
-            }
-            KeyValue::Tuple(items)
-        }
-        4 => {
-            let type_id = TypeId(read_u32(bytes, pos)?);
-            let len = read_collection_len(bytes, pos, 1)?;
-            let mut fields = Vec::new();
-            for _ in 0..len {
-                fields.push(decode_key(bytes, pos, depth + 1)?);
-            }
-            KeyValue::Struct(type_id, fields)
-        }
-        5 => {
-            let type_id = TypeId(read_u32(bytes, pos)?);
-            let variant = read_len(bytes, pos)?;
-            let len = read_collection_len(bytes, pos, 1)?;
-            let mut payload = Vec::new();
-            for _ in 0..len {
-                payload.push(decode_key(bytes, pos, depth + 1)?);
-            }
-            KeyValue::Enum(type_id, variant, payload)
-        }
-        6 => {
-            if read_u8(bytes, pos)? == 0 {
-                KeyValue::Option(None)
-            } else {
-                KeyValue::Option(Some(Box::new(decode_key(bytes, pos, depth + 1)?)))
-            }
-        }
-        7 => {
-            if read_u8(bytes, pos)? == 0 {
-                KeyValue::Result(Ok(Box::new(decode_key(bytes, pos, depth + 1)?)))
-            } else {
-                KeyValue::Result(Err(Box::new(decode_key(bytes, pos, depth + 1)?)))
-            }
-        }
-        8 => {
-            let type_id = TypeId(read_u32(bytes, pos)?);
-            let token = read_string(bytes, pos)?;
-            KeyValue::Handle(type_id, token)
-        }
-        _ => return Err("invalid map key in snapshot".into()),
-    })
-}
-
-fn read_u8(bytes: &[u8], pos: &mut usize) -> Result<u8, String> {
-    let byte = *bytes.get(*pos).ok_or("truncated snapshot")?;
-    *pos += 1;
-    Ok(byte)
-}
-
-fn read_u64(bytes: &[u8], pos: &mut usize) -> Result<u64, String> {
-    let rest = bytes.get(*pos..).ok_or("truncated snapshot")?;
-    let slice = rest.get(..8).ok_or("truncated snapshot")?;
-    *pos += 8;
-    Ok(u64::from_le_bytes(
-        slice.try_into().map_err(|_| "truncated snapshot")?,
-    ))
-}
-
-fn read_i64(bytes: &[u8], pos: &mut usize) -> Result<i64, String> {
-    Ok(read_u64(bytes, pos)? as i64)
-}
-
-fn read_len(bytes: &[u8], pos: &mut usize) -> Result<usize, String> {
-    usize::try_from(read_u64(bytes, pos)?).map_err(|_| "snapshot length is too large".into())
-}
-
-fn read_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, String> {
-    u32::try_from(read_len(bytes, pos)?).map_err(|_| "snapshot type id is too large".into())
-}
-
-fn read_collection_len(
-    bytes: &[u8],
-    pos: &mut usize,
-    min_item_bytes: usize,
-) -> Result<usize, String> {
-    let len = read_len(bytes, pos)?;
-    let remaining = bytes.len().saturating_sub(*pos);
-    if len > remaining / min_item_bytes.max(1) {
-        return Err("snapshot container length exceeds remaining bytes".into());
-    }
-    Ok(len)
-}
-
-fn read_string(bytes: &[u8], pos: &mut usize) -> Result<String, String> {
-    let len = read_len(bytes, pos)?;
-    let remaining = bytes.len().saturating_sub(*pos);
-    if len > remaining {
-        return Err("truncated snapshot string".into());
-    }
-    let slice = &bytes[*pos..*pos + len];
-    *pos += len;
-    String::from_utf8(slice.to_vec()).map_err(|_| "invalid UTF-8 in snapshot".into())
-}
-
-fn validate_snapshot_value(value: &Value, types: &TypeTable, depth: usize) -> Result<(), String> {
-    if depth > MAX_VALUE_DEPTH {
-        return Err("snapshot value nesting is too deep".into());
-    }
-    match value {
-        Value::Unit
-        | Value::Int(_)
-        | Value::Float(_)
-        | Value::Bool(_)
-        | Value::Str(_)
-        | Value::Range { .. }
-        | Value::Option(None) => Ok(()),
-        Value::List(items) | Value::Tuple(items) => {
-            for item in items.iter() {
-                validate_snapshot_value(item, types, depth + 1)?;
-            }
-            Ok(())
-        }
-        Value::Map(map) => {
-            for (key, value) in map.entries() {
-                validate_snapshot_key(key, types, depth + 1)?;
-                validate_snapshot_value(value, types, depth + 1)?;
-            }
-            Ok(())
-        }
-        Value::Struct(value) => {
-            let Some(def) = types.get(value.type_id) else {
-                return Err("snapshot references an unknown struct type".into());
-            };
-            let TypeDefKind::Struct { fields } = &def.kind else {
-                return Err("snapshot struct type is not a struct".into());
-            };
-            if fields.len() != value.fields.len() {
-                return Err("snapshot struct field count does not match its type".into());
-            }
-            for field in &value.fields {
-                validate_snapshot_value(field, types, depth + 1)?;
-            }
-            Ok(())
-        }
-        Value::Enum(value) => {
-            let Some(def) = types.get(value.type_id) else {
-                return Err("snapshot references an unknown enum type".into());
-            };
-            let TypeDefKind::Enum { variants } = &def.kind else {
-                return Err("snapshot enum type is not an enum".into());
-            };
-            let Some(variant) = variants.get(value.variant) else {
-                return Err("snapshot enum variant is out of range".into());
-            };
-            if variant.payload.len() != value.payload.len() {
-                return Err("snapshot enum payload count does not match its variant".into());
-            }
-            for field in &value.payload {
-                validate_snapshot_value(field, types, depth + 1)?;
-            }
-            Ok(())
-        }
-        Value::Option(Some(value)) => validate_snapshot_value(value, types, depth + 1),
-        Value::Result(Ok(value)) | Value::Result(Err(value)) => {
-            validate_snapshot_value(value, types, depth + 1)
-        }
-        Value::Handle(value) => {
-            let Some(def) = types.get(value.type_id) else {
-                return Err("snapshot references an unknown handle type".into());
-            };
-            if matches!(&def.kind, TypeDefKind::Opaque) {
-                Ok(())
-            } else {
-                Err("snapshot handle type is not opaque".into())
-            }
-        }
-        Value::Fn(_) | Value::Builtin(_) | Value::BuiltinModuleFn(_) => {
-            Err("snapshot contains a function value".into())
-        }
-    }
-}
-
-fn validate_snapshot_key(
-    key: &martite_runtime::KeyValue,
-    types: &TypeTable,
-    depth: usize,
-) -> Result<(), String> {
-    use martite_runtime::KeyValue;
-    if depth > MAX_VALUE_DEPTH {
-        return Err("snapshot key nesting is too deep".into());
-    }
-    match key {
-        KeyValue::Int(_) | KeyValue::Bool(_) | KeyValue::Str(_) => Ok(()),
-        KeyValue::Tuple(items) => {
-            for item in items.iter() {
-                validate_snapshot_key(item, types, depth + 1)?;
-            }
-            Ok(())
-        }
-        KeyValue::Struct(type_id, fields) => {
-            let Some(def) = types.get(*type_id) else {
-                return Err("snapshot key references an unknown struct type".into());
-            };
-            let TypeDefKind::Struct { fields: def_fields } = &def.kind else {
-                return Err("snapshot key struct type is not a struct".into());
-            };
-            if def_fields.len() != fields.len() {
-                return Err("snapshot key field count does not match its type".into());
-            }
-            for field in fields {
-                validate_snapshot_key(field, types, depth + 1)?;
-            }
-            Ok(())
-        }
-        KeyValue::Enum(type_id, variant, fields) => {
-            let Some(def) = types.get(*type_id) else {
-                return Err("snapshot key references an unknown enum type".into());
-            };
-            let TypeDefKind::Enum { variants } = &def.kind else {
-                return Err("snapshot key enum type is not an enum".into());
-            };
-            let Some(variant) = variants.get(*variant) else {
-                return Err("snapshot key enum variant is out of range".into());
-            };
-            if variant.payload.len() != fields.len() {
-                return Err("snapshot key payload count does not match its variant".into());
-            }
-            for field in fields {
-                validate_snapshot_key(field, types, depth + 1)?;
-            }
-            Ok(())
-        }
-        KeyValue::Option(Some(value))
-        | KeyValue::Result(Ok(value))
-        | KeyValue::Result(Err(value)) => validate_snapshot_key(value, types, depth + 1),
-        KeyValue::Option(None) => Ok(()),
-        KeyValue::Handle(type_id, _) => {
-            let Some(def) = types.get(*type_id) else {
-                return Err("snapshot key references an unknown handle type".into());
-            };
-            if matches!(&def.kind, TypeDefKind::Opaque) {
-                Ok(())
-            } else {
-                Err("snapshot key handle type is not opaque".into())
-            }
-        }
-    }
-}
-
 /// Convenience for tests and examples: a sandboxed provider rooted at a directory.
 pub fn fs_provider(root: impl Into<std::path::PathBuf>) -> FileSystemProvider {
     FileSystemProvider::new(root)
@@ -1834,25 +1297,6 @@ pub fn memory_provider(files: &[(&str, &str)]) -> MemoryProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn snapshot_length_overflow_is_rejected() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
-        let mut pos = 0;
-        let _ = read_len(&bytes, &mut pos);
-        let mut pos = 0;
-        assert!(read_collection_len(&bytes, &mut pos, 1).is_err());
-    }
-
-    #[test]
-    fn snapshot_string_length_is_bounded_by_remaining_bytes() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&100u64.to_le_bytes());
-        bytes.extend_from_slice(b"short");
-        let mut pos = 0;
-        assert!(read_string(&bytes, &mut pos).is_err());
-    }
 
     #[test]
     fn api_versions_are_strict() {
