@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use martite::{Engine, HostSignature, HostType, Instance, Limits, Outcome};
+use martite::{Engine, HostSignature, HostType, Instance, Limits, Outcome, VerifyMode};
 use martite_base::MemoryProvider;
 use martite_runtime::{HostFault, Trap, Value};
 
@@ -66,6 +66,16 @@ fn load_plugin() -> martite::Plugin {
                     .join("\n")
             )
         })
+}
+
+#[test]
+fn engine_verifies_ir_by_default_and_exposes_the_switch() {
+    let mut engine = Engine::new();
+    assert_eq!(engine.verification(), VerifyMode::Always);
+    engine.set_verification(VerifyMode::Never);
+    assert_eq!(engine.verification(), VerifyMode::Never);
+    engine.set_verification(VerifyMode::DebugOnly);
+    assert_eq!(engine.verification(), VerifyMode::DebugOnly);
 }
 
 fn state_saves(instance: &Instance) -> i64 {

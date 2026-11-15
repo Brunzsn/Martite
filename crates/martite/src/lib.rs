@@ -8,7 +8,7 @@ use martite_check::{
     CheckedProgram, FnSig, Ty, TypeDefKind as CheckTypeDefKind, TypeId as CheckTypeId,
 };
 use martite_config::{Manifest, parse_manifest};
-use martite_driver::{LoadOptions, LoadedProgram, load, lower};
+use martite_driver::{LoadOptions, LoadedProgram, LowerOptions, load, lower_with};
 use martite_ir::{HostId, IrProgram, TypeDefKind, TypeId, TypeTable};
 use martite_resolve::InterfaceSource;
 use martite_runtime::{
@@ -18,6 +18,7 @@ use martite_runtime::{
 use martite_syntax::ParseOptions;
 
 pub use martite_base::{Code, Diagnostic, SourceId, SourceMap, Span};
+pub use martite_ir::VerifyMode;
 pub use martite_runtime::{ExecLimits as Limits, Value as HostValue, show};
 
 /// The language edition implemented by this crate.
@@ -122,6 +123,7 @@ pub struct Engine {
     default_limits: ExecLimits,
     optimize: bool,
     require_host_impls: bool,
+    verification: VerifyMode,
 }
 
 impl Default for Engine {
@@ -140,6 +142,7 @@ impl Engine {
             default_limits: ExecLimits::default(),
             optimize: true,
             require_host_impls: true,
+            verification: VerifyMode::Always,
         }
     }
 
@@ -172,18 +175,41 @@ impl Engine {
         self
     }
 
+    /// The IR verification policy used by loading and optimization.
+    ///
+    /// Defaults to [`VerifyMode::Always`], including release builds.
+    pub fn verification(&self) -> VerifyMode {
+        self.verification
+    }
+
+    /// Select the IR verification policy for loading and optimization.
+    ///
+    /// [`VerifyMode::Always`] is the default. [`VerifyMode::Never`] is for
+    /// benchmarks and fuzzing only; it does not change observable behavior.
+    /// [`VerifyMode::DebugOnly`] restores the older debug-build-only policy.
+    pub fn set_verification(&mut self, mode: VerifyMode) -> &mut Self {
+        self.verification = mode;
+        self
+    }
+
     fn optimize_ir(&self, ir: &mut IrProgram) -> Result<(), Vec<Diagnostic>> {
         if !self.optimize {
             return Ok(());
         }
-        martite_opt::optimize(ir, martite_opt::OptimizeOptions::default())
-            .map(|_| ())
-            .map_err(|error| {
-                vec![Diagnostic::error(
-                    Code::E508,
-                    format!("optimization failed: {error}"),
-                )]
-            })
+        martite_opt::optimize(
+            ir,
+            martite_opt::OptimizeOptions {
+                verify: self.verification,
+                ..Default::default()
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            vec![Diagnostic::error(
+                Code::E508,
+                format!("optimization failed: {error}"),
+            )]
+        })
     }
 
     /// Register an `.mti` interface module, for example `app.editor`.
@@ -433,7 +459,13 @@ impl Engine {
                 sources,
             });
         }
-        let lowered = lower(&program, &sources);
+        let lowered = lower_with(
+            &program,
+            &sources,
+            LowerOptions {
+                verify: self.verification,
+            },
+        );
         if lowered.has_errors() {
             return Err(LoadError {
                 diagnostics: lowered.diagnostics,
@@ -476,6 +508,7 @@ impl Engine {
             max_limits: self.max_limits,
             caller,
             manifest,
+            verification: self.verification,
         }))
     }
 
@@ -577,7 +610,13 @@ impl Engine {
                 sources,
             });
         }
-        let lowered = lower(&program, &sources);
+        let lowered = lower_with(
+            &program,
+            &sources,
+            LowerOptions {
+                verify: self.verification,
+            },
+        );
         if lowered.has_errors() {
             return Err(LoadError {
                 diagnostics: lowered.diagnostics,
@@ -621,6 +660,7 @@ impl Engine {
             max_limits: self.max_limits,
             caller,
             manifest,
+            verification: self.verification,
         }))
     }
 }
@@ -657,6 +697,7 @@ struct PluginInner {
     max_limits: ExecLimits,
     caller: HostCaller,
     manifest: Manifest,
+    verification: VerifyMode,
 }
 
 impl PluginInner {
@@ -739,7 +780,14 @@ impl Plugin {
     /// Used by the CLI's `--dump-ir=before` stage; normal execution uses
     /// [`Self::ir`].
     pub fn lowered_ir(&self) -> Option<IrProgram> {
-        lower(&self.inner.program, &self.inner.sources).program
+        lower_with(
+            &self.inner.program,
+            &self.inner.sources,
+            LowerOptions {
+                verify: self.inner.verification,
+            },
+        )
+        .program
     }
 
     /// IR-owned type definitions for this program.

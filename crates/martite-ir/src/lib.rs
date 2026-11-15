@@ -85,5 +85,7 @@ pub use program::{
     IrProgram, ParamInfo, PreludeVariant, SlotInfo,
 };
 pub use types::{FieldDef, Ty, TyId, TypeDef, TypeDefKind, TypeId, TypeTable, VariantDef};
-pub use verify::{VerifyError, VerifyErrorKind, verify, verify_after_pass};
+pub use verify::{
+    VerifyError, VerifyErrorKind, VerifyMode, verify, verify_after_pass, verify_with,
+};
 pub use walk::children_of;

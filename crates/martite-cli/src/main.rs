@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use martite::{Engine, HostSignature, HostType, LANG_EDITION, LoadError, Plugin};
+use martite::{Engine, HostSignature, HostType, LANG_EDITION, LoadError, Plugin, VerifyMode};
 use martite_base::{
     Applicability, Code, Diagnostic, FileSystemProvider, LoadLimits, Severity, SourceMap,
     SourceProvider, normalize_source,
@@ -58,6 +58,9 @@ Lint options:
     --list-rules          List every rule
     --explain L019        Explain one rule
 ";
+
+/// `run`, `test` and `lower` verify lowered and optimized IR by default.
+const CLI_VERIFICATION: VerifyMode = VerifyMode::Always;
 
 const STD_IO: &str = r#"fn read_line() -> Result[str?, str]
 fn read_file(path: str) -> Result[str, str]
@@ -943,6 +946,7 @@ fn exec_limits(args: &CliArgs) -> ExecLimits {
 fn build_engine(spec: &ProjectSpec, args: &CliArgs, script_args: Vec<String>) -> Engine {
     let mut engine = Engine::new();
     engine.set_optimize(!args.no_optimize);
+    engine.set_verification(CLI_VERIFICATION);
     let limits = exec_limits(args);
     engine.set_limits(limits, limits);
     for interface in &spec.interfaces {
@@ -1638,7 +1642,13 @@ fn cmd_lower(raw: &[String]) -> ExitCode {
 }
 
 fn optimize_ir(ir: &mut IrProgram, json: bool) -> bool {
-    match martite_opt::optimize(ir, martite_opt::OptimizeOptions::default()) {
+    match martite_opt::optimize(
+        ir,
+        martite_opt::OptimizeOptions {
+            verify: CLI_VERIFICATION,
+            ..Default::default()
+        },
+    ) {
         Ok(_) => true,
         Err(error) => {
             let diagnostic = Diagnostic::error(Code::E508, format!("optimization failed: {error}"));
@@ -1737,7 +1747,13 @@ fn dump_ir(stage: DumpStage, lowered: Option<&IrProgram>, executing: &IrProgram)
 }
 
 fn lower_for_dump(program: &CheckedProgram, sources: &SourceMap, json: bool) -> Option<IrProgram> {
-    let lowered = lower_with(program, sources, LowerOptions { verify: true });
+    let lowered = lower_with(
+        program,
+        sources,
+        LowerOptions {
+            verify: CLI_VERIFICATION,
+        },
+    );
     if lowered.has_errors() {
         print_diagnostics(&lowered.diagnostics, sources, json);
         return None;

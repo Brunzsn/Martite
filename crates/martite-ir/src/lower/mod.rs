@@ -44,6 +44,7 @@ use crate::program::{
     SlotInfo,
 };
 use crate::types::{Ty, TyId, TypeId, TypeTable};
+use crate::verify::VerifyMode;
 
 pub(crate) use context::FnLowerer;
 pub(crate) use slots::{BodyRoot, SlotPlan};
@@ -51,14 +52,14 @@ pub(crate) use slots::{BodyRoot, SlotPlan};
 /// Options for [`lower_with`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LowerOptions {
-    /// Run [`crate::verify`] on the result before returning it.
-    pub verify: bool,
+    /// Verification policy applied to the lowered program.
+    pub verify: VerifyMode,
 }
 
 impl Default for LowerOptions {
     fn default() -> Self {
         Self {
-            verify: cfg!(debug_assertions),
+            verify: VerifyMode::Always,
         }
     }
 }
@@ -69,15 +70,15 @@ impl Default for LowerOptions {
 /// `CheckedProgram` does not retain them, and the IR needs them for trap
 /// provenance and dumps.
 ///
-/// [`LowerOptions::default`] verifies the result in debug builds.
+/// [`LowerOptions::default`] verifies the result in every build.
 pub fn lower(program: &CheckedProgram, sources: &SourceMap) -> Result<IrProgram, LowerError> {
     lower_with(program, sources, LowerOptions::default())
 }
 
 /// Lower one checked program with explicit [`LowerOptions`].
 ///
-/// Tests and benchmarks use this to measure lowering without the debug-build
-/// self-check; production callers should keep verification on.
+/// Benchmarks and fuzzing pass [`VerifyMode::Never`]; production callers keep
+/// [`VerifyMode::Always`] (the default).
 pub fn lower_with(
     program: &CheckedProgram,
     sources: &SourceMap,
@@ -112,7 +113,7 @@ pub enum LowerErrorKind {
     Internal { message: String },
     /// The IR tree exceeds [`crate::MAX_NODE_DEPTH`].
     DepthLimit { limit: u32 },
-    /// The debug-build self-check rejected the lowered program.
+    /// The verification policy rejected the lowered program.
     Verification(Box<crate::VerifyError>),
 }
 
@@ -638,9 +639,7 @@ impl<'p> Lowerer<'p> {
             source_names: self.source_names,
         };
         effects::fill(&mut program)?;
-        if options.verify
-            && let Err(error) = crate::verify(&program)
-        {
+        if let Err(error) = crate::verify_with(&program, options.verify) {
             return Err(LowerError {
                 fn_id: error.function,
                 source: error.source,

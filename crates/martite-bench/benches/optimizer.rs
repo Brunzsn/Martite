@@ -12,17 +12,28 @@ use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use martite_bench::{BENCH_LIMITS, fixture};
-use martite_driver::{LowerOptions, lower_with};
+use martite_driver::{LowerOptions, VerifyMode, lower_with};
 use martite_opt::{OptimizeOptions, optimize};
 use martite_runtime::IrRuntime;
 
+fn no_verify() -> OptimizeOptions {
+    OptimizeOptions {
+        verify: VerifyMode::Never,
+        ..Default::default()
+    }
+}
+
+const NO_VERIFY_LOWER: LowerOptions = LowerOptions {
+    verify: VerifyMode::Never,
+};
+
 fn optimizer_benches(c: &mut Criterion) {
     let (fold_program, fold_sources) = fixture("optimize/constant_fold.mt").checked();
-    let unoptimized = lower_with(&fold_program, &fold_sources, LowerOptions { verify: false })
+    let unoptimized = lower_with(&fold_program, &fold_sources, NO_VERIFY_LOWER)
         .program
         .expect("optimizer fixture lowers");
     let mut optimized = unoptimized.clone();
-    optimize(&mut optimized, OptimizeOptions::default()).expect("optimizer fixture optimizes");
+    optimize(&mut optimized, no_verify()).expect("optimizer fixture optimizes");
 
     let corpus: Vec<_> = [
         "arithmetic_loop",
@@ -46,7 +57,7 @@ fn optimizer_benches(c: &mut Criterion) {
     let lowered_corpus: Vec<_> = corpus
         .iter()
         .map(|(program, sources)| {
-            lower_with(program, sources, LowerOptions { verify: false })
+            lower_with(program, sources, NO_VERIFY_LOWER)
                 .program
                 .expect("runtime fixture lowers")
         })
@@ -56,7 +67,7 @@ fn optimizer_benches(c: &mut Criterion) {
     group.bench_function("lower_const_fold", |b| {
         b.iter(|| {
             black_box(
-                lower_with(&fold_program, &fold_sources, LowerOptions { verify: false })
+                lower_with(&fold_program, &fold_sources, NO_VERIFY_LOWER)
                     .program
                     .expect("optimizer fixture lowers"),
             )
@@ -67,7 +78,7 @@ fn optimizer_benches(c: &mut Criterion) {
             let lowered: Vec<_> = corpus
                 .iter()
                 .map(|(program, sources)| {
-                    lower_with(program, sources, LowerOptions { verify: false })
+                    lower_with(program, sources, NO_VERIFY_LOWER)
                         .program
                         .expect("runtime fixture lowers")
                 })
@@ -79,7 +90,7 @@ fn optimizer_benches(c: &mut Criterion) {
         b.iter_batched(
             || unoptimized.clone(),
             |mut ir| {
-                optimize(&mut ir, OptimizeOptions::default()).expect("optimize");
+                optimize(&mut ir, no_verify()).expect("optimize");
                 black_box(ir)
             },
             BatchSize::SmallInput,
@@ -90,7 +101,7 @@ fn optimizer_benches(c: &mut Criterion) {
             || lowered_corpus.clone(),
             |mut programs| {
                 for ir in &mut programs {
-                    optimize(ir, OptimizeOptions::default()).expect("optimize");
+                    optimize(ir, no_verify()).expect("optimize");
                 }
                 black_box(programs)
             },
