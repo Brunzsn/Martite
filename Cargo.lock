@@ -623,6 +623,7 @@ name = "martite-check"
 version = "0.1.0"
 dependencies = [
  "martite-base",
+ "martite-builtin",
  "martite-resolve",
  "martite-syntax",
  "rustc-hash",
@@ -709,6 +710,7 @@ name = "martite-ir"
 version = "0.1.0"
 dependencies = [
  "martite-base",
+ "martite-builtin",
  "martite-check",
  "martite-driver",
  "martite-resolve",
@@ -747,6 +749,7 @@ name = "martite-resolve"
 version = "0.1.0"
 dependencies = [
  "martite-base",
+ "martite-builtin",
  "martite-syntax",
  "rustc-hash",
 ]

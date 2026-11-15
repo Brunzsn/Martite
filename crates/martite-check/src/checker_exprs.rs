@@ -5,11 +5,7 @@ enum FieldKind {
     StructField(usize),
     TupleField(u32),
     Method(DefId),
-    BuiltinMethod {
-        receiver: BuiltinReceiver,
-        name: &'static str,
-        mut_self: bool,
-    },
+    BuiltinMethod { method: BuiltinMethodId },
     Variant(TypeId, usize),
     ModuleItem(DefId),
     BuiltinItem(BuiltinItem),
@@ -1033,17 +1029,17 @@ impl<'a> Checker<'a> {
         match name {
             "print" => {
                 self.resolutions
-                    .insert(expr.id, Resolution::BuiltinFn(BuiltinFn::Print));
+                    .insert(expr.id, Resolution::BuiltinFn(BuiltinFnId::PRINT));
                 return Ty::Fn(vec![Ty::Param(0)], Box::new(Ty::Unit));
             }
             "panic" => {
                 self.resolutions
-                    .insert(expr.id, Resolution::BuiltinFn(BuiltinFn::Panic));
+                    .insert(expr.id, Resolution::BuiltinFn(BuiltinFnId::PANIC));
                 return Ty::Fn(vec![Ty::Str], Box::new(Ty::Never));
             }
             "assert" => {
                 self.resolutions
-                    .insert(expr.id, Resolution::BuiltinFn(BuiltinFn::Assert));
+                    .insert(expr.id, Resolution::BuiltinFn(BuiltinFnId::ASSERT));
                 return Ty::Fn(vec![Ty::Bool, Ty::Str], Box::new(Ty::Unit));
             }
             "Some" | "Ok" | "Err" => {
@@ -1166,15 +1162,10 @@ impl<'a> Checker<'a> {
             FieldKind::Method(def) => {
                 self.resolutions.insert(expr.id, Resolution::Method(*def));
             }
-            FieldKind::BuiltinMethod {
-                receiver, name, ..
-            } => {
+            FieldKind::BuiltinMethod { method } => {
                 self.resolutions.insert(
                     expr.id,
-                    Resolution::BuiltinMethod {
-                        receiver: *receiver,
-                        name: *name,
-                    },
+                    Resolution::BuiltinMethod { method: *method },
                 );
             }
             FieldKind::Variant(id, index) => {
@@ -1494,17 +1485,13 @@ impl<'a> Checker<'a> {
                             kind: FieldKind::Value,
                         };
                     };
-                    if let Some(info) = builtin_method_info(receiver, name) {
+                    if let Some(method) = BuiltinMethodId::lookup(receiver, name) {
                         let _ = infer;
                         return FieldResult {
                             // Methods are not first-class values; the call
                             // checker uses the field kind directly.
                             ty: Ty::Error,
-                            kind: FieldKind::BuiltinMethod {
-                                receiver,
-                                name: info.name,
-                                mut_self: info.mut_self,
-                            },
+                            kind: FieldKind::BuiltinMethod { method },
                         };
                     }
                     let module = self.current_module();
@@ -1565,20 +1552,16 @@ impl<'a> Checker<'a> {
                         infer,
                     );
                 }
-                FieldKind::BuiltinMethod {
-                    receiver,
-                    name,
-                    mut_self,
-                } => {
+                FieldKind::BuiltinMethod { method } => {
                     let recv_raw = self.check_expr(base, None, infer);
                     let receiver_ty = infer.resolve(&recv_raw);
-                    if mut_self {
+                    let def = method.def().expect("builtin method id is in range");
+                    if def.mut_self {
                         self.require_mutable_place(base, expr.span);
                     }
                     return self.check_builtin_method(
                         expr,
-                        receiver,
-                        name,
+                        method,
                         &receiver_ty,
                         args,
                         expected,
@@ -2179,12 +2162,12 @@ impl<'a> Checker<'a> {
     fn check_builtin_call(
         &mut self,
         expr: &Expr,
-        function: BuiltinFn,
+        function: BuiltinFnId,
         args: &[Arg],
         infer: &mut Infer,
     ) -> Ty {
         match function {
-            BuiltinFn::Print => {
+            BuiltinFnId::PRINT => {
                 if args.len() != 1 {
                     let module = self.current_module();
                     self.err_at(module, expr.span, Code::E204, "`print` takes one argument");
@@ -2203,7 +2186,7 @@ impl<'a> Checker<'a> {
                 }
                 Ty::Unit
             }
-            BuiltinFn::Panic => {
+            BuiltinFnId::PANIC => {
                 if args.len() != 1 {
                     let module = self.current_module();
                     self.err_at(module, expr.span, Code::E204, "`panic` takes one argument");
@@ -2213,7 +2196,7 @@ impl<'a> Checker<'a> {
                 }
                 Ty::Never
             }
-            BuiltinFn::Assert => {
+            BuiltinFnId::ASSERT => {
                 if args.len() != 2 {
                     let module = self.current_module();
                     self.err_at(module, expr.span, Code::E204, "`assert` takes two arguments");
@@ -2226,6 +2209,7 @@ impl<'a> Checker<'a> {
                 }
                 Ty::Unit
             }
+            _ => Ty::Error,
         }
     }
 
@@ -2662,75 +2646,6 @@ fn has_conflicting_alias(roots: &[(BindingId, bool)]) -> bool {
         }
     }
     false
-}
-
-#[derive(Clone, Copy)]
-struct BuiltinMethodInfo {
-    name: &'static str,
-    mut_self: bool,
-}
-
-fn builtin_method_info(receiver: BuiltinReceiver, name: &str) -> Option<BuiltinMethodInfo> {
-    let (known, mut_self): (&'static [&'static str], bool) = match receiver {
-        BuiltinReceiver::List => (
-            &[
-                "len", "get", "first", "last", "contains", "map", "filter", "fold", "any",
-                "all", "enumerate", "reversed", "sorted", "sorted_by", "join", "push", "pop",
-                "sort", "insert", "remove_at", "extend", "clear",
-            ],
-            matches!(
-                name,
-                "push" | "pop" | "sort" | "insert" | "remove_at" | "extend" | "clear"
-            ),
-        ),
-        BuiltinReceiver::Map => (
-            &[
-                "len", "get", "has", "keys", "values", "entries", "remove", "clear",
-            ],
-            matches!(name, "remove" | "clear"),
-        ),
-        BuiltinReceiver::Str => (
-            &[
-                "len",
-                "chars",
-                "split",
-                "trim",
-                "contains",
-                "find",
-                "starts_with",
-                "ends_with",
-                "replace",
-                "to_upper",
-                "to_lower",
-                "parse_int",
-                "parse_float",
-            ],
-            false,
-        ),
-        BuiltinReceiver::Int => (&["abs", "pow"], false),
-        BuiltinReceiver::Float => (
-            &[
-                "abs", "floor", "ceil", "trunc", "sqrt", "pow", "round", "is_nan",
-                "is_finite",
-            ],
-            false,
-        ),
-        BuiltinReceiver::Range => (&["len", "contains", "to_list"], false),
-        BuiltinReceiver::Option => (
-            &[
-                "is_some", "is_none", "map", "and_then", "unwrap_or", "ok_or", "expect",
-            ],
-            false,
-        ),
-        BuiltinReceiver::Result => (
-            &[
-                "is_ok", "is_err", "map", "map_err", "and_then", "unwrap_or", "ok", "expect",
-            ],
-            false,
-        ),
-    };
-    let name = known.iter().find(|candidate| **candidate == name)?;
-    Some(BuiltinMethodInfo { name, mut_self })
 }
 
 fn builtin_receiver(ty: &Ty) -> Option<BuiltinReceiver> {

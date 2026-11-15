@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
 use martite_base::{SourceId, Span};
+pub use martite_builtin::BuiltinReceiver;
+use martite_builtin::{BuiltinFnId, BuiltinMethodId};
 use martite_resolve::{BuiltinItem, DefId, DefInfo, ModuleId, ModuleTarget, ResolvedProgram};
 use martite_syntax::{Block, FnDecl, LambdaBody, LambdaParam, NodeId, NodeTable};
 use rustc_hash::FxHashMap;
@@ -13,25 +15,6 @@ pub enum PreludeVariant {
     Some,
     Ok,
     Err,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BuiltinFn {
-    Print,
-    Panic,
-    Assert,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BuiltinReceiver {
-    List,
-    Map,
-    Str,
-    Int,
-    Float,
-    Range,
-    Option,
-    Result,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -47,14 +30,11 @@ pub enum Resolution {
     Module(ModuleTarget),
     ModuleItem(DefId),
     BuiltinItem(BuiltinItem),
-    BuiltinFn(BuiltinFn),
+    BuiltinFn(BuiltinFnId),
     StructField(usize),
     TupleField(u32),
     Method(DefId),
-    BuiltinMethod {
-        receiver: BuiltinReceiver,
-        name: &'static str,
-    },
+    BuiltinMethod { method: BuiltinMethodId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

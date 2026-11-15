@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use martite_base::{Code, Diagnostic, Severity, Span};
+use martite_builtin::{BuiltinFnId, BuiltinMethodId};
 use martite_resolve::{
     BuiltinItem, DefId, DefKind, ModuleId, ModuleTarget, ResolvedProgram, builtin_item,
 };
