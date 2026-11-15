@@ -722,6 +722,7 @@ dependencies = [
  "martite-base",
  "martite-fuel",
  "martite-ir",
+ "proptest",
  "serde_json",
  "smallvec",
 ]
