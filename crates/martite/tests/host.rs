@@ -206,6 +206,43 @@ fn missing_host_implementation_is_a_load_error() {
     ));
 }
 
+const OFFLINE_MATH_PLUGIN: &str = r#"
+use app.math
+
+test "offline tests need no host implementation" {
+    assert(1 + 1 == 2, "math is broken")
+}
+"#;
+
+#[test]
+fn tests_without_host_calls_load_without_implementations() {
+    let mut engine = Engine::new();
+    engine.interface("app.math", MATH_INTERFACE);
+    engine.set_allow_missing_host_impls(true);
+    let mut provider = MemoryProvider::new();
+    provider.insert("main.mt", OFFLINE_MATH_PLUGIN);
+    let plugin = engine.load(MATH_MANIFEST, &provider).expect("load");
+    let reports = plugin.run_tests();
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].passed(), "test failed: {:?}", reports[0].outcome);
+}
+
+#[test]
+fn unregistered_host_calls_report_no_test_double() {
+    let mut engine = Engine::new();
+    engine.interface("app.math", MATH_INTERFACE);
+    engine.set_allow_missing_host_impls(true);
+    let mut provider = MemoryProvider::new();
+    provider.insert("main.mt", MATH_PLUGIN);
+    let plugin = engine.load(MATH_MANIFEST, &provider).expect("load");
+    let reports = plugin.run_tests();
+    assert_eq!(reports.len(), 1);
+    match &reports[0].outcome {
+        Err(Trap::HostFault(message)) => assert_eq!(message, "no test double"),
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+}
+
 const SETTINGS_PLUGIN: &str = r#"
 use std.json
 use std.json.Json
