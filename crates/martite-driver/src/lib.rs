@@ -6,7 +6,7 @@ use martite_ir::IrProgram;
 use martite_resolve::{InterfaceSource, ResolveOptions, resolve};
 use martite_syntax::ParseOptions;
 
-pub use martite_ir::LowerOptions;
+pub use martite_ir::{LowerOptions, VerifyMode};
 
 #[derive(Debug, Clone, Default)]
 pub struct LoadOptions {
@@ -107,9 +107,9 @@ impl LoweredProgram {
 
 /// Lower one checked program into self-contained IR.
 ///
-/// Uses [`LowerOptions::default`], which verifies the result only in debug
-/// builds. Pass [`LowerOptions`] to [`lower_with`] to force or skip the
-/// verifier.
+/// Uses [`LowerOptions::default`], which verifies the result in every build.
+/// Pass [`LowerOptions`] with [`VerifyMode::Never`] to [`lower_with`] for
+/// benchmarks or fuzzing.
 pub fn lower(program: &CheckedProgram, sources: &SourceMap) -> LoweredProgram {
     lower_with(program, sources, LowerOptions::default())
 }

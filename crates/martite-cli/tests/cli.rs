@@ -192,6 +192,129 @@ fn test_runs_passing_and_failing_blocks() {
 }
 
 #[test]
+fn test_runs_std_host_calls_in_scripts() {
+    let dir = TempDir::new("test-std");
+    let script = dir.file(
+        "main.mt",
+        "use std.env\nuse std.io\n\ntest \"standalone host is registered\" {\n    assert(env.args().len() == 0, \"no script arguments\")\n    let missing = io.read_file(\"definitely-not-a-real-file.txt\")\n    assert(missing.is_err(), \"expected a read error\")\n}\n",
+    );
+    let output = martite(&[s("test"), script.as_os_str()]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(
+        stdout(&output).contains("1/1 tests passed"),
+        "stdout: {}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn check_accepts_std_host_calls_in_scripts() {
+    let dir = TempDir::new("check-std");
+    let script = dir.file(
+        "main.mt",
+        "use std.io\n\nfn main() {\n    match io.read_file(\"x\") {\n        Ok(text) => print(text),\n        Err(message) => print(message),\n    }\n}\n",
+    );
+    let output = martite(&[s("check"), script.as_os_str()]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+}
+
+#[test]
+fn test_reports_load_errors_with_source_location() {
+    let dir = TempDir::new("test-load-error");
+    let script = dir.file("main.mt", "test \"broken\" {\n    let x: int = \"no\"\n}\n");
+    let output = martite(&[s("test"), script.as_os_str()]);
+    assert_eq!(output.status.code(), Some(1));
+    let error = stderr(&output);
+    assert!(error.contains("E201"), "stderr: {error}");
+    assert!(error.contains("main.mt:2:"), "stderr: {error}");
+}
+
+#[test]
+fn test_reports_a_malformed_manifest_as_e508() {
+    let dir = TempDir::new("test-manifest");
+    dir.file("plugin.toml", "[plugin\nname = \"x\"\n");
+    let output = martite(&[s("test"), dir.path().as_os_str()]);
+    assert_eq!(output.status.code(), Some(1));
+    let error = stderr(&output);
+    assert!(error.contains("E508"), "stderr: {error}");
+}
+
+#[test]
+fn test_loads_plugin_directories_without_host_impls() {
+    let dir = TempDir::new("test-plugin");
+    dir.file(
+        "plugin.toml",
+        r#"
+[plugin]
+name = "test-plugin"
+version = "0.1.0"
+lang = "1"
+api = "1.0"
+entry = "main.mt"
+
+[permissions]
+grant = ["app.api"]
+"#,
+    );
+    dir.file(
+        "main.mt",
+        "use app.api\n\ntest \"offline\" {\n    assert(1 + 1 == 2, \"math\")\n}\n\ntest \"needs a double\" {\n    let _ = api.value()\n}\n",
+    );
+    let interface = dir.file("app/api.mti", "fn value() -> int\n");
+    let output = martite(&[
+        s("test"),
+        s("--interface"),
+        interface.as_os_str(),
+        dir.path().as_os_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let text = stdout(&output);
+    assert!(text.contains("test offline ... ok"), "stdout: {text}");
+    assert!(
+        text.contains("test needs a double ... FAILED"),
+        "stdout: {text}"
+    );
+    assert!(text.contains("no test double"), "stdout: {text}");
+    assert!(text.contains("1/2 tests passed"), "stdout: {text}");
+}
+
+#[test]
+fn run_registers_cli_interfaces() {
+    let dir = TempDir::new("run-interface");
+    let interface = dir.file("api.mti", "const LIMIT: int = 5\n");
+    let script = dir.file(
+        "main.mt",
+        "use api.LIMIT\n\nfn main() {\n    print(\"{LIMIT}\")\n}\n",
+    );
+    let output = martite(&[
+        s("run"),
+        s("--interface"),
+        interface.as_os_str(),
+        script.as_os_str(),
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains('5'), "stdout: {}", stdout(&output));
+}
+
+#[test]
+fn common_argument_parsing_stays_per_command() {
+    let dir = TempDir::new("args");
+    let script = dir.file("main.mt", "fn main() {}\n");
+
+    let no_optimize = martite(&[s("check"), s("--no-optimize"), script.as_os_str()]);
+    assert_eq!(no_optimize.status.code(), Some(2));
+
+    let run_optimize = martite(&[s("run"), s("--optimize"), script.as_os_str()]);
+    assert_eq!(run_optimize.status.code(), Some(2));
+
+    let test_optimize = martite(&[s("test"), s("--optimize"), script.as_os_str()]);
+    assert_eq!(test_optimize.status.code(), Some(2));
+
+    let lower_dump = martite(&[s("lower"), s("--dump-ir"), script.as_os_str()]);
+    assert_eq!(lower_dump.status.code(), Some(2));
+}
+
+#[test]
 fn check_loads_a_plugin_directory_with_an_interface() {
     let dir = TempDir::new("plugin");
     dir.file(

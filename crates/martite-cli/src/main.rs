@@ -2,18 +2,18 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use martite::{Engine, HostSignature, HostType, LANG_EDITION};
+use martite::{Engine, HostSignature, HostType, LANG_EDITION, LoadError, Plugin, VerifyMode};
 use martite_base::{
     Applicability, Code, Diagnostic, FileSystemProvider, LoadLimits, Severity, SourceMap,
     SourceProvider, normalize_source,
 };
 use martite_check::CheckedProgram;
 use martite_config::{Manifest, ToolConfig, parse_manifest, parse_tool_config};
-use martite_driver::{LoadOptions, LowerOptions, load, lower_with};
+use martite_driver::{LoadOptions, LoadedProgram, LowerOptions, load, lower_with};
 use martite_ir::{IrProgram, Printer};
 use martite_lint::{LintInputs, ManifestInput, SettingsResolver, normalize_path, sort_diagnostics};
 use martite_resolve::InterfaceSource;
-use martite_runtime::{ExecLimits, IrRuntime, Trap, Value};
+use martite_runtime::{ExecLimits, Trap, Value};
 use martite_syntax::{ParseOptions, parse_interface_with, parse_source_with};
 
 const USAGE: &str = "\
@@ -59,6 +59,9 @@ Lint options:
     --explain L019        Explain one rule
 ";
 
+/// `run`, `test` and `lower` verify lowered and optimized IR by default.
+const CLI_VERIFICATION: VerifyMode = VerifyMode::Always;
+
 const STD_IO: &str = r#"fn read_line() -> Result[str?, str]
 fn read_file(path: str) -> Result[str, str]
 fn write_file(path: str, text: str) -> Result[(), str]
@@ -77,7 +80,7 @@ fn main() -> ExitCode {
     let rest = &args[1..];
     match command.as_str() {
         "run" => cmd_run(rest),
-        "check" => cmd_check(rest, false),
+        "check" => cmd_check(rest),
         "lower" => cmd_lower(rest),
         "lint" => cmd_lint(rest),
         "test" => cmd_test(rest),
@@ -109,8 +112,16 @@ enum DumpStage {
     Both,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Run,
+    Check,
+    Test,
+    Lower,
+}
+
 #[derive(Default)]
-struct Parsed {
+struct CliArgs {
     json: bool,
     interfaces: Vec<PathBuf>,
     fuel: Option<u64>,
@@ -118,15 +129,17 @@ struct Parsed {
     depth: Option<u32>,
     dump_ir: Option<DumpStage>,
     no_optimize: bool,
+    optimize: bool,
     path: Option<String>,
     /// Arguments after the script path, passed through to `std.env.args()`.
     script_args: Vec<String>,
 }
 
-fn parse_args(args: &[String], allow_trailing: bool) -> Result<Parsed, String> {
+fn parse_args(args: &[String], command: Command) -> Result<CliArgs, String> {
     use lexopt::prelude::*;
 
-    let mut out = Parsed::default();
+    let allow_trailing = command == Command::Run;
+    let mut out = CliArgs::default();
     let mut parser = lexopt::Parser::from_args(args.iter().cloned());
     while let Some(arg) = parser.next().map_err(|error| error.to_string())? {
         match arg {
@@ -173,6 +186,7 @@ fn parse_args(args: &[String], allow_trailing: bool) -> Result<Parsed, String> {
                 );
             }
             Long("no-optimize") => out.no_optimize = true,
+            Long("optimize") => out.optimize = true,
             Long("dump-ir") => {
                 out.dump_ir = Some(match parser.optional_value() {
                     None => DumpStage::Both,
@@ -211,6 +225,39 @@ fn parse_args(args: &[String], allow_trailing: bool) -> Result<Parsed, String> {
                 }
             }
             _ => return Err(arg.unexpected().to_string()),
+        }
+    }
+    match command {
+        Command::Check => {
+            if out.dump_ir.is_some() {
+                return Err(
+                    "--dump-ir is only supported by `martite run` and `martite test`".into(),
+                );
+            }
+            if out.no_optimize {
+                return Err(
+                    "--no-optimize is only supported by `martite run` and `martite test`".into(),
+                );
+            }
+            if out.optimize {
+                return Err("unexpected option '--optimize'".into());
+            }
+        }
+        Command::Run | Command::Test => {
+            if out.optimize {
+                return Err("unexpected option '--optimize'".into());
+            }
+        }
+        Command::Lower => {
+            if out.fuel.is_some() || out.memory.is_some() || out.depth.is_some() {
+                return Err("`lower` does not accept --fuel, --memory, or --depth".into());
+            }
+            if out.dump_ir.is_some() {
+                return Err("`lower` does not accept --dump-ir".into());
+            }
+            if out.no_optimize {
+                return Err("`lower` does not accept --no-optimize".into());
+            }
         }
     }
     Ok(out)
@@ -736,10 +783,80 @@ struct ProjectSpec {
     root: PathBuf,
     entry: String,
     edition: String,
+    /// `.mti` files supplied on the command line, keyed by module path.
     interfaces: Vec<InterfaceSource>,
+    /// Modules granted by a plugin manifest.
     grants: Vec<String>,
     manifest: Option<Manifest>,
     manifest_text: Option<String>,
+}
+
+impl ProjectSpec {
+    fn is_script(&self) -> bool {
+        self.manifest.is_none()
+    }
+
+    /// Interfaces a static load sees: the caller's `.mti` files plus the
+    /// standalone std modules, which only scripts may use.
+    fn static_interfaces(&self) -> Vec<InterfaceSource> {
+        let mut interfaces = self.interfaces.clone();
+        if self.is_script() {
+            for module in StandaloneHost::interfaces() {
+                if !interfaces
+                    .iter()
+                    .any(|interface| interface.path == module.path)
+                {
+                    interfaces.push(module);
+                }
+            }
+        }
+        interfaces
+    }
+
+    /// Grants a static load sees. Scripts grant every registered interface;
+    /// plugins grant only what their manifest lists.
+    fn static_grants(&self) -> Vec<String> {
+        if self.is_script() {
+            interface_paths(&self.static_interfaces())
+        } else {
+            self.grants.clone()
+        }
+    }
+
+    fn load_static(&self, parse: ParseOptions) -> LoadedProgram {
+        let provider = FileSystemProvider::new(self.root.clone());
+        load(
+            &provider,
+            &LoadOptions {
+                entry: self.entry.clone(),
+                interfaces: self.static_interfaces(),
+                grants: self.static_grants(),
+                limits: LoadLimits::default(),
+                edition: self.edition.clone(),
+                parse,
+            },
+        )
+    }
+}
+
+/// The standalone host's pure modules. `martite run` and `martite test`
+/// register them for scripts; plugins never see them.
+struct StandaloneHost {
+    script_args: Vec<String>,
+}
+
+impl StandaloneHost {
+    const MODULES: [(&'static str, &'static str); 2] = [("std.io", STD_IO), ("std.env", STD_ENV)];
+
+    fn interfaces() -> Vec<InterfaceSource> {
+        Self::MODULES
+            .iter()
+            .map(|(path, text)| InterfaceSource {
+                path: (*path).into(),
+                text: (*text).into(),
+            })
+            .collect()
+    }
 }
 
 fn interface_paths(interfaces: &[InterfaceSource]) -> Vec<String> {
@@ -749,34 +866,106 @@ fn interface_paths(interfaces: &[InterfaceSource]) -> Vec<String> {
         .collect()
 }
 
-fn script_interfaces(cli: &[PathBuf], root: &Path) -> Vec<InterfaceSource> {
-    let mut interfaces = load_interfaces(cli, Some(root));
-    if !interfaces
-        .iter()
-        .any(|interface| interface.path == "std.io")
-    {
-        interfaces.push(std_interface("std.io", STD_IO));
-    }
-    if !interfaces
-        .iter()
-        .any(|interface| interface.path == "std.env")
-    {
-        interfaces.push(std_interface("std.env", STD_ENV));
-    }
-    interfaces
-}
-
 fn script_spec(root: PathBuf, entry: String, cli: &[PathBuf]) -> ProjectSpec {
-    let interfaces = script_interfaces(cli, &root);
-    let grants = interface_paths(&interfaces);
     ProjectSpec {
+        interfaces: load_interfaces(cli, Some(&root)),
+        grants: Vec::new(),
         root,
         entry,
         edition: LANG_EDITION.to_string(),
-        interfaces,
-        grants,
         manifest: None,
         manifest_text: None,
+    }
+}
+
+/// Why a single-project path could not be resolved.
+enum ProjectError {
+    /// Bad invocation, such as a missing path or manifest. Exit 2.
+    Usage(String),
+    /// A diagnostic the command reports, such as E508.
+    Diagnostic(Diagnostic),
+}
+
+fn resolve_project(path: &Path, interfaces: &[PathBuf]) -> Result<ProjectSpec, ProjectError> {
+    if path.is_dir() {
+        return load_plugin_spec(path, interfaces);
+    }
+    if !path.is_file() {
+        return Err(ProjectError::Usage(format!(
+            "path not found: {}",
+            path.display()
+        )));
+    }
+    let root = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let entry = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ProjectError::Usage(format!("invalid path `{}`", path.display())))?
+        .to_string();
+    Ok(script_spec(root, entry, interfaces))
+}
+
+fn load_plugin_spec(root: &Path, interfaces: &[PathBuf]) -> Result<ProjectSpec, ProjectError> {
+    let manifest_path = root.join("plugin.toml");
+    let text = std::fs::read_to_string(&manifest_path).map_err(|error| {
+        ProjectError::Usage(format!("cannot read {}: {error}", manifest_path.display()))
+    })?;
+    let manifest = parse_manifest(&text).map_err(|error| {
+        ProjectError::Diagnostic(Diagnostic::error(Code::E508, error.to_string()))
+    })?;
+    Ok(ProjectSpec {
+        root: root.to_path_buf(),
+        entry: manifest.entry.clone(),
+        edition: manifest.lang.clone(),
+        grants: manifest.grants.clone(),
+        interfaces: load_interfaces(interfaces, Some(root)),
+        manifest: Some(manifest),
+        manifest_text: Some(text),
+    })
+}
+
+fn exec_limits(args: &CliArgs) -> ExecLimits {
+    let defaults = ExecLimits::default();
+    ExecLimits {
+        fuel: args.fuel.unwrap_or(defaults.fuel),
+        memory: args.memory.unwrap_or(defaults.memory),
+        depth: args.depth.unwrap_or(defaults.depth),
+        deadline: None,
+    }
+}
+
+/// Build the execution host for one project.
+///
+/// `run` and `test` share this: the same interfaces, standalone std modules
+/// (scripts only), optimizer switch and limits. `check` and `lint` stay on the
+/// static driver loader so they never require Rust host implementations.
+fn build_engine(spec: &ProjectSpec, args: &CliArgs, script_args: Vec<String>) -> Engine {
+    let mut engine = Engine::new();
+    engine.set_optimize(!args.no_optimize);
+    engine.set_verification(CLI_VERIFICATION);
+    let limits = exec_limits(args);
+    engine.set_limits(limits, limits);
+    for interface in &spec.interfaces {
+        engine.interface(interface.path.clone(), interface.text.clone());
+    }
+    if spec.is_script() {
+        StandaloneHost { script_args }.register(&mut engine, &spec.interfaces);
+    }
+    engine
+}
+
+fn load_executable(
+    spec: &ProjectSpec,
+    engine: &Engine,
+    provider: &dyn SourceProvider,
+) -> Result<Plugin, LoadError> {
+    match &spec.manifest {
+        Some(manifest) => engine.try_load_with_manifest(manifest.clone(), provider),
+        None => engine.try_load_script(spec.entry.clone(), provider),
     }
 }
 
@@ -794,7 +983,7 @@ fn collect_projects(
             );
         };
         if root.join("plugin.toml").is_file() {
-            if let Some(spec) = plugin_spec(&root, args, diagnostics) {
+            if let Some(spec) = plugin_spec(&root, &args.interfaces, diagnostics) {
                 specs.push(spec);
             }
         } else {
@@ -823,7 +1012,7 @@ fn collect_projects(
                 specs.push(script_spec(root, entry, &args.interfaces));
             } else if path.is_dir() {
                 if path.join("plugin.toml").is_file() {
-                    if let Some(spec) = plugin_spec(&path, args, diagnostics) {
+                    if let Some(spec) = plugin_spec(&path, &args.interfaces, diagnostics) {
                         specs.push(spec);
                     }
                 } else {
@@ -850,37 +1039,20 @@ fn collect_projects(
 
 fn plugin_spec(
     root: &Path,
-    args: &LintArgs,
+    interfaces: &[PathBuf],
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<ProjectSpec> {
-    let manifest_path = root.join("plugin.toml");
-    let text = match std::fs::read_to_string(&manifest_path) {
-        Ok(text) => text,
-        Err(error) => {
-            diagnostics.push(Diagnostic::error(
-                Code::E508,
-                format!("cannot read {}: {error}", manifest_path.display()),
-            ));
-            return None;
+    match load_plugin_spec(root, interfaces) {
+        Ok(spec) => Some(spec),
+        Err(ProjectError::Diagnostic(diagnostic)) => {
+            diagnostics.push(diagnostic);
+            None
         }
-    };
-    let manifest = match parse_manifest(&text) {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            diagnostics.push(Diagnostic::error(Code::E508, error.message));
-            return None;
+        Err(ProjectError::Usage(message)) => {
+            diagnostics.push(Diagnostic::error(Code::E508, message));
+            None
         }
-    };
-    let interfaces = load_interfaces(&args.interfaces, Some(root));
-    Some(ProjectSpec {
-        root: root.to_path_buf(),
-        entry: manifest.entry.clone(),
-        edition: manifest.lang.clone(),
-        grants: manifest.grants.clone(),
-        interfaces,
-        manifest: Some(manifest),
-        manifest_text: Some(text),
-    })
+    }
 }
 
 struct OverlayProvider<'a> {
@@ -949,7 +1121,7 @@ fn fix_project(
             (
                 spec.entry.clone(),
                 spec.edition.clone(),
-                spec.grants.clone(),
+                spec.static_grants(),
                 None,
             )
         };
@@ -962,7 +1134,7 @@ fn fix_project(
             &provider,
             &LoadOptions {
                 entry,
-                interfaces: spec.interfaces.clone(),
+                interfaces: spec.static_interfaces(),
                 grants,
                 limits: LoadLimits::default(),
                 edition,
@@ -1207,18 +1379,7 @@ fn cmd_lint(args: &[String]) -> ExitCode {
             }
             continue;
         }
-        let provider = FileSystemProvider::new(spec.root.clone());
-        let mut loaded = load(
-            &provider,
-            &LoadOptions {
-                entry: spec.entry.clone(),
-                interfaces: spec.interfaces,
-                grants: spec.grants,
-                limits: LoadLimits::default(),
-                edition: spec.edition,
-                parse: ParseOptions::TOOLING,
-            },
-        );
+        let mut loaded = spec.load_static(ParseOptions::TOOLING);
         render_all(&loaded.diagnostics, &loaded.sources, &mut rendered);
         if loaded
             .diagnostics
@@ -1341,50 +1502,47 @@ fn lint_syntax_only_mode(args: &LintArgs) -> ExitCode {
     }
 }
 
-fn cmd_run(args: &[String]) -> ExitCode {
-    let parsed = match parse_args(args, true) {
-        Ok(p) => p,
+fn cmd_run(raw: &[String]) -> ExitCode {
+    let args = match parse_args(raw, Command::Run) {
+        Ok(args) => args,
         Err(message) => {
             eprintln!("error: {message}\n");
             return ExitCode::from(2);
         }
     };
-    let Some(file) = parsed.path.clone() else {
+    let Some(file) = args.path.clone() else {
         eprintln!("error: run requires a file\n");
         return ExitCode::from(2);
     };
     let path = PathBuf::from(&file);
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        eprintln!("error: invalid file path `{file}`");
-        return ExitCode::from(2);
-    };
     if !path.is_file() {
         eprintln!("error: file not found: {file}");
         return ExitCode::from(2);
     }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        eprintln!("error: invalid file path `{file}`");
+        return ExitCode::from(2);
+    };
+    let root = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let spec = script_spec(root.clone(), name.to_string(), &args.interfaces);
+    let engine = build_engine(&spec, &args, args.script_args.clone());
     // `martite run` is the standalone host: it is intentionally unrestricted.
-    let provider = FileSystemProvider::unrestricted(parent);
-    let mut engine = Engine::new();
-    engine.set_optimize(!parsed.no_optimize);
-    register_std(&mut engine, parsed.script_args.clone());
-    apply_limits(&mut engine, &parsed);
-    let plugin = match engine.try_load_script(name, &provider) {
+    let provider = FileSystemProvider::unrestricted(root);
+    let plugin = match load_executable(&spec, &engine, &provider) {
         Ok(plugin) => plugin,
         Err(error) => {
-            print_diagnostics(&error.diagnostics, &error.sources, parsed.json);
+            print_diagnostics(&error.diagnostics, &error.sources, args.json);
             return ExitCode::from(2);
         }
     };
-    if let Some(stage) = parsed.dump_ir {
-        let before = plugin.lowered_ir();
-        dump_ir(stage, before.as_ref(), plugin.ir());
+    if let Some(stage) = args.dump_ir {
+        dump_ir(stage, plugin.lowered_ir().as_ref(), plugin.ir());
     }
-    let result = plugin.run_main();
-    match result {
+    match plugin.run_main() {
         Ok(main) => {
             for line in main.log {
                 println!("{line}");
@@ -1404,159 +1562,48 @@ fn cmd_run(args: &[String]) -> ExitCode {
     }
 }
 
-fn cmd_check(args: &[String], lint: bool) -> ExitCode {
-    let parsed = match parse_args(args, false) {
-        Ok(p) => p,
+fn cmd_check(raw: &[String]) -> ExitCode {
+    let args = match parse_args(raw, Command::Check) {
+        Ok(args) => args,
         Err(message) => {
             eprintln!("error: {message}\n");
             return ExitCode::from(2);
         }
     };
-    if parsed.dump_ir.is_some() {
-        eprintln!("error: --dump-ir is only supported by `martite run` and `martite test`\n");
-        return ExitCode::from(2);
-    }
-    if parsed.no_optimize {
-        eprintln!("error: --no-optimize is only supported by `martite run` and `martite test`\n");
-        return ExitCode::from(2);
-    }
-    let Some(path) = parsed.path else {
-        eprintln!(
-            "error: {} requires a path",
-            if lint { "lint" } else { "check" }
-        );
+    let Some(path) = args.path.clone() else {
+        eprintln!("error: check requires a path");
         return ExitCode::from(2);
     };
     let path = PathBuf::from(&path);
-    let (root, entry, edition, load_limits, mut interfaces, mut grants) = if path.is_dir() {
-        let manifest_path = path.join("plugin.toml");
-        let manifest_text = match std::fs::read_to_string(&manifest_path) {
-            Ok(text) => text,
-            Err(error) => {
-                eprintln!("error: cannot read {}: {error}", manifest_path.display());
-                return ExitCode::from(2);
-            }
-        };
-        let manifest = match parse_manifest(&manifest_text) {
-            Ok(m) => m,
-            Err(error) => {
-                let d = Diagnostic::error(Code::E508, error.to_string());
-                print_diagnostics(&[d], &SourceMap::new(), parsed.json);
-                return ExitCode::from(1);
-            }
-        };
-        let interfaces = load_interfaces(&parsed.interfaces, Some(&path));
-        (
-            path.clone(),
-            manifest.entry.clone(),
-            manifest.lang.clone(),
-            LoadLimits::default(),
-            interfaces,
-            manifest.grants.clone(),
-        )
-    } else if path.is_file() {
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("main.mt")
-            .to_string();
-        let interfaces = load_interfaces(&parsed.interfaces, Some(&parent));
-        (
-            parent,
-            name,
-            LANG_EDITION.to_string(),
-            LoadLimits::default(),
-            interfaces,
-            Vec::new(),
-        )
-    } else {
-        eprintln!("error: path not found: {}", path.display());
-        return ExitCode::from(2);
+    let spec = match resolve_project(&path, &args.interfaces) {
+        Ok(spec) => spec,
+        Err(ProjectError::Usage(message)) => {
+            eprintln!("error: {message}");
+            return ExitCode::from(2);
+        }
+        Err(ProjectError::Diagnostic(diagnostic)) => {
+            print_diagnostics(&[diagnostic], &SourceMap::new(), args.json);
+            return ExitCode::from(1);
+        }
     };
-    if !path.is_dir() {
-        if !interfaces.iter().any(|i| i.path == "std.io") {
-            interfaces.push(std_interface("std.io", STD_IO));
-        }
-        if !interfaces.iter().any(|i| i.path == "std.env") {
-            interfaces.push(std_interface("std.env", STD_ENV));
-        }
-        grants = interfaces.iter().map(|i| i.path.clone()).collect();
-    }
-    let provider = FileSystemProvider::new(root);
-    let loaded = load(
-        &provider,
-        &LoadOptions {
-            entry,
-            interfaces,
-            grants,
-            limits: load_limits,
-            edition,
-            parse: ParseOptions::default(),
-        },
-    );
-    print_diagnostics(&loaded.diagnostics, &loaded.sources, parsed.json);
-    let has_errors = loaded
-        .diagnostics
-        .iter()
-        .any(|d| d.severity == Severity::Error);
-    if has_errors {
+    let loaded = spec.load_static(ParseOptions::default());
+    print_diagnostics(&loaded.diagnostics, &loaded.sources, args.json);
+    if loaded.has_errors() {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
     }
 }
 
-#[derive(Default)]
-struct LowerArgs {
-    json: bool,
-    optimize: bool,
-    interfaces: Vec<PathBuf>,
-    path: Option<String>,
-}
-
-fn parse_lower_args(args: &[String]) -> Result<LowerArgs, String> {
-    use lexopt::prelude::*;
-
-    let mut out = LowerArgs::default();
-    let mut parser = lexopt::Parser::from_args(args.iter().cloned());
-    while let Some(arg) = parser.next().map_err(|error| error.to_string())? {
-        match arg {
-            Long("json") => out.json = true,
-            Long("optimize") => out.optimize = true,
-            Long("interface") => {
-                let path = parser
-                    .value()
-                    .map_err(|error| error.to_string())?
-                    .string()
-                    .map_err(|error| error.to_string())?;
-                out.interfaces.push(PathBuf::from(path));
-            }
-            Value(value) => {
-                if out.path.is_some() {
-                    return Err("expected a single file".into());
-                }
-                out.path = Some(value.string().map_err(|error| error.to_string())?);
-            }
-            _ => return Err(arg.unexpected().to_string()),
-        }
-    }
-    Ok(out)
-}
-
-fn cmd_lower(args: &[String]) -> ExitCode {
-    let parsed = match parse_lower_args(args) {
-        Ok(parsed) => parsed,
+fn cmd_lower(raw: &[String]) -> ExitCode {
+    let args = match parse_args(raw, Command::Lower) {
+        Ok(args) => args,
         Err(message) => {
             eprintln!("error: {message}\n");
             return ExitCode::from(2);
         }
     };
-    let Some(file) = parsed.path else {
+    let Some(file) = args.path.clone() else {
         eprintln!("error: lower requires a file\n");
         return ExitCode::from(2);
     };
@@ -1565,29 +1612,18 @@ fn cmd_lower(args: &[String]) -> ExitCode {
         eprintln!("error: file not found: {file}");
         return ExitCode::from(2);
     }
-    let parent = path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         eprintln!("error: invalid file path `{file}`");
         return ExitCode::from(2);
     };
-    let interfaces = script_interfaces(&parsed.interfaces, parent);
-    let grants = interface_paths(&interfaces);
-    let provider = FileSystemProvider::new(parent.to_path_buf());
-    let loaded = load(
-        &provider,
-        &LoadOptions {
-            entry: name.to_string(),
-            interfaces,
-            grants,
-            limits: LoadLimits::default(),
-            edition: LANG_EDITION.to_string(),
-            parse: ParseOptions::default(),
-        },
-    );
-    print_diagnostics(&loaded.diagnostics, &loaded.sources, parsed.json);
+    let root = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let spec = script_spec(root, name.to_string(), &args.interfaces);
+    let loaded = spec.load_static(ParseOptions::default());
+    print_diagnostics(&loaded.diagnostics, &loaded.sources, args.json);
     if loaded.has_errors() {
         return ExitCode::from(1);
     }
@@ -1595,10 +1631,10 @@ fn cmd_lower(args: &[String]) -> ExitCode {
         eprintln!("error: no program");
         return ExitCode::from(2);
     };
-    let Some(mut ir) = lower_for_dump(program, &loaded.sources, parsed.json) else {
+    let Some(mut ir) = lower_for_dump(program, &loaded.sources, args.json) else {
         return ExitCode::from(1);
     };
-    if parsed.optimize && !optimize_ir(&mut ir, parsed.json) {
+    if args.optimize && !optimize_ir(&mut ir, args.json) {
         return ExitCode::from(1);
     }
     print!("{}", Printer::new(&ir).program());
@@ -1606,7 +1642,13 @@ fn cmd_lower(args: &[String]) -> ExitCode {
 }
 
 fn optimize_ir(ir: &mut IrProgram, json: bool) -> bool {
-    match martite_opt::optimize(ir, martite_opt::OptimizeOptions::default()) {
+    match martite_opt::optimize(
+        ir,
+        martite_opt::OptimizeOptions {
+            verify: CLI_VERIFICATION,
+            ..Default::default()
+        },
+    ) {
         Ok(_) => true,
         Err(error) => {
             let diagnostic = Diagnostic::error(Code::E508, format!("optimization failed: {error}"));
@@ -1616,118 +1658,57 @@ fn optimize_ir(ir: &mut IrProgram, json: bool) -> bool {
     }
 }
 
-fn cmd_test(args: &[String]) -> ExitCode {
-    let parsed = match parse_args(args, false) {
-        Ok(p) => p,
+fn cmd_test(raw: &[String]) -> ExitCode {
+    let args = match parse_args(raw, Command::Test) {
+        Ok(args) => args,
         Err(message) => {
             eprintln!("error: {message}\n");
             return ExitCode::from(2);
         }
     };
-    let Some(path) = parsed.path else {
+    let Some(path) = args.path.clone() else {
         eprintln!("error: test requires a path\n");
         return ExitCode::from(2);
     };
     let path = PathBuf::from(&path);
-    let (root, entry, mut interfaces, mut grants) = if path.is_dir() {
-        let manifest_path = path.join("plugin.toml");
-        let manifest = match std::fs::read_to_string(&manifest_path)
-            .ok()
-            .and_then(|text| parse_manifest(&text).ok())
-        {
-            Some(m) => m,
-            None => {
-                eprintln!("error: cannot load {}", manifest_path.display());
-                return ExitCode::from(2);
-            }
-        };
-        let interfaces = load_interfaces(&parsed.interfaces, Some(&path));
-        (
-            path.clone(),
-            manifest.entry.clone(),
-            interfaces,
-            manifest.grants.clone(),
-        )
-    } else if path.is_file() {
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."))
-            .to_path_buf();
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("main.mt")
-            .to_string();
-        let interfaces = load_interfaces(&parsed.interfaces, Some(&parent));
-        (parent, name, interfaces, Vec::new())
-    } else {
-        eprintln!("error: path not found: {}", path.display());
-        return ExitCode::from(2);
-    };
-    if !path.is_dir() {
-        if !interfaces.iter().any(|i| i.path == "std.io") {
-            interfaces.push(std_interface("std.io", STD_IO));
+    let spec = match resolve_project(&path, &args.interfaces) {
+        Ok(spec) => spec,
+        Err(ProjectError::Usage(message)) => {
+            eprintln!("error: {message}");
+            return ExitCode::from(2);
         }
-        if !interfaces.iter().any(|i| i.path == "std.env") {
-            interfaces.push(std_interface("std.env", STD_ENV));
+        Err(ProjectError::Diagnostic(diagnostic)) => {
+            print_diagnostics(&[diagnostic], &SourceMap::new(), args.json);
+            return ExitCode::from(1);
         }
-        grants = interfaces.iter().map(|i| i.path.clone()).collect();
-    }
-    let provider = FileSystemProvider::new(root);
-    let loaded = load(
-        &provider,
-        &LoadOptions {
-            entry,
-            interfaces,
-            grants,
-            limits: LoadLimits::default(),
-            edition: LANG_EDITION.into(),
-            parse: ParseOptions::default(),
-        },
-    );
-    if loaded.has_errors() {
-        print_diagnostics(&loaded.diagnostics, &loaded.sources, parsed.json);
-        return ExitCode::from(1);
-    }
-    let Some(program) = loaded.program else {
-        eprintln!("error: no program");
-        return ExitCode::from(2);
     };
-    let Some(mut ir) = lower_for_dump(&program, &loaded.sources, parsed.json) else {
-        return ExitCode::from(1);
+    let mut engine = build_engine(&spec, &args, Vec::new());
+    // Tests run without a double for every host function: an unregistered
+    // call traps with `no test double` instead of failing the load.
+    engine.set_allow_missing_host_impls(true);
+    let provider = FileSystemProvider::new(spec.root.clone());
+    let plugin = match load_executable(&spec, &engine, &provider) {
+        Ok(plugin) => plugin,
+        Err(error) => {
+            print_diagnostics(&error.diagnostics, &error.sources, args.json);
+            return ExitCode::from(1);
+        }
     };
-    let lowered = ir.clone();
-    if !parsed.no_optimize && !optimize_ir(&mut ir, parsed.json) {
-        return ExitCode::from(1);
+    if let Some(stage) = args.dump_ir {
+        dump_ir(stage, plugin.lowered_ir().as_ref(), plugin.ir());
     }
-    if let Some(stage) = parsed.dump_ir {
-        dump_ir(stage, Some(&lowered), &ir);
-    }
-    let limits = ExecLimits {
-        fuel: parsed.fuel.unwrap_or(1_000_000),
-        memory: parsed.memory.unwrap_or(8 << 20),
-        depth: parsed.depth.unwrap_or(200),
-        deadline: None,
-    };
     let mut failed = 0usize;
     let mut total = 0usize;
-    for (def, function) in program.tests.iter().zip(&ir.entries.tests) {
+    for report in plugin.run_tests() {
         total += 1;
-        let name = program.resolved.def(*def).name.clone();
-        let mut runtime = IrRuntime::new(&ir, limits);
-        let outcome = runtime
-            .invoke(*function, Vec::new())
-            .map(|result| result.value);
-        let log = runtime.take_log();
-        for line in log {
+        for line in report.log {
             println!("{line}");
         }
-        match outcome {
-            Ok(_) => println!("test {name} ... ok"),
+        match report.outcome {
+            Ok(_) => println!("test {} ... ok", report.name),
             Err(trap) => {
                 failed += 1;
-                println!("test {name} ... FAILED: {}", trap.panic_message());
+                println!("test {} ... FAILED: {}", report.name, trap.panic_message());
             }
         }
     }
@@ -1766,7 +1747,13 @@ fn dump_ir(stage: DumpStage, lowered: Option<&IrProgram>, executing: &IrProgram)
 }
 
 fn lower_for_dump(program: &CheckedProgram, sources: &SourceMap, json: bool) -> Option<IrProgram> {
-    let lowered = lower_with(program, sources, LowerOptions { verify: true });
+    let lowered = lower_with(
+        program,
+        sources,
+        LowerOptions {
+            verify: CLI_VERIFICATION,
+        },
+    );
     if lowered.has_errors() {
         print_diagnostics(&lowered.diagnostics, sources, json);
         return None;
@@ -1830,103 +1817,92 @@ fn load_interfaces(paths: &[PathBuf], root: Option<&Path>) -> Vec<InterfaceSourc
     out
 }
 
-fn std_interface(path: &str, text: &str) -> InterfaceSource {
-    InterfaceSource {
-        path: path.into(),
-        text: text.into(),
-    }
-}
+impl StandaloneHost {
+    fn register(&self, engine: &mut Engine, interfaces: &[InterfaceSource]) {
+        for (path, text) in Self::MODULES {
+            if interfaces.iter().any(|interface| interface.path == path) {
+                continue;
+            }
+            engine.interface(path, text);
+        }
+        let script_args = self.script_args.clone();
 
-#[allow(clippy::too_many_arguments)]
-fn register_std(engine: &mut Engine, args: Vec<String>) {
-    engine.interface("std.io", STD_IO);
-    engine.interface("std.env", STD_ENV);
-
-    engine.host_fn(
-        "std.io.read_line",
-        HostSignature::new(
-            vec![],
-            HostType::Result(
-                Box::new(HostType::Option(Box::new(HostType::Str))),
-                Box::new(HostType::Str),
+        engine.host_fn(
+            "std.io.read_line",
+            HostSignature::new(
+                vec![],
+                HostType::Result(
+                    Box::new(HostType::Option(Box::new(HostType::Str))),
+                    Box::new(HostType::Str),
+                ),
             ),
-        ),
-        |_cx, _args| {
-            let mut line = String::new();
-            match std::io::stdin().read_line(&mut line) {
-                Ok(0) => Ok(Value::Result(Ok(Box::new(Value::Option(None))))),
-                Ok(_) => {
-                    while line.ends_with('\n') || line.ends_with('\r') {
-                        line.pop();
+            |_cx, _args| {
+                let mut line = String::new();
+                match std::io::stdin().read_line(&mut line) {
+                    Ok(0) => Ok(Value::Result(Ok(Box::new(Value::Option(None))))),
+                    Ok(_) => {
+                        while line.ends_with('\n') || line.ends_with('\r') {
+                            line.pop();
+                        }
+                        Ok(Value::Result(Ok(Box::new(Value::Option(Some(Box::new(
+                            Value::str(line),
+                        )))))))
                     }
-                    Ok(Value::Result(Ok(Box::new(Value::Option(Some(Box::new(
-                        Value::str(line),
-                    )))))))
+                    Err(error) => Ok(Value::Result(Err(Box::new(Value::str(error.to_string()))))),
                 }
-                Err(error) => Ok(Value::Result(Err(Box::new(Value::str(error.to_string()))))),
-            }
-        },
-    );
-    engine.host_fn(
-        "std.io.read_file",
-        HostSignature::new(
-            vec![HostType::Str],
-            HostType::Result(Box::new(HostType::Str), Box::new(HostType::Str)),
-        ),
-        |_cx, args| {
-            let path = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            match std::fs::read_to_string(path) {
-                Ok(text) => Ok(Value::Result(Ok(Box::new(Value::str(text))))),
-                Err(error) => Ok(Value::Result(Err(Box::new(Value::str(error.to_string()))))),
-            }
-        },
-    );
-    engine.host_fn(
-        "std.io.write_file",
-        HostSignature::new(
-            vec![HostType::Str, HostType::Str],
-            HostType::Result(Box::new(HostType::Unit), Box::new(HostType::Str)),
-        ),
-        |_cx, args| {
-            let path = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            let text = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            match std::fs::write(path, text) {
-                Ok(()) => Ok(Value::Result(Ok(Box::new(Value::Unit)))),
-                Err(error) => Ok(Value::Result(Err(Box::new(Value::str(error.to_string()))))),
-            }
-        },
-    );
-    engine.host_fn(
-        "std.env.args",
-        HostSignature::new(vec![], HostType::List(Box::new(HostType::Str))),
-        move |_cx, _args| {
-            Ok(Value::list(
-                args.clone().into_iter().map(Value::str).collect(),
-            ))
-        },
-    );
-    engine.host_fn(
-        "std.env.get",
-        HostSignature::new(
-            vec![HostType::Str],
-            HostType::Option(Box::new(HostType::Str)),
-        ),
-        |_cx, args| {
-            let name = args.first().and_then(|v| v.as_str()).unwrap_or("");
-            Ok(match std::env::var(name) {
-                Ok(value) => Value::Option(Some(Box::new(Value::str(value)))),
-                Err(_) => Value::Option(None),
-            })
-        },
-    );
-}
-
-fn apply_limits(engine: &mut Engine, parsed: &Parsed) {
-    let limits = ExecLimits {
-        fuel: parsed.fuel.unwrap_or(1_000_000),
-        memory: parsed.memory.unwrap_or(8 << 20),
-        depth: parsed.depth.unwrap_or(200),
-        deadline: None,
-    };
-    engine.set_limits(limits, limits);
+            },
+        );
+        engine.host_fn(
+            "std.io.read_file",
+            HostSignature::new(
+                vec![HostType::Str],
+                HostType::Result(Box::new(HostType::Str), Box::new(HostType::Str)),
+            ),
+            |_cx, args| {
+                let path = args.first().and_then(|v| v.as_str()).unwrap_or("");
+                match std::fs::read_to_string(path) {
+                    Ok(text) => Ok(Value::Result(Ok(Box::new(Value::str(text))))),
+                    Err(error) => Ok(Value::Result(Err(Box::new(Value::str(error.to_string()))))),
+                }
+            },
+        );
+        engine.host_fn(
+            "std.io.write_file",
+            HostSignature::new(
+                vec![HostType::Str, HostType::Str],
+                HostType::Result(Box::new(HostType::Unit), Box::new(HostType::Str)),
+            ),
+            |_cx, args| {
+                let path = args.first().and_then(|v| v.as_str()).unwrap_or("");
+                let text = args.get(1).and_then(|v| v.as_str()).unwrap_or("");
+                match std::fs::write(path, text) {
+                    Ok(()) => Ok(Value::Result(Ok(Box::new(Value::Unit)))),
+                    Err(error) => Ok(Value::Result(Err(Box::new(Value::str(error.to_string()))))),
+                }
+            },
+        );
+        engine.host_fn(
+            "std.env.args",
+            HostSignature::new(vec![], HostType::List(Box::new(HostType::Str))),
+            move |_cx, _args| {
+                Ok(Value::list(
+                    script_args.iter().cloned().map(Value::str).collect(),
+                ))
+            },
+        );
+        engine.host_fn(
+            "std.env.get",
+            HostSignature::new(
+                vec![HostType::Str],
+                HostType::Option(Box::new(HostType::Str)),
+            ),
+            |_cx, args| {
+                let name = args.first().and_then(|v| v.as_str()).unwrap_or("");
+                Ok(match std::env::var(name) {
+                    Ok(value) => Value::Option(Some(Box::new(Value::str(value)))),
+                    Err(_) => Value::Option(None),
+                })
+            },
+        );
+    }
 }

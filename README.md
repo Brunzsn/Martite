@@ -63,6 +63,11 @@ cargo bench -p martite-bench
 `martite lower <file>` prints the resolved IR without executing it;
 `martite lower --optimize <file>` prints the optimized IR instead.
 
+`martite run`, `martite test`, and `martite lower` verify the lowered IR and
+every changed optimizer pass by default, including release builds. Embedders can
+change the policy with `Engine::set_verification`; benchmarks and fuzzing use
+`VerifyMode::Never` because verification has no observable effect.
+
 `martite run` and `martite test` run optimizer passes by default. The first pass
 is constant folding under the `Preserve` policy, so fuel, traps and limits are
 unchanged. `--no-optimize` executes the lowered program directly. Both commands

@@ -314,12 +314,13 @@ Inputs: `CheckedProgram` (resolved program, `expr_types`, `resolutions`, `patter
 3. Walk each body once. For every expression read its type and resolution and emit a node with kind, type, charge schedule (8.1), effects and span.
 4. Resolve method calls to `FnId`s and builtin methods to a builtin id plus receiver kind; resolve host functions to `HostFnInfo` (including the opaque-handle return type).
 5. Lower patterns (6.3), lambdas, constants and static strings (pools), then fill `Entries` (6.6).
-6. Run the verifier.
+6. Run the verifier according to `LowerOptions::verify` (`VerifyMode::Always` by default, including release builds).
 
 Lambdas are allocated lazily when their expression is lowered, in parent-before-child order; sorting lambda `NodeId`s would visit an inner lambda first because the parser allocates a lambda's node after its body. A lambda's capture list is its checker-recorded free-variable set in sorted `BindingId` order. Each binding resolves to a local slot in the creating function or to one of its captures (6.2); `MakeClosure` carries the resulting list. Expression bodies lower as a zero-charge body `Block` with one zero-charge `ExprStmt` safepoint, so they keep a safepoint-bearing function body without adding expression fuel.
 
 Rules:
 
+- **Verification policy:** `VerifyMode` is explicit. `Always` (the default for lowering, the optimizer and the embedding `Engine`) verifies in release builds too; `DebugOnly` keeps the old debug-build behavior; `Never` is only for benchmarks and fuzzing and does not change observable behavior.
 - **Lowering never optimizes** and never desugars across a charge boundary (principle 6).
 - After lowering nothing reads the AST `NodeTable`s. Spans and source ids come from the IR.
 - Lowering must be total on programs that passed the checker; a failure is an internal compiler error.
@@ -341,7 +342,7 @@ pub trait ProgramPass { /* same shape over IrProgram */ }
 
 - `PassCx`: on-demand analyses invalidated on `Changed`; per-pass counters; active edition and policy.
 - **Rewriter** (the only way passes mutate IR): sets provenance, recomputes effects bottom-up, enforces the cost policy (`carry_charge`), keeps the tree property, and **refuses** under `Preserve` to remove, duplicate or reorder `SAFEPOINT` nodes or `SHARES` reads.
-- **Pass manager:** ordered list, fixpoint mode with an iteration cap, verifier after every pass in tests and debug builds, enable/disable by name, bisect limit, deterministic.
+- **Pass manager:** ordered list, fixpoint mode with an iteration cap, verifier after every changing pass according to `OptimizeOptions::verify` (`Always` by default), enable/disable by name, bisect limit, deterministic.
 - **Dumps:** a text printer showing charge, effects and origin, and a CLI flag to dump the IR before and after optimization; golden dumps in tests.
 
 Starter passes that are safe under `Preserve` (they do not touch sharing or safepoints): constant folding of scalar operators, branch folding on literal conditions, trivial dead-code removal of literal-only expression statements with their charge carried. Anything involving heap values needs the S1/M2 argument first.
@@ -351,8 +352,8 @@ Starter passes that are safe under `Preserve` (they do not touch sharing or safe
 `martite-opt` now provides `FnPass`, `ProgramPass`, `CostPolicy`, `PassCx`,
 `PassManager`, `OptimizeOptions` and the `const-fold` pass. The pass manager is
 deterministic, supports fixpoint mode with an iteration cap, disables passes by
-name, and verifies after every pass in debug builds (tests force verification
-explicitly).
+name, and verifies after every changing pass according to `OptimizeOptions::verify`
+(`Always` by default; benchmark and property timings use `VerifyMode::Never`).
 
 The rewriter is the only mutation path. It rebuilds the function arena, remaps
 every child reference, call argument range, struct layout, match set and
