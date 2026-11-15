@@ -298,14 +298,14 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                                 .trap(self.internal_panic("closure target is out of range"));
                         };
                         for item in snapshot.iter() {
-                            out.push(
-                                self.call_closure_function(
+                            let (value, _) = self
+                                .call_resolved(
                                     function_info,
-                                    closure.captures.clone(),
                                     smallvec![item.clone()],
+                                    closure.captures.clone(),
                                 )
-                                .map_err(EvalError::Trap)?,
-                            );
+                                .map_err(EvalError::Trap)?;
+                            out.push(value);
                         }
                     }
                     FnValue::Def(function) => {
@@ -332,11 +332,11 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                                 .trap(self.internal_panic("closure target is out of range"));
                         };
                         for item in snapshot.iter() {
-                            let keep = self
-                                .call_closure_function(
+                            let (keep, _) = self
+                                .call_resolved(
                                     function_info,
-                                    closure.captures.clone(),
                                     smallvec![item.clone()],
+                                    closure.captures.clone(),
                                 )
                                 .map_err(EvalError::Trap)?;
                             if matches!(keep, Value::Bool(true)) {
@@ -375,13 +375,14 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                                 .trap(self.internal_panic("closure target is out of range"));
                         };
                         for item in snapshot.iter() {
-                            init = self
-                                .call_closure_function(
+                            let (next, _) = self
+                                .call_resolved(
                                     function_info,
-                                    closure.captures.clone(),
                                     smallvec![init, item.clone()],
+                                    closure.captures.clone(),
                                 )
                                 .map_err(EvalError::Trap)?;
+                            init = next;
                         }
                     }
                     FnValue::Def(function) => {
