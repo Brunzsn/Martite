@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 const CRATES: &[&str] = &[
     "martite-base",
+    "martite-builtin",
     "martite-fuel",
     "martite-syntax",
     "martite-config",
@@ -339,6 +340,7 @@ fn runtime_and_optimizer_resolve_without_checker_crates() {
     let metadata = probe_metadata();
     let allowed = [
         "martite-base",
+        "martite-builtin",
         "martite-fuel",
         "martite-ir",
         "martite-runtime",
