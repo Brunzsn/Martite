@@ -2181,12 +2181,25 @@ impl<'a> Checker<'a> {
         args: &[Arg],
         infer: &mut Infer,
     ) -> Ty {
+        let Some(def) = function.def() else {
+            return Ty::Error;
+        };
+        if args.len() != def.sig.params.len() {
+            let module = self.current_module();
+            self.err_at(
+                module,
+                expr.span,
+                Code::E204,
+                format!(
+                    "`{}` takes {} argument(s), found {}",
+                    def.name,
+                    def.sig.params.len(),
+                    args.len()
+                ),
+            );
+        }
         match function {
             BuiltinFnId::PRINT => {
-                if args.len() != 1 {
-                    let module = self.current_module();
-                    self.err_at(module, expr.span, Code::E204, "`print` takes one argument");
-                }
                 if let Some(arg) = args.first() {
                     let ty = self.check_expr(&arg.expr, None, infer);
                     if !self.has_bound(&ty, Bound::Show) {
@@ -2199,33 +2212,15 @@ impl<'a> Checker<'a> {
                         );
                     }
                 }
-                Ty::Unit
             }
-            BuiltinFnId::PANIC => {
-                if args.len() != 1 {
-                    let module = self.current_module();
-                    self.err_at(module, expr.span, Code::E204, "`panic` takes one argument");
+            BuiltinFnId::PANIC | BuiltinFnId::ASSERT => {
+                for (arg, param) in args.iter().zip(def.sig.params) {
+                    self.check_expr(&arg.expr, Some(&self.builtin_ty(*param)), infer);
                 }
-                if let Some(arg) = args.first() {
-                    self.check_expr(&arg.expr, Some(&Ty::Str), infer);
-                }
-                Ty::Never
             }
-            BuiltinFnId::ASSERT => {
-                if args.len() != 2 {
-                    let module = self.current_module();
-                    self.err_at(module, expr.span, Code::E204, "`assert` takes two arguments");
-                }
-                if let Some(arg) = args.first() {
-                    self.check_expr(&arg.expr, Some(&Ty::Bool), infer);
-                }
-                if let Some(arg) = args.get(1) {
-                    self.check_expr(&arg.expr, Some(&Ty::Str), infer);
-                }
-                Ty::Unit
-            }
-            _ => Ty::Error,
+            _ => return Ty::Error,
         }
+        self.builtin_ty(def.sig.ret)
     }
 
     fn check_builtin_module_call(

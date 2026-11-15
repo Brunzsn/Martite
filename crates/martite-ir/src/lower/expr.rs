@@ -650,55 +650,27 @@ impl FnLowerer<'_, '_> {
         ty: TyId,
         span: Span,
     ) -> Result<IrId, LowerError> {
-        match function {
-            BuiltinFnId::ASSERT => {
-                let children = self.lower_plain_args(args)?;
-                if children.len() != 2 {
-                    return Err(self.internal(span, "assert arity mismatch"));
-                }
-                let range = self.append_children(children);
-                Ok(self.push(
-                    NodeKind::Assert(range),
-                    ty,
-                    Charge::expression(),
-                    span,
-                    false,
-                ))
-            }
-            BuiltinFnId::PANIC => {
-                let children = self.lower_plain_args(args)?;
-                if children.len() != 1 {
-                    return Err(self.internal(span, "panic arity mismatch"));
-                }
-                let range = self.append_children(children);
-                Ok(self.push(
-                    NodeKind::Panic(range),
-                    ty,
-                    Charge::expression(),
-                    span,
-                    false,
-                ))
-            }
-            BuiltinFnId::PRINT => {
-                let children = self.lower_plain_args(args)?;
-                if children.len() != 1 {
-                    return Err(self.internal(span, "print arity mismatch"));
-                }
-                let first_arg = self.append_children(children).start;
-                let safepoint = BuiltinFnId::PRINT.def().is_some_and(|def| def.safepoint);
-                Ok(self.push(
-                    NodeKind::CallBuiltinFn {
-                        builtin: BuiltinFnId::PRINT,
-                        first_arg,
-                    },
-                    ty,
-                    Charge::expression(),
-                    span,
-                    safepoint,
-                ))
-            }
-            _ => Err(self.internal(span, "unknown builtin function")),
+        let Some(def) = function.def() else {
+            return Err(self.internal(span, "unknown builtin function"));
+        };
+        let children = self.lower_plain_args(args)?;
+        if children.len() != def.sig.params.len() {
+            return Err(self.internal(span, "builtin function arity mismatch"));
         }
+        let range = self.append_children(children);
+        let (kind, safepoint) = match function {
+            BuiltinFnId::ASSERT => (NodeKind::Assert(range), false),
+            BuiltinFnId::PANIC => (NodeKind::Panic(range), false),
+            BuiltinFnId::PRINT => (
+                NodeKind::CallBuiltinFn {
+                    builtin: BuiltinFnId::PRINT,
+                    first_arg: range.start,
+                },
+                def.safepoint,
+            ),
+            _ => return Err(self.internal(span, "unknown builtin function")),
+        };
+        Ok(self.push(kind, ty, Charge::expression(), span, safepoint))
     }
 
     fn lower_builtin_module_call(

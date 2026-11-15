@@ -45,3 +45,23 @@ impl From<BuiltinEffects> for Effects {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_builtin_effect_maps_to_an_ir_effect() {
+        let expected = Effects::MAY_TRAP
+            | Effects::READS_HEAP
+            | Effects::WRITES_HEAP
+            | Effects::SHARES
+            | Effects::ALLOCATES
+            | Effects::DYN_COST
+            | Effects::LOGS
+            | Effects::PANICS
+            | Effects::CALLS;
+        assert_eq!(Effects::from(BuiltinEffects::ALL), expected);
+        assert_eq!(Effects::from(BuiltinEffects::NONE), Effects::NONE);
+    }
+}
