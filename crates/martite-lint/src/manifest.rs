@@ -1,5 +1,7 @@
 //! L020: manifest grants that no source module uses.
 
+use std::collections::HashMap;
+
 use martite_base::{Applicability, Code, Diagnostic, Fix, FixEdit, LintGroup, Span};
 use martite_check::CheckedProgram;
 use martite_resolve::ModuleTargetUse;
@@ -50,15 +52,14 @@ pub fn run(
     }
 
     let mut diagnostics = Vec::new();
-    let mut searched = 0u32;
+    let spans = grant_spans(input.text);
     for grant in input.grants {
         if used.contains(grant) {
             continue;
         }
-        let Some((span, _quoted)) = find_grant_span(input.text, grant, searched) else {
+        let Some(span) = spans.get(grant).copied() else {
             continue;
         };
-        searched = span.end;
         let edit_span = grant_removal_span(input.text, span);
         let fix = Fix {
             applicability: Applicability::Maybe,
@@ -93,20 +94,50 @@ fn module_path(program: &CheckedProgram, target: &martite_check::ModuleTarget) -
     }
 }
 
-fn find_grant_span(text: &str, grant: &str, from: u32) -> Option<(Span, bool)> {
-    let start = from.min(text.len() as u32) as usize;
-    for (quote, quoted) in [('"', format!("\"{grant}\"")), ('\'', format!("'{grant}'"))] {
-        let _ = quote;
-        if let Some(offset) = text[start..].find(&quoted) {
-            let at = start + offset;
-            return Some((Span::new(at as u32, (at + quoted.len()) as u32), true));
+/// Map each decoded grant value to the exact span of its TOML string literal.
+fn grant_spans(text: &str) -> HashMap<String, Span> {
+    let mut spans = HashMap::new();
+    let Ok(document) = toml_edit::Document::parse(text.to_owned()) else {
+        return spans;
+    };
+    let Some(grants) = document
+        .get("permissions")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|permissions| permissions.get("grant"))
+        .and_then(toml_edit::Item::as_array)
+    else {
+        return spans;
+    };
+    for value in grants.iter() {
+        let Some((grant, span)) = value.as_str().zip(value.span()) else {
+            continue;
+        };
+        if span.start > span.end || span.end > text.len() {
+            continue;
         }
+        spans
+            .entry(grant.to_string())
+            .or_insert(Span::new(span.start as u32, span.end as u32));
     }
-    // Fall back to the bare value if the manifest used escaping or a different
-    // TOML spelling.
-    let offset = text[start..].find(grant)?;
-    let at = start + offset;
-    Some((Span::new(at as u32, (at + grant.len()) as u32), false))
+    spans
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grant_spans_follow_decoded_toml_values() {
+        let text = "[permissions]\ngrant = [\"app.editor\", \"a\\u0070p\", 'plain']\n";
+        let spans = grant_spans(text);
+        let slice = |grant: &str| {
+            let span = spans[grant];
+            &text[span.start as usize..span.end as usize]
+        };
+        assert_eq!(slice("app.editor"), "\"app.editor\"");
+        assert_eq!(slice("app"), "\"a\\u0070p\"");
+        assert_eq!(slice("plain"), "'plain'");
+    }
 }
 
 /// Expand a quoted grant string to include one adjacent comma, so the array

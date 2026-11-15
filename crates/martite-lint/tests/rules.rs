@@ -25,6 +25,13 @@ fn lint_script(source: &str, preset: &str) -> Vec<Code> {
 }
 
 fn lint_script_with(source: &str, settings: &SettingsResolver) -> Vec<Code> {
+    codes(&lint_script_diagnostics_with(source, settings))
+}
+
+fn lint_script_diagnostics_with(
+    source: &str,
+    settings: &SettingsResolver,
+) -> Vec<martite_base::Diagnostic> {
     let mut provider = MemoryProvider::new();
     provider.insert("main.mt", source);
     let loaded = load(
@@ -47,14 +54,14 @@ fn lint_script_with(source: &str, settings: &SettingsResolver) -> Vec<Code> {
         codes(&loaded.diagnostics)
     );
     let program = loaded.program.as_ref().expect("checked program");
-    let output = lint(
+    lint(
         program,
         &loaded.sources,
         settings,
         "",
         &LintInputs::default(),
-    );
-    codes(&output.diagnostics)
+    )
+    .diagnostics
 }
 
 #[test]
@@ -200,6 +207,26 @@ on check(mut self) {
 }
 
 #[test]
+fn l024_uses_the_parsed_operator_span() {
+    let source = "fn check(a: bool, b: bool, c: bool) -> bool {\n    a and b // or\n    or c\n}\n\ntest \"mixed\" {\n    assert(check(true, true, false), \"yes\")\n}\n";
+    let parsed = parse_source_with(source, Default::default(), ParseOptions::TOOLING);
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let settings = resolver("recommended").resolve("main.mt");
+    let diagnostics = lint_syntax_only(SourceId(0), source, &parsed.program, &settings);
+    let l024 = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == Code::L024)
+        .expect("expected L024");
+    let span = l024.span.expect("L024 span");
+    assert_eq!(&source[span.start as usize..span.end as usize], "or");
+    let comment = source.find("// or").expect("comment");
+    assert!(
+        span.start as usize > comment,
+        "matched the comment: {span:?}"
+    );
+}
+
+#[test]
 fn l020_reports_unused_grant() {
     let interface = "struct Doc\non check()\n";
     let unused = "struct Other\n";
@@ -265,6 +292,24 @@ fn suppression_marks_a_used_id_and_skips_its_diagnostic() {
     let found = lint_script(source, "recommended");
     assert!(!found.contains(&Code::L002), "{found:?}");
     assert!(!found.contains(&Code::L022), "{found:?}");
+}
+
+#[test]
+fn l022_reports_only_the_unused_id_in_a_mixed_suppression() {
+    let source = "fn main() {\n    // allow(L002, L005)\n    var value = 1\n    print(value)\n}\n";
+    let diagnostics = lint_script_diagnostics_with(source, &resolver("recommended"));
+    let found = codes(&diagnostics);
+    assert!(!found.contains(&Code::L002), "{found:?}");
+    let l022 = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == Code::L022)
+        .expect("expected L022");
+    assert!(
+        l022.message.contains("`L005` suppresses nothing here"),
+        "{}",
+        l022.message
+    );
+    assert!(!l022.message.contains('\0'), "{}", l022.message);
 }
 
 #[test]
