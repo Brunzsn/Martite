@@ -736,10 +736,20 @@ impl<'a> Checker<'a> {
                 };
                 let value_ty = self.check_expr(value, annotation.as_ref(), infer);
                 let bind_ty = annotation.unwrap_or(value_ty);
+                let alias = if !*mutable && matches!(&pattern.kind, PatKind::Bind(_)) {
+                    self.builtin_fn_alias(value)
+                } else {
+                    None
+                };
                 let bindings =
                     self.check_pattern(pattern, &bind_ty, PatMode::Let, *mutable, infer);
                 for (name, (id, _)) in &bindings {
                     self.bind_existing(name, *id, pattern.span);
+                }
+                if let Some(item) = alias {
+                    for (_, (id, _)) in &bindings {
+                        self.builtin_fn_aliases.insert(*id, item);
+                    }
                 }
             }
             StmtKind::While { cond, body } => {
@@ -1057,9 +1067,13 @@ impl<'a> Checker<'a> {
     fn builtin_item_ty(&self, item: &BuiltinItem) -> Ty {
         match (item.module, item.name) {
             ("std.math", "PI") | ("std.math", "EULER") => Ty::Float,
-            ("std.math", "min" | "max" | "clamp") => {
+            ("std.math", "min" | "max") => {
                 Ty::Fn(vec![Ty::Param(0), Ty::Param(0)], Box::new(Ty::Param(0)))
             }
+            ("std.math", "clamp") => Ty::Fn(
+                vec![Ty::Param(0), Ty::Param(0), Ty::Param(0)],
+                Box::new(Ty::Param(0)),
+            ),
             ("std.math", "sin" | "cos" | "tan" | "exp" | "ln" | "log10") => {
                 Ty::Fn(vec![Ty::Float], Box::new(Ty::Float))
             }
@@ -1077,6 +1091,21 @@ impl<'a> Checker<'a> {
             ),
             ("std.json", "Json") => Ty::Named(self.json_type.unwrap_or(TypeId(0)), Vec::new()),
             _ => Ty::Error,
+        }
+    }
+
+    /// Resolves a value expression that is either a builtin function item or
+    /// an immutable local alias of one.
+    fn builtin_fn_alias(&self, expr: &Expr) -> Option<BuiltinItem> {
+        let item = match self.resolutions.get(&expr.id)? {
+            Resolution::BuiltinItem(item) => *item,
+            Resolution::Local(id) => *self.builtin_fn_aliases.get(id)?,
+            _ => return None,
+        };
+        if item.kind == DefKind::Fn {
+            Some(item)
+        } else {
+            None
         }
     }
 
@@ -1593,6 +1622,16 @@ impl<'a> Checker<'a> {
         }
         if let Some(Resolution::BuiltinFn(function)) = self.resolutions.get(&callee.id).copied() {
             return self.check_builtin_call(expr, function, args, infer);
+        }
+        if let Some(Resolution::BuiltinItem(item)) = self.resolutions.get(&callee.id).copied()
+            && item.kind == DefKind::Fn
+        {
+            return self.check_builtin_module_call(expr, &item, args, expected, infer);
+        }
+        if let Some(Resolution::Local(id)) = self.resolutions.get(&callee.id).copied()
+            && let Some(item) = self.builtin_fn_aliases.get(&id).copied()
+        {
+            return self.check_builtin_module_call(expr, &item, args, expected, infer);
         }
         let Ty::Fn(params, ret) = callee_ty else {
             if !callee_ty.is_error() {
@@ -2206,7 +2245,8 @@ impl<'a> Checker<'a> {
                 self.check_generic_ord_call(expr, args, expected, infer, 3)
             }
             ("std.math", "atan2") => {
-                self.check_fixed_args(expr, args, &[Ty::Float, Ty::Float], infer)
+                self.check_fixed_args(expr, args, &[Ty::Float, Ty::Float], infer);
+                Ty::Float
             }
             (
                 "std.math",

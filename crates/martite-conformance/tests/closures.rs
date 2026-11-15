@@ -76,6 +76,29 @@ fn builtin_module_function_values_are_callable() {
 }
 
 #[test]
+fn builtin_module_generic_function_values_are_callable() {
+    assert_eq!(
+        run(r#"
+            use std.math
+            use std.math.clamp
+            fn main() {
+                let module_clamp = math.clamp
+                print("{module_clamp(5, 0, 3)}")
+                print("{module_clamp(2.5, 0.0, 3.0)}")
+                print("{clamp(9, 0, 7)}")
+                let minimum = math.min
+                let maximum = math.max
+                print("{minimum(3, 1)}")
+                print("{maximum(3, 1)}")
+                let atan = math.atan2
+                print("{atan(1.0, 2.0)}")
+            }
+            "#),
+        ["3", "2.5", "7", "1", "3", "0.4636476090008061"]
+    );
+}
+
+#[test]
 fn higher_order_builtins_accept_borrowed_closures() {
     assert_eq!(
         run(r#"
