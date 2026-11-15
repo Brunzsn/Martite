@@ -4721,11 +4721,16 @@ impl<'p> FnCheck<'p> {
                         },
                     ));
                 };
-                if params.len() != 2
+                if params.len() != 3
                     || !type_accepts_owned(
                         self.program,
                         &self.ty(params[0])?,
                         &self.ty(params[1])?,
+                    )?
+                    || !type_accepts_owned(
+                        self.program,
+                        &self.ty(params[0])?,
+                        &self.ty(params[2])?,
                     )?
                     || !type_accepts_owned(self.program, &self.ty(*ret)?, &self.ty(params[0])?)?
                 {
