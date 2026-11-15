@@ -21,10 +21,6 @@ pub fn structurally_equal(
     after_source: &str,
     after: &Program,
 ) -> bool {
-    assert!(
-        before.records_parentheses() && after.records_parentheses(),
-        "structurally_equal requires programs parsed with ParseOptions::TOOLING"
-    );
     if before.is_interface != after.is_interface {
         return false;
     }
@@ -551,21 +547,15 @@ impl Cmp<'_> {
     }
 
     fn expr_parens(&self, program: &Program, expr: &Expr) -> usize {
-        program
-            .parentheses()
-            .map_or(0, |tables| tables.expression_parens(expr.id).len())
+        program.parentheses().expression_parens(expr.id).len()
     }
 
     fn type_parens(&self, program: &Program, ty: &TyExpr) -> usize {
-        program
-            .parentheses()
-            .map_or(0, |tables| tables.type_parens(ty.id).len())
+        program.parentheses().type_parens(ty.id).len()
     }
 
     fn pattern_parens(&self, program: &Program, pattern: &Pattern) -> usize {
-        program
-            .parentheses()
-            .map_or(0, |tables| tables.pattern_parens(pattern.id).len())
+        program.parentheses().pattern_parens(pattern.id).len()
     }
 }
 
@@ -581,13 +571,11 @@ fn field_name_eq(left: &FieldName, right: &FieldName) -> bool {
 mod tests {
     use super::*;
     use martite_base::LoadLimits;
-    use martite_syntax::{ParseOptions, parse_source_with};
+    use martite_syntax::parse_source;
 
     fn equal(left: &str, right: &str) -> bool {
-        let left_program =
-            parse_source_with(left, LoadLimits::default(), ParseOptions::TOOLING).program;
-        let right_program =
-            parse_source_with(right, LoadLimits::default(), ParseOptions::TOOLING).program;
+        let left_program = parse_source(left, LoadLimits::default()).program;
+        let right_program = parse_source(right, LoadLimits::default()).program;
         structurally_equal(left, &left_program, right, &right_program)
     }
 

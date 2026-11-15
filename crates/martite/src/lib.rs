@@ -15,7 +15,6 @@ use martite_runtime::{
     ExecLimits, HostCaller, HostContext, HostFault, IrHostDispatcher, IrRuntime, MAX_VALUE_DEPTH,
     Trap, Value,
 };
-use martite_syntax::ParseOptions;
 
 pub use martite_base::{Code, Diagnostic, SourceId, SourceMap, Span};
 pub use martite_ir::VerifyMode;
@@ -391,7 +390,6 @@ impl Engine {
                 grants: manifest.grants.clone(),
                 limits: self.load_limits,
                 edition: manifest.lang.clone(),
-                parse: ParseOptions::default(),
             },
         );
         if loaded.has_errors() {
@@ -553,7 +551,6 @@ impl Engine {
                 grants: self.interfaces.iter().map(|i| i.path.clone()).collect(),
                 limits: self.load_limits,
                 edition: LANG_EDITION.into(),
-                parse: ParseOptions::default(),
             },
         );
         if loaded.has_errors() {

@@ -18,7 +18,6 @@ fn run_source(source: &str) -> Vec<String> {
             grants: Vec::new(),
             limits: LoadLimits::default(),
             edition: "1".into(),
-            parse: martite_syntax::ParseOptions::default(),
         },
     );
     if !loaded.diagnostics.is_empty() {

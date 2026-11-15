@@ -14,7 +14,7 @@ use martite_ir::{IrProgram, Printer};
 use martite_lint::{LintInputs, ManifestInput, SettingsResolver, normalize_path, sort_diagnostics};
 use martite_resolve::InterfaceSource;
 use martite_runtime::{ExecLimits, Trap, Value};
-use martite_syntax::{ParseOptions, parse_interface_with, parse_source_with};
+use martite_syntax::{parse_interface, parse_source};
 
 const USAGE: &str = "\
 Martite language toolchain
@@ -705,14 +705,14 @@ fn format_file(path: &Path, args: &FmtArgs) -> Result<ExitCode, String> {
 
 fn verify_format(before: &str, after: &str, interface: bool) -> Result<(), String> {
     let left = if interface {
-        parse_interface_with(before, LoadLimits::default(), ParseOptions::TOOLING)
+        parse_interface(before, LoadLimits::default())
     } else {
-        parse_source_with(before, LoadLimits::default(), ParseOptions::TOOLING)
+        parse_source(before, LoadLimits::default())
     };
     let right = if interface {
-        parse_interface_with(after, LoadLimits::default(), ParseOptions::TOOLING)
+        parse_interface(after, LoadLimits::default())
     } else {
-        parse_source_with(after, LoadLimits::default(), ParseOptions::TOOLING)
+        parse_source(after, LoadLimits::default())
     };
     if right.diagnostics.iter().any(|diagnostic| {
         matches!(diagnostic.code, Code::E001 | Code::E002 | Code::E003)
@@ -823,7 +823,7 @@ impl ProjectSpec {
         }
     }
 
-    fn load_static(&self, parse: ParseOptions) -> LoadedProgram {
+    fn load_static(&self) -> LoadedProgram {
         let provider = FileSystemProvider::new(self.root.clone());
         load(
             &provider,
@@ -833,7 +833,6 @@ impl ProjectSpec {
                 grants: self.static_grants(),
                 limits: LoadLimits::default(),
                 edition: self.edition.clone(),
-                parse,
             },
         )
     }
@@ -1138,7 +1137,6 @@ fn fix_project(
                 grants,
                 limits: LoadLimits::default(),
                 edition,
-                parse: ParseOptions::TOOLING,
             },
         );
         last.clear();
@@ -1379,7 +1377,7 @@ fn cmd_lint(args: &[String]) -> ExitCode {
             }
             continue;
         }
-        let mut loaded = spec.load_static(ParseOptions::TOOLING);
+        let mut loaded = spec.load_static();
         render_all(&loaded.diagnostics, &loaded.sources, &mut rendered);
         if loaded
             .diagnostics
@@ -1465,7 +1463,7 @@ fn lint_syntax_only_mode(args: &LintArgs) -> ExitCode {
             .display()
             .to_string();
         let source = sources.add(display, text.clone());
-        let parsed = parse_source_with(&text, LoadLimits::default(), ParseOptions::TOOLING);
+        let parsed = parse_source(&text, LoadLimits::default());
         if !parsed.diagnostics.is_empty() {
             had_parse_error = true;
             let mut parse_diagnostics = parsed.diagnostics;
@@ -1586,7 +1584,7 @@ fn cmd_check(raw: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let loaded = spec.load_static(ParseOptions::default());
+    let loaded = spec.load_static();
     print_diagnostics(&loaded.diagnostics, &loaded.sources, args.json);
     if loaded.has_errors() {
         ExitCode::from(1)
@@ -1622,7 +1620,7 @@ fn cmd_lower(raw: &[String]) -> ExitCode {
         .unwrap_or(Path::new("."))
         .to_path_buf();
     let spec = script_spec(root, name.to_string(), &args.interfaces);
-    let loaded = spec.load_static(ParseOptions::default());
+    let loaded = spec.load_static();
     print_diagnostics(&loaded.diagnostics, &loaded.sources, args.json);
     if loaded.has_errors() {
         return ExitCode::from(1);
