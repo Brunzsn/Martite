@@ -2,11 +2,11 @@
 //!
 //! This crate is the data model between the checker and the runtime. It owns
 //! the type, builtin and id vocabulary, the deterministic text printer
-//! ([`Printer`]) for dumps and golden tests, the verifier ([`verify`]) that
-//! enforces the contract between lowering and every pass, the on-demand slot
-//! analyses in [`analysis`], and lowering ([`lower`]). Calls, patterns and
-//! lambdas all lower here. The runtime lives in `martite-runtime`; passes and
-//! the rewriter live in `martite-opt`.
+//! ([`Printer`]) for dumps and golden tests, the shared tree traversal in
+//! [`walk`], the verifier ([`verify`]) that enforces the contract between
+//! lowering and every pass, the on-demand slot analyses in [`analysis`], and
+//! lowering ([`lower`]). Calls, patterns and lambdas all lower here. The runtime
+//! lives in `martite-runtime`; passes and the rewriter live in `martite-opt`.
 //!
 //! Dependency direction: the default `lower` feature may depend on
 //! `martite-base`, `martite-syntax` and `martite-check` for lowering inputs,
@@ -34,6 +34,11 @@
 //! Per-function side vectors carry spans, synthetic provenance, safepoints and
 //! the arenas whose payloads do not fit on a node. They are indexed by the ids
 //! in [`id`], and [`verify`] checks that they stay parallel to `nodes`.
+//!
+//! Node traversal lives in [`walk`], not in the verifier. Every consumer
+//! (effects, analyses, the optimizer and the verifier itself) uses
+//! [`walk::children_of`] so there is one definition of a node's semantic
+//! children.
 
 pub mod analysis;
 pub mod builtin;
@@ -48,6 +53,7 @@ pub mod print;
 pub mod program;
 pub mod types;
 pub mod verify;
+pub mod walk;
 
 /// Maximum IR tree depth per function, enforced by lowering and the verifier.
 ///
@@ -79,4 +85,5 @@ pub use program::{
     IrProgram, ParamInfo, PreludeVariant, SlotInfo,
 };
 pub use types::{FieldDef, Ty, TyId, TypeDef, TypeDefKind, TypeId, TypeTable, VariantDef};
-pub use verify::{VerifyError, VerifyErrorKind, children_of, verify, verify_after_pass};
+pub use verify::{VerifyError, VerifyErrorKind, verify, verify_after_pass};
+pub use walk::children_of;

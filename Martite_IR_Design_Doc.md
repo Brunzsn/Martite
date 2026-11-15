@@ -55,7 +55,7 @@ sources -> parse -> resolve -> check -> lower -> [optimize] -> runtime
 | Crate | Role | Depends on |
 | --- | --- | --- |
 | `martite-fuel` | **Single fuel table**: static charge constants and dynamic cost functions (`sort_cost`, string bytes `div_ceil(8)`, comparison cost, ...). Every charge site in the IR evaluator calls it. Helpers take counts, not `Value`, so the IR can use the table without the runtime | none |
-| `martite-ir` | IR types, printer, verifier, lowering from `CheckedProgram` | base, fuel, syntax, check |
+| `martite-ir` | IR types, shared tree traversal, printer, verifier, lowering from `CheckedProgram` | base, fuel, syntax, check |
 | `martite-opt` | passes, pass manager (created with the first pass, section 11) | ir |
 | `martite-runtime` | executes `IrProgram` | base, fuel, ir |
 | `martite-driver` | `load` (unchanged) plus `lower` | base, syntax, resolve, check, ir (not runtime) |
@@ -411,6 +411,7 @@ follow-ups because they need explicit safepoint-preservation arguments.
 
 Runs after lowering and, in tests and debug builds, after each pass. Checks:
 
+- Node traversal is defined once in `martite-ir::walk` (`children_of`). The verifier, effects, the slot analyses and the optimizer all use it; `verify.rs` does not own child enumeration.
 - All ids (`IrId`, `FnId`, slot, const, str, host) are in range; the tree property holds.
 - Each node kind has the right number and roles of children; types match the kind (including `Binary` operand class).
 - Call arity and argument types match the callee; `MutPlace` roots are distinct; no `mut` arguments on `CallValue`.

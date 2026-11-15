@@ -12,7 +12,7 @@ The workspace is split along the compiler pipeline:
 - `martite-config` — `plugin.toml` and `martite.toml`
 - `martite-resolve` — module graph, imports, grants, top-level names
 - `martite-check` — bidirectional type checker, patterns, constants, handlers
-- `martite-ir` - resolved, self-contained tree IR, lowering (`lower` feature), verifier and text dumps
+- `martite-ir` - resolved, self-contained tree IR, shared tree traversal, lowering (`lower` feature), verifier and text dumps
 - `martite-opt` - ordered pass manager, `Preserve` rewriter and the first constant-folding pass
 - `martite-runtime` - IR evaluator, values, standard library, limits and traps; it does not depend on the checker or syntax tree
 - `martite-driver` — load orchestration

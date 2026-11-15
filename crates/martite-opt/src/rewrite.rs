@@ -7,9 +7,10 @@
 
 use std::collections::BTreeMap;
 
+use martite_ir::walk::children_of;
 use martite_ir::{
     Charge, ChildRange, Effects, IrFn, IrId, IrProgram, MatchSet, MatchSetId, Node, NodeKind, Span,
-    StrPart, StructLayoutId, Ty, TyId, children_of,
+    StrPart, StructLayoutId, Ty, TyId,
 };
 
 use crate::error::{RewriteError, RewriteErrorKind};

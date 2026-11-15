@@ -10,7 +10,7 @@ use crate::analysis::slots::{SlotSet, pattern_always_matches, pattern_binding_sl
 use crate::id::{IrId, MatchSetId, PatternId, Slot};
 use crate::node::{AccessMode, Node, NodeKind};
 use crate::program::{IrFn, IrProgram};
-use crate::verify::children_of;
+use crate::walk::children_of;
 
 /// One slot read that is not definitely assigned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

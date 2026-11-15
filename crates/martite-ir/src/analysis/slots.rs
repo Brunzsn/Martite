@@ -12,7 +12,7 @@ use crate::node::NodeKind;
 use crate::pattern::Pattern;
 use crate::program::{IrFn, IrProgram};
 use crate::types::TypeDefKind;
-use crate::verify::children_of;
+use crate::walk::children_of;
 
 /// A set of frame slots, indexed densely over `IrFn::locals`.
 #[derive(Clone, PartialEq, Eq)]

@@ -2,9 +2,9 @@
 
 use std::collections::BTreeSet;
 
+use martite_ir::walk::children_of;
 use martite_ir::{
-    ConstId, ConstValue, IrFn, IrId, IrProgram, StrId, Ty, TyId, children_of, recompute_effects,
-    verify,
+    ConstId, ConstValue, IrFn, IrId, IrProgram, StrId, Ty, TyId, recompute_effects, verify,
 };
 
 use crate::error::{OptimizeError, RewriteError};

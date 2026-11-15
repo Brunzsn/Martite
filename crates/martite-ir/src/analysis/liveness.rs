@@ -12,7 +12,7 @@ use crate::analysis::slots::{SlotSet, pattern_binding_slots};
 use crate::id::{IrId, MatchSetId, PatternId, Slot};
 use crate::node::{Node, NodeKind};
 use crate::program::{IrFn, IrProgram};
-use crate::verify::children_of;
+use crate::walk::children_of;
 
 /// Per-node liveness facts for one function.
 #[derive(Debug, Clone)]

@@ -9,7 +9,8 @@ use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
 use crate::id::IrId;
 use crate::program::{IrFn, IrProgram};
-use crate::verify::{EffectsCheck, children_of};
+use crate::verify::EffectsCheck;
+use crate::walk::children_of;
 
 /// A set of effect flags.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
