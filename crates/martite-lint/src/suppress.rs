@@ -22,6 +22,7 @@ struct SuppressionId {
     span: Span,
     retired: bool,
     error_code: bool,
+    used: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -69,7 +70,7 @@ pub fn apply(
                     .ids
                     .iter_mut()
                     .filter(|id| id.code == Some(diagnostic.code))
-                    .for_each(|id| id.text.push('\0')); // mark used, keep the text
+                    .for_each(|id| id.used = true);
             }
         }
     }
@@ -122,49 +123,27 @@ fn emit_l022(
     for suppression in suppressions {
         let mut offending = Vec::new();
         for id in &suppression.ids {
-            let used = id.text.ends_with('\0');
             if id.error_code {
-                offending.push((
-                    id,
-                    format!(
-                        "`{}` is a compile error code",
-                        id.text.trim_end_matches('\0')
-                    ),
-                ));
+                offending.push((id, format!("`{}` is a compile error code", id.text)));
                 continue;
             }
             let Some(code) = id.code else {
-                offending.push((
-                    id,
-                    format!("unknown lint rule `{}`", id.text.trim_end_matches('\0')),
-                ));
+                offending.push((id, format!("unknown lint rule `{}`", id.text)));
                 continue;
             };
             if id.retired {
-                offending.push((
-                    id,
-                    format!("retired lint rule `{}`", id.text.trim_end_matches('\0')),
-                ));
+                offending.push((id, format!("retired lint rule `{}`", id.text)));
                 continue;
             }
             if !registry::is_known(code) {
-                offending.push((
-                    id,
-                    format!("unknown lint rule `{}`", id.text.trim_end_matches('\0')),
-                ));
+                offending.push((id, format!("unknown lint rule `{}`", id.text)));
                 continue;
             }
             if !settings.selected(code) || !settings.enabled(code) {
                 continue;
             }
-            if !used {
-                offending.push((
-                    id,
-                    format!(
-                        "`{}` suppresses nothing here",
-                        id.text.trim_end_matches('\0')
-                    ),
-                ));
+            if !id.used {
+                offending.push((id, format!("`{}` suppresses nothing here", id.text)));
             }
         }
         if offending.is_empty() {
@@ -310,6 +289,7 @@ fn parse_allow(span: Span, text: &str) -> Option<Vec<SuppressionId>> {
                 span: Span::new(start, end),
                 retired,
                 error_code: id_text.starts_with('E'),
+                used: false,
             });
         }
         offset += raw.len() + 1;
