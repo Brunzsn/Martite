@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use martite_base::Severity;
 use martite_conformance::{Case, lower_case_ir, min_depth, min_fuel, min_memory};
-use martite_ir::{HostId, IrProgram, lower, verify};
+use martite_ir::{FnKind, HostId, IrProgram, lower, verify};
 use martite_runtime::{
     ExecLimits, HostContext, HostFault, IrHostDispatcher, IrRuntime, Trap, Value, show,
 };
@@ -413,4 +413,79 @@ fn invoke_returns_mutable_parameters_in_declaration_order() {
     assert_eq!(show(&result.value, &ir.types, true), "2");
     assert_eq!(result.params.len(), 1);
     assert_eq!(show(&result.params[0], &ir.types, true), "2");
+}
+
+#[test]
+fn mutable_call_arguments_write_back_through_field_and_index_places() {
+    let case = Case::single(
+        r#"
+        struct Counter { value: int }
+
+        fn bump(mut value: int, amount: int) {
+            value += amount
+        }
+
+        fn main() {
+            var counter = Counter { value: 1 }
+            bump(mut counter.value, 2)
+            var values = [1, 2]
+            bump(mut values[1], 10)
+            print("{counter.value}:{values[1]}")
+        }
+        "#,
+    );
+    let observation = observe(&case, ExecLimits::default());
+    assert_eq!(observation.outcome, Ok("()".into()));
+    assert_eq!(observation.log, ["3:12"]);
+}
+
+#[test]
+fn closure_captures_survive_builtin_calls() {
+    let case = Case::single(
+        r#"
+        fn main() {
+            let offset = 10
+            let values = [1, 2, 3]
+            let shifted = values.map(fn(value) => value + offset)
+            print("{shifted[0]}:{shifted[1]}:{shifted[2]}")
+        }
+        "#,
+    );
+    let observation = observe(&case, ExecLimits::default());
+    assert_eq!(observation.outcome, Ok("()".into()));
+    assert_eq!(observation.log, ["11:12:13"]);
+}
+
+#[test]
+fn destructured_lambda_parameters_bind_through_the_pattern_frame() {
+    let case = Case::single(
+        r#"
+        fn main() {
+            let pair = (2, 3)
+            let add = fn((left, right): (int, int)) => left + right
+            print("{add(pair)}")
+        }
+        "#,
+    );
+    let observation = observe(&case, ExecLimits::default());
+    assert_eq!(observation.outcome, Ok("()".into()));
+    assert_eq!(observation.log, ["5"]);
+}
+
+#[test]
+fn invoke_dispatches_host_functions() {
+    let case = host_case();
+    let ir = lowered(&case);
+    let function = ir
+        .fns
+        .iter()
+        .find(|function| matches!(function.kind, FnKind::Host(_)))
+        .expect("host function")
+        .id;
+
+    let (mut host, calls) = TestHost::new(5, HostOutcome::Unit);
+    let mut runtime = IrRuntime::with_host(&ir, limits(100, 200), &mut host);
+    let result = runtime.invoke(function, Vec::new()).expect("host invoke");
+    assert_eq!(calls.get(), 1);
+    assert_eq!(show(&result.value, &ir.types, true), "()");
 }

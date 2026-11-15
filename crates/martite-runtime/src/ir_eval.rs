@@ -13,6 +13,11 @@
 //! Host dispatch uses [`IrHostDispatcher`], whose argument is a [`HostId`].
 //! This keeps the evaluator independent of checker definition ids; embedders
 //! map their host registry to the IR host table once, at setup time.
+//!
+//! All calls funnel through `call_resolved`. The `FnId`, closure and `FnValue`
+//! entry points only resolve their target; frame setup and the return path
+//! exist once. Plain parameter lists fill their slots directly, while
+//! destructured lambda parameters take the pattern path.
 
 mod builtins;
 
@@ -242,7 +247,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             call_args.push(state.clone().unwrap_or(Value::Unit));
         }
         call_args.extend(args);
-        let (value, mut updated) = self.call_function_with_writebacks(function, call_args)?;
+        let (value, mut updated) = self.call_resolved(info, call_args, None)?;
         if has_self && self_mutable {
             *state = take_writeback(&mut updated, 0);
         }
@@ -314,235 +319,42 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         Err(EvalError::Trap(trap))
     }
 
-    fn call_function(&mut self, function: FnId, args: CallArgs) -> Result<Value, Trap> {
-        self.call_function_with_writebacks(function, args)
-            .map(|(value, _)| value)
-    }
-
-    fn call_function_with_writebacks(
-        &mut self,
-        function: FnId,
-        args: CallArgs,
-    ) -> Result<(Value, Writebacks), Trap> {
-        self.call_function_with_writebacks_and_captures(function, args, None)
-    }
-
-    /// Calls a closure value. Lambda parameters cannot be `mut`, so a closure
-    /// call never produces writeback values.
-    #[inline]
-    fn call_closure(&mut self, closure: &Closure, args: CallArgs) -> Result<Value, Trap> {
-        let program = self.program;
-        let Some(function_info) = program.function(closure.target) else {
-            return Err(self.internal_panic(format!("missing function #{:?}", closure.target)));
-        };
-        self.call_closure_function(function_info, closure.captures.clone(), args)
-    }
-
-    /// Call a closure whose target function has already been resolved. The
-    /// higher-order builtins use this to hoist the target lookup out of their
-    /// per-element loops.
-    #[inline]
-    fn call_closure_function(
-        &mut self,
-        function_info: &'p IrFn,
-        captures: Option<Rc<[Value]>>,
-        args: CallArgs,
-    ) -> Result<Value, Trap> {
-        if matches!(function_info.kind, FnKind::Lambda) {
-            return self.call_lambda(function_info, captures, args);
-        }
-        self.call_function_with_writebacks_and_captures(function_info.id, args, captures)
-            .map(|(value, _)| value)
-    }
-
-    /// Specialized lambda call. It skips the mutable-writeback scan and the
-    /// non-lambda capture checks that every higher-order builtin would
-    /// otherwise repeat per element.
-    #[inline]
-    fn call_lambda(
-        &mut self,
-        function_info: &'p IrFn,
-        captures: Option<Rc<[Value]>>,
-        args: CallArgs,
-    ) -> Result<Value, Trap> {
-        if self.frames.len() >= self.limits.depth as usize {
-            return Err(Trap::DepthExceeded);
-        }
-        if args.len() != function_info.params.len() {
-            return Err(self.internal_panic(format!(
-                "lambda `{}` expected {} arguments, got {}",
-                function_info.name,
-                function_info.params.len(),
-                args.len()
-            )));
-        }
-        debug_assert_eq!(
-            captures.as_ref().map_or(0, |captures| captures.len()),
-            function_info.captures.len(),
-            "lambda capture count"
-        );
-
-        let mut slots = SmallVec::from_elem(None, function_info.locals as usize);
-        if self.simple_params[function_info.id.index()] {
-            for (param, value) in function_info.params.iter().zip(args) {
-                slots[param.slot.index()] = Some(value);
-            }
-        } else {
-            let mut pattern_params: SmallVec<[(&Pattern, Value); 2]> = SmallVec::new();
-            for (param, value) in function_info.params.iter().zip(args) {
-                if let Some(pattern_id) = param.pattern {
-                    let Some(pattern) = function_info.pattern(pattern_id) else {
-                        return Err(self.internal_panic("lambda parameter pattern is out of range"));
-                    };
-                    pattern_params.push((pattern, value));
-                } else {
-                    slots[param.slot.index()] = Some(value);
-                }
-            }
-            self.frames.push(Frame {
-                slots,
-                captures,
-                source: function_info.source,
-                name: function_info.name.as_ref(),
-            });
-            for (pattern, value) in pattern_params {
-                if let Err(error) = self.bind_pattern(pattern, &value) {
-                    self.frames.pop();
-                    return Err(match error {
-                        EvalError::Trap(trap) => trap,
-                        _ => self.internal_panic("lambda parameter binding failed"),
-                    });
-                }
-            }
-            return self.finish_lambda_call(function_info);
-        }
-
-        self.frames.push(Frame {
-            slots,
-            captures,
-            source: function_info.source,
-            name: function_info.name.as_ref(),
-        });
-        self.finish_lambda_call(function_info)
-    }
-
-    /// Fast path for plain functions with no mutable or destructured
-    /// parameters. It avoids the generic writeback scan and capture checks.
-    #[inline]
-    fn call_simple_function(
-        &mut self,
-        function_info: &'p IrFn,
-        args: CallArgs,
-    ) -> Result<Value, Trap> {
-        if self.frames.len() >= self.limits.depth as usize {
-            return Err(Trap::DepthExceeded);
-        }
-        if args.len() != function_info.params.len() {
-            return Err(self.internal_panic(format!(
-                "`{}` expected {} arguments, got {}",
-                function_info.name,
-                function_info.params.len(),
-                args.len()
-            )));
-        }
-        let mut slots = SmallVec::from_elem(None, function_info.locals as usize);
-        for (param, value) in function_info.params.iter().zip(args) {
-            slots[param.slot.index()] = Some(value);
-        }
-        self.frames.push(Frame {
-            slots,
-            captures: None,
-            source: function_info.source,
-            name: function_info.name.as_ref(),
-        });
-        if let Err(trap) = self.maybe_check_memory() {
-            self.frames.pop();
-            return Err(match trap {
-                EvalError::Trap(trap) => trap,
-                _ => Trap::OutOfMemory,
-            });
-        }
-        let body = function_info.body.expect("simple function body");
-        let previous = self.current;
-        self.current = Some(function_info);
-        let result = match self.eval_body(body) {
-            Ok(value) => Ok(value),
-            Err(EvalError::Return(value)) => Ok(value),
-            Err(EvalError::Trap(trap)) => Err(trap),
-            Err(EvalError::Break) | Err(EvalError::Continue) => {
-                Err(self.internal_panic("`break`/`continue` escaped a loop"))
-            }
-        };
-        self.current = previous;
-        self.frames.pop();
-        let value = result?;
-        self.maybe_check_returned_value(&value)
-            .map_err(|error| match error {
-                EvalError::Trap(trap) => trap,
-                _ => Trap::OutOfMemory,
-            })?;
-        if value_depth_exceeds(&value, MAX_VALUE_DEPTH) {
-            return Err(Trap::DepthExceeded);
-        }
-        Ok(value)
-    }
-
-    #[inline]
-    fn finish_lambda_call(&mut self, function_info: &'p IrFn) -> Result<Value, Trap> {
-        if let Err(trap) = self.maybe_check_memory() {
-            self.frames.pop();
-            return Err(match trap {
-                EvalError::Trap(trap) => trap,
-                _ => Trap::OutOfMemory,
-            });
-        }
-        let body = function_info.body.expect("lambda body");
-        let previous = self.current;
-        self.current = Some(function_info);
-        let result = match self.eval_body(body) {
-            Ok(value) => Ok(value),
-            Err(EvalError::Return(value)) => Ok(value),
-            Err(EvalError::Trap(trap)) => Err(trap),
-            Err(EvalError::Break) | Err(EvalError::Continue) => {
-                Err(self.internal_panic("loop control escaped a lambda"))
-            }
-        };
-        self.current = previous;
-        self.frames.pop();
-        let value = result?;
-        self.maybe_check_returned_value(&value)
-            .map_err(|error| match error {
-                EvalError::Trap(trap) => trap,
-                _ => Trap::OutOfMemory,
-            })?;
-        if value_depth_exceeds(&value, MAX_VALUE_DEPTH) {
-            return Err(Trap::DepthExceeded);
-        }
-        Ok(value)
-    }
-
-    fn call_function_with_writebacks_and_captures(
-        &mut self,
-        function: FnId,
-        args: CallArgs,
-        captures: Option<Rc<[Value]>>,
-    ) -> Result<(Value, Writebacks), Trap> {
-        if self.frames.len() >= self.limits.depth as usize {
-            return Err(Trap::DepthExceeded);
-        }
-        let program = self.program;
-        let function_info = program
+    fn function_info(&self, function: FnId) -> Result<&'p IrFn, Trap> {
+        self.program
             .function(function)
-            .ok_or_else(|| self.internal_panic(format!("missing function #{:?}", function)))?;
+            .ok_or_else(|| self.internal_panic(format!("missing function #{:?}", function)))
+    }
+
+    /// The single call implementation. Every entry point resolves its target
+    /// and then delegates here, so depth, argument, capture, frame and return
+    /// handling exist in exactly one place.
+    fn call_resolved(
+        &mut self,
+        function_info: &'p IrFn,
+        args: CallArgs,
+        captures: Option<Rc<[Value]>>,
+    ) -> Result<(Value, Writebacks), Trap> {
+        if self.frames.len() >= self.limits.depth as usize {
+            return Err(Trap::DepthExceeded);
+        }
         if let FnKind::Host(host) = function_info.kind {
             return Ok((self.call_host(host, &args)?, Writebacks::new()));
         }
-        if function_info.body.is_none() {
+        let Some(body) = function_info.body else {
             return Err(
                 self.internal_panic(format!("function `{}` has no body", function_info.name))
             );
-        }
+        };
+        let lambda = matches!(function_info.kind, FnKind::Lambda);
         if args.len() != function_info.params.len() {
+            if lambda {
+                return Err(self.internal_panic(format!(
+                    "lambda `{}` expected {} arguments, got {}",
+                    function_info.name,
+                    function_info.params.len(),
+                    args.len()
+                )));
+            }
             return Err(self.internal_panic(format!(
                 "`{}` expected {} arguments, got {}",
                 function_info.name,
@@ -550,7 +362,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 args.len()
             )));
         }
-        let captures = if matches!(function_info.kind, FnKind::Lambda) {
+        let captures = if lambda {
             let provided = captures.as_ref().map_or(0, |captures| captures.len());
             if provided != function_info.captures.len() {
                 return Err(self.internal_panic(format!(
@@ -568,39 +380,91 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             None
         };
 
-        if !matches!(function_info.kind, FnKind::Lambda)
-            && function_info.body.is_some()
-            && self.simple_params[function.index()]
-            && !self.mutable_params[function.index()]
-        {
-            return self
-                .call_simple_function(function_info, args)
-                .map(|value| (value, Writebacks::new()));
-        }
+        self.push_frame(function_info, args, captures)?;
+        let escaped = if lambda {
+            "loop control escaped a lambda"
+        } else {
+            "`break`/`continue` escaped a loop"
+        };
+        let result = self.run_body(function_info, body, escaped);
+        self.pop_frame(function_info, result)
+    }
 
+    fn call_function(&mut self, function: FnId, args: CallArgs) -> Result<Value, Trap> {
+        let function_info = self.function_info(function)?;
+        self.call_resolved(function_info, args, None)
+            .map(|(value, _)| value)
+    }
+
+    fn call_function_with_writebacks(
+        &mut self,
+        function: FnId,
+        args: CallArgs,
+    ) -> Result<(Value, Writebacks), Trap> {
+        let function_info = self.function_info(function)?;
+        self.call_resolved(function_info, args, None)
+    }
+
+    /// Calls a closure value. Lambda parameters cannot be `mut`, so a closure
+    /// call never produces writeback values.
+    #[inline]
+    fn call_closure(&mut self, closure: &Closure, args: CallArgs) -> Result<Value, Trap> {
+        let function_info = self.function_info(closure.target)?;
+        self.call_resolved(function_info, args, closure.captures.clone())
+            .map(|(value, _)| value)
+    }
+
+    #[inline]
+    fn call_closure_value(&mut self, function: &FnValue, args: CallArgs) -> Result<Value, Trap> {
+        match function {
+            FnValue::Def(id) => self.call_function(*id, args),
+            FnValue::Closure(closure) => self.call_closure(closure, args),
+        }
+    }
+
+    /// Builds and pushes one frame, binds its parameters, and runs the shared
+    /// pre-body memory check. The frame is popped again on every failure path.
+    fn push_frame(
+        &mut self,
+        function_info: &'p IrFn,
+        args: CallArgs,
+        captures: Option<Rc<[Value]>>,
+    ) -> Result<(), Trap> {
+        // Plain parameter lists are the common case. Filling their slots
+        // directly avoids the pattern vector and the bounds-checked path that
+        // only destructured lambda parameters need.
+        let simple = self.simple_params[function_info.id.index()];
         let mut slots = SmallVec::from_elem(None, function_info.locals as usize);
         let mut pattern_params: SmallVec<[(&Pattern, Value); 2]> = SmallVec::new();
         for (param, value) in function_info.params.iter().zip(args) {
-            if let Some(pattern_id) = param.pattern {
-                let Some(pattern) = function_info.pattern(pattern_id) else {
-                    return Err(self.internal_panic("parameter pattern is out of range"));
-                };
-                pattern_params.push((pattern, value));
-            } else {
+            if simple {
+                slots[param.slot.index()] = Some(value);
+                continue;
+            }
+            let Some(pattern_id) = param.pattern else {
                 let Some(slot) = slots.get_mut(param.slot.index()) else {
                     return Err(self.internal_panic("parameter slot is out of range"));
                 };
                 *slot = Some(value);
-            }
+                continue;
+            };
+            let Some(pattern) = function_info.pattern(pattern_id) else {
+                let message = if matches!(function_info.kind, FnKind::Lambda) {
+                    "lambda parameter pattern is out of range"
+                } else {
+                    "parameter pattern is out of range"
+                };
+                return Err(self.internal_panic(message));
+            };
+            pattern_params.push((pattern, value));
         }
 
-        let frame = Frame {
+        self.frames.push(Frame {
             slots,
             captures,
             source: function_info.source,
             name: function_info.name.as_ref(),
-        };
-        self.frames.push(frame);
+        });
         for (pattern, value) in pattern_params {
             if let Err(error) = self.bind_pattern(pattern, &value) {
                 let trap = match error {
@@ -618,20 +482,42 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 _ => Trap::OutOfMemory,
             });
         }
+        Ok(())
+    }
 
-        let body = function_info.body.expect("body checked above");
+    /// Runs a pushed frame's body, restoring `current` on every path. Function
+    /// bodies lower to zero-charge `Block`s, so `eval_body`'s transparent-block
+    /// skip is safe here for every call kind.
+    #[inline]
+    fn run_body(
+        &mut self,
+        function_info: &'p IrFn,
+        body: IrId,
+        escaped_loop: &'static str,
+    ) -> Result<Value, Trap> {
         let previous = self.current;
         self.current = Some(function_info);
-        let result = match self.eval(body) {
-            Ok(value) => Ok(value),
-            Err(EvalError::Return(value)) => Ok(value),
+        let result = match self.eval_body(body) {
+            Ok(value) | Err(EvalError::Return(value)) => Ok(value),
             Err(EvalError::Trap(trap)) => Err(trap),
             Err(EvalError::Break) | Err(EvalError::Continue) => {
-                Err(self.internal_panic("`break`/`continue` escaped a loop"))
+                Err(self.internal_panic(escaped_loop))
             }
         };
         self.current = previous;
-        let updated: Writebacks = if result.is_ok() && self.mutable_params[function.index()] {
+        result
+    }
+
+    /// The single return path: extracts mutable writebacks while the frame is
+    /// still live, pops the frame, then applies the returned-value memory and
+    /// depth checks in the order the snapshots pin.
+    fn pop_frame(
+        &mut self,
+        function_info: &'p IrFn,
+        result: Result<Value, Trap>,
+    ) -> Result<(Value, Writebacks), Trap> {
+        let updated: Writebacks = if result.is_ok() && self.mutable_params[function_info.id.index()]
+        {
             let frame = self.frames.last_mut().expect("evaluation frame");
             function_info
                 .params
@@ -661,14 +547,6 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             return Err(Trap::DepthExceeded);
         }
         Ok((value, updated))
-    }
-
-    #[inline]
-    fn call_closure_value(&mut self, function: &FnValue, args: CallArgs) -> Result<Value, Trap> {
-        match function {
-            FnValue::Def(id) => self.call_function(*id, args),
-            FnValue::Closure(closure) => self.call_closure(closure, args),
-        }
     }
 
     fn call_host(&mut self, host: HostId, args: &[Value]) -> Result<Value, Trap> {
@@ -2082,7 +1960,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             }
         }
         let (value, mut updated) = self
-            .call_function_with_writebacks(target, values)
+            .call_resolved(function_info, values, None)
             .map_err(EvalError::Trap)?;
         for (place, index) in writebacks {
             if let Some(value) = take_writeback(&mut updated, index) {
@@ -2937,6 +2815,10 @@ mod tests {
             .call_closure(&closure, CallArgs::new())
             .expect("closure call runs");
         assert_eq!(value, Value::Int(7));
+        let value = runtime
+            .call_closure(&closure, CallArgs::new())
+            .expect("closure call runs again");
+        assert_eq!(value, Value::Int(7), "captures survive repeated calls");
     }
 
     #[test]
@@ -3119,5 +3001,51 @@ mod tests {
         assert_eq!(message, "boom");
         assert_eq!(source, Some(martite_base::SourceId(0)));
         assert_eq!(trace, vec!["main".to_string(), "<lambda>".to_string()]);
+    }
+
+    #[test]
+    fn a_trapping_call_leaves_the_runtime_ready_for_the_next_call() {
+        let mut boom = empty_function(0);
+        boom.name = "boom".into();
+        let mut boom = finish(
+            boom,
+            vec![
+                expression(NodeKind::Str(StrId::new(0))),
+                expression(NodeKind::Panic(ChildRange::new(0, 1))),
+            ],
+            vec![IrId::new(0)],
+        );
+        boom.body = Some(IrId::new(1));
+
+        let mut good = empty_function(0);
+        good.id = FnId::new(1);
+        good.name = "good".into();
+        let mut good = finish(
+            good,
+            vec![expression(NodeKind::Int(ConstId::new(0)))],
+            Vec::new(),
+        );
+        good.body = Some(IrId::new(0));
+
+        let program = IrProgram {
+            fns: vec![boom, good],
+            consts: vec![ConstValue::Int(42)],
+            strs: vec!["boom".into()],
+            ..IrProgram::default()
+        };
+        let mut runtime = IrRuntime::new(&program, ExecLimits::default());
+        assert!(
+            runtime
+                .call_function(FnId::new(0), CallArgs::new())
+                .is_err()
+        );
+        assert!(runtime.frames.is_empty(), "the trapped frame must pop");
+        assert!(runtime.current.is_none(), "current must be restored");
+        assert_eq!(
+            runtime
+                .call_function(FnId::new(1), CallArgs::new())
+                .expect("the runtime recovers"),
+            Value::Int(42)
+        );
     }
 }
