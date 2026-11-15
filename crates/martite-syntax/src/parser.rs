@@ -13,12 +13,15 @@ use crate::token::{IdentClass, StrLit, StrPart, Token, TokenKind, TypeName};
 pub struct ParseOptions {
     /// Record source parentheses for the formatter and style linting.
     pub keep_parentheses: bool,
+    /// Record exact name, keyword, and operator spans for tooling fixes.
+    pub keep_spans: bool,
 }
 
 impl ParseOptions {
-    /// Options used by tooling that needs to reproduce or inspect parentheses.
+    /// Options used by tooling that needs to reproduce or inspect source syntax.
     pub const TOOLING: Self = Self {
         keep_parentheses: true,
+        keep_spans: true,
     };
 }
 
@@ -85,6 +88,38 @@ impl ParenthesisTables {
     }
 }
 
+/// Exact source spans for names, keywords, and operators, keyed by AST node.
+///
+/// These are recorded only when [`ParseOptions::keep_spans`] is enabled. Tools
+/// use them instead of searching the source text, which can match inside
+/// comments or string literals.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpanTables {
+    names: HashMap<NodeId, Span>,
+    keywords: HashMap<NodeId, Span>,
+    operators: HashMap<NodeId, Span>,
+}
+
+impl SpanTables {
+    pub fn name(&self, id: NodeId) -> Option<Span> {
+        self.names.get(&id).copied()
+    }
+
+    pub fn keyword(&self, id: NodeId) -> Option<Span> {
+        self.keywords.get(&id).copied()
+    }
+
+    pub fn operator(&self, id: NodeId) -> Option<Span> {
+        self.operators.get(&id).copied()
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.names.extend(other.names);
+        self.keywords.extend(other.keywords);
+        self.operators.extend(other.operators);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub items: Vec<Item>,
@@ -95,6 +130,8 @@ pub struct Program {
     pub comments: Vec<crate::token::Comment>,
     /// Present only when the program was parsed with parenthesis recording on.
     parentheses: Option<ParenthesisTables>,
+    /// Present only when the program was parsed with span recording on.
+    spans: Option<SpanTables>,
 }
 
 impl Program {
@@ -104,6 +141,26 @@ impl Program {
 
     pub fn records_parentheses(&self) -> bool {
         self.parentheses.is_some()
+    }
+
+    pub fn spans(&self) -> Option<&SpanTables> {
+        self.spans.as_ref()
+    }
+
+    pub fn records_spans(&self) -> bool {
+        self.spans.is_some()
+    }
+
+    pub fn name_span(&self, id: NodeId) -> Option<Span> {
+        self.spans.as_ref()?.name(id)
+    }
+
+    pub fn keyword_span(&self, id: NodeId) -> Option<Span> {
+        self.spans.as_ref()?.keyword(id)
+    }
+
+    pub fn operator_span(&self, id: NodeId) -> Option<Span> {
+        self.spans.as_ref()?.operator(id)
     }
 
     pub fn is_parenthesized(&self, id: NodeId) -> bool {
@@ -295,6 +352,7 @@ struct Parser<'a> {
     limit_hit: bool,
     comments: Vec<crate::token::Comment>,
     parentheses: Option<ParenthesisTables>,
+    spans: Option<SpanTables>,
 }
 
 impl<'a> Parser<'a> {
@@ -331,6 +389,7 @@ impl<'a> Parser<'a> {
             limit_hit: false,
             comments: lexed.comments,
             parentheses: options.keep_parentheses.then(ParenthesisTables::default),
+            spans: options.keep_spans.then(SpanTables::default),
         }
     }
 
@@ -365,6 +424,7 @@ impl<'a> Parser<'a> {
             span: start.merge(end),
             comments: self.comments,
             parentheses: self.parentheses,
+            spans: self.spans,
         };
         (
             ParseOutput {
@@ -401,6 +461,24 @@ impl<'a> Parser<'a> {
             self.idx += 1;
         }
         span
+    }
+
+    fn record_name(&mut self, id: NodeId, span: Span) {
+        if let Some(spans) = self.spans.as_mut() {
+            spans.names.insert(id, span);
+        }
+    }
+
+    fn record_keyword(&mut self, id: NodeId, span: Span) {
+        if let Some(spans) = self.spans.as_mut() {
+            spans.keywords.insert(id, span);
+        }
+    }
+
+    fn record_operator(&mut self, id: NodeId, span: Span) {
+        if let Some(spans) = self.spans.as_mut() {
+            spans.operators.insert(id, span);
+        }
     }
 
     /// Move an identifier out of the token stream, leaving a payload-free
@@ -753,21 +831,25 @@ impl<'a> Parser<'a> {
 
     fn parse_use(&mut self) -> PResult<UseDecl> {
         let start = self.expect(&TokenKind::Use)?;
-        let mut path = vec![self.expect_snake()?.0];
+        let (first, mut local_span) = self.expect_snake()?;
+        let mut path = vec![first];
         while self.eat(&TokenKind::Dot) {
-            let (name, _, _) = self.expect_ident()?;
+            let (name, _, span) = self.expect_ident()?;
             path.push(name);
+            local_span = span;
         }
         let alias = if self.eat(&TokenKind::As) {
             let (name, _, span) = self.expect_ident()?;
-            let _ = span;
+            local_span = span;
             Some(name)
         } else {
             None
         };
         let span = start.merge(self.span_before());
+        let id = self.id();
+        self.record_name(id, local_span);
         Ok(UseDecl {
-            id: self.id(),
+            id,
             span,
             path,
             alias,
@@ -794,8 +876,16 @@ impl<'a> Parser<'a> {
         }
         let body = self.parse_block()?;
         let span = start.merge(body.span);
+        let id = self.id();
+        self.record_name(
+            id,
+            Span::new(
+                token_span.start.saturating_add(1),
+                token_span.end.saturating_sub(1),
+            ),
+        );
         Ok(TestDecl {
-            id: self.id(),
+            id,
             span,
             name: text,
             body,
@@ -804,7 +894,7 @@ impl<'a> Parser<'a> {
 
     fn parse_on(&mut self) -> PResult<OnDecl> {
         let start = self.expect(&TokenKind::On)?;
-        let (name, _) = self.expect_snake()?;
+        let (name, name_span) = self.expect_snake()?;
         let params = self.parse_params(true)?;
         let ret = self.parse_optional_ret()?;
         let body = if self.interface {
@@ -818,8 +908,10 @@ impl<'a> Parser<'a> {
             self.parse_block()?
         };
         let span = start.merge(body.span);
+        let id = self.id();
+        self.record_name(id, name_span);
         Ok(OnDecl {
-            id: self.id(),
+            id,
             span,
             name,
             params,
@@ -860,7 +952,7 @@ impl<'a> Parser<'a> {
 
     fn parse_fn(&mut self, is_pub: bool, allow_self: bool) -> PResult<FnDecl> {
         let start = self.expect(&TokenKind::Fn)?;
-        let (name, _) = self.expect_snake()?;
+        let (name, name_span) = self.expect_snake()?;
         let generics = self.parse_generics()?;
         let params = self.parse_params(allow_self)?;
         let ret = self.parse_optional_ret()?;
@@ -875,8 +967,10 @@ impl<'a> Parser<'a> {
             .map(|b| b.span)
             .unwrap_or_else(|| self.span_before());
         let span = start.merge(end);
+        let id = self.id();
+        self.record_name(id, name_span);
         Ok(FnDecl {
-            id: self.id(),
+            id,
             span,
             is_pub,
             name,
@@ -894,7 +988,15 @@ impl<'a> Parser<'a> {
             let mut first = true;
             while !p.at(&TokenKind::RParen) && !p.at(&TokenKind::Eof) {
                 let start = p.span();
-                let mutable = p.eat(&TokenKind::Mut);
+                let mut_span = if p.at(&TokenKind::Mut) {
+                    Some(p.peek_token().span)
+                } else {
+                    None
+                };
+                let mutable = mut_span.is_some();
+                if mutable {
+                    p.advance();
+                }
                 if p.eat(&TokenKind::SelfKw) {
                     if !allow_self || !first || p.interface {
                         return Err(p.error_at(
@@ -903,8 +1005,12 @@ impl<'a> Parser<'a> {
                             "`self` may only be the first parameter of a method or handler",
                         ));
                     }
+                    let id = p.id();
+                    if let Some(span) = mut_span {
+                        p.record_keyword(id, span);
+                    }
                     params.push(Param {
-                        id: p.id(),
+                        id,
                         span: start.merge(p.span_before()),
                         kind: ParamKind::SelfParam { mutable },
                     });
@@ -912,12 +1018,16 @@ impl<'a> Parser<'a> {
                     let (name, name_span) = p.expect_snake()?;
                     p.expect(&TokenKind::Colon)?;
                     let ty = p.parse_type()?;
+                    let id = p.id();
+                    p.record_name(id, name_span);
+                    if let Some(span) = mut_span {
+                        p.record_keyword(id, span);
+                    }
                     params.push(Param {
-                        id: p.id(),
+                        id,
                         span: start.merge(ty.span),
                         kind: ParamKind::Normal { name, mutable, ty },
                     });
-                    let _ = name_span;
                 }
                 first = false;
                 if !p.eat(&TokenKind::Comma) {
@@ -941,7 +1051,7 @@ impl<'a> Parser<'a> {
 
     fn parse_struct(&mut self, is_pub: bool) -> PResult<StructDecl> {
         let start = self.expect(&TokenKind::Struct)?;
-        let (name, _) = self.expect_pascal()?;
+        let (name, name_span) = self.expect_pascal()?;
         let generics = self.parse_generics()?;
         let mut fields = Vec::new();
         let mut opaque = false;
@@ -950,11 +1060,13 @@ impl<'a> Parser<'a> {
             self.with_newlines(true, |p| {
                 while !p.at(&TokenKind::RBrace) && !p.at(&TokenKind::Eof) {
                     let field_start = p.span();
-                    let (field_name, _) = p.expect_snake()?;
+                    let (field_name, field_name_span) = p.expect_snake()?;
                     p.expect(&TokenKind::Colon)?;
                     let ty = p.parse_type()?;
+                    let id = p.id();
+                    p.record_name(id, field_name_span);
                     fields.push(Field {
-                        id: p.id(),
+                        id,
                         span: field_start.merge(ty.span),
                         name: field_name,
                         ty,
@@ -973,8 +1085,10 @@ impl<'a> Parser<'a> {
             return Err(self.error_at_current("expected `{` after struct name"));
         }
         let span = start.merge(self.span_before());
+        let id = self.id();
+        self.record_name(id, name_span);
         Ok(StructDecl {
-            id: self.id(),
+            id,
             span,
             is_pub,
             name,
@@ -986,7 +1100,7 @@ impl<'a> Parser<'a> {
 
     fn parse_enum(&mut self, is_pub: bool) -> PResult<EnumDecl> {
         let start = self.expect(&TokenKind::Enum)?;
-        let (name, _) = self.expect_pascal()?;
+        let (name, name_span) = self.expect_pascal()?;
         let generics = self.parse_generics()?;
         self.expect(&TokenKind::LBrace)?;
         let mut variants = Vec::new();
@@ -1006,8 +1120,10 @@ impl<'a> Parser<'a> {
                     })?;
                     p.expect(&TokenKind::RParen)?;
                 }
+                let id = p.id();
+                p.record_name(id, variant_span);
                 variants.push(Variant {
-                    id: p.id(),
+                    id,
                     span: variant_span.merge(p.span_before()),
                     name: variant_name,
                     payload,
@@ -1020,8 +1136,10 @@ impl<'a> Parser<'a> {
         })?;
         self.expect(&TokenKind::RBrace)?;
         let span = start.merge(self.span_before());
+        let id = self.id();
+        self.record_name(id, name_span);
         Ok(EnumDecl {
-            id: self.id(),
+            id,
             span,
             is_pub,
             name,
@@ -1032,15 +1150,17 @@ impl<'a> Parser<'a> {
 
     fn parse_const(&mut self, is_pub: bool) -> PResult<ConstDecl> {
         let start = self.expect(&TokenKind::Const)?;
-        let (name, _) = self.expect_screaming()?;
+        let (name, name_span) = self.expect_screaming()?;
         self.expect(&TokenKind::Colon)?;
         self.skip_continuation_newlines();
         let ty = self.parse_type()?;
         self.expect(&TokenKind::Eq)?;
         let value = self.parse_expr()?;
         let span = start.merge(value.span);
+        let id = self.id();
+        self.record_name(id, name_span);
         Ok(ConstDecl {
-            id: self.id(),
+            id,
             span,
             is_pub,
             name,
@@ -1296,8 +1416,10 @@ impl<'a> Parser<'a> {
             self.expect(&TokenKind::Eq)?;
             let value = self.parse_expr()?;
             let span = start.merge(value.span);
+            let id = self.id();
+            self.record_keyword(id, start);
             return Ok(Stmt {
-                id: self.id(),
+                id,
                 span,
                 kind: StmtKind::Let {
                     mutable,
@@ -1313,8 +1435,10 @@ impl<'a> Parser<'a> {
             self.skip_all_newlines();
             let body = self.parse_block()?;
             let span = start.merge(body.span);
+            let id = self.id();
+            self.record_keyword(id, start);
             return Ok(Stmt {
-                id: self.id(),
+                id,
                 span,
                 kind: StmtKind::While { cond, body },
             });
@@ -1326,8 +1450,10 @@ impl<'a> Parser<'a> {
             self.skip_all_newlines();
             let body = self.parse_block()?;
             let span = start.merge(body.span);
+            let id = self.id();
+            self.record_keyword(id, start);
             return Ok(Stmt {
-                id: self.id(),
+                id,
                 span,
                 kind: StmtKind::For {
                     pattern,
@@ -1344,31 +1470,39 @@ impl<'a> Parser<'a> {
                 None
             };
             let span = start.merge(self.span_before());
+            let id = self.id();
+            self.record_keyword(id, start);
             return Ok(Stmt {
-                id: self.id(),
+                id,
                 span,
                 kind: StmtKind::Return(value),
             });
         }
         if self.eat(&TokenKind::Break) {
             let span = start.merge(self.span_before());
+            let id = self.id();
+            self.record_keyword(id, start);
             return Ok(Stmt {
-                id: self.id(),
+                id,
                 span,
                 kind: StmtKind::Break,
             });
         }
         if self.eat(&TokenKind::Continue) {
             let span = start.merge(self.span_before());
+            let id = self.id();
+            self.record_keyword(id, start);
             return Ok(Stmt {
-                id: self.id(),
+                id,
                 span,
                 kind: StmtKind::Continue,
             });
         }
 
         let expr = self.parse_expr()?;
+        let mut assign_span = None;
         let assign = if let Some(op) = self.assign_op() {
+            assign_span = Some(self.span());
             self.advance();
             self.skip_continuation_newlines();
             let rhs = self.parse_expr()?;
@@ -1377,8 +1511,13 @@ impl<'a> Parser<'a> {
             None
         };
         let span = start.merge(self.span_before());
+        let id = self.id();
+        self.record_keyword(id, start);
+        if let Some(span) = assign_span {
+            self.record_operator(id, span);
+        }
         Ok(Stmt {
-            id: self.id(),
+            id,
             span,
             kind: StmtKind::Expr { expr, assign },
         })
@@ -1447,12 +1586,15 @@ impl<'a> Parser<'a> {
         let lhs = self.parse_or()?;
         self.skip_continuation_newlines();
         if self.at(&TokenKind::QuestionQuestion) {
+            let op_span = self.span();
             self.advance();
             self.skip_continuation_newlines();
             let rhs = self.parse_expr()?;
             let span = lhs.span.merge(rhs.span);
+            let id = self.id();
+            self.record_operator(id, op_span);
             return Ok(Expr {
-                id: self.id(),
+                id,
                 span,
                 kind: ExprKind::Binary {
                     op: BinaryOp::Coalesce,
@@ -1471,12 +1613,15 @@ impl<'a> Parser<'a> {
             if !self.at(&TokenKind::Or) {
                 break;
             }
+            let op_span = self.span();
             self.advance();
             self.skip_continuation_newlines();
             let rhs = self.parse_and()?;
             let span = lhs.span.merge(rhs.span);
+            let id = self.id();
+            self.record_operator(id, op_span);
             lhs = Expr {
-                id: self.id(),
+                id,
                 span,
                 kind: ExprKind::Binary {
                     op: BinaryOp::Or,
@@ -1495,12 +1640,15 @@ impl<'a> Parser<'a> {
             if !self.at(&TokenKind::And) {
                 break;
             }
+            let op_span = self.span();
             self.advance();
             self.skip_continuation_newlines();
             let rhs = self.parse_not()?;
             let span = lhs.span.merge(rhs.span);
+            let id = self.id();
+            self.record_operator(id, op_span);
             lhs = Expr {
-                id: self.id(),
+                id,
                 span,
                 kind: ExprKind::Binary {
                     op: BinaryOp::And,
@@ -1540,6 +1688,7 @@ impl<'a> Parser<'a> {
             TokenKind::Ge => BinaryOp::Ge,
             _ => return Ok(lhs),
         };
+        let op_span = self.span();
         self.advance();
         self.skip_continuation_newlines();
         let rhs = self.parse_range()?;
@@ -1557,8 +1706,10 @@ impl<'a> Parser<'a> {
             );
         }
         let span = lhs.span.merge(rhs.span);
+        let id = self.id();
+        self.record_operator(id, op_span);
         Ok(Expr {
-            id: self.id(),
+            id,
             span,
             kind: ExprKind::Binary {
                 op,
@@ -1603,12 +1754,15 @@ impl<'a> Parser<'a> {
                 TokenKind::Minus => BinaryOp::Sub,
                 _ => break,
             };
+            let op_span = self.span();
             self.advance();
             self.skip_continuation_newlines();
             let rhs = self.parse_mul()?;
             let span = lhs.span.merge(rhs.span);
+            let id = self.id();
+            self.record_operator(id, op_span);
             lhs = Expr {
-                id: self.id(),
+                id,
                 span,
                 kind: ExprKind::Binary {
                     op,
@@ -1629,12 +1783,15 @@ impl<'a> Parser<'a> {
                 TokenKind::Percent => BinaryOp::Rem,
                 _ => break,
             };
+            let op_span = self.span();
             self.advance();
             self.skip_continuation_newlines();
             let rhs = self.parse_unary()?;
             let span = lhs.span.merge(rhs.span);
+            let id = self.id();
+            self.record_operator(id, op_span);
             lhs = Expr {
-                id: self.id(),
+                id,
                 span,
                 kind: ExprKind::Binary {
                     op,
@@ -1760,10 +1917,22 @@ impl<'a> Parser<'a> {
         self.with_newlines(true, |p| {
             while !p.at(&TokenKind::RParen) && !p.at(&TokenKind::Eof) {
                 let start = p.span();
-                let mutable = p.eat(&TokenKind::Mut);
+                let mut_span = if p.at(&TokenKind::Mut) {
+                    Some(p.peek_token().span)
+                } else {
+                    None
+                };
+                let mutable = mut_span.is_some();
+                if mutable {
+                    p.advance();
+                }
                 let expr = p.parse_expr()?;
+                let id = p.id();
+                if let Some(span) = mut_span {
+                    p.record_keyword(id, span);
+                }
                 args.push(Arg {
-                    id: p.id(),
+                    id,
                     span: start.merge(expr.span),
                     mutable,
                     expr,
@@ -1930,6 +2099,7 @@ impl<'a> Parser<'a> {
                     let lexed = lex_fragment(self.source, expr_span, self.limits);
                     let options = ParseOptions {
                         keep_parentheses: self.parentheses.is_some(),
+                        keep_spans: self.spans.is_some(),
                     };
                     let mut sub = Parser::with_lexed(
                         self.source,
@@ -1966,6 +2136,10 @@ impl<'a> Parser<'a> {
                         (self.parentheses.as_mut(), sub.parentheses.take())
                     {
                         parentheses.merge(sub_parentheses);
+                    }
+                    if let (Some(spans), Some(sub_spans)) = (self.spans.as_mut(), sub.spans.take())
+                    {
+                        spans.merge(sub_spans);
                     }
                     parts.push(StrExprPart::Expr(expr));
                 }
@@ -2651,5 +2825,65 @@ mod tests {
         assert_eq!(ids.allocate(), NodeId(1));
         assert_eq!(ids.allocate(), NodeId(2));
         assert_eq!(ids.next_id(), 3);
+    }
+
+    #[test]
+    fn tooling_records_exact_name_keyword_and_operator_spans() {
+        let source = "use app.editor.Doc as Doc\n\nfn pick(mut value: int) -> int {\n    var total = 0\n    total = total + value\n    while true {\n        return total\n    }\n}\n";
+        let limits = LoadLimits::default();
+        let plain = parse_source(source, limits);
+        assert!(plain.program.spans().is_none());
+
+        let parsed = parse_source_with(source, limits, ParseOptions::TOOLING);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let program = &parsed.program;
+        let slice = |span: Span| &source[span.start as usize..span.end as usize];
+
+        let Item::Use(use_decl) = &program.items[0] else {
+            panic!("expected a use item");
+        };
+        assert_eq!(slice(program.name_span(use_decl.id).unwrap()), "Doc");
+
+        let Item::Fn(function) = &program.items[1] else {
+            panic!("expected a function");
+        };
+        assert_eq!(slice(program.name_span(function.id).unwrap()), "pick");
+        let param = &function.params[0];
+        assert_eq!(slice(program.name_span(param.id).unwrap()), "value");
+        assert_eq!(slice(program.keyword_span(param.id).unwrap()), "mut");
+
+        let body = function.body.as_ref().expect("function body");
+        assert_eq!(
+            slice(program.keyword_span(body.stmts[0].id).unwrap()),
+            "var"
+        );
+        let StmtKind::Expr {
+            assign: Some((_, rhs)),
+            ..
+        } = &body.stmts[1].kind
+        else {
+            panic!("expected an assignment");
+        };
+        assert_eq!(slice(program.operator_span(body.stmts[1].id).unwrap()), "=");
+        assert_eq!(slice(program.operator_span(rhs.id).unwrap()), "+");
+
+        assert_eq!(
+            slice(program.keyword_span(body.stmts[2].id).unwrap()),
+            "while"
+        );
+        let StmtKind::While {
+            body: while_body, ..
+        } = &body.stmts[2].kind
+        else {
+            panic!("expected a while statement");
+        };
+        let return_stmt = &while_body.stmts[0];
+        let StmtKind::Return(_) = &return_stmt.kind else {
+            panic!("expected a return statement");
+        };
+        assert_eq!(
+            slice(program.keyword_span(return_stmt.id).unwrap()),
+            "return"
+        );
     }
 }

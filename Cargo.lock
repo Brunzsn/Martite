@@ -690,6 +690,7 @@ dependencies = [
  "martite-resolve",
  "martite-syntax",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]
@@ -722,6 +723,7 @@ dependencies = [
  "martite-base",
  "martite-fuel",
  "martite-ir",
+ "proptest",
  "serde_json",
  "smallvec",
 ]
@@ -1189,6 +1191,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 

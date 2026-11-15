@@ -39,7 +39,8 @@ pub enum DeclKind {
 pub struct Decl {
     pub kind: DeclKind,
     pub name: String,
-    pub span: Span,
+    pub name_span: Span,
+    pub keyword_span: Option<Span>,
     pub source: SourceId,
 }
 
@@ -56,13 +57,19 @@ pub struct UseSite {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CallArg {
+    pub mutable: bool,
+    pub mut_span: Option<Span>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CallSite {
     pub caller: Option<DefId>,
     pub callee: DefId,
     pub source: SourceId,
-    /// Argument spans in call order, with their `mut` marker.
-    pub args: Vec<(Span, bool)>,
+    /// Arguments in call order, with their `mut` markers.
+    pub args: Vec<CallArg>,
 }
 
 #[derive(Debug, Clone)]
@@ -250,7 +257,8 @@ impl<'a> Analysis<'a> {
             Decl {
                 kind,
                 name: param.name.clone(),
-                span: param.span,
+                name_span: module.ast.name_span(param.node).unwrap_or(param.span),
+                keyword_span: None,
                 source: module.source,
             },
         );
@@ -415,6 +423,7 @@ impl<'a> Analysis<'a> {
         pattern: &Pattern,
         kind: DeclKind,
         mutable: bool,
+        keyword_span: Option<Span>,
         walk: Walk<'a>,
     ) {
         let _ = mutable;
@@ -430,24 +439,25 @@ impl<'a> Analysis<'a> {
                             .get(binding)
                             .map(|info| info.name.clone())
                             .unwrap_or_default(),
-                        span: pattern.span,
+                        name_span: pattern.span,
+                        keyword_span,
                         source: walk.module.source,
                     });
                 }
             }
             PatKind::Tuple(items) | PatKind::Or(items) => {
                 for item in items {
-                    self.declare_pattern(item, kind, mutable, walk);
+                    self.declare_pattern(item, kind, mutable, keyword_span, walk);
                 }
             }
             PatKind::Variant { args, .. } => {
                 for item in args {
-                    self.declare_pattern(item, kind, mutable, walk);
+                    self.declare_pattern(item, kind, mutable, keyword_span, walk);
                 }
             }
             PatKind::Struct { fields, .. } => {
                 for field in fields {
-                    self.declare_pattern(&field.pattern, kind, mutable, walk);
+                    self.declare_pattern(&field.pattern, kind, mutable, keyword_span, walk);
                 }
             }
             _ => {}
@@ -553,6 +563,7 @@ impl<'a> Analysis<'a> {
                         DeclKind::Let
                     },
                     *mutable,
+                    walk.module.ast.keyword_span(stmt.id),
                     walk,
                 );
                 self.walk_expr(value, walk.read());
@@ -566,7 +577,7 @@ impl<'a> Analysis<'a> {
                 iter,
                 body,
             } => {
-                self.declare_pattern(pattern, DeclKind::For, false, walk);
+                self.declare_pattern(pattern, DeclKind::For, false, None, walk);
                 self.walk_expr(iter, walk.read());
                 self.walk_block(body, walk.in_loop());
             }
@@ -662,7 +673,7 @@ impl<'a> Analysis<'a> {
             ExprKind::Match { scrutinee, arms } => {
                 self.walk_expr(scrutinee, walk.read());
                 for arm in arms {
-                    self.declare_pattern(&arm.pattern, DeclKind::Match, false, walk);
+                    self.declare_pattern(&arm.pattern, DeclKind::Match, false, None, walk);
                     if let Some(guard) = &arm.guard {
                         self.walk_expr(guard, walk.read());
                     }
@@ -677,7 +688,7 @@ impl<'a> Analysis<'a> {
                     if let Some(ty) = &param.ty {
                         self.collect_ty_names(walk.module.id, ty);
                     }
-                    self.declare_pattern(&param.pattern, DeclKind::Lambda, false, walk);
+                    self.declare_pattern(&param.pattern, DeclKind::Lambda, false, None, walk);
                 }
                 match body {
                     martite_syntax::LambdaBody::Block(block) => self.walk_block(block, walk),
@@ -799,7 +810,13 @@ impl<'a> Analysis<'a> {
             caller: walk.owner,
             callee,
             source: walk.module.source,
-            args: args.iter().map(|arg| (arg.span, arg.mutable)).collect(),
+            args: args
+                .iter()
+                .map(|arg| CallArg {
+                    mutable: arg.mutable,
+                    mut_span: walk.module.ast.keyword_span(arg.id),
+                })
+                .collect(),
         });
     }
 

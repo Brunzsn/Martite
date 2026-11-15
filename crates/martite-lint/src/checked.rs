@@ -15,7 +15,6 @@ use martite_syntax::{
 use crate::analysis::{self, Analysis, ModuleRef, same_expr, same_place, stable};
 use crate::registry;
 use crate::settings::ResolvedSettings;
-use crate::trivia::find_name_span;
 
 pub fn run(
     program: &CheckedProgram,
@@ -206,7 +205,11 @@ impl<'a> Checked<'a> {
                     && matches!(cond.kind, ExprKind::Bool(true))
                     && !loop_has_exit(body)
                 {
-                    let span = find_name_span(self.module.text, stmt.span, "while");
+                    let span = self
+                        .module
+                        .ast
+                        .keyword_span(stmt.id)
+                        .unwrap_or_else(|| Span::empty(stmt.span.start));
                     self.emit(
                         Code::L019,
                         span,
@@ -260,12 +263,11 @@ impl<'a> Checked<'a> {
         rhs: &'a Expr,
         ctx: &Ctx<'a>,
     ) {
-        let operator = operator_span(
-            self.module.text,
-            lhs.span.end,
-            rhs.span.start,
-            assign_op_str(op),
-        );
+        let operator = self
+            .module
+            .ast
+            .operator_span(stmt.id)
+            .unwrap_or_else(|| Span::empty(lhs.span.end));
         if op == AssignOp::Assign && same_place(self.program, lhs, rhs) {
             let help = if analysis::ty_has_float(self.program, lhs) {
                 Some("for floats, use `x.is_nan()` to test for NaN".into())
@@ -562,8 +564,11 @@ impl<'a> Checked<'a> {
         ctx: &Ctx<'a>,
     ) {
         if matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
-            let operator =
-                operator_span(self.module.text, lhs.span.end, rhs.span.start, op.as_str());
+            let operator = self
+                .module
+                .ast
+                .operator_span(expr.id)
+                .unwrap_or_else(|| Span::empty(lhs.span.end));
             if self_comparison(self.program, lhs, rhs) {
                 let help = if analysis::ty_has_float(self.program, lhs) && op == BinaryOp::Ne {
                     Some("for floats, `x.is_nan()` is the intended NaN test".into())
@@ -1177,7 +1182,11 @@ impl<'a> Checked<'a> {
             ) {
                 continue;
             }
-            let span = find_name_span(self.module.text, body.sig.span, &body.sig.name);
+            let span = self
+                .module
+                .ast
+                .name_span(body.sig.node)
+                .unwrap_or(body.sig.span);
             self.emit(
                 Code::L030,
                 span,
@@ -1274,7 +1283,7 @@ impl<'a> Checked<'a> {
             {
                 continue;
             }
-            let span = find_name_span(self.module.text, decl.span, &decl.name);
+            let span = decl.name_span;
             let fix = Fix {
                 applicability: Applicability::Maybe,
                 edits: vec![FixEdit::new(Span::empty(span.start), "_")],
@@ -1295,7 +1304,9 @@ impl<'a> Checked<'a> {
             if decl.kind != analysis::DeclKind::Var || self.analysis.is_mutated(*binding) {
                 continue;
             }
-            let span = keyword_before(self.module.text, decl.span.start, "var");
+            let Some(span) = decl.keyword_span else {
+                continue;
+            };
             self.emit(
                 Code::L002,
                 span,
@@ -1336,10 +1347,7 @@ impl<'a> Checked<'a> {
                 continue;
             };
             let name = decl.name.trim_start_matches('_');
-            let mut edits = vec![FixEdit::new(
-                find_name_span(self.module.text, decl.span, &decl.name),
-                name.to_string(),
-            )];
+            let mut edits = vec![FixEdit::new(decl.name_span, name.to_string())];
             for site in reads.iter().chain(self.analysis.writes_of(*binding)) {
                 edits.push(FixEdit::new(site.span, name.to_string()));
             }
@@ -1372,7 +1380,9 @@ impl<'a> Checked<'a> {
                 if !param.mutable || self.analysis.is_mutated(param.binding) {
                     continue;
                 }
-                let span = find_name_span(self.module.text, param.span, "mut");
+                let Some(span) = self.module.ast.keyword_span(param.node) else {
+                    continue;
+                };
                 let fix = self.mut_param_fix(sig, param, span);
                 self.emit(
                     Code::L015,
@@ -1411,12 +1421,12 @@ impl<'a> Checked<'a> {
                 .iter()
                 .filter(|call| call.callee == sig.def)
             {
-                let (arg_span, mutable) = *call.args.get(index)?;
-                if !mutable {
+                let arg = *call.args.get(index)?;
+                if !arg.mutable {
                     return None;
                 }
                 let text = self.analysis.source_text(call.source)?;
-                let span = find_mut_keyword(text, arg_span)?;
+                let span = keyword_removal_span(text, arg.mut_span?);
                 edits.push(FixEdit::in_source(call.source, span, ""));
             }
         }
@@ -1478,7 +1488,11 @@ impl<'a> Checked<'a> {
             if used {
                 continue;
             }
-            let span = find_name_span(self.module.text, import.span, &local);
+            let span = self
+                .module
+                .ast
+                .name_span(import.decl_node)
+                .unwrap_or(import.span);
             let fix = Fix::machine(vec![FixEdit::new(
                 line_removal_span(self.module.text, import.span),
                 "",
@@ -1526,14 +1540,22 @@ impl<'a> Checked<'a> {
                 _ => continue,
             }
             let resolved_module = self.program.resolved.module(def.module);
-            let span = if let Some(decl) = self.program.function_decl(def.id) {
-                find_name_span(self.module.text, decl.span, &def.name)
-            } else {
-                let Some(item) = resolved_module.ast.items.get(def.item_index) else {
-                    continue;
-                };
-                find_name_span(self.module.text, item.span(), &def.name)
-            };
+            let span = self
+                .module
+                .ast
+                .name_span(def.node)
+                .or_else(|| {
+                    self.program
+                        .function_decl(def.id)
+                        .and_then(|decl| self.module.ast.name_span(decl.id))
+                })
+                .unwrap_or_else(|| {
+                    resolved_module
+                        .ast
+                        .items
+                        .get(def.item_index)
+                        .map_or_else(|| Span::empty(0), Item::span)
+                });
             self.emit(
                 Code::L001,
                 span,
@@ -1800,44 +1822,14 @@ fn option_arg(tyexpr: &TyExpr) -> Option<&TyExpr> {
 
 // ----- helpers ----------------------------------------------------------
 
-fn assign_op_str(op: AssignOp) -> &'static str {
-    match op {
-        AssignOp::Assign => "=",
-        AssignOp::Add => "+=",
-        AssignOp::Sub => "-=",
-        AssignOp::Mul => "*=",
-        AssignOp::Div => "/=",
-        AssignOp::Rem => "%=",
-    }
-}
-
-fn operator_span(text: &str, lhs_end: u32, rhs_start: u32, op: &str) -> Span {
-    if op == "=" || op == "+=" || op == "-=" || op == "*=" || op == "/=" || op == "%=" {
-        let start = lhs_end.min(text.len() as u32) as usize;
-        let end = rhs_start.min(text.len() as u32) as usize;
-        if start <= end {
-            if let Some(offset) = text[start..end].find(op) {
-                let at = start + offset;
-                return Span::new(at as u32, (at + op.len()) as u32);
-            }
-        }
-        return Span::empty(lhs_end);
-    }
-    crate::trivia::operator_span(text, lhs_end, rhs_start, op)
-}
-
-fn find_mut_keyword(text: &str, span: Span) -> Option<Span> {
-    let start = span.start.min(text.len() as u32) as usize;
-    let end = span.end.min(text.len() as u32) as usize;
-    let offset = text[start..end].find("mut")?;
-    let at = start + offset;
-    let mut after = at + 3;
+fn keyword_removal_span(text: &str, span: Span) -> Span {
+    let mut end = (span.end as usize).min(text.len());
     // Remove the separator too, so the fix does not leave `fn f( x)` or
     // `f( x)` behind.
-    while after < text.len() && matches!(text.as_bytes()[after], b' ' | b'\t') {
-        after += 1;
+    while end < text.len() && matches!(text.as_bytes()[end], b' ' | b'\t') {
+        end += 1;
     }
-    Some(Span::new(at as u32, after as u32))
+    Span::new(span.start, end as u32)
 }
 
 fn line_removal_span(text: &str, span: Span) -> Span {
@@ -1852,19 +1844,6 @@ fn line_removal_span(text: &str, span: Span) -> Span {
         .map(|offset| end + offset + 1)
         .unwrap_or(text.len());
     Span::new(line_start as u32, line_end as u32)
-}
-
-fn keyword_before(text: &str, at: u32, keyword: &str) -> Span {
-    let start = at.min(text.len() as u32) as usize;
-    let line_start = text[..start]
-        .rfind('\n')
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    if let Some(offset) = text[line_start..start].rfind(keyword) {
-        let at = line_start + offset;
-        return Span::new(at as u32, (at + keyword.len()) as u32);
-    }
-    Span::empty(at as u32)
 }
 
 fn self_comparison(program: &CheckedProgram, lhs: &Expr, rhs: &Expr) -> bool {
