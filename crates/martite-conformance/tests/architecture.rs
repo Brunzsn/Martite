@@ -1,5 +1,16 @@
+//! Architecture checks over Cargo's resolved workspace and package graphs.
+//!
+//! These tests deliberately do not scan manifest or source text: comments,
+//! aliases and formatting cannot trip them. Source-level vocabulary rules are
+//! enforced by dependency isolation instead.
+
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use cargo_metadata::{DependencyKind, Metadata, Package, PackageId};
+use serde::Deserialize;
 
 const CRATES: &[&str] = &[
     "martite-base",
@@ -20,191 +31,441 @@ const CRATES: &[&str] = &[
     "martite-bench",
 ];
 
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn workspace_metadata() -> &'static Metadata {
+    static METADATA: OnceLock<Metadata> = OnceLock::new();
+    METADATA.get_or_init(|| {
+        let mut command = cargo_metadata::MetadataCommand::new();
+        command.manifest_path(workspace_root().join("Cargo.toml"));
+        command.current_dir(workspace_root());
+        command.other_options(vec!["--locked".to_owned()]);
+        command
+            .exec()
+            .expect("cargo metadata for the workspace failed")
+    })
+}
+
+struct ProbeDir(PathBuf);
+
+impl ProbeDir {
+    fn new() -> Self {
+        let path =
+            std::env::temp_dir().join(format!("martite-architecture-probe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create architecture probe directory");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ProbeDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn toml_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Resolve a package that depends only on the runtime and the optimizer.
+///
+/// The workspace graph includes dev-dependencies and feature unification from
+/// every member, so `cargo metadata` for the workspace cannot show whether the
+/// runtime by itself enables `martite-ir/lower`. This representative build can.
+fn probe_metadata() -> &'static Metadata {
+    static METADATA: OnceLock<Metadata> = OnceLock::new();
+    METADATA.get_or_init(|| {
+        let root = workspace_root();
+        let probe = ProbeDir::new();
+        let manifest = format!(
+            r#"[package]
+name = "architecture-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+martite-runtime = {{ path = '{}' }}
+martite-opt = {{ path = '{}' }}
+"#,
+            toml_path(&root.join("crates/martite-runtime")),
+            toml_path(&root.join("crates/martite-opt")),
+        );
+        fs::write(probe.path().join("Cargo.toml"), manifest)
+            .expect("write architecture probe manifest");
+        fs::create_dir_all(probe.path().join("src"))
+            .expect("create architecture probe source directory");
+        fs::write(probe.path().join("src/lib.rs"), "").expect("write architecture probe source");
+
+        let mut command = cargo_metadata::MetadataCommand::new();
+        command.manifest_path(probe.path().join("Cargo.toml"));
+        command.current_dir(probe.path());
+        command.other_options(vec!["--offline".to_owned()]);
+        command
+            .exec()
+            .expect("cargo metadata for the architecture probe failed")
+    })
+}
+
+fn package<'a>(metadata: &'a Metadata, name: &str) -> &'a Package {
+    metadata
+        .packages
+        .iter()
+        .find(|package| package.name == name)
+        .unwrap_or_else(|| panic!("missing package: {name}"))
+}
+
+fn workspace_packages(metadata: &Metadata) -> Vec<&Package> {
+    metadata
+        .workspace_members
+        .iter()
+        .map(|id| {
+            metadata
+                .packages
+                .iter()
+                .find(|package| &package.id == id)
+                .expect("workspace member must have a package")
+        })
+        .collect()
+}
+
+fn workspace_crate_names(metadata: &Metadata) -> BTreeSet<&str> {
+    workspace_packages(metadata)
+        .into_iter()
+        .map(|package| package.name.as_str())
+        .collect()
+}
+
+fn resolve_node<'a>(metadata: &'a Metadata, id: &PackageId) -> &'a cargo_metadata::Node {
+    metadata
+        .resolve
+        .as_ref()
+        .expect("cargo metadata must include a resolve graph")
+        .nodes
+        .iter()
+        .find(|node| &node.id == id)
+        .unwrap_or_else(|| panic!("missing resolve node for {id}"))
+}
+
 #[test]
 fn workspace_is_split_into_pipeline_crates() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for name in CRATES {
-        let manifest = root.join("crates").join(name).join("Cargo.toml");
-        assert!(manifest.is_file(), "missing crate manifest: {manifest:?}");
-    }
+    let metadata = workspace_metadata();
+    let actual = workspace_crate_names(metadata);
+    let expected: BTreeSet<&str> = CRATES.iter().copied().collect();
+    assert_eq!(actual, expected, "workspace members changed");
 }
 
 #[test]
 fn benchmarks_are_isolated_from_production_crates() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let bench = fs::read_to_string(root.join("crates/martite-bench/Cargo.toml"))
-        .expect("read benchmark manifest");
+    let metadata = workspace_metadata();
+    let bench = package(metadata, "martite-bench");
     assert!(
-        bench.contains("publish = false"),
+        bench.publish.as_ref().is_some_and(Vec::is_empty),
         "bench crate must not publish"
     );
+    assert!(
+        bench
+            .dependencies
+            .iter()
+            .any(|dependency| dependency.name == "criterion")
+            && bench
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.name == "stats_alloc"),
+        "bench crate must own the benchmark-only tooling"
+    );
 
-    for name in CRATES.iter().filter(|name| **name != "martite-bench") {
-        let manifest = fs::read_to_string(root.join("crates").join(name).join("Cargo.toml"))
-            .expect("read crate manifest");
-        assert!(
-            !manifest.contains("martite-bench"),
-            "{name} must not depend on the benchmark crate"
-        );
-        assert!(
-            !manifest.contains("criterion") && !manifest.contains("stats_alloc"),
-            "{name} must not depend on benchmark-only tooling"
-        );
+    for package in workspace_packages(metadata) {
+        if package.name == "martite-bench" {
+            continue;
+        }
+        for dependency in &package.dependencies {
+            assert!(
+                !matches!(
+                    dependency.name.as_str(),
+                    "martite-bench" | "criterion" | "stats_alloc"
+                ),
+                "{} must not depend on benchmark-only crate {} ({})",
+                package.name,
+                dependency.name,
+                dependency.kind
+            );
+        }
     }
 }
 
 #[test]
 fn optimizer_stays_above_the_ir() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let manifest = fs::read_to_string(root.join("crates/martite-opt/Cargo.toml"))
-        .expect("read optimizer manifest");
-    let dependencies = manifest
-        .split("[dev-dependencies]")
-        .next()
-        .expect("dependency section");
-    for forbidden in [
-        "martite-runtime",
-        "martite-check",
-        "martite-syntax",
-        "martite-driver",
-        "martite-bench",
-    ] {
+    let metadata = workspace_metadata();
+    let optimizer = package(metadata, "martite-opt");
+    let mut ir_dependency = None;
+    for dependency in optimizer
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.kind != DependencyKind::Development)
+    {
         assert!(
-            !dependencies.contains(forbidden),
-            "martite-opt production dependencies must not include {forbidden}"
+            !matches!(
+                dependency.name.as_str(),
+                "martite-runtime"
+                    | "martite-check"
+                    | "martite-syntax"
+                    | "martite-driver"
+                    | "martite-bench"
+            ),
+            "martite-opt production dependencies must not include {}",
+            dependency.name
         );
-    }
-    assert!(
-        dependencies.contains("martite-ir.workspace = true"),
-        "martite-opt must depend on martite-ir"
-    );
-}
-
-#[test]
-fn runtime_values_use_the_ir_vocabulary() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for name in [
-        "lib.rs",
-        "value.rs",
-        "ops.rs",
-        "json.rs",
-        "exec.rs",
-        "ir_eval.rs",
-        "ir_eval/builtins.rs",
-    ] {
-        let path = root.join("crates/martite-runtime/src").join(name);
-        let source = fs::read_to_string(&path).expect("read runtime source");
-        for forbidden in [
-            "martite_check",
-            "CheckedProgram",
-            "BindingId",
-            "DefId",
-            "NodeId",
-        ] {
-            assert!(
-                !source.contains(forbidden),
-                "{name} must use the IR vocabulary, not {forbidden}"
-            );
+        if dependency.name == "martite-ir" {
+            ir_dependency = Some(dependency);
         }
     }
-    let value = fs::read_to_string(root.join("crates/martite-runtime/src/value.rs"))
-        .expect("read runtime value source");
+
+    let ir_dependency = ir_dependency.expect("martite-opt must depend on martite-ir");
     assert!(
-        !value.contains("NodeId"),
-        "runtime values must not carry syntax node ids"
+        !ir_dependency.uses_default_features,
+        "martite-opt must not enable martite-ir default features"
+    );
+    assert!(
+        !ir_dependency
+            .features
+            .iter()
+            .any(|feature| feature == "lower"),
+        "martite-opt must not enable martite-ir/lower"
     );
 }
 
 #[test]
 fn ir_stays_above_the_runtime() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let manifest =
-        fs::read_to_string(root.join("crates/martite-ir/Cargo.toml")).expect("read IR manifest");
-    assert!(
-        !manifest.contains("martite-runtime"),
-        "martite-ir must not depend on the runtime"
-    );
-    assert!(
-        !manifest.contains("martite-bench"),
-        "martite-ir must not depend on the benchmark crate"
-    );
+    let metadata = workspace_metadata();
+    let ir = package(metadata, "martite-ir");
+    for dependency in &ir.dependencies {
+        assert!(
+            !matches!(
+                dependency.name.as_str(),
+                "martite-runtime" | "martite-bench"
+            ),
+            "martite-ir must not depend on {}",
+            dependency.name
+        );
+    }
 }
 
 #[test]
 fn runtime_is_ir_only() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let manifest = fs::read_to_string(root.join("crates/martite-runtime/Cargo.toml"))
-        .expect("read runtime manifest");
-    for forbidden in ["ast-eval", "martite-check", "martite-syntax"] {
-        assert!(
-            !manifest.contains(forbidden),
-            "martite-runtime must not reference {forbidden}"
-        );
+    let metadata = workspace_metadata();
+    let runtime = package(metadata, "martite-runtime");
+    let workspace_names = workspace_crate_names(metadata);
+    for dependency in &runtime.dependencies {
+        if workspace_names.contains(dependency.name.as_str()) {
+            assert!(
+                matches!(
+                    dependency.name.as_str(),
+                    "martite-base" | "martite-fuel" | "martite-ir"
+                ),
+                "martite-runtime must use the IR vocabulary, not {}",
+                dependency.name
+            );
+        }
     }
 
-    let lib = fs::read_to_string(root.join("crates/martite-runtime/src/lib.rs"))
-        .expect("read runtime lib");
+    let ir_dependency = runtime
+        .dependencies
+        .iter()
+        .find(|dependency| dependency.name == "martite-ir")
+        .expect("martite-runtime must depend on martite-ir");
+    assert_eq!(ir_dependency.kind, DependencyKind::Normal);
     assert!(
-        lib.contains("pub mod ir_eval;"),
-        "IR evaluator must be built"
+        !ir_dependency.uses_default_features,
+        "martite-runtime must not enable martite-ir default features"
     );
     assert!(
-        !lib.contains("interp"),
+        !ir_dependency
+            .features
+            .iter()
+            .any(|feature| feature == "lower"),
+        "martite-runtime must not enable martite-ir/lower"
+    );
+
+    for package in workspace_packages(metadata) {
+        assert!(
+            !package.features.contains_key("ast-eval"),
+            "{} still defines the removed ast-eval feature",
+            package.name
+        );
+    }
+    let runtime_node = resolve_node(metadata, &runtime.id);
+    assert!(
+        !runtime_node
+            .features
+            .iter()
+            .any(|feature| feature == "ast-eval"),
+        "the resolved runtime build must not enable ast-eval"
+    );
+
+    let source = Path::new(runtime.manifest_path.as_str())
+        .parent()
+        .expect("runtime manifest must have a parent directory")
+        .join("src");
+    assert!(
+        source.join("ir_eval.rs").is_file(),
+        "the IR evaluator must be built"
+    );
+    assert!(
+        source.join("ir_eval/builtins.rs").is_file(),
+        "the IR builtin include must be built"
+    );
+    assert!(
+        !source.join("interp.rs").exists(),
         "the AST evaluator must be removed from the runtime"
     );
     assert!(
-        !root.join("crates/martite-runtime/src/interp.rs").exists(),
-        "interp.rs must be deleted"
-    );
-    assert!(
-        !root.join("crates/martite-runtime/src/builtins.rs").exists(),
+        !source.join("builtins.rs").exists(),
         "the AST builtin include must be deleted"
     );
+}
 
-    let cli =
-        fs::read_to_string(root.join("crates/martite-cli/Cargo.toml")).expect("read CLI manifest");
+#[test]
+fn runtime_and_optimizer_resolve_without_checker_crates() {
+    let metadata = probe_metadata();
+    let allowed = [
+        "martite-base",
+        "martite-fuel",
+        "martite-ir",
+        "martite-runtime",
+        "martite-opt",
+    ];
+    for package in &metadata.packages {
+        if package.name.starts_with("martite-") {
+            assert!(
+                allowed.contains(&package.name.as_str()),
+                "unexpected crate in the runtime/optimizer graph: {}",
+                package.name
+            );
+        }
+        assert!(
+            !matches!(package.name.as_str(), "criterion" | "stats_alloc"),
+            "benchmark-only tooling leaked into the runtime/optimizer graph: {}",
+            package.name
+        );
+    }
+
+    let ir = package(metadata, "martite-ir");
+    let ir_node = resolve_node(metadata, &ir.id);
     assert!(
-        !cli.contains("ast-eval"),
-        "the temporary CLI evaluator feature must be removed"
+        !ir_node.features.iter().any(|feature| feature == "lower"),
+        "the runtime/optimizer build must not enable martite-ir/lower"
     );
 }
 
 #[test]
 fn ir_lowering_is_an_opt_in_dependency() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let manifest =
-        fs::read_to_string(root.join("crates/martite-ir/Cargo.toml")).expect("read IR manifest");
+    let manifest_text =
+        fs::read_to_string(workspace_root().join("Cargo.toml")).expect("read workspace manifest");
+    let manifest: WorkspaceManifest =
+        toml::from_str(&manifest_text).expect("parse workspace manifest");
+    let dependency: IrWorkspaceDependency = manifest
+        .workspace
+        .dependencies
+        .get("martite-ir")
+        .expect("workspace martite-ir dependency")
+        .clone()
+        .try_into()
+        .expect("parse workspace martite-ir dependency");
+    assert_eq!(dependency.path, "crates/martite-ir");
+    assert_eq!(dependency.version, manifest.workspace.package.version);
     assert!(
-        manifest.contains("lower = [\"dep:martite-check\", \"dep:martite-syntax\"]"),
-        "lowering and the checker must be opt-in"
+        !dependency.default_features,
+        "the workspace IR dependency must not enable default features"
     );
-    let workspace = fs::read_to_string(root.join("Cargo.toml")).expect("read workspace manifest");
     assert!(
-        workspace.contains("martite-ir = { path = \"crates/martite-ir\", version = \"0.1.0\", default-features = false }"),
-        "the workspace IR dependency must not enable lowering by default"
+        dependency.features.is_empty(),
+        "the workspace IR dependency must not enable features"
     );
-}
 
-#[test]
-fn ir_evaluator_reads_only_the_ir_program() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for name in ["ir_eval.rs", "ir_eval/builtins.rs"] {
-        let path = root.join("crates/martite-runtime/src").join(name);
-        let source = fs::read_to_string(&path).expect("read IR evaluator source");
-        for forbidden in [
-            "martite_check",
-            "CheckedProgram",
-            "BindingId",
-            "DefId",
-            "NodeId",
-            "HashMap",
-            "BuiltinFn::",
-            "BuiltinItem::",
-        ] {
+    let metadata = workspace_metadata();
+    let ir = package(metadata, "martite-ir");
+    let lower = ir
+        .features
+        .get("lower")
+        .expect("martite-ir must define the lower feature");
+    assert_eq!(
+        lower.iter().map(String::as_str).collect::<Vec<_>>(),
+        ["dep:martite-check", "dep:martite-syntax"],
+        "lowering must pull in the checker and parser"
+    );
+
+    let mut edges = 0;
+    for package in workspace_packages(metadata) {
+        for dependency in package
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.name == "martite-ir")
+        {
+            edges += 1;
             assert!(
-                !source.contains(forbidden),
-                "{name}: the IR evaluator must not use {forbidden}"
+                !dependency.uses_default_features,
+                "{} must not enable martite-ir default features",
+                package.name
             );
         }
     }
+    assert!(edges > 0, "no workspace crate depends on martite-ir");
+
+    let ir_node = resolve_node(metadata, &ir.id);
+    assert!(
+        ir_node.features.iter().any(|feature| feature == "lower"),
+        "a workspace build must explicitly opt into martite-ir/lower"
+    );
+
+    let probe = probe_metadata();
+    let probe_ir = package(probe, "martite-ir");
+    let probe_ir_node = resolve_node(probe, &probe_ir.id);
+    assert!(
+        !probe_ir_node
+            .features
+            .iter()
+            .any(|feature| feature == "lower"),
+        "the runtime/optimizer build must not enable martite-ir/lower"
+    );
+}
+
+#[derive(Deserialize)]
+struct WorkspaceManifest {
+    workspace: WorkspaceSection,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceSection {
+    package: WorkspacePackage,
+    dependencies: std::collections::BTreeMap<String, toml::Value>,
+}
+
+#[derive(Deserialize)]
+struct WorkspacePackage {
+    version: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct IrWorkspaceDependency {
+    path: String,
+    version: String,
+    #[serde(default = "default_true")]
+    default_features: bool,
+    #[serde(default)]
+    features: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
