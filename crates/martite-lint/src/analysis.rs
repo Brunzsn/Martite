@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 
 use martite_base::{SourceId, SourceMap, Span};
 use martite_check::{
-    BindingId, BuiltinItem, BuiltinReceiver, CheckedProgram, DefId, DefKind, FnSig, ModuleId,
-    ModuleTarget, ParamSig, Resolution, Ty,
+    BindingId, BuiltinItem, CheckedProgram, DefId, DefKind, FnSig, ModuleId, ModuleTarget,
+    ParamSig, Resolution, Ty,
 };
 use martite_syntax::{
     Arg, Block, Expr, ExprKind, Item, MatchBody, PatKind, Pattern, Program, Stmt, StmtKind, TyExpr,
@@ -776,8 +776,8 @@ impl<'a> Analysis<'a> {
                     self.walk_arg(arg, walk);
                 }
             }
-            (ExprKind::Field { base, .. }, Some(Resolution::BuiltinMethod { receiver, name }))
-                if builtin_mutates(receiver, name) =>
+            (ExprKind::Field { base, .. }, Some(Resolution::BuiltinMethod { method }))
+                if method.def().is_some_and(|def| def.mut_self) =>
             {
                 self.walk_expr(base, walk.with_access(Access::Write));
                 for arg in args {
@@ -948,17 +948,17 @@ pub fn stable(program: &CheckedProgram, expr: &Expr) -> bool {
     }
     match &expr.kind {
         ExprKind::Field { base, .. } => match program.resolution(expr.id) {
-            Some(Resolution::BuiltinMethod { name, .. }) => {
-                builtin_is_stable(*name) && stable(program, base)
+            Some(Resolution::BuiltinMethod { method }) => {
+                method.def().is_some_and(|def| builtin_is_stable(def.name)) && stable(program, base)
             }
             Some(Resolution::Method(_)) => false,
             _ => stable(program, base),
         },
         ExprKind::Call { callee, args } => {
-            let Some(Resolution::BuiltinMethod { name, .. }) = program.resolution(callee.id) else {
+            let Some(Resolution::BuiltinMethod { method }) = program.resolution(callee.id) else {
                 return false;
             };
-            if !builtin_is_stable(*name)
+            if !method.def().is_some_and(|def| builtin_is_stable(def.name))
                 || !args.iter().all(|arg| side_effect_free(program, &arg.expr))
             {
                 return false;
@@ -1120,16 +1120,4 @@ pub fn ty_has_float(program: &CheckedProgram, expr: &Expr) -> bool {
 
 pub fn expr_is_result(program: &CheckedProgram, expr: &Expr) -> bool {
     matches!(program.type_of(expr.id), Some(Ty::Result(_, _)))
-}
-
-/// Builtin methods that follow `mut self`.
-pub fn builtin_mutates(receiver: BuiltinReceiver, name: &str) -> bool {
-    match receiver {
-        BuiltinReceiver::List => matches!(
-            name,
-            "push" | "pop" | "sort" | "insert" | "remove_at" | "extend" | "clear"
-        ),
-        BuiltinReceiver::Map => matches!(name, "remove" | "clear"),
-        _ => false,
-    }
 }

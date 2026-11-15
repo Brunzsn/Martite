@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 martite-base.workspace = true
+martite-builtin.workspace = true
 martite-syntax.workspace = true
 rustc-hash.workspace = true
 

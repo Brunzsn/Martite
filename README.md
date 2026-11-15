@@ -7,12 +7,13 @@ A Rust implementation of the Martite language described in `Martite - The Rules.
 The workspace is split along the compiler pipeline:
 
 - `martite-base` — spans, source maps, providers, diagnostics, load limits
+- `martite-builtin` — canonical builtin names, item/function signatures, arities, effects and safepoints
 - `martite-fuel` — edition fuel table shared by the runtime and IR
 - `martite-syntax` — lexer, AST, source and `.mti` parser
 - `martite-config` — `plugin.toml` and `martite.toml`
 - `martite-resolve` — module graph, imports, grants, top-level names
 - `martite-check` — bidirectional type checker, patterns, constants, handlers
-- `martite-ir` - resolved, self-contained tree IR, shared tree traversal, lowering (`lower` feature), verifier and text dumps
+- `martite-ir` - resolved, self-contained tree IR, re-exported canonical builtin metadata, shared tree traversal, lowering (`lower` feature), verifier and text dumps
 - `martite-opt` - ordered pass manager, `Preserve` rewriter and the first constant-folding pass
 - `martite-runtime` - IR evaluator, values, standard library, limits and traps; it does not depend on the checker or syntax tree
 - `martite-driver` — load orchestration

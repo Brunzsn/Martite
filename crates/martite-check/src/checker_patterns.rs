@@ -18,24 +18,28 @@ impl<'a> Checker<'a> {
     fn check_builtin_method(
         &mut self,
         expr: &Expr,
-        receiver: BuiltinReceiver,
-        name: &str,
+        method: BuiltinMethodId,
         receiver_ty: &Ty,
         args: &[Arg],
         expected: Option<&Ty>,
         infer: &mut Infer,
     ) -> Ty {
+        let def = method.def().expect("builtin method id is in range");
+        let receiver = def.receiver;
+        let name = def.name;
         let module = self.current_module();
-        let arity = |checker: &mut Self, n: usize| {
-            if args.len() != n {
-                checker.err_at(
-                    module,
-                    expr.span,
-                    Code::E204,
-                    format!("method `{name}` takes {n} argument(s), found {}", args.len()),
-                );
-            }
-        };
+        if args.len() != def.arity as usize {
+            self.err_at(
+                module,
+                expr.span,
+                Code::E204,
+                format!(
+                    "method `{name}` takes {} argument(s), found {}",
+                    def.arity,
+                    args.len()
+                ),
+            );
+        }
         let mut ret = Ty::Error;
         match receiver {
             BuiltinReceiver::List => {
@@ -45,11 +49,9 @@ impl<'a> Checker<'a> {
                 let t = (**inner).clone();
                 match name {
                     "len" => {
-                        arity(self, 0);
                         ret = Ty::Int;
                     }
                     "get" | "insert" => {
-                        arity(self, if name == "insert" { 2 } else { 1 });
                         if name == "insert" {
                             self.check_method_arg(args, 0, &Ty::Int, infer);
                             self.check_method_arg(args, 1, &t, infer);
@@ -60,11 +62,9 @@ impl<'a> Checker<'a> {
                         }
                     }
                     "first" | "last" | "pop" => {
-                        arity(self, 0);
                         ret = Ty::option(t);
                     }
                     "contains" => {
-                        arity(self, 1);
                         self.check_method_arg(args, 0, &t, infer);
                         if !self.has_bound(&t, Bound::Eq) {
                             self.err_at(
@@ -77,7 +77,6 @@ impl<'a> Checker<'a> {
                         ret = Ty::Bool;
                     }
                     "map" => {
-                        arity(self, 1);
                         let u = infer.fresh();
                         self.check_method_arg(args, 0, &Ty::Fn(vec![t], Box::new(u.clone())), infer);
                         if infer.resolve(&u).has_var() {
@@ -93,7 +92,6 @@ impl<'a> Checker<'a> {
                         }
                     }
                     "filter" | "any" | "all" => {
-                        arity(self, 1);
                         self.check_method_arg(
                             args,
                             0,
@@ -103,7 +101,6 @@ impl<'a> Checker<'a> {
                         ret = if name == "filter" { Ty::list(t) } else { Ty::Bool };
                     }
                     "fold" => {
-                        arity(self, 2);
                         let u = infer.fresh();
                         self.check_method_arg(args, 0, &u, infer);
                         self.check_method_arg(
@@ -125,15 +122,12 @@ impl<'a> Checker<'a> {
                         }
                     }
                     "enumerate" => {
-                        arity(self, 0);
                         ret = Ty::list(Ty::Tuple(vec![Ty::Int, t]));
                     }
                     "reversed" => {
-                        arity(self, 0);
                         ret = Ty::list(t);
                     }
                     "sorted" | "sort" => {
-                        arity(self, 0);
                         if !self.has_bound(&t, Bound::Ord) {
                             self.err_at(
                                 module,
@@ -145,7 +139,6 @@ impl<'a> Checker<'a> {
                         ret = if name == "sorted" { Ty::list(t) } else { Ty::Unit };
                     }
                     "sorted_by" => {
-                        arity(self, 1);
                         let k = infer.fresh();
                         self.check_method_arg(
                             args,
@@ -172,7 +165,6 @@ impl<'a> Checker<'a> {
                         ret = Ty::list(t);
                     }
                     "join" => {
-                        arity(self, 1);
                         if t != Ty::Str {
                             self.err_at(
                                 module,
@@ -185,22 +177,18 @@ impl<'a> Checker<'a> {
                         ret = Ty::Str;
                     }
                     "push" => {
-                        arity(self, 1);
                         self.check_method_arg(args, 0, &t, infer);
                         ret = Ty::Unit;
                     }
                     "remove_at" => {
-                        arity(self, 1);
                         self.check_method_arg(args, 0, &Ty::Int, infer);
                         ret = t;
                     }
                     "extend" => {
-                        arity(self, 1);
                         self.check_method_arg(args, 0, &Ty::list(t), infer);
                         ret = Ty::Unit;
                     }
                     "clear" => {
-                        arity(self, 0);
                         ret = Ty::Unit;
                     }
                     _ => {
@@ -221,11 +209,9 @@ impl<'a> Checker<'a> {
                 let v = (**value_ty).clone();
                 match name {
                     "len" => {
-                        arity(self, 0);
                         ret = Ty::Int;
                     }
                     "get" | "has" | "remove" => {
-                        arity(self, 1);
                         self.check_method_arg(args, 0, &k, infer);
                         ret = if name == "has" {
                             Ty::Bool
@@ -236,19 +222,15 @@ impl<'a> Checker<'a> {
                         };
                     }
                     "keys" => {
-                        arity(self, 0);
                         ret = Ty::list(k);
                     }
                     "values" => {
-                        arity(self, 0);
                         ret = Ty::list(v);
                     }
                     "entries" => {
-                        arity(self, 0);
                         ret = Ty::list(Ty::Tuple(vec![k, v]));
                     }
                     "clear" => {
-                        arity(self, 0);
                         ret = Ty::Unit;
                     }
                     _ => {
@@ -263,49 +245,39 @@ impl<'a> Checker<'a> {
             }
             BuiltinReceiver::Str => match name {
                 "len" => {
-                    arity(self, 0);
                     ret = Ty::Int;
                 }
                 "chars" => {
-                    arity(self, 0);
                     ret = Ty::list(Ty::Str);
                 }
                 "split" => {
-                    arity(self, 1);
                     self.check_method_arg(args, 0, &Ty::Str, infer);
                     ret = Ty::list(Ty::Str);
                 }
                 "trim" | "to_upper" | "to_lower" => {
-                    arity(self, 0);
                     ret = Ty::Str;
                 }
                 "contains" => {
-                    arity(self, 1);
                     self.check_method_arg(args, 0, &Ty::Str, infer);
                     ret = Ty::Bool;
                 }
                 "find" => {
-                    arity(self, 1);
                     self.check_method_arg(args, 0, &Ty::Str, infer);
                     ret = Ty::option(Ty::Int);
                 }
                 "starts_with" | "ends_with" => {
-                    arity(self, 1);
                     self.check_method_arg(args, 0, &Ty::Str, infer);
                     ret = Ty::Bool;
                 }
                 "replace" => {
-                    arity(self, 2);
                     self.check_method_arg(args, 0, &Ty::Str, infer);
                     self.check_method_arg(args, 1, &Ty::Str, infer);
                     ret = Ty::Str;
                 }
                 "parse_int" => {
-                    arity(self, 0);
                     ret = Ty::option(Ty::Int);
                 }
                 "parse_float" => {
-                    arity(self, 0);
                     ret = Ty::option(Ty::Float);
                 }
                 _ => {
@@ -319,11 +291,9 @@ impl<'a> Checker<'a> {
             },
             BuiltinReceiver::Int => match name {
                 "abs" => {
-                    arity(self, 0);
                     ret = Ty::Int;
                 }
                 "pow" => {
-                    arity(self, 1);
                     self.check_method_arg(args, 0, &Ty::Int, infer);
                     ret = Ty::Int;
                 }
@@ -338,21 +308,17 @@ impl<'a> Checker<'a> {
             },
             BuiltinReceiver::Float => match name {
                 "abs" | "floor" | "ceil" | "trunc" | "sqrt" => {
-                    arity(self, 0);
                     ret = Ty::Float;
                 }
                 "pow" => {
-                    arity(self, 1);
                     self.check_method_arg(args, 0, &Ty::Float, infer);
                     ret = Ty::Float;
                 }
                 "round" => {
-                    arity(self, 1);
                     self.check_method_arg(args, 0, &Ty::Int, infer);
                     ret = Ty::Float;
                 }
                 "is_nan" | "is_finite" => {
-                    arity(self, 0);
                     ret = Ty::Bool;
                 }
                 _ => {
@@ -366,16 +332,13 @@ impl<'a> Checker<'a> {
             },
             BuiltinReceiver::Range => match name {
                 "len" => {
-                    arity(self, 0);
                     ret = Ty::Int;
                 }
                 "contains" => {
-                    arity(self, 1);
                     self.check_method_arg(args, 0, &Ty::Int, infer);
                     ret = Ty::Bool;
                 }
                 "to_list" => {
-                    arity(self, 0);
                     ret = Ty::list(Ty::Int);
                 }
                 _ => {
@@ -394,17 +357,14 @@ impl<'a> Checker<'a> {
                 let t = (**inner).clone();
                 match name {
                     "is_some" | "is_none" => {
-                        arity(self, 0);
                         ret = Ty::Bool;
                     }
                     "map" => {
-                        arity(self, 1);
                         let u = infer.fresh();
                         self.check_method_arg(args, 0, &Ty::Fn(vec![t], Box::new(u.clone())), infer);
                         ret = Ty::option(infer.resolve(&u));
                     }
                     "and_then" => {
-                        arity(self, 1);
                         let u = infer.fresh();
                         self.check_method_arg(
                             args,
@@ -415,18 +375,15 @@ impl<'a> Checker<'a> {
                         ret = Ty::option(infer.resolve(&u));
                     }
                     "unwrap_or" => {
-                        arity(self, 1);
                         self.check_method_arg(args, 0, &t, infer);
                         ret = t;
                     }
                     "ok_or" => {
-                        arity(self, 1);
                         let e = infer.fresh();
                         self.check_method_arg(args, 0, &e, infer);
                         ret = Ty::Result(Box::new(t), Box::new(infer.resolve(&e)));
                     }
                     "expect" => {
-                        arity(self, 1);
                         self.check_method_arg(args, 0, &Ty::Str, infer);
                         ret = t;
                     }
@@ -448,23 +405,19 @@ impl<'a> Checker<'a> {
                 let e = (**err_ty).clone();
                 match name {
                     "is_ok" | "is_err" => {
-                        arity(self, 0);
                         ret = Ty::Bool;
                     }
                     "map" => {
-                        arity(self, 1);
                         let u = infer.fresh();
                         self.check_method_arg(args, 0, &Ty::Fn(vec![t], Box::new(u.clone())), infer);
                         ret = Ty::Result(Box::new(infer.resolve(&u)), Box::new(e));
                     }
                     "map_err" => {
-                        arity(self, 1);
                         let f = infer.fresh();
                         self.check_method_arg(args, 0, &Ty::Fn(vec![e], Box::new(f.clone())), infer);
                         ret = Ty::Result(Box::new(t), Box::new(infer.resolve(&f)));
                     }
                     "and_then" => {
-                        arity(self, 1);
                         let u = infer.fresh();
                         self.check_method_arg(
                             args,
@@ -478,16 +431,13 @@ impl<'a> Checker<'a> {
                         ret = Ty::Result(Box::new(infer.resolve(&u)), Box::new(e));
                     }
                     "unwrap_or" => {
-                        arity(self, 1);
                         self.check_method_arg(args, 0, &t, infer);
                         ret = t;
                     }
                     "ok" => {
-                        arity(self, 0);
                         ret = Ty::option(t);
                     }
                     "expect" => {
-                        arity(self, 1);
                         self.check_method_arg(args, 0, &Ty::Str, infer);
                         ret = t;
                     }

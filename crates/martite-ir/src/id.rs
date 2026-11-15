@@ -66,15 +66,5 @@ define_id!(
     /// Identifies a field layout in [`crate::IrFn::struct_layouts`].
     StructLayoutId
 );
-define_id!(
-    /// Identifies a builtin function value or call target.
-    BuiltinFnId
-);
-define_id!(
-    /// Identifies a builtin-module item value or call target.
-    BuiltinItemId
-);
-define_id!(
-    /// Identifies a builtin method in [`crate::builtin::BUILTIN_METHODS`].
-    BuiltinMethodId
-);
+
+pub use martite_builtin::{BuiltinFnId, BuiltinItemId, BuiltinMethodId};

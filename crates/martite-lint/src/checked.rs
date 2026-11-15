@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use martite_base::{Applicability, Code, Diagnostic, Fix, FixEdit, Span};
 use martite_check::{
-    BindingId, BuiltinFn, BuiltinReceiver, CheckedProgram, DefId, DefKind, EntryKind, FnKind,
+    BindingId, BuiltinFnId, BuiltinReceiver, CheckedProgram, DefId, DefKind, EntryKind, FnKind,
     FnSig, ModuleId, ParamSig, PreludeVariant, Resolution, Ty, TypeDefKind, exhaustive,
 };
 use martite_syntax::{
@@ -402,7 +402,7 @@ impl<'a> Checked<'a> {
         };
         matches!(
             self.program.resolution(callee.id),
-            Some(Resolution::BuiltinFn(BuiltinFn::Panic))
+            Some(Resolution::BuiltinFn(BuiltinFnId::PANIC))
         )
     }
 
@@ -722,10 +722,11 @@ impl<'a> Checked<'a> {
             if field == Some("expect")
                 && matches!(
                     self.program.resolution(callee.id),
-                    Some(Resolution::BuiltinMethod {
-                        receiver: BuiltinReceiver::Option | BuiltinReceiver::Result,
-                        ..
-                    })
+                    Some(Resolution::BuiltinMethod { method })
+                        if method.def().is_some_and(|def| matches!(
+                            def.receiver,
+                            BuiltinReceiver::Option | BuiltinReceiver::Result
+                        ))
                 )
                 && self.program.entry_kind == EntryKind::Plugin
                 && !ctx.in_test
@@ -742,10 +743,10 @@ impl<'a> Checked<'a> {
             if field == Some("unwrap_or") && args.len() == 1 {
                 let option = matches!(
                     self.program.resolution(callee.id),
-                    Some(Resolution::BuiltinMethod {
-                        receiver: BuiltinReceiver::Option,
-                        ..
-                    })
+                    Some(Resolution::BuiltinMethod { method })
+                        if method.def().is_some_and(|def| {
+                            def.receiver == BuiltinReceiver::Option
+                        })
                 );
                 if option && !simple_default(&args[0].expr) {
                     let replacement = format!(
@@ -772,7 +773,7 @@ impl<'a> Checked<'a> {
         if self.in_handler(ctx)
             && matches!(
                 self.program.resolution(callee.id),
-                Some(Resolution::BuiltinFn(BuiltinFn::Panic))
+                Some(Resolution::BuiltinFn(BuiltinFnId::PANIC))
             )
         {
             self.emit(
@@ -787,7 +788,7 @@ impl<'a> Checked<'a> {
             && !ctx.in_test
             && matches!(
                 self.program.resolution(callee.id),
-                Some(Resolution::BuiltinFn(BuiltinFn::Print))
+                Some(Resolution::BuiltinFn(BuiltinFnId::PRINT))
             )
         {
             self.emit(
@@ -1115,8 +1116,8 @@ impl<'a> Checked<'a> {
                             }
                         }
                     }
-                    Some(Resolution::BuiltinMethod { receiver, name })
-                        if analysis::builtin_mutates(*receiver, name) =>
+                    Some(Resolution::BuiltinMethod { method })
+                        if method.def().is_some_and(|def| def.mut_self) =>
                     {
                         if let ExprKind::Field { base, .. } = &callee.kind {
                             if analysis::place_root(self.program, base)
@@ -1203,11 +1204,14 @@ impl<'a> Checked<'a> {
         args: &'a [martite_syntax::Arg],
         call: &'a Expr,
     ) {
-        let Some(Resolution::BuiltinMethod { receiver, name }) = self.program.resolution(callee.id)
-        else {
+        let Some(Resolution::BuiltinMethod { method }) = self.program.resolution(callee.id) else {
             return;
         };
-        let name = *name;
+        let Some(def) = method.def() else {
+            return;
+        };
+        let receiver = def.receiver;
+        let name = def.name;
         let (message, help): (&str, &str) = match (receiver, name) {
             (BuiltinReceiver::List, "insert") => (
                 "`insert` can panic",
@@ -2386,7 +2390,7 @@ fn expr_asserts(program: &CheckedProgram, expr: &Expr) -> bool {
         ExprKind::Call { callee, args } => {
             if matches!(
                 program.resolution(callee.id),
-                Some(Resolution::BuiltinFn(BuiltinFn::Assert))
+                Some(Resolution::BuiltinFn(BuiltinFnId::ASSERT))
             ) {
                 return true;
             }
