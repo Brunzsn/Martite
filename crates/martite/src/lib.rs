@@ -3,14 +3,12 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use martite_base::{
-    Code, Diagnostic, FileSystemProvider, LoadLimits, MemoryProvider, SourceMap, SourceProvider,
-};
+use martite_base::{FileSystemProvider, LoadLimits, MemoryProvider, SourceProvider};
 use martite_check::{
     CheckedProgram, FnSig, Ty, TypeDefKind as CheckTypeDefKind, TypeId as CheckTypeId,
 };
 use martite_config::{Manifest, parse_manifest};
-use martite_driver::{LoadOptions, load, lower};
+use martite_driver::{LoadOptions, LoadedProgram, load, lower};
 use martite_ir::{HostId, IrProgram, TypeDefKind, TypeId, TypeTable};
 use martite_resolve::InterfaceSource;
 use martite_runtime::{
@@ -18,7 +16,7 @@ use martite_runtime::{
 };
 use martite_syntax::ParseOptions;
 
-pub use martite_base::{SourceId, Span};
+pub use martite_base::{Code, Diagnostic, SourceId, SourceMap, Span};
 pub use martite_runtime::{ExecLimits as Limits, Value as HostValue, show};
 
 /// The language edition implemented by this crate.
@@ -27,6 +25,18 @@ pub const LANG_EDITION: &str = "1";
 /// The host interface version implemented by this crate. Interfaces carry no
 /// version comments; the embedding owns the version.
 const HOST_API_VERSION: (u32, u32) = (1, 0);
+
+/// A failed plugin load together with the sources used to compile it.
+///
+/// [`Engine::load`] keeps its diagnostics-only signature for compatibility.
+/// Hosts that render load failures should call [`Engine::try_load`] and pass
+/// [`LoadError::sources`] to [`Diagnostic::render`] or their own source
+/// renderer.
+#[derive(Debug, Clone)]
+pub struct LoadError {
+    pub diagnostics: Vec<Diagnostic>,
+    pub sources: SourceMap,
+}
 
 pub type HostFn = dyn Fn(&mut HostContext, &[Value]) -> Result<Value, HostFault>;
 
@@ -224,6 +234,8 @@ impl Engine {
     ///
     /// The returned [`Reload`] calls `init` when the state fingerprint changed,
     /// and restores the snapshot without calling `init` when it did not.
+    ///
+    /// This is the diagnostics-only variant of [`Engine::try_reload`].
     pub fn reload(
         &self,
         manifest_text: &str,
@@ -231,7 +243,19 @@ impl Engine {
         previous: &Plugin,
         snapshot: &Snapshot,
     ) -> Result<Reload, Vec<Diagnostic>> {
-        let plugin = self.load(manifest_text, provider)?;
+        self.try_reload(manifest_text, provider, previous, snapshot)
+            .map_err(|error| error.diagnostics)
+    }
+
+    /// Re-check a plugin and keep the load sources when it fails.
+    pub fn try_reload(
+        &self,
+        manifest_text: &str,
+        provider: &dyn SourceProvider,
+        previous: &Plugin,
+        snapshot: &Snapshot,
+    ) -> Result<Reload, LoadError> {
+        let plugin = self.try_load(manifest_text, provider)?;
         let fingerprint = plugin.type_fingerprint();
         let keep_snapshot = fingerprint != [0u8; 32]
             && fingerprint == previous.type_fingerprint()
@@ -243,31 +267,65 @@ impl Engine {
         })
     }
 
+    /// Load a plugin, keeping only the diagnostics on failure.
+    ///
+    /// Use [`Engine::try_load`] when the host needs the [`SourceMap`] to render
+    /// the failure.
     pub fn load(
         &self,
         manifest_text: &str,
         provider: &dyn SourceProvider,
     ) -> Result<Plugin, Vec<Diagnostic>> {
-        let manifest = parse_manifest(manifest_text)
-            .map_err(|e| vec![Diagnostic::error(Code::E508, e.to_string())])?;
-        self.load_with_manifest(manifest, provider)
+        self.try_load(manifest_text, provider)
+            .map_err(|error| error.diagnostics)
     }
 
+    /// Load a plugin and keep the sources used to compile it when loading fails.
+    pub fn try_load(
+        &self,
+        manifest_text: &str,
+        provider: &dyn SourceProvider,
+    ) -> Result<Plugin, LoadError> {
+        let manifest = parse_manifest(manifest_text).map_err(|e| LoadError {
+            diagnostics: vec![Diagnostic::error(Code::E508, e.to_string())],
+            sources: SourceMap::default(),
+        })?;
+        self.try_load_with_manifest(manifest, provider)
+    }
+
+    /// Load a parsed manifest, keeping only the diagnostics on failure.
+    ///
+    /// Use [`Engine::try_load_with_manifest`] when the host needs the
+    /// [`SourceMap`] to render the failure.
     pub fn load_with_manifest(
         &self,
         manifest: Manifest,
         provider: &dyn SourceProvider,
     ) -> Result<Plugin, Vec<Diagnostic>> {
+        self.try_load_with_manifest(manifest, provider)
+            .map_err(|error| error.diagnostics)
+    }
+
+    /// Load a parsed manifest and keep the sources used to compile it when
+    /// loading fails.
+    pub fn try_load_with_manifest(
+        &self,
+        manifest: Manifest,
+        provider: &dyn SourceProvider,
+    ) -> Result<Plugin, LoadError> {
         // Check the manifest's API version against the host's interface version.
         let (host_major, host_minor) = HOST_API_VERSION;
         let mut diagnostics = Vec::new();
         let (want_major, want_minor) = match parse_api(&manifest.api) {
             Ok(version) => version,
             Err(()) => {
-                return Err(vec![Diagnostic::error(
-                    Code::E508,
-                    format!("malformed plugin API version `{}`", manifest.api),
-                )]);
+                return Err(LoadError {
+                    diagnostics: vec![Diagnostic::error(
+                        Code::E508,
+                        format!("malformed plugin API version `{}`", manifest.api),
+                    )],
+                    sources: SourceMap::default(),
+                });
             }
         };
         if want_major != host_major {
@@ -284,7 +342,10 @@ impl Engine {
             ));
         }
         if !diagnostics.is_empty() {
-            return Err(diagnostics);
+            return Err(LoadError {
+                diagnostics,
+                sources: SourceMap::default(),
+            });
         }
 
         let loaded = load(
@@ -299,11 +360,20 @@ impl Engine {
             },
         );
         if loaded.has_errors() {
-            return Err(loaded.diagnostics);
+            return Err(LoadError {
+                diagnostics: loaded.diagnostics,
+                sources: loaded.sources,
+            });
         }
-        let program = loaded
-            .program
-            .ok_or_else(|| vec![Diagnostic::error(Code::E508, "program failed to load")])?;
+        let LoadedProgram {
+            program, sources, ..
+        } = loaded;
+        let Some(program) = program else {
+            return Err(LoadError {
+                diagnostics: vec![Diagnostic::error(Code::E508, "program failed to load")],
+                sources,
+            });
+        };
         let mut missing = Vec::new();
         for module in &program.resolved.modules {
             if !module.is_interface {
@@ -347,21 +417,35 @@ impl Engine {
             ));
         }
         if !diagnostics.is_empty() {
-            return Err(diagnostics);
+            return Err(LoadError {
+                diagnostics,
+                sources,
+            });
         }
-        let lowered = lower(&program, &loaded.sources);
+        let lowered = lower(&program, &sources);
         if lowered.has_errors() {
-            return Err(lowered.diagnostics);
+            return Err(LoadError {
+                diagnostics: lowered.diagnostics,
+                sources,
+            });
         }
-        let mut ir = lowered
-            .program
-            .ok_or_else(|| vec![Diagnostic::error(Code::E508, "program failed to lower")])?;
-        self.optimize_ir(&mut ir)?;
+        let Some(mut ir) = lowered.program else {
+            return Err(LoadError {
+                diagnostics: vec![Diagnostic::error(Code::E508, "program failed to lower")],
+                sources,
+            });
+        };
+        if let Err(diagnostics) = self.optimize_ir(&mut ir) {
+            return Err(LoadError {
+                diagnostics,
+                sources,
+            });
+        }
         let host_by_id = self.host_map(&ir);
         Ok(Plugin {
             program,
             ir,
-            sources: loaded.sources,
+            sources,
             host_by_id,
             settings: manifest.settings.clone(),
             limits: clamp_limits(
@@ -384,15 +468,14 @@ impl Engine {
     ///
     /// The IR identifies hosts by a dense [`HostId`]; embedders resolve their
     /// name-based registry once, at load time.
-    fn host_map(&self, ir: &IrProgram) -> HashMap<HostId, RegisteredFn> {
-        let mut hosts = HashMap::new();
-        for (index, info) in ir.hosts.iter().enumerate() {
-            let qualified = format!("{}.{}", info.module, info.name);
-            if let Some(registered) = self.host_fns.get(&qualified) {
-                hosts.insert(HostId::new(index as u32), registered.clone());
-            }
-        }
-        hosts
+    fn host_map(&self, ir: &IrProgram) -> Vec<Option<RegisteredFn>> {
+        ir.hosts
+            .iter()
+            .map(|info| {
+                let qualified = format!("{}.{}", info.module, info.name);
+                self.host_fns.get(&qualified).cloned()
+            })
+            .collect()
     }
 
     pub fn load_script(
@@ -512,7 +595,7 @@ pub struct Plugin {
     program: CheckedProgram,
     ir: IrProgram,
     sources: SourceMap,
-    host_by_id: HashMap<HostId, RegisteredFn>,
+    host_by_id: Vec<Option<RegisteredFn>>,
     settings: toml::Value,
     limits: ExecLimits,
     manifest: Manifest,
@@ -802,7 +885,7 @@ pub struct Snapshot {
 }
 
 struct IrDispatch<'a> {
-    fns: &'a HashMap<HostId, RegisteredFn>,
+    fns: &'a [Option<RegisteredFn>],
 }
 
 impl IrHostDispatcher for IrDispatch<'_> {
@@ -812,12 +895,12 @@ impl IrHostDispatcher for IrDispatch<'_> {
         args: &[Value],
         cx: &mut HostContext,
     ) -> Result<Value, HostFault> {
-        let function = self
+        let registered = self
             .fns
-            .get(&host)
-            .map(|r| r.function.clone())
+            .get(host.index())
+            .and_then(Option::as_ref)
             .ok_or_else(|| HostFault::new("host function is not registered"))?;
-        function(cx, args)
+        (registered.function)(cx, args)
     }
 }
 

@@ -54,14 +54,14 @@ fn load_plugin() -> martite::Plugin {
     let mut provider = MemoryProvider::new();
     provider.insert("main.mt", PLUGIN);
     engine
-        .load(MANIFEST, &provider)
-        .unwrap_or_else(|diagnostics| {
-            let sources = martite_base::SourceMap::new();
+        .try_load(MANIFEST, &provider)
+        .unwrap_or_else(|error| {
             panic!(
                 "{}",
-                diagnostics
+                error
+                    .diagnostics
                     .iter()
-                    .map(|d| d.render(&sources))
+                    .map(|d| d.render(&error.sources))
                     .collect::<Vec<_>>()
                     .join("\n")
             )
@@ -528,6 +528,81 @@ fn host_functions_can_construct_result_handles() {
     let seen = seen.borrow();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0], expected);
+}
+
+const BROKEN_MANIFEST: &str = r#"
+[plugin]
+name = "broken"
+version = "0.1.0"
+lang = "1"
+api = "1.0"
+entry = "main.mt"
+"#;
+
+const BROKEN_PLUGIN: &str = r#"
+on init() -> int {
+    "not an int"
+}
+"#;
+
+#[test]
+fn try_load_keeps_sources_for_rendering() {
+    let engine = Engine::new();
+    let mut provider = MemoryProvider::new();
+    provider.insert("main.mt", BROKEN_PLUGIN);
+    let error = match engine.try_load(BROKEN_MANIFEST, &provider) {
+        Ok(_) => panic!("expected a load error"),
+        Err(error) => error,
+    };
+    let diagnostic = error
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.source.is_some() && diagnostic.span.is_some())
+        .expect("expected a sourced diagnostic");
+    let file = error
+        .sources
+        .get(diagnostic.source.unwrap())
+        .expect("source map retained");
+    assert_eq!(file.name(), "main.mt");
+    let (line, _) = file.line_col(diagnostic.span.unwrap().start);
+    assert!(
+        file.line_text(line).contains("\"not an int\""),
+        "unexpected source line: {}",
+        file.line_text(line)
+    );
+    assert!(diagnostic.render(&error.sources).contains("main.mt:"));
+}
+
+#[test]
+fn load_still_returns_diagnostics_only() {
+    let engine = Engine::new();
+    let mut provider = MemoryProvider::new();
+    provider.insert("main.mt", BROKEN_PLUGIN);
+    let diagnostics = match engine.load(BROKEN_MANIFEST, &provider) {
+        Ok(_) => panic!("expected a load error"),
+        Err(diagnostics) => diagnostics,
+    };
+    assert!(!diagnostics.is_empty());
+}
+
+#[test]
+fn unregistered_host_functions_still_trap() {
+    let mut engine = Engine::new();
+    engine.interface("app.missing", "fn value() -> int\n");
+    let mut provider = MemoryProvider::new();
+    provider.insert(
+        "main.mt",
+        "use app.missing\n\nfn main() {\n    let value = missing.value()\n}\n",
+    );
+    let plugin = engine
+        .load_script("main.mt", &provider)
+        .expect("script loads");
+    match plugin.run_main() {
+        Err(Trap::HostFault(message)) => {
+            assert!(message.contains("not registered"), "{message}");
+        }
+        other => panic!("expected a host fault, got {other:?}"),
+    }
 }
 
 #[test]
