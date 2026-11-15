@@ -73,19 +73,144 @@ fn wrapped_meta(inner: ValueMeta) -> ValueMeta {
     }
 }
 
-fn add_slot_meta(meta: &mut ValueMeta, deep_count: &mut u32, child: ValueMeta) {
-    meta.slots = meta.slots.saturating_add(1).saturating_add(child.slots);
-    meta.string_slots = meta.string_slots.saturating_add(child.string_slots);
-    meta.bytes = meta.bytes.saturating_add(8).saturating_add(child.bytes);
-    add_depth_meta(meta, deep_count, 1 + child.depth);
+/// The metadata contribution of one entry in a container payload.
+///
+/// Entries carry their full structural cost so a container's cached metadata
+/// is its empty baseline plus the sum of its entries. Replacement subtracts the
+/// old entry and adds the new one, cancelling the fixed structural part.
+#[derive(Debug, Clone, Copy)]
+struct EntryMeta {
+    depth: u16,
+    slots: u64,
+    string_slots: u64,
+    bytes: u64,
 }
 
-fn add_depth_meta(meta: &mut ValueMeta, deep_count: &mut u32, depth: u16) {
-    if depth > meta.depth {
-        meta.depth = depth;
-        *deep_count = 1;
-    } else if depth == meta.depth {
-        *deep_count = deep_count.saturating_add(1);
+impl EntryMeta {
+    /// A sequence slot, struct field, or enum payload value.
+    fn item(child: ValueMeta) -> Self {
+        Self {
+            depth: child.depth.saturating_add(1),
+            slots: child.slots.saturating_add(1),
+            string_slots: child.string_slots,
+            bytes: child.bytes.saturating_add(8),
+        }
+    }
+
+    /// A map key/value pair.
+    fn map(key: KeyStats, child: ValueMeta) -> Self {
+        Self {
+            depth: key.entry_depth(child),
+            slots: key.slots.saturating_add(child.slots).saturating_add(2),
+            string_slots: key.string_slots.saturating_add(child.string_slots),
+            bytes: key.bytes.saturating_add(child.bytes).saturating_add(16),
+        }
+    }
+
+    /// A closure capture: counts toward depth and bytes, not fuel slots.
+    fn capture(child: ValueMeta) -> Self {
+        Self {
+            depth: child.depth.saturating_add(1),
+            slots: 0,
+            string_slots: 0,
+            bytes: child.bytes,
+        }
+    }
+}
+
+/// Cached container metadata and the number of entries at the deepest level.
+///
+/// Keeping the deepest-entry count makes insertion, removal and replacement
+/// O(1). When the last deepest entry is removed or replaced, the container
+/// recomputes the depth from its current children.
+#[derive(Debug, Clone, Copy)]
+struct ContainerMeta {
+    value: ValueMeta,
+    deep_count: u32,
+}
+
+impl ContainerMeta {
+    const fn empty() -> Self {
+        Self {
+            value: ValueMeta::empty_container(),
+            deep_count: 0,
+        }
+    }
+
+    fn add(&mut self, entry: EntryMeta) {
+        self.value.slots = self.value.slots.saturating_add(entry.slots);
+        self.value.string_slots = self.value.string_slots.saturating_add(entry.string_slots);
+        self.value.bytes = self.value.bytes.saturating_add(entry.bytes);
+        self.add_depth(entry.depth);
+    }
+
+    fn remove(&mut self, entry: EntryMeta, recompute: impl FnOnce(&mut Self)) {
+        self.value.slots = self.value.slots.saturating_sub(entry.slots);
+        self.value.string_slots = self.value.string_slots.saturating_sub(entry.string_slots);
+        self.value.bytes = self.value.bytes.saturating_sub(entry.bytes);
+        if entry.depth != self.value.depth {
+            return;
+        }
+        self.deep_count = self.deep_count.saturating_sub(1);
+        if self.deep_count == 0 {
+            recompute(self);
+        }
+    }
+
+    fn replace(&mut self, old: EntryMeta, new: EntryMeta, recompute: impl FnOnce(&mut Self)) {
+        self.value.slots = self
+            .value
+            .slots
+            .saturating_sub(old.slots)
+            .saturating_add(new.slots);
+        self.value.string_slots = self
+            .value
+            .string_slots
+            .saturating_sub(old.string_slots)
+            .saturating_add(new.string_slots);
+        self.value.bytes = self
+            .value
+            .bytes
+            .saturating_sub(old.bytes)
+            .saturating_add(new.bytes);
+        if old.depth == self.value.depth {
+            if self.deep_count > 1 {
+                self.deep_count -= 1;
+            } else {
+                // The replacement is already in the container, so recomputing
+                // picks up its contribution and we must not add it again.
+                recompute(self);
+                return;
+            }
+        }
+        self.add_depth(new.depth);
+    }
+
+    fn add_depth(&mut self, depth: u16) {
+        if depth > self.value.depth {
+            self.value.depth = depth;
+            self.deep_count = 1;
+        } else if depth == self.value.depth {
+            self.deep_count = self.deep_count.saturating_add(1);
+        }
+    }
+
+    fn recompute_depth<I>(&mut self, entries: I)
+    where
+        I: IntoIterator<Item = EntryMeta>,
+    {
+        let mut depth = 1;
+        let mut count = 0;
+        for entry in entries {
+            if entry.depth > depth {
+                depth = entry.depth;
+                count = 1;
+            } else if entry.depth == depth {
+                count += 1;
+            }
+        }
+        self.value.depth = depth;
+        self.deep_count = count;
     }
 }
 
@@ -93,23 +218,17 @@ fn add_depth_meta(meta: &mut ValueMeta, deep_count: &mut u32, depth: u16) {
 #[derive(Debug, Clone)]
 pub struct SeqValue {
     items: Vec<Value>,
-    meta: ValueMeta,
-    deep_count: u32,
+    meta: ContainerMeta,
 }
 
 impl SeqValue {
     /// Build a sequence that adopts `items` and computes its metadata in place.
     pub fn new(items: Vec<Value>) -> Self {
-        let mut meta = ValueMeta::empty_container();
-        let mut deep_count = 0;
+        let mut meta = ContainerMeta::empty();
         for item in &items {
-            add_slot_meta(&mut meta, &mut deep_count, item.meta());
+            meta.add(EntryMeta::item(item.meta()));
         }
-        Self {
-            items,
-            meta,
-            deep_count,
-        }
+        Self { items, meta }
     }
 
     pub(crate) fn push(&mut self, value: Value) {
@@ -138,8 +257,7 @@ impl SeqValue {
 
     pub(crate) fn clear(&mut self) {
         self.items.clear();
-        self.meta = ValueMeta::empty_container();
-        self.deep_count = 0;
+        self.meta = ContainerMeta::empty();
     }
 
     pub(crate) fn sort_by<F>(&mut self, compare: F)
@@ -160,85 +278,22 @@ impl SeqValue {
     }
 
     pub(crate) fn note_child_replaced(&mut self, old: ValueMeta, new: ValueMeta) {
-        self.meta.slots = self
-            .meta
-            .slots
-            .saturating_sub(old.slots)
-            .saturating_add(new.slots);
-        self.meta.string_slots = self
-            .meta
-            .string_slots
-            .saturating_sub(old.string_slots)
-            .saturating_add(new.string_slots);
-        self.meta.bytes = self
-            .meta
-            .bytes
-            .saturating_sub(old.bytes)
-            .saturating_add(new.bytes);
-        self.replace_depth(1 + old.depth, 1 + new.depth);
+        let items = &self.items;
+        self.meta
+            .replace(EntryMeta::item(old), EntryMeta::item(new), |meta| {
+                meta.recompute_depth(items.iter().map(|item| EntryMeta::item(item.meta())));
+            });
     }
 
     fn add_slot(&mut self, child: ValueMeta) {
-        add_slot_meta(&mut self.meta, &mut self.deep_count, child);
+        self.meta.add(EntryMeta::item(child));
     }
 
     fn remove_slot(&mut self, child: ValueMeta) {
-        self.meta.slots = self
-            .meta
-            .slots
-            .saturating_sub(1)
-            .saturating_sub(child.slots);
-        self.meta.string_slots = self.meta.string_slots.saturating_sub(child.string_slots);
-        self.meta.bytes = self
-            .meta
-            .bytes
-            .saturating_sub(8)
-            .saturating_sub(child.bytes);
-        self.remove_depth(1 + child.depth);
-    }
-
-    fn add_depth(&mut self, depth: u16) {
-        add_depth_meta(&mut self.meta, &mut self.deep_count, depth);
-    }
-
-    fn remove_depth(&mut self, depth: u16) {
-        if depth != self.meta.depth {
-            return;
-        }
-        self.deep_count = self.deep_count.saturating_sub(1);
-        if self.deep_count == 0 {
-            self.recompute_depth();
-        }
-    }
-
-    fn replace_depth(&mut self, old: u16, new: u16) {
-        if old == self.meta.depth {
-            if self.deep_count > 1 {
-                self.deep_count -= 1;
-            } else {
-                // The replacement is already in `items`, so recomputing picks
-                // up its contribution and we must not add it again.
-                self.recompute_depth();
-                return;
-            }
-        }
-        self.add_depth(new);
-    }
-
-    fn recompute_depth(&mut self) {
-        let mut depth = 1;
-        let mut count = 0;
-        for item in &self.items {
-            let child = 1 + item.meta().depth;
-            if child > depth {
-                depth = child;
-                count = 1;
-            } else if child == depth {
-                count += 1;
-            }
-        }
-        self.meta.depth = depth;
-        self.deep_count = count;
+        let items = &self.items;
+        self.meta.remove(EntryMeta::item(child), |meta| {
+            meta.recompute_depth(items.iter().map(|item| EntryMeta::item(item.meta())));
+        });
     }
 }
 
@@ -254,35 +309,16 @@ impl Deref for SeqValue {
 #[derive(Debug, Clone)]
 pub struct MapValue {
     map: OrderedMap,
-    meta: ValueMeta,
-    deep_count: u32,
+    meta: ContainerMeta,
 }
 
 impl MapValue {
     pub fn new(map: OrderedMap) -> Self {
-        let mut meta = ValueMeta::empty_container();
-        let mut deep_count = 0u32;
+        let mut meta = ContainerMeta::empty();
         for (key, item) in map.entries() {
-            let stats = KeyStats::new(key);
-            let child = item.meta();
-            meta.slots = meta.slots.saturating_add(2 + stats.slots + child.slots);
-            meta.string_slots = meta
-                .string_slots
-                .saturating_add(stats.string_slots + child.string_slots);
-            meta.bytes = meta.bytes.saturating_add(16 + stats.bytes + child.bytes);
-            let depth = stats.entry_depth(child);
-            if depth > meta.depth {
-                meta.depth = depth;
-                deep_count = 1;
-            } else if depth == meta.depth {
-                deep_count = deep_count.saturating_add(1);
-            }
+            meta.add(EntryMeta::map(KeyStats::new(key), item.meta()));
         }
-        Self {
-            map,
-            meta,
-            deep_count,
-        }
+        Self { map, meta }
     }
 
     pub(crate) fn insert(&mut self, key: Key, value: Value) -> Option<Value> {
@@ -290,23 +326,17 @@ impl MapValue {
         let child = value.meta();
         let old = self.map.insert(key, value);
         if let Some(old_value) = &old {
-            let old_meta = old_value.meta();
-            self.meta.slots = self
-                .meta
-                .slots
-                .saturating_sub(old_meta.slots)
-                .saturating_add(child.slots);
-            self.meta.string_slots = self
-                .meta
-                .string_slots
-                .saturating_sub(old_meta.string_slots)
-                .saturating_add(child.string_slots);
-            self.meta.bytes = self
-                .meta
-                .bytes
-                .saturating_sub(old_meta.bytes)
-                .saturating_add(child.bytes);
-            self.replace_depth(stats.entry_depth(old_meta), stats.entry_depth(child));
+            let entries = self.map.iter();
+            self.meta.replace(
+                EntryMeta::map(stats, old_value.meta()),
+                EntryMeta::map(stats, child),
+                |meta| {
+                    meta.recompute_depth(
+                        entries
+                            .map(|(key, value)| EntryMeta::map(KeyStats::new(key), value.meta())),
+                    );
+                },
+            );
         } else {
             self.add_entry(stats, child);
         }
@@ -316,27 +346,19 @@ impl MapValue {
     pub(crate) fn remove_with_index(&mut self, key: &Key) -> Option<(usize, Value)> {
         let stats = KeyStats::new(key);
         let (index, value) = self.map.remove_with_index(key)?;
-        let child = value.meta();
-        self.meta.slots = self
-            .meta
-            .slots
-            .saturating_sub(2 + stats.slots + child.slots);
-        self.meta.string_slots = self
-            .meta
-            .string_slots
-            .saturating_sub(stats.string_slots + child.string_slots);
-        self.meta.bytes = self
-            .meta
-            .bytes
-            .saturating_sub(16 + stats.bytes + child.bytes);
-        self.remove_depth(stats.entry_depth(child));
+        let entries = self.map.iter();
+        self.meta
+            .remove(EntryMeta::map(stats, value.meta()), |meta| {
+                meta.recompute_depth(
+                    entries.map(|(key, value)| EntryMeta::map(KeyStats::new(key), value.meta())),
+                );
+            });
         Some((index, value))
     }
 
     pub(crate) fn clear(&mut self) {
         self.map.clear();
-        self.meta = ValueMeta::empty_container();
-        self.deep_count = 0;
+        self.meta = ContainerMeta::empty();
     }
 
     pub(crate) fn value_mut(&mut self, key: &Key) -> Option<&mut Value> {
@@ -345,87 +367,20 @@ impl MapValue {
 
     pub(crate) fn note_value_replaced(&mut self, key: &Key, old: ValueMeta, new: ValueMeta) {
         let stats = KeyStats::new(key);
-        self.meta.slots = self
-            .meta
-            .slots
-            .saturating_sub(old.slots)
-            .saturating_add(new.slots);
-        self.meta.string_slots = self
-            .meta
-            .string_slots
-            .saturating_sub(old.string_slots)
-            .saturating_add(new.string_slots);
-        self.meta.bytes = self
-            .meta
-            .bytes
-            .saturating_sub(old.bytes)
-            .saturating_add(new.bytes);
-        self.replace_depth(stats.entry_depth(old), stats.entry_depth(new));
+        let entries = self.map.iter();
+        self.meta.replace(
+            EntryMeta::map(stats, old),
+            EntryMeta::map(stats, new),
+            |meta| {
+                meta.recompute_depth(
+                    entries.map(|(key, value)| EntryMeta::map(KeyStats::new(key), value.meta())),
+                );
+            },
+        );
     }
 
     fn add_entry(&mut self, stats: KeyStats, child: ValueMeta) {
-        self.meta.slots = self
-            .meta
-            .slots
-            .saturating_add(2 + stats.slots + child.slots);
-        self.meta.string_slots = self
-            .meta
-            .string_slots
-            .saturating_add(stats.string_slots + child.string_slots);
-        self.meta.bytes = self
-            .meta
-            .bytes
-            .saturating_add(16 + stats.bytes + child.bytes);
-        self.add_depth(stats.entry_depth(child));
-    }
-
-    fn add_depth(&mut self, depth: u16) {
-        if depth > self.meta.depth {
-            self.meta.depth = depth;
-            self.deep_count = 1;
-        } else if depth == self.meta.depth {
-            self.deep_count = self.deep_count.saturating_add(1);
-        }
-    }
-
-    fn remove_depth(&mut self, depth: u16) {
-        if depth != self.meta.depth {
-            return;
-        }
-        self.deep_count = self.deep_count.saturating_sub(1);
-        if self.deep_count == 0 {
-            self.recompute_depth();
-        }
-    }
-
-    fn replace_depth(&mut self, old: u16, new: u16) {
-        if old == self.meta.depth {
-            if self.deep_count > 1 {
-                self.deep_count -= 1;
-            } else {
-                // The replacement is already in the map, so recomputing picks
-                // up its contribution and we must not add it again.
-                self.recompute_depth();
-                return;
-            }
-        }
-        self.add_depth(new);
-    }
-
-    fn recompute_depth(&mut self) {
-        let mut depth = 1;
-        let mut count = 0;
-        for (key, value) in self.map.entries() {
-            let child = KeyStats::new(key).entry_depth(value.meta());
-            if child > depth {
-                depth = child;
-                count = 1;
-            } else if child == depth {
-                count += 1;
-            }
-        }
-        self.meta.depth = depth;
-        self.deep_count = count;
+        self.meta.add(EntryMeta::map(stats, child));
     }
 }
 
@@ -464,37 +419,20 @@ impl KeyStats {
 pub struct StructValue {
     pub type_id: TypeId,
     pub fields: Vec<Value>,
-    meta: ValueMeta,
-    deep_count: u32,
+    meta: ContainerMeta,
 }
 
 impl StructValue {
     pub fn new(type_id: TypeId, fields: Vec<Value>) -> Self {
-        let mut value = Self {
+        let mut meta = ContainerMeta::empty();
+        for field in &fields {
+            meta.add(EntryMeta::item(field.meta()));
+        }
+        Self {
             type_id,
             fields,
-            meta: ValueMeta::empty_container(),
-            deep_count: 0,
-        };
-        value.meta.slots = value.fields.len() as u64;
-        value.meta.bytes = value
-            .meta
-            .bytes
-            .saturating_add(8 * value.fields.len() as u64);
-        for field in &value.fields {
-            let child = field.meta();
-            value.meta.string_slots = value.meta.string_slots.saturating_add(child.string_slots);
-            value.meta.bytes = value.meta.bytes.saturating_add(child.bytes);
-            value.meta.slots = value.meta.slots.saturating_add(child.slots);
-            let depth = 1 + child.depth;
-            if depth > value.meta.depth {
-                value.meta.depth = depth;
-                value.deep_count = 1;
-            } else if depth == value.meta.depth {
-                value.deep_count = value.deep_count.saturating_add(1);
-            }
+            meta,
         }
-        value
     }
 
     pub(crate) fn field_mut(&mut self, index: usize) -> Option<&mut Value> {
@@ -502,56 +440,11 @@ impl StructValue {
     }
 
     pub(crate) fn note_field_replaced(&mut self, old: ValueMeta, new: ValueMeta) {
-        self.meta.slots = self
-            .meta
-            .slots
-            .saturating_sub(old.slots)
-            .saturating_add(new.slots);
-        self.meta.string_slots = self
-            .meta
-            .string_slots
-            .saturating_sub(old.string_slots)
-            .saturating_add(new.string_slots);
-        self.meta.bytes = self
-            .meta
-            .bytes
-            .saturating_sub(old.bytes)
-            .saturating_add(new.bytes);
-        self.replace_depth(1 + old.depth, 1 + new.depth);
-    }
-
-    fn replace_depth(&mut self, old: u16, new: u16) {
-        if old == self.meta.depth {
-            if self.deep_count > 1 {
-                self.deep_count -= 1;
-            } else {
-                // The replacement is already in `fields`, so recomputing picks
-                // up its contribution and we must not add it again.
-                self.recompute_depth();
-                return;
-            }
-        }
-        let depth = new;
-        if depth > self.meta.depth {
-            self.meta.depth = depth;
-            self.deep_count = 1;
-        } else if depth == self.meta.depth {
-            self.deep_count = self.deep_count.saturating_add(1);
-        }
-    }
-
-    fn recompute_depth(&mut self) {
-        self.meta.depth = 1;
-        self.deep_count = 0;
-        for field in &self.fields {
-            let depth = 1 + field.meta().depth;
-            if depth > self.meta.depth {
-                self.meta.depth = depth;
-                self.deep_count = 1;
-            } else if depth == self.meta.depth {
-                self.deep_count = self.deep_count.saturating_add(1);
-            }
-        }
+        let fields = &self.fields;
+        self.meta
+            .replace(EntryMeta::item(old), EntryMeta::item(new), |meta| {
+                meta.recompute_depth(fields.iter().map(|field| EntryMeta::item(field.meta())));
+            });
     }
 }
 
@@ -565,21 +458,15 @@ pub struct EnumValue {
 
 impl EnumValue {
     pub fn new(type_id: TypeId, variant: usize, payload: Vec<Value>) -> Self {
-        let mut meta = ValueMeta::empty_container();
-        meta.slots = payload.len() as u64;
-        meta.bytes = meta.bytes.saturating_add(8 * payload.len() as u64);
+        let mut meta = ContainerMeta::empty();
         for field in &payload {
-            let child = field.meta();
-            meta.slots = meta.slots.saturating_add(child.slots);
-            meta.string_slots = meta.string_slots.saturating_add(child.string_slots);
-            meta.bytes = meta.bytes.saturating_add(child.bytes);
-            meta.depth = meta.depth.max(1 + child.depth);
+            meta.add(EntryMeta::item(field.meta()));
         }
         Self {
             type_id,
             variant,
             payload,
-            meta,
+            meta: meta.value,
         }
     }
 }
@@ -603,22 +490,16 @@ pub struct Closure {
 
 impl Closure {
     pub fn new(target: FnId, captures: Option<Rc<[Value]>>) -> Self {
-        let mut meta = ValueMeta {
-            depth: 1,
-            slots: 0,
-            string_slots: 0,
-            bytes: 16,
-        };
+        let mut meta = ContainerMeta::empty();
         if let Some(captures) = &captures {
             for value in captures.iter() {
-                meta.bytes = meta.bytes.saturating_add(value.meta().bytes);
-                meta.depth = meta.depth.max(1 + value.meta().depth);
+                meta.add(EntryMeta::capture(value.meta()));
             }
         }
         Self {
             target,
             captures,
-            meta,
+            meta: meta.value,
         }
     }
 
@@ -830,9 +711,9 @@ impl Value {
     /// Cached depth, fuel slots, and nominal bytes for this value.
     pub fn meta(&self) -> ValueMeta {
         match self {
-            Value::List(items) | Value::Tuple(items) => items.meta,
-            Value::Map(map) => map.meta,
-            Value::Struct(value) => value.meta,
+            Value::List(items) | Value::Tuple(items) => items.meta.value,
+            Value::Map(map) => map.meta.value,
+            Value::Struct(value) => value.meta.value,
             Value::Enum(value) => value.meta,
             Value::Fn(FnValue::Def(_)) => ValueMeta::leaf(),
             Value::Fn(FnValue::Closure(closure)) => closure.meta,
@@ -1028,6 +909,8 @@ fn key_nesting(key: &KeyValue) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     #[test]
@@ -1364,11 +1247,39 @@ mod tests {
     }
 
     fn assert_seq(seq: &SeqValue) {
-        assert_meta(&Value::List(Rc::new(seq.clone())));
+        let value = Value::List(Rc::new(seq.clone()));
+        assert_meta(&value);
+        let expected = reference_meta(&value);
+        let count = seq
+            .items
+            .iter()
+            .filter(|item| 1 + item.meta().depth == expected.depth)
+            .count();
+        assert_eq!(seq.meta.deep_count, count as u32);
     }
 
     fn assert_map(map: &MapValue) {
-        assert_meta(&Value::Map(Rc::new(map.clone())));
+        let value = Value::Map(Rc::new(map.clone()));
+        assert_meta(&value);
+        let expected = reference_meta(&value);
+        let count = map
+            .map
+            .iter()
+            .filter(|(key, value)| KeyStats::new(key).entry_depth(value.meta()) == expected.depth)
+            .count();
+        assert_eq!(map.meta.deep_count, count as u32);
+    }
+
+    fn assert_struct(value: &StructValue) {
+        let wrapped = Value::Struct(Rc::new(value.clone()));
+        assert_meta(&wrapped);
+        let expected = reference_meta(&wrapped);
+        let count = value
+            .fields
+            .iter()
+            .filter(|field| 1 + field.meta().depth == expected.depth)
+            .count();
+        assert_eq!(value.meta.deep_count, count as u32);
     }
 
     fn compound_value() -> Value {
@@ -1394,6 +1305,12 @@ mod tests {
                 ],
             ))),
         );
+        map.insert(
+            KeyValue::Tuple(vec![KeyValue::Tuple(vec![KeyValue::Tuple(vec![
+                KeyValue::Tuple(vec![KeyValue::Str("deep".into())]),
+            ])])]),
+            Value::Int(5),
+        );
         let captures: Rc<[Value]> = Rc::from(vec![Value::list(vec![Value::Int(3)])]);
         let closure = Value::Fn(FnValue::Closure(Rc::new(Closure::new(
             FnId(1),
@@ -1405,6 +1322,8 @@ mod tests {
                 Value::map(map),
                 Value::Result(Ok(Box::new(Value::str("hello")))),
             ]),
+            Value::list(Vec::new()),
+            Value::map(OrderedMap::new()),
             Value::Enum(Rc::new(EnumValue::new(
                 TypeId(9),
                 2,
@@ -1526,12 +1445,12 @@ mod tests {
                 Value::list(vec![Value::list(vec![Value::Int(2)])]),
             ],
         );
-        assert_meta(&Value::Struct(Rc::new(value.clone())));
+        assert_struct(&value);
         let old = value.fields[1].meta();
         *value.field_mut(1).expect("field") = Value::Int(9);
         let new = value.fields[1].meta();
         value.note_field_replaced(old, new);
-        assert_meta(&Value::Struct(Rc::new(value)));
+        assert_struct(&value);
     }
 
     #[test]
@@ -1555,5 +1474,246 @@ mod tests {
         assert_eq!(meta.slots, 2);
         assert_eq!(meta.string_slots, 2);
         assert_eq!(fuel::comparison_cost(meta.slots, meta.string_slots), 4);
+    }
+
+    fn arb_key_leaf() -> BoxedStrategy<KeyValue> {
+        prop_oneof![
+            any::<i64>().prop_map(KeyValue::Int),
+            any::<bool>().prop_map(KeyValue::Bool),
+            "[a-z]{0,6}".prop_map(KeyValue::Str),
+        ]
+        .boxed()
+    }
+
+    fn arb_value_leaf() -> BoxedStrategy<Value> {
+        prop_oneof![
+            Just(Value::Unit),
+            any::<i64>().prop_map(Value::Int),
+            any::<bool>().prop_map(Value::Bool),
+            "[a-z]{0,6}".prop_map(|text| Value::str(text)),
+        ]
+        .boxed()
+    }
+
+    fn arb_key(depth: u32) -> BoxedStrategy<KeyValue> {
+        if depth == 0 {
+            return arb_key_leaf();
+        }
+        prop_oneof![
+            4 => arb_key_leaf(),
+            2 => prop::collection::vec(arb_key(depth - 1), 0..4).prop_map(KeyValue::Tuple),
+            1 => (any::<u32>(), prop::collection::vec(arb_key(depth - 1), 0..4))
+                .prop_map(|(id, fields)| KeyValue::Struct(TypeId(id), fields)),
+            1 => (
+                any::<u32>(),
+                any::<u8>(),
+                prop::collection::vec(arb_key(depth - 1), 0..4),
+            )
+                .prop_map(|(id, variant, fields)| KeyValue::Enum(
+                    TypeId(id),
+                    variant as usize,
+                    fields,
+                )),
+            1 => prop::option::of(arb_key(depth - 1))
+                .prop_map(|inner| KeyValue::Option(inner.map(Box::new))),
+            1 => any::<bool>().prop_flat_map(move |is_ok| {
+                arb_key(depth - 1).prop_map(move |inner| {
+                    let inner = Box::new(inner);
+                    KeyValue::Result(if is_ok { Ok(inner) } else { Err(inner) })
+                })
+            }),
+        ]
+        .boxed()
+    }
+
+    fn arb_value(depth: u32) -> BoxedStrategy<Value> {
+        if depth == 0 {
+            return arb_value_leaf();
+        }
+        prop_oneof![
+            4 => arb_value_leaf(),
+            2 => prop::collection::vec(arb_value(depth - 1), 0..4).prop_map(Value::list),
+            1 => prop::collection::vec(arb_value(depth - 1), 0..4).prop_map(Value::tuple),
+            2 => prop::collection::vec((arb_key(depth - 1), arb_value(depth - 1)), 0..4)
+                .prop_map(|entries| {
+                    let mut map = OrderedMap::new();
+                    for (key, value) in entries {
+                        map.insert(key, value);
+                    }
+                    Value::map(map)
+                }),
+            1 => (any::<u32>(), prop::collection::vec(arb_value(depth - 1), 0..4)).prop_map(
+                |(id, fields)| {
+                    Value::Struct(Rc::new(StructValue::new(TypeId(id), fields)))
+                }
+            ),
+            1 => (
+                any::<u32>(),
+                any::<u8>(),
+                prop::collection::vec(arb_value(depth - 1), 0..4),
+            )
+                .prop_map(|(id, variant, payload)| {
+                    Value::Enum(Rc::new(EnumValue::new(TypeId(id), variant as usize, payload)))
+                }),
+            1 => prop::option::of(arb_value(depth - 1))
+                .prop_map(|inner| Value::Option(inner.map(Box::new))),
+            1 => any::<bool>().prop_flat_map(move |is_ok| {
+                arb_value(depth - 1).prop_map(move |inner| {
+                    let inner = Box::new(inner);
+                    Value::Result(if is_ok { Ok(inner) } else { Err(inner) })
+                })
+            }),
+            1 => prop::collection::vec(arb_value(depth - 1), 0..3).prop_map(|captures| {
+                Value::Fn(FnValue::Closure(Rc::new(Closure::new(
+                    FnId(1),
+                    Some(Rc::from(captures)),
+                ))))
+            }),
+        ]
+        .boxed()
+    }
+
+    #[derive(Debug, Clone)]
+    enum SeqOp {
+        Push(usize),
+        Insert(usize, usize),
+        Remove(usize),
+        Pop,
+        Sort,
+        Clear,
+        Replace(usize, usize),
+    }
+
+    fn arb_seq_op() -> impl Strategy<Value = SeqOp> {
+        prop_oneof![
+            any::<usize>().prop_map(SeqOp::Push),
+            (any::<usize>(), any::<usize>()).prop_map(|(index, slot)| SeqOp::Insert(index, slot)),
+            any::<usize>().prop_map(SeqOp::Remove),
+            Just(SeqOp::Pop),
+            Just(SeqOp::Sort),
+            Just(SeqOp::Clear),
+            (any::<usize>(), any::<usize>()).prop_map(|(index, slot)| SeqOp::Replace(index, slot)),
+        ]
+    }
+
+    #[derive(Debug, Clone)]
+    enum MapOp {
+        Put(usize, usize),
+        Remove(usize),
+        Replace(usize, usize),
+        Clear,
+    }
+
+    fn arb_map_op() -> impl Strategy<Value = MapOp> {
+        prop_oneof![
+            (any::<usize>(), any::<usize>()).prop_map(|(key, value)| MapOp::Put(key, value)),
+            any::<usize>().prop_map(MapOp::Remove),
+            (any::<usize>(), any::<usize>()).prop_map(|(key, value)| MapOp::Replace(key, value)),
+            Just(MapOp::Clear),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 48,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn randomized_sequence_mutations_match_recursive_reference(
+            initial in prop::collection::vec(arb_value(2), 0..5),
+            pool in prop::collection::vec(arb_value(2), 1..5),
+            ops in prop::collection::vec(arb_seq_op(), 0..50),
+        ) {
+            let mut seq = SeqValue::new(initial);
+            assert_seq(&seq);
+            for op in ops {
+                match op {
+                    SeqOp::Push(slot) => seq.push(pool[slot % pool.len()].clone()),
+                    SeqOp::Insert(index, slot) => {
+                        let index = index % (seq.len() + 1);
+                        seq.insert(index, pool[slot % pool.len()].clone());
+                    }
+                    SeqOp::Remove(index) if !seq.is_empty() => {
+                        seq.remove(index % seq.len());
+                    }
+                    SeqOp::Pop => {
+                        let _ = seq.pop();
+                    }
+                    SeqOp::Sort => seq.sort_by(|a, b| b.meta().depth.cmp(&a.meta().depth)),
+                    SeqOp::Clear => seq.clear(),
+                    SeqOp::Replace(index, slot) if !seq.is_empty() => {
+                        let index = index % seq.len();
+                        let old = seq[index].meta();
+                        *seq.slot_mut(index).expect("slot") = pool[slot % pool.len()].clone();
+                        let new = seq[index].meta();
+                        seq.note_child_replaced(old, new);
+                    }
+                    _ => {}
+                }
+                assert_seq(&seq);
+            }
+        }
+
+        #[test]
+        fn randomized_map_mutations_match_recursive_reference(
+            initial in prop::collection::vec((arb_key(2), arb_value(2)), 0..5),
+            keys in prop::collection::vec(arb_key(2), 1..5),
+            values in prop::collection::vec(arb_value(2), 1..5),
+            ops in prop::collection::vec(arb_map_op(), 0..50),
+        ) {
+            let mut map = OrderedMap::new();
+            for (key, value) in initial {
+                map.insert(key, value);
+            }
+            let mut map = MapValue::new(map);
+            assert_map(&map);
+            for op in ops {
+                match op {
+                    MapOp::Put(key_slot, value_slot) => {
+                        let _ = map.insert(
+                            keys[key_slot % keys.len()].clone(),
+                            values[value_slot % values.len()].clone(),
+                        );
+                    }
+                    MapOp::Remove(key_slot) => {
+                        let _ = map.remove_with_index(&keys[key_slot % keys.len()]);
+                    }
+                    MapOp::Replace(key_slot, value_slot) if !map.is_empty() => {
+                        let index = key_slot % map.len();
+                        let key = map.keys()[index].clone();
+                        let old = map.get(&key).expect("key").meta();
+                        *map.value_mut(&key).expect("key") =
+                            values[value_slot % values.len()].clone();
+                        let new = map.get(&key).expect("key").meta();
+                        map.note_value_replaced(&key, old, new);
+                    }
+                    MapOp::Clear => map.clear(),
+                    _ => {}
+                }
+                assert_map(&map);
+            }
+        }
+
+        #[test]
+        fn randomized_struct_mutations_match_recursive_reference(
+            initial in prop::collection::vec(arb_value(2), 0..5),
+            pool in prop::collection::vec(arb_value(2), 1..5),
+            ops in prop::collection::vec((any::<usize>(), any::<usize>()), 0..50),
+        ) {
+            let mut value = StructValue::new(TypeId(1), initial);
+            assert_struct(&value);
+            for (index, slot) in ops {
+                if value.fields.is_empty() {
+                    break;
+                }
+                let index = index % value.fields.len();
+                let old = value.fields[index].meta();
+                *value.field_mut(index).expect("field") = pool[slot % pool.len()].clone();
+                let new = value.fields[index].meta();
+                value.note_field_replaced(old, new);
+                assert_struct(&value);
+            }
+        }
     }
 }
