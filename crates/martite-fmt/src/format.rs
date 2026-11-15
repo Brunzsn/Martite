@@ -208,14 +208,7 @@ impl<'a> Formatter<'a> {
     }
 
     fn is_trailing(&self, comment: &Comment) -> bool {
-        let start = comment.span.start as usize;
-        let line_start = self.source[..start.min(self.source.len())]
-            .rfind('\n')
-            .map(|index| index + 1)
-            .unwrap_or(0);
-        self.source[line_start..start]
-            .chars()
-            .any(|ch| !ch.is_whitespace())
+        normalize::is_trailing_comment(self.source, comment)
     }
 
     fn pending_index_before(&mut self, pos: u32) -> Option<usize> {

@@ -85,9 +85,9 @@ end_of_line = "lf" # "lf" or "crlf"
 
 `[format]` is accepted as a deprecated alias for `[fmt]`. `martite fmt` formats
 `.mt` and `.mti` files in place; `--check` prints a unified diff, `--verify`
-re-parses the output and compares ASTs before writing, and `--stdin` reads one
-source file from stdin. Files with syntax errors (E001–E003) are reported and
-left untouched.
+re-parses the output and compares ASTs and comment anchors before writing, and
+`--stdin` reads one source file from stdin. Files with syntax errors (E001–E003)
+are reported and left untouched.
 
 Lint settings live in `martite.toml`:
 
