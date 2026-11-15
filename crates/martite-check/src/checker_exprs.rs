@@ -1030,17 +1030,32 @@ impl<'a> Checker<'a> {
             "print" => {
                 self.resolutions
                     .insert(expr.id, Resolution::BuiltinFn(BuiltinFnId::PRINT));
-                return Ty::Fn(vec![Ty::Param(0)], Box::new(Ty::Unit));
+                return self.builtin_fn_ty(
+                    BuiltinFnId::PRINT
+                        .def()
+                        .expect("print is in the canonical table")
+                        .sig,
+                );
             }
             "panic" => {
                 self.resolutions
                     .insert(expr.id, Resolution::BuiltinFn(BuiltinFnId::PANIC));
-                return Ty::Fn(vec![Ty::Str], Box::new(Ty::Never));
+                return self.builtin_fn_ty(
+                    BuiltinFnId::PANIC
+                        .def()
+                        .expect("panic is in the canonical table")
+                        .sig,
+                );
             }
             "assert" => {
                 self.resolutions
                     .insert(expr.id, Resolution::BuiltinFn(BuiltinFnId::ASSERT));
-                return Ty::Fn(vec![Ty::Bool, Ty::Str], Box::new(Ty::Unit));
+                return self.builtin_fn_ty(
+                    BuiltinFnId::ASSERT
+                        .def()
+                        .expect("assert is in the canonical table")
+                        .sig,
+                );
             }
             "Some" | "Ok" | "Err" => {
                 self.resolutions.insert(
@@ -1061,32 +1076,32 @@ impl<'a> Checker<'a> {
     }
 
     fn builtin_item_ty(&self, item: &BuiltinItem) -> Ty {
-        match (item.module, item.name) {
-            ("std.math", "PI") | ("std.math", "EULER") => Ty::Float,
-            ("std.math", "min" | "max") => {
-                Ty::Fn(vec![Ty::Param(0), Ty::Param(0)], Box::new(Ty::Param(0)))
+        self.builtin_ty(item.def().ty)
+    }
+
+    fn builtin_fn_ty(&self, sig: BuiltinFnSig) -> Ty {
+        Ty::Fn(
+            sig.params.iter().map(|param| self.builtin_ty(*param)).collect(),
+            Box::new(self.builtin_ty(sig.ret)),
+        )
+    }
+
+    fn builtin_ty(&self, ty: BuiltinTy) -> Ty {
+        match ty {
+            BuiltinTy::Unit => Ty::Unit,
+            BuiltinTy::Bool => Ty::Bool,
+            BuiltinTy::Int => Ty::Int,
+            BuiltinTy::Float => Ty::Float,
+            BuiltinTy::Str => Ty::Str,
+            BuiltinTy::Never => Ty::Never,
+            BuiltinTy::Json => Ty::Named(self.json_type.unwrap_or(TypeId(0)), Vec::new()),
+            BuiltinTy::Param(index) => Ty::Param(u32::from(index)),
+            BuiltinTy::List(item) => Ty::list(self.builtin_ty(*item)),
+            BuiltinTy::Option(item) => Ty::option(self.builtin_ty(*item)),
+            BuiltinTy::Result(ok, err) => {
+                Ty::Result(Box::new(self.builtin_ty(*ok)), Box::new(self.builtin_ty(*err)))
             }
-            ("std.math", "clamp") => Ty::Fn(
-                vec![Ty::Param(0), Ty::Param(0), Ty::Param(0)],
-                Box::new(Ty::Param(0)),
-            ),
-            ("std.math", "sin" | "cos" | "tan" | "exp" | "ln" | "log10") => {
-                Ty::Fn(vec![Ty::Float], Box::new(Ty::Float))
-            }
-            ("std.math", "atan2") => Ty::Fn(vec![Ty::Float, Ty::Float], Box::new(Ty::Float)),
-            ("std.json", "parse") => Ty::Fn(
-                vec![Ty::Str],
-                Box::new(Ty::Result(
-                    Box::new(Ty::Named(self.json_type.unwrap_or(TypeId(0)), Vec::new())),
-                    Box::new(Ty::Str),
-                )),
-            ),
-            ("std.json", "stringify") => Ty::Fn(
-                vec![Ty::Named(self.json_type.unwrap_or(TypeId(0)), Vec::new())],
-                Box::new(Ty::Str),
-            ),
-            ("std.json", "Json") => Ty::Named(self.json_type.unwrap_or(TypeId(0)), Vec::new()),
-            _ => Ty::Error,
+            BuiltinTy::Fn(sig) => self.builtin_fn_ty(*sig),
         }
     }
 
@@ -1133,7 +1148,7 @@ impl<'a> Checker<'a> {
                     }
                 }
                 if let Some(item) = symbols.builtin_items.get(base_name).copied() {
-                    if item.name == "Json" {
+                    if item.id == martite_builtin::BuiltinItemId::JSON {
                         let id = self.json_type.unwrap_or(TypeId(0));
                         let result = self.resolve_type_field(expr, id, name, expected, infer);
                         return self.record_field(expr, result);
@@ -2221,35 +2236,19 @@ impl<'a> Checker<'a> {
         expected: Option<&Ty>,
         infer: &mut Infer,
     ) -> Ty {
-        match (item.module, item.name) {
-            ("std.math", "min" | "max") => {
-                self.check_generic_ord_call(expr, args, expected, infer, 2)
+        let def = item.def();
+        let Some(sig) = def.ty.fn_sig() else {
+            return Ty::Error;
+        };
+        match def.generics {
+            BuiltinGenerics::SameOrd => {
+                self.check_generic_ord_call(expr, args, expected, infer, sig.params.len())
             }
-            ("std.math", "clamp") => {
-                self.check_generic_ord_call(expr, args, expected, infer, 3)
+            BuiltinGenerics::None => {
+                let params: Vec<Ty> = sig.params.iter().map(|param| self.builtin_ty(*param)).collect();
+                self.check_fixed_args(expr, args, &params, infer);
+                self.builtin_ty(sig.ret)
             }
-            ("std.math", "atan2") => {
-                self.check_fixed_args(expr, args, &[Ty::Float, Ty::Float], infer);
-                Ty::Float
-            }
-            (
-                "std.math",
-                "sin" | "cos" | "tan" | "exp" | "ln" | "log10",
-            ) => {
-                self.check_fixed_args(expr, args, &[Ty::Float], infer);
-                Ty::Float
-            }
-            ("std.json", "parse") => {
-                self.check_fixed_args(expr, args, &[Ty::Str], infer);
-                let json = Ty::Named(self.json_type.unwrap_or(TypeId(0)), Vec::new());
-                Ty::Result(Box::new(json), Box::new(Ty::Str))
-            }
-            ("std.json", "stringify") => {
-                let json = Ty::Named(self.json_type.unwrap_or(TypeId(0)), Vec::new());
-                self.check_fixed_args(expr, args, &[json], infer);
-                Ty::Str
-            }
-            _ => Ty::Error,
         }
     }
 

@@ -452,7 +452,7 @@ impl TypeResolver<'_> {
                     }
                     _ => {
                         if let Some(item) = symbols.builtin_items.get(name) {
-                            if item.module == "std.json" && item.name == "Json" {
+                            if item.id == martite_builtin::BuiltinItemId::JSON {
                                 let id = self.builtin_json.ok_or("Json is unavailable")?;
                                 return Ok(Ty::Named(id, Vec::new()));
                             }

@@ -17,7 +17,9 @@ use martite_base::{SourceId, Span};
 use crate::analysis::{
     DefiniteAssignment, check_slot_initialization, pattern_binding_set, pattern_binds_irrefutably,
 };
-use crate::builtin::{BuiltinEffects, BuiltinMethodDef, BuiltinReceiver};
+use crate::builtin::{
+    BuiltinEffects, BuiltinGenerics, BuiltinMethodDef, BuiltinReceiver, BuiltinTy,
+};
 use crate::charge::Charge;
 use crate::effects::Effects;
 use crate::id::{
@@ -4236,33 +4238,38 @@ impl<'p> FnCheck<'p> {
                 },
             ));
         };
-        let result = match def.name {
-            "print" => {
-                self.check_child_count(first_arg, 1, "print")?;
-                let child = self.function.children[first_arg as usize];
-                self.check_arg(child, false, 0)?;
-                Ty::Unit
-            }
-            "panic" => {
-                self.check_plain_args(first_arg, &[Ty::Str], "panic")?;
-                Ty::Never
-            }
-            "assert" => {
-                self.check_plain_args(first_arg, &[Ty::Bool, Ty::Str], "assert")?;
-                Ty::Unit
-            }
-            _ => {
+        let sig = def.sig;
+        self.check_child_count(
+            first_arg,
+            sig.params.len() as u32,
+            "builtin function arguments",
+        )?;
+        let mut subst = Vec::new();
+        for (index, param) in sig.params.iter().enumerate() {
+            let child = self.function.children[first_arg as usize + index];
+            let (actual, _) = self.check_arg(child, false, index as u32)?;
+            if !self.match_builtin(*param, actual, &mut subst)? {
                 return Err(self.error(
-                    None,
-                    VerifyErrorKind::Builtin {
-                        id: builtin.0,
-                        context: "unknown builtin function",
+                    Some(child),
+                    VerifyErrorKind::TypeMismatch {
+                        expected: Box::new(self.builtin_expected_ty(*param)),
+                        found: Box::new(self.ty(actual)?),
+                        context: "builtin function argument",
                     },
                 ));
             }
-        };
-        self.expect_ty_value(node_ty, &result, "builtin function result")?;
-        Ok(result)
+        }
+        if !self.match_builtin(sig.ret, node_ty, &mut subst)? {
+            return Err(self.error(
+                None,
+                VerifyErrorKind::TypeMismatch {
+                    expected: Box::new(self.builtin_expected_ty(sig.ret)),
+                    found: Box::new(self.ty(node_ty)?),
+                    context: "builtin function result",
+                },
+            ));
+        }
+        self.ty(node_ty)
     }
 
     fn check_builtin_item_call(
@@ -4280,101 +4287,78 @@ impl<'p> FnCheck<'p> {
                 },
             ));
         };
-        match (def.module, def.name) {
-            ("std.math", "min" | "max") => {
-                let args = self.check_any_args(first_arg, 2, "math min/max")?;
-                let first = self.ty(args[0])?;
-                let second = self.ty(args[1])?;
-                if !type_accepts_owned(self.program, &second, &first)? {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(first.clone()),
-                            found: Box::new(second),
-                            context: "math min/max arguments",
-                        },
-                    ));
-                }
-                self.expect_ty_value(node_ty, &first, "math min/max result")?;
-                Ok(first)
-            }
-            ("std.math", "clamp") => {
-                let args = self.check_any_args(first_arg, 3, "math clamp")?;
-                let first = self.ty(args[0])?;
-                for arg in &args[1..] {
-                    if !type_accepts_owned(self.program, &self.ty(*arg)?, &first)? {
-                        return Err(self.error(
-                            None,
-                            VerifyErrorKind::TypeMismatch {
-                                expected: Box::new(first.clone()),
-                                found: Box::new(self.ty(*arg)?),
-                                context: "math clamp arguments",
-                            },
-                        ));
-                    }
-                }
-                self.expect_ty_value(node_ty, &first, "math clamp result")?;
-                Ok(first)
-            }
-            ("std.math", "atan2") => {
-                self.check_plain_args(first_arg, &[Ty::Float, Ty::Float], "math atan2")?;
-                self.expect_ty_value(node_ty, &Ty::Float, "math atan2 result")?;
-                Ok(Ty::Float)
-            }
-            ("std.math", "sin" | "cos" | "tan" | "exp" | "ln" | "log10") => {
-                self.check_plain_args(first_arg, &[Ty::Float], "math function")?;
-                self.expect_ty_value(node_ty, &Ty::Float, "math result")?;
-                Ok(Ty::Float)
-            }
-            ("std.json", "parse") => {
-                self.check_plain_args(first_arg, &[Ty::Str], "json parse")?;
-                let ty = self.ty(node_ty)?;
-                let Ty::Result(ok, err) = &ty else {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Result(node_ty, node_ty)),
-                            found: Box::new(ty),
-                            context: "json parse result",
-                        },
-                    ));
-                };
-                if !type_accepts_owned(self.program, &self.ty(*ok)?, &self.json_ty())?
-                    || !type_accepts_owned(self.program, &self.ty(*err)?, &Ty::Str)?
-                {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Result(node_ty, node_ty)),
-                            found: Box::new(ty),
-                            context: "json parse result",
-                        },
-                    ));
-                }
-                Ok(ty)
-            }
-            ("std.json", "stringify") => {
-                self.check_plain_args(first_arg, &[self.json_ty()], "json stringify")?;
-                self.expect_ty_value(node_ty, &Ty::Str, "json stringify result")?;
-                Ok(Ty::Str)
-            }
-            ("std.json", "Json") | ("std.math", "PI" | "EULER") => Err(self.error(
+        let Some(sig) = def.ty.fn_sig() else {
+            return Err(self.error(
                 None,
                 VerifyErrorKind::Builtin {
                     id: item.0,
                     context: "item is not callable",
                 },
-            )),
-            _ => Err(self.error(
+            ));
+        };
+        let values =
+            self.check_any_args(first_arg, sig.params.len() as u32, "builtin item arguments")?;
+        let mut subst = Vec::new();
+        match def.generics {
+            BuiltinGenerics::SameOrd => {
+                let Some(pattern) = sig.params.first().copied() else {
+                    return Err(self.error(
+                        None,
+                        VerifyErrorKind::Arity {
+                            expected: 1,
+                            found: 0,
+                            context: "builtin item arguments",
+                        },
+                    ));
+                };
+                for (index, value) in values.iter().enumerate() {
+                    if !self.match_builtin(pattern, *value, &mut subst)? {
+                        let child = self.function.children[first_arg as usize + index];
+                        return Err(self.error(
+                            Some(child),
+                            VerifyErrorKind::TypeMismatch {
+                                expected: Box::new(self.builtin_expected_ty(pattern)),
+                                found: Box::new(self.ty(*value)?),
+                                context: "builtin item arguments",
+                            },
+                        ));
+                    }
+                }
+            }
+            BuiltinGenerics::None => {
+                for (index, param) in sig.params.iter().enumerate() {
+                    let value = values[index];
+                    if !self.match_builtin(*param, value, &mut subst)? {
+                        let child = self.function.children[first_arg as usize + index];
+                        return Err(self.error(
+                            Some(child),
+                            VerifyErrorKind::TypeMismatch {
+                                expected: Box::new(self.builtin_expected_ty(*param)),
+                                found: Box::new(self.ty(value)?),
+                                context: "builtin item arguments",
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        if !self.match_builtin(sig.ret, node_ty, &mut subst)? {
+            return Err(self.error(
                 None,
-                VerifyErrorKind::Builtin {
-                    id: item.0,
-                    context: "unknown builtin module item",
+                VerifyErrorKind::TypeMismatch {
+                    expected: Box::new(self.builtin_expected_ty(sig.ret)),
+                    found: Box::new(self.ty(node_ty)?),
+                    context: "builtin item result",
                 },
-            )),
+            ));
+        }
+        if def.generics == BuiltinGenerics::SameOrd {
+            let first = values.first().copied().unwrap_or(node_ty);
+            self.ty(first)
+        } else {
+            self.ty(node_ty)
         }
     }
-
     fn check_host_call(
         &mut self,
         host: HostId,
@@ -4575,6 +4559,105 @@ impl<'p> FnCheck<'p> {
         Ok(ty)
     }
 
+    fn builtin_expected_ty(&self, pattern: BuiltinTy) -> Ty {
+        match pattern {
+            BuiltinTy::Unit => Ty::Unit,
+            BuiltinTy::Bool => Ty::Bool,
+            BuiltinTy::Int => Ty::Int,
+            BuiltinTy::Float => Ty::Float,
+            BuiltinTy::Str => Ty::Str,
+            BuiltinTy::Never => Ty::Never,
+            BuiltinTy::Json => self.json_ty(),
+            BuiltinTy::Param(index) => Ty::Param(u32::from(index)),
+            BuiltinTy::List(item) => self
+                .find_ty(&self.builtin_expected_ty(*item))
+                .map(Ty::List)
+                .unwrap_or(Ty::Unit),
+            BuiltinTy::Option(item) => self
+                .find_ty(&self.builtin_expected_ty(*item))
+                .map(Ty::Option)
+                .unwrap_or(Ty::Unit),
+            BuiltinTy::Result(ok, err) => {
+                let Ok(ok) = self.find_ty(&self.builtin_expected_ty(*ok)) else {
+                    return Ty::Unit;
+                };
+                let Ok(err) = self.find_ty(&self.builtin_expected_ty(*err)) else {
+                    return Ty::Unit;
+                };
+                Ty::Result(ok, err)
+            }
+            BuiltinTy::Fn(sig) => {
+                let params: Vec<TyId> = sig
+                    .params
+                    .iter()
+                    .map(|param| self.find_ty(&self.builtin_expected_ty(*param)))
+                    .collect::<Result<_, _>>()
+                    .unwrap_or_default();
+                let Ok(ret) = self.find_ty(&self.builtin_expected_ty(sig.ret)) else {
+                    return Ty::Unit;
+                };
+                Ty::Fn(params, ret)
+            }
+        }
+    }
+
+    fn match_builtin(
+        &self,
+        pattern: BuiltinTy,
+        actual: TyId,
+        subst: &mut Vec<Option<TyId>>,
+    ) -> Result<bool, VerifyError> {
+        if matches!(pattern, BuiltinTy::Never) {
+            return Ok(true);
+        }
+        let actual_ty = self.ty(actual)?;
+        if matches!(actual_ty, Ty::Never) {
+            return Ok(true);
+        }
+        if matches!(pattern, BuiltinTy::Json) {
+            return type_accepts_owned(self.program, &actual_ty, &self.json_ty());
+        }
+        match (pattern, &actual_ty) {
+            (BuiltinTy::Param(index), _) => {
+                let index = index as usize;
+                if subst.len() <= index {
+                    subst.resize(index + 1, None);
+                }
+                match subst[index] {
+                    Some(bound) => type_accepts_owned(self.program, &actual_ty, &self.ty(bound)?),
+                    None => {
+                        subst[index] = Some(actual);
+                        Ok(true)
+                    }
+                }
+            }
+            (BuiltinTy::Unit, Ty::Unit)
+            | (BuiltinTy::Bool, Ty::Bool)
+            | (BuiltinTy::Int, Ty::Int)
+            | (BuiltinTy::Float, Ty::Float)
+            | (BuiltinTy::Str, Ty::Str) => Ok(true),
+            (BuiltinTy::List(item), Ty::List(actual_item))
+            | (BuiltinTy::Option(item), Ty::Option(actual_item)) => {
+                self.match_builtin(*item, *actual_item, subst)
+            }
+            (BuiltinTy::Result(ok, err), Ty::Result(actual_ok, actual_err)) => Ok(self
+                .match_builtin(*ok, *actual_ok, subst)?
+                && self.match_builtin(*err, *actual_err, subst)?),
+            (BuiltinTy::Fn(sig), Ty::Fn(actual_params, actual_ret)) => {
+                if sig.params.len() != actual_params.len() {
+                    return Ok(false);
+                }
+                for (pattern, actual) in sig.params.iter().zip(actual_params) {
+                    if !self.match_builtin(*pattern, *actual, subst)? {
+                        return Ok(false);
+                    }
+                }
+                self.match_builtin(sig.ret, *actual_ret, subst)
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn builtin_fn_type(&self, builtin: BuiltinFnId, node_ty: TyId) -> Result<Ty, VerifyError> {
         let Some(def) = builtin.def() else {
             return Err(self.error(
@@ -4585,74 +4668,17 @@ impl<'p> FnCheck<'p> {
                 },
             ));
         };
-        let ty = self.ty(node_ty)?;
-        let Ty::Fn(params, ret) = &ty else {
+        if !self.match_builtin(BuiltinTy::Fn(&def.sig), node_ty, &mut Vec::new())? {
             return Err(self.error(
                 None,
                 VerifyErrorKind::TypeMismatch {
-                    expected: Box::new(Ty::Fn(Vec::new(), node_ty)),
-                    found: Box::new(ty),
+                    expected: Box::new(self.builtin_expected_ty(BuiltinTy::Fn(&def.sig))),
+                    found: Box::new(self.ty(node_ty)?),
                     context: "builtin function value",
                 },
             ));
-        };
-        match def.name {
-            "print" => {
-                if params.len() != 1
-                    || !type_accepts_owned(self.program, &self.ty(*ret)?, &Ty::Unit)?
-                {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Fn(vec![node_ty], node_ty)),
-                            found: Box::new(ty),
-                            context: "print function value",
-                        },
-                    ));
-                }
-            }
-            "panic" => {
-                if params.len() != 1
-                    || !type_accepts_owned(self.program, &self.ty(params[0])?, &Ty::Str)?
-                    || !type_accepts_owned(self.program, &self.ty(*ret)?, &Ty::Never)?
-                {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Fn(vec![node_ty], node_ty)),
-                            found: Box::new(ty),
-                            context: "panic function value",
-                        },
-                    ));
-                }
-            }
-            "assert" => {
-                if params.len() != 2
-                    || !type_accepts_owned(self.program, &self.ty(params[0])?, &Ty::Bool)?
-                    || !type_accepts_owned(self.program, &self.ty(params[1])?, &Ty::Str)?
-                    || !type_accepts_owned(self.program, &self.ty(*ret)?, &Ty::Unit)?
-                {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Fn(vec![node_ty], node_ty)),
-                            found: Box::new(ty),
-                            context: "assert function value",
-                        },
-                    ));
-                }
-            }
-            _ => {
-                return Err(self.error(
-                    None,
-                    VerifyErrorKind::Builtin {
-                        id: builtin.0,
-                        context: "unknown builtin function",
-                    },
-                ));
-            }
         }
-        Ok(ty)
+        self.ty(node_ty)
     }
 
     fn builtin_item_type(&self, item: BuiltinItemId, node_ty: TyId) -> Result<Ty, VerifyError> {
@@ -4665,225 +4691,18 @@ impl<'p> FnCheck<'p> {
                 },
             ));
         };
-        let ty = self.ty(node_ty)?;
-        match (def.module, def.name) {
-            ("std.math", "PI" | "EULER") => {
-                if !type_accepts_owned(self.program, &ty, &Ty::Float)? {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Float),
-                            found: Box::new(ty),
-                            context: "math constant",
-                        },
-                    ));
-                }
-                Ok(ty)
-            }
-            ("std.math", "min" | "max") => {
-                let Ty::Fn(params, ret) = &ty else {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Fn(Vec::new(), node_ty)),
-                            found: Box::new(ty),
-                            context: "math function value",
-                        },
-                    ));
-                };
-                if params.len() != 2
-                    || !type_accepts_owned(
-                        self.program,
-                        &self.ty(params[0])?,
-                        &self.ty(params[1])?,
-                    )?
-                    || !type_accepts_owned(self.program, &self.ty(*ret)?, &self.ty(params[0])?)?
-                {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Fn(Vec::new(), node_ty)),
-                            found: Box::new(ty),
-                            context: "math function value",
-                        },
-                    ));
-                }
-                Ok(ty)
-            }
-            ("std.math", "clamp") => {
-                let Ty::Fn(params, ret) = &ty else {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Fn(Vec::new(), node_ty)),
-                            found: Box::new(ty),
-                            context: "math clamp value",
-                        },
-                    ));
-                };
-                if params.len() != 3
-                    || !type_accepts_owned(
-                        self.program,
-                        &self.ty(params[0])?,
-                        &self.ty(params[1])?,
-                    )?
-                    || !type_accepts_owned(
-                        self.program,
-                        &self.ty(params[0])?,
-                        &self.ty(params[2])?,
-                    )?
-                    || !type_accepts_owned(self.program, &self.ty(*ret)?, &self.ty(params[0])?)?
-                {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Fn(Vec::new(), node_ty)),
-                            found: Box::new(ty),
-                            context: "math clamp value",
-                        },
-                    ));
-                }
-                Ok(ty)
-            }
-            ("std.math", "sin" | "cos" | "tan" | "exp" | "ln" | "log10") => {
-                let Ty::Fn(params, ret) = &ty else {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Fn(Vec::new(), node_ty)),
-                            found: Box::new(ty),
-                            context: "math function value",
-                        },
-                    ));
-                };
-                if params.len() != 1
-                    || !type_accepts_owned(self.program, &self.ty(params[0])?, &Ty::Float)?
-                    || !type_accepts_owned(self.program, &self.ty(*ret)?, &Ty::Float)?
-                {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Fn(Vec::new(), node_ty)),
-                            found: Box::new(ty),
-                            context: "math function value",
-                        },
-                    ));
-                }
-                Ok(ty)
-            }
-            ("std.math", "atan2") => {
-                let Ty::Fn(params, ret) = &ty else {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Fn(Vec::new(), node_ty)),
-                            found: Box::new(ty),
-                            context: "math atan2 value",
-                        },
-                    ));
-                };
-                if params.len() != 2
-                    || !type_accepts_owned(self.program, &self.ty(params[0])?, &Ty::Float)?
-                    || !type_accepts_owned(self.program, &self.ty(params[1])?, &Ty::Float)?
-                    || !type_accepts_owned(self.program, &self.ty(*ret)?, &Ty::Float)?
-                {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Fn(Vec::new(), node_ty)),
-                            found: Box::new(ty),
-                            context: "math atan2 value",
-                        },
-                    ));
-                }
-                Ok(ty)
-            }
-            ("std.json", "Json") => {
-                if !type_accepts_owned(self.program, &ty, &self.json_ty())? {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(self.json_ty()),
-                            found: Box::new(ty),
-                            context: "json type value",
-                        },
-                    ));
-                }
-                Ok(ty)
-            }
-            ("std.json", "parse") => {
-                let Ty::Fn(params, ret) = &ty else {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Fn(Vec::new(), node_ty)),
-                            found: Box::new(ty),
-                            context: "json parse value",
-                        },
-                    ));
-                };
-                let Ty::Result(ok, err) = self.ty(*ret)? else {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Result(node_ty, node_ty)),
-                            found: Box::new(self.ty(*ret)?),
-                            context: "json parse value",
-                        },
-                    ));
-                };
-                if params.len() != 1
-                    || !type_accepts_owned(self.program, &self.ty(params[0])?, &Ty::Str)?
-                    || !type_accepts_owned(self.program, &self.ty(ok)?, &self.json_ty())?
-                    || !type_accepts_owned(self.program, &self.ty(err)?, &Ty::Str)?
-                {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Fn(Vec::new(), node_ty)),
-                            found: Box::new(ty),
-                            context: "json parse value",
-                        },
-                    ));
-                }
-                Ok(ty)
-            }
-            ("std.json", "stringify") => {
-                let Ty::Fn(params, ret) = &ty else {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Fn(Vec::new(), node_ty)),
-                            found: Box::new(ty),
-                            context: "json stringify value",
-                        },
-                    ));
-                };
-                if params.len() != 1
-                    || !type_accepts_owned(self.program, &self.ty(params[0])?, &self.json_ty())?
-                    || !type_accepts_owned(self.program, &self.ty(*ret)?, &Ty::Str)?
-                {
-                    return Err(self.error(
-                        None,
-                        VerifyErrorKind::TypeMismatch {
-                            expected: Box::new(Ty::Fn(Vec::new(), node_ty)),
-                            found: Box::new(ty),
-                            context: "json stringify value",
-                        },
-                    ));
-                }
-                Ok(ty)
-            }
-            _ => Err(self.error(
+        if !self.match_builtin(def.ty, node_ty, &mut Vec::new())? {
+            return Err(self.error(
                 None,
-                VerifyErrorKind::Builtin {
-                    id: item.0,
-                    context: "unknown builtin module item",
+                VerifyErrorKind::TypeMismatch {
+                    expected: Box::new(self.builtin_expected_ty(def.ty)),
+                    found: Box::new(self.ty(node_ty)?),
+                    context: "builtin module item value",
                 },
-            )),
+            ));
         }
+        self.ty(node_ty)
     }
-
     fn check_any_args(
         &mut self,
         first_arg: u32,
