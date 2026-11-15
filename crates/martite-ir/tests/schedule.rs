@@ -503,18 +503,18 @@ fn main() {
                 )
                 || matches!(
                     node.kind,
-                    NodeKind::CallBuiltinFn { builtin, .. } if builtin == BuiltinFnId::PRINT
+                    NodeKind::CallBuiltinFn { builtin, .. }
+                        if builtin.def().is_some_and(|def| def.safepoint)
                 )
                 || matches!(
                     node.kind,
                     NodeKind::CallBuiltinMethod { method, .. }
-                        if method
-                            .def()
-                            .is_some_and(|def| matches!(def.name, "sorted" | "sorted_by" | "sort"))
+                        if method.def().is_some_and(|def| def.safepoint)
                 )
                 || matches!(
                     node.kind,
-                    NodeKind::CallBuiltinModule { item, .. } if item == BuiltinItemId::JSON_PARSE
+                    NodeKind::CallBuiltinModule { item, .. }
+                        if item.item().is_some_and(|def| def.safepoint)
                 );
             assert_eq!(
                 function.is_safepoint(id),

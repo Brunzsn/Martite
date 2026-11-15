@@ -5,11 +5,7 @@ enum FieldKind {
     StructField(usize),
     TupleField(u32),
     Method(DefId),
-    BuiltinMethod {
-        receiver: BuiltinReceiver,
-        name: &'static str,
-        mut_self: bool,
-    },
+    BuiltinMethod { method: BuiltinMethodId },
     Variant(TypeId, usize),
     ModuleItem(DefId),
     BuiltinItem(BuiltinItem),
@@ -1033,18 +1029,33 @@ impl<'a> Checker<'a> {
         match name {
             "print" => {
                 self.resolutions
-                    .insert(expr.id, Resolution::BuiltinFn(BuiltinFn::Print));
-                return Ty::Fn(vec![Ty::Param(0)], Box::new(Ty::Unit));
+                    .insert(expr.id, Resolution::BuiltinFn(BuiltinFnId::PRINT));
+                return self.builtin_fn_ty(
+                    BuiltinFnId::PRINT
+                        .def()
+                        .expect("print is in the canonical table")
+                        .sig,
+                );
             }
             "panic" => {
                 self.resolutions
-                    .insert(expr.id, Resolution::BuiltinFn(BuiltinFn::Panic));
-                return Ty::Fn(vec![Ty::Str], Box::new(Ty::Never));
+                    .insert(expr.id, Resolution::BuiltinFn(BuiltinFnId::PANIC));
+                return self.builtin_fn_ty(
+                    BuiltinFnId::PANIC
+                        .def()
+                        .expect("panic is in the canonical table")
+                        .sig,
+                );
             }
             "assert" => {
                 self.resolutions
-                    .insert(expr.id, Resolution::BuiltinFn(BuiltinFn::Assert));
-                return Ty::Fn(vec![Ty::Bool, Ty::Str], Box::new(Ty::Unit));
+                    .insert(expr.id, Resolution::BuiltinFn(BuiltinFnId::ASSERT));
+                return self.builtin_fn_ty(
+                    BuiltinFnId::ASSERT
+                        .def()
+                        .expect("assert is in the canonical table")
+                        .sig,
+                );
             }
             "Some" | "Ok" | "Err" => {
                 self.resolutions.insert(
@@ -1065,32 +1076,32 @@ impl<'a> Checker<'a> {
     }
 
     fn builtin_item_ty(&self, item: &BuiltinItem) -> Ty {
-        match (item.module, item.name) {
-            ("std.math", "PI") | ("std.math", "EULER") => Ty::Float,
-            ("std.math", "min" | "max") => {
-                Ty::Fn(vec![Ty::Param(0), Ty::Param(0)], Box::new(Ty::Param(0)))
+        self.builtin_ty(item.def().ty)
+    }
+
+    fn builtin_fn_ty(&self, sig: BuiltinFnSig) -> Ty {
+        Ty::Fn(
+            sig.params.iter().map(|param| self.builtin_ty(*param)).collect(),
+            Box::new(self.builtin_ty(sig.ret)),
+        )
+    }
+
+    fn builtin_ty(&self, ty: BuiltinTy) -> Ty {
+        match ty {
+            BuiltinTy::Unit => Ty::Unit,
+            BuiltinTy::Bool => Ty::Bool,
+            BuiltinTy::Int => Ty::Int,
+            BuiltinTy::Float => Ty::Float,
+            BuiltinTy::Str => Ty::Str,
+            BuiltinTy::Never => Ty::Never,
+            BuiltinTy::Json => Ty::Named(self.json_type.unwrap_or(TypeId(0)), Vec::new()),
+            BuiltinTy::Param(index) => Ty::Param(u32::from(index)),
+            BuiltinTy::List(item) => Ty::list(self.builtin_ty(*item)),
+            BuiltinTy::Option(item) => Ty::option(self.builtin_ty(*item)),
+            BuiltinTy::Result(ok, err) => {
+                Ty::Result(Box::new(self.builtin_ty(*ok)), Box::new(self.builtin_ty(*err)))
             }
-            ("std.math", "clamp") => Ty::Fn(
-                vec![Ty::Param(0), Ty::Param(0), Ty::Param(0)],
-                Box::new(Ty::Param(0)),
-            ),
-            ("std.math", "sin" | "cos" | "tan" | "exp" | "ln" | "log10") => {
-                Ty::Fn(vec![Ty::Float], Box::new(Ty::Float))
-            }
-            ("std.math", "atan2") => Ty::Fn(vec![Ty::Float, Ty::Float], Box::new(Ty::Float)),
-            ("std.json", "parse") => Ty::Fn(
-                vec![Ty::Str],
-                Box::new(Ty::Result(
-                    Box::new(Ty::Named(self.json_type.unwrap_or(TypeId(0)), Vec::new())),
-                    Box::new(Ty::Str),
-                )),
-            ),
-            ("std.json", "stringify") => Ty::Fn(
-                vec![Ty::Named(self.json_type.unwrap_or(TypeId(0)), Vec::new())],
-                Box::new(Ty::Str),
-            ),
-            ("std.json", "Json") => Ty::Named(self.json_type.unwrap_or(TypeId(0)), Vec::new()),
-            _ => Ty::Error,
+            BuiltinTy::Fn(sig) => self.builtin_fn_ty(*sig),
         }
     }
 
@@ -1137,7 +1148,7 @@ impl<'a> Checker<'a> {
                     }
                 }
                 if let Some(item) = symbols.builtin_items.get(base_name).copied() {
-                    if item.name == "Json" {
+                    if item.id == martite_builtin::BuiltinItemId::JSON {
                         let id = self.json_type.unwrap_or(TypeId(0));
                         let result = self.resolve_type_field(expr, id, name, expected, infer);
                         return self.record_field(expr, result);
@@ -1166,15 +1177,10 @@ impl<'a> Checker<'a> {
             FieldKind::Method(def) => {
                 self.resolutions.insert(expr.id, Resolution::Method(*def));
             }
-            FieldKind::BuiltinMethod {
-                receiver, name, ..
-            } => {
+            FieldKind::BuiltinMethod { method } => {
                 self.resolutions.insert(
                     expr.id,
-                    Resolution::BuiltinMethod {
-                        receiver: *receiver,
-                        name: *name,
-                    },
+                    Resolution::BuiltinMethod { method: *method },
                 );
             }
             FieldKind::Variant(id, index) => {
@@ -1494,17 +1500,13 @@ impl<'a> Checker<'a> {
                             kind: FieldKind::Value,
                         };
                     };
-                    if let Some(info) = builtin_method_info(receiver, name) {
+                    if let Some(method) = BuiltinMethodId::lookup(receiver, name) {
                         let _ = infer;
                         return FieldResult {
                             // Methods are not first-class values; the call
                             // checker uses the field kind directly.
                             ty: Ty::Error,
-                            kind: FieldKind::BuiltinMethod {
-                                receiver,
-                                name: info.name,
-                                mut_self: info.mut_self,
-                            },
+                            kind: FieldKind::BuiltinMethod { method },
                         };
                     }
                     let module = self.current_module();
@@ -1565,20 +1567,16 @@ impl<'a> Checker<'a> {
                         infer,
                     );
                 }
-                FieldKind::BuiltinMethod {
-                    receiver,
-                    name,
-                    mut_self,
-                } => {
+                FieldKind::BuiltinMethod { method } => {
                     let recv_raw = self.check_expr(base, None, infer);
                     let receiver_ty = infer.resolve(&recv_raw);
-                    if mut_self {
+                    let def = method.def().expect("builtin method id is in range");
+                    if def.mut_self {
                         self.require_mutable_place(base, expr.span);
                     }
                     return self.check_builtin_method(
                         expr,
-                        receiver,
-                        name,
+                        method,
                         &receiver_ty,
                         args,
                         expected,
@@ -2179,16 +2177,29 @@ impl<'a> Checker<'a> {
     fn check_builtin_call(
         &mut self,
         expr: &Expr,
-        function: BuiltinFn,
+        function: BuiltinFnId,
         args: &[Arg],
         infer: &mut Infer,
     ) -> Ty {
+        let Some(def) = function.def() else {
+            return Ty::Error;
+        };
+        if args.len() != def.sig.params.len() {
+            let module = self.current_module();
+            self.err_at(
+                module,
+                expr.span,
+                Code::E204,
+                format!(
+                    "`{}` takes {} argument(s), found {}",
+                    def.name,
+                    def.sig.params.len(),
+                    args.len()
+                ),
+            );
+        }
         match function {
-            BuiltinFn::Print => {
-                if args.len() != 1 {
-                    let module = self.current_module();
-                    self.err_at(module, expr.span, Code::E204, "`print` takes one argument");
-                }
+            BuiltinFnId::PRINT => {
                 if let Some(arg) = args.first() {
                     let ty = self.check_expr(&arg.expr, None, infer);
                     if !self.has_bound(&ty, Bound::Show) {
@@ -2201,32 +2212,15 @@ impl<'a> Checker<'a> {
                         );
                     }
                 }
-                Ty::Unit
             }
-            BuiltinFn::Panic => {
-                if args.len() != 1 {
-                    let module = self.current_module();
-                    self.err_at(module, expr.span, Code::E204, "`panic` takes one argument");
+            BuiltinFnId::PANIC | BuiltinFnId::ASSERT => {
+                for (arg, param) in args.iter().zip(def.sig.params) {
+                    self.check_expr(&arg.expr, Some(&self.builtin_ty(*param)), infer);
                 }
-                if let Some(arg) = args.first() {
-                    self.check_expr(&arg.expr, Some(&Ty::Str), infer);
-                }
-                Ty::Never
             }
-            BuiltinFn::Assert => {
-                if args.len() != 2 {
-                    let module = self.current_module();
-                    self.err_at(module, expr.span, Code::E204, "`assert` takes two arguments");
-                }
-                if let Some(arg) = args.first() {
-                    self.check_expr(&arg.expr, Some(&Ty::Bool), infer);
-                }
-                if let Some(arg) = args.get(1) {
-                    self.check_expr(&arg.expr, Some(&Ty::Str), infer);
-                }
-                Ty::Unit
-            }
+            _ => return Ty::Error,
         }
+        self.builtin_ty(def.sig.ret)
     }
 
     fn check_builtin_module_call(
@@ -2237,35 +2231,19 @@ impl<'a> Checker<'a> {
         expected: Option<&Ty>,
         infer: &mut Infer,
     ) -> Ty {
-        match (item.module, item.name) {
-            ("std.math", "min" | "max") => {
-                self.check_generic_ord_call(expr, args, expected, infer, 2)
+        let def = item.def();
+        let Some(sig) = def.ty.fn_sig() else {
+            return Ty::Error;
+        };
+        match def.generics {
+            BuiltinGenerics::SameOrd => {
+                self.check_generic_ord_call(expr, args, expected, infer, sig.params.len())
             }
-            ("std.math", "clamp") => {
-                self.check_generic_ord_call(expr, args, expected, infer, 3)
+            BuiltinGenerics::None => {
+                let params: Vec<Ty> = sig.params.iter().map(|param| self.builtin_ty(*param)).collect();
+                self.check_fixed_args(expr, args, &params, infer);
+                self.builtin_ty(sig.ret)
             }
-            ("std.math", "atan2") => {
-                self.check_fixed_args(expr, args, &[Ty::Float, Ty::Float], infer);
-                Ty::Float
-            }
-            (
-                "std.math",
-                "sin" | "cos" | "tan" | "exp" | "ln" | "log10",
-            ) => {
-                self.check_fixed_args(expr, args, &[Ty::Float], infer);
-                Ty::Float
-            }
-            ("std.json", "parse") => {
-                self.check_fixed_args(expr, args, &[Ty::Str], infer);
-                let json = Ty::Named(self.json_type.unwrap_or(TypeId(0)), Vec::new());
-                Ty::Result(Box::new(json), Box::new(Ty::Str))
-            }
-            ("std.json", "stringify") => {
-                let json = Ty::Named(self.json_type.unwrap_or(TypeId(0)), Vec::new());
-                self.check_fixed_args(expr, args, &[json], infer);
-                Ty::Str
-            }
-            _ => Ty::Error,
         }
     }
 
@@ -2662,75 +2640,6 @@ fn has_conflicting_alias(roots: &[(BindingId, bool)]) -> bool {
         }
     }
     false
-}
-
-#[derive(Clone, Copy)]
-struct BuiltinMethodInfo {
-    name: &'static str,
-    mut_self: bool,
-}
-
-fn builtin_method_info(receiver: BuiltinReceiver, name: &str) -> Option<BuiltinMethodInfo> {
-    let (known, mut_self): (&'static [&'static str], bool) = match receiver {
-        BuiltinReceiver::List => (
-            &[
-                "len", "get", "first", "last", "contains", "map", "filter", "fold", "any",
-                "all", "enumerate", "reversed", "sorted", "sorted_by", "join", "push", "pop",
-                "sort", "insert", "remove_at", "extend", "clear",
-            ],
-            matches!(
-                name,
-                "push" | "pop" | "sort" | "insert" | "remove_at" | "extend" | "clear"
-            ),
-        ),
-        BuiltinReceiver::Map => (
-            &[
-                "len", "get", "has", "keys", "values", "entries", "remove", "clear",
-            ],
-            matches!(name, "remove" | "clear"),
-        ),
-        BuiltinReceiver::Str => (
-            &[
-                "len",
-                "chars",
-                "split",
-                "trim",
-                "contains",
-                "find",
-                "starts_with",
-                "ends_with",
-                "replace",
-                "to_upper",
-                "to_lower",
-                "parse_int",
-                "parse_float",
-            ],
-            false,
-        ),
-        BuiltinReceiver::Int => (&["abs", "pow"], false),
-        BuiltinReceiver::Float => (
-            &[
-                "abs", "floor", "ceil", "trunc", "sqrt", "pow", "round", "is_nan",
-                "is_finite",
-            ],
-            false,
-        ),
-        BuiltinReceiver::Range => (&["len", "contains", "to_list"], false),
-        BuiltinReceiver::Option => (
-            &[
-                "is_some", "is_none", "map", "and_then", "unwrap_or", "ok_or", "expect",
-            ],
-            false,
-        ),
-        BuiltinReceiver::Result => (
-            &[
-                "is_ok", "is_err", "map", "map_err", "and_then", "unwrap_or", "ok", "expect",
-            ],
-            false,
-        ),
-    };
-    let name = known.iter().find(|candidate| **candidate == name)?;
-    Some(BuiltinMethodInfo { name, mut_self })
 }
 
 fn builtin_receiver(ty: &Ty) -> Option<BuiltinReceiver> {

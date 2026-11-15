@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use martite_conformance::snapshot_cases;
 use martite_ir::{
     BuiltinFnId, BuiltinItemId, Charge, Effects, EntryKind, IrId, IrProgram, LowerOptions,
-    NodeKind, lower, lower_with, verify,
+    NodeKind, VerifyMode, lower, lower_with, verify,
 };
 
 #[test]
@@ -272,8 +272,14 @@ fn verification_cost_is_small_relative_to_lowering() {
     let programs: Vec<_> = cases
         .iter()
         .map(|(program, sources)| {
-            lower_with(program, sources, LowerOptions { verify: false })
-                .expect("benchmark fixture lowers")
+            lower_with(
+                program,
+                sources,
+                LowerOptions {
+                    verify: VerifyMode::Never,
+                },
+            )
+            .expect("benchmark fixture lowers")
         })
         .collect();
 
@@ -282,8 +288,14 @@ fn verification_cost_is_small_relative_to_lowering() {
     for _ in 0..REPS {
         for (program, sources) in &cases {
             black_box(
-                lower_with(program, sources, LowerOptions { verify: false })
-                    .expect("benchmark fixture lowers"),
+                lower_with(
+                    program,
+                    sources,
+                    LowerOptions {
+                        verify: VerifyMode::Never,
+                    },
+                )
+                .expect("benchmark fixture lowers"),
             );
         }
     }

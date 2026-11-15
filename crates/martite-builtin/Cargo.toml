@@ -1,0 +1,10 @@
+[package]
+name = "martite-builtin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Canonical builtin vocabulary shared by the resolver, checker, IR and runtime"
+publish = false
+
+[lints]
+workspace = true

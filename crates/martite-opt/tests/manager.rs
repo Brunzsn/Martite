@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use martite_base::{LoadLimits, MemoryProvider, Severity};
 use martite_driver::{LoadOptions, load};
-use martite_ir::{IrProgram, lower};
+use martite_ir::{FnId, IrProgram, VerifyMode, lower};
 use martite_opt::{
     Changed, FnPass, OptimizeError, OptimizeOptions, PassCx, PassManager, ProgramPass,
 };
@@ -48,6 +48,19 @@ impl ProgramPass for ProgramRecord {
     fn run(&mut self, _program: &mut IrProgram, _cx: &mut PassCx<'_>) -> Changed {
         self.log.borrow_mut().push("program-record");
         Changed::NO
+    }
+}
+
+struct CorruptEntry;
+
+impl ProgramPass for CorruptEntry {
+    fn name(&self) -> &'static str {
+        "corrupt-entry"
+    }
+
+    fn run(&mut self, program: &mut IrProgram, _cx: &mut PassCx<'_>) -> Changed {
+        program.entries.main = Some(FnId::new(u32::MAX));
+        Changed::YES
     }
 }
 
@@ -142,4 +155,28 @@ fn reduce_passes_are_gated() {
         .run(&mut program())
         .expect_err("reduce must be opt-in");
     assert!(matches!(error, OptimizeError::Policy { .. }));
+}
+
+#[test]
+fn optimizer_verifies_in_every_build_by_default() {
+    assert_eq!(OptimizeOptions::default().verify, VerifyMode::Always);
+}
+
+#[test]
+fn always_verification_rejects_a_corrupting_pass() {
+    let mut manager = PassManager::new(OptimizeOptions {
+        verify: VerifyMode::Always,
+        ..Default::default()
+    });
+    manager.add_program_pass(CorruptEntry);
+    let error = manager
+        .run(&mut program())
+        .expect_err("corrupted IR must be rejected");
+    assert!(matches!(
+        error,
+        OptimizeError::Verify {
+            pass: "corrupt-entry",
+            ..
+        }
+    ));
 }

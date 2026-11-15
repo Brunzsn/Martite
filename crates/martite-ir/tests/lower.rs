@@ -1,9 +1,15 @@
 use martite_base::{LoadLimits, MemoryProvider};
 use martite_driver::{LoadOptions, load};
 use martite_ir::{
-    IrFn, IrId, IrProgram, LowerError, LowerErrorKind, Node, NodeKind, lower, verify,
+    IrFn, IrId, IrProgram, LowerError, LowerErrorKind, LowerOptions, Node, NodeKind, VerifyMode,
+    lower, verify,
 };
 use martite_resolve::InterfaceSource;
+
+#[test]
+fn lowering_verifies_in_every_build_by_default() {
+    assert_eq!(LowerOptions::default().verify, VerifyMode::Always);
+}
 
 fn lower_source_result_with(
     source: &str,

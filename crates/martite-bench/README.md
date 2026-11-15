@@ -179,10 +179,11 @@ on candidate `2d6f75f` against baseline `7abd955`:
 | Windows | 7.465 µs | 234.985 µs | 8.730 µs | 51.990 µs | 759.585 µs | 485.884 µs | -36.0% |
 | Ubuntu | 3.706 µs | 172.303 µs | 3.954 µs | 20.583 µs | 564.093 µs | 382.374 µs | -32.2% |
 
-`lower_*` times `CheckedProgram -> IrProgram` with verification disabled and
-checking excluded. `pass_*` excludes the IR clone via `iter_batched`. The
-corpus is the 14 runtime fixtures. The optimizer fixture still consumes exactly
-the same fuel; the execution delta is fewer dispatches.
+`lower_*` times `CheckedProgram -> IrProgram` with `VerifyMode::Never` and
+checking excluded. `pass_*` also runs the optimizer with `VerifyMode::Never` and
+excludes the IR clone via `iter_batched`. The corpus is the 14 runtime fixtures.
+The optimizer fixture still consumes exactly the same fuel; the execution delta
+is fewer dispatches.
 
 The allocation report from the same run:
 

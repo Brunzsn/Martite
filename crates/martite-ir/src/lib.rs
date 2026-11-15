@@ -1,7 +1,8 @@
 //! Resolved, self-contained tree IR for Martite.
 //!
 //! This crate is the data model between the checker and the runtime. It owns
-//! the type, builtin and id vocabulary, the deterministic text printer
+//! the type and id vocabulary and re-exports the canonical builtin descriptors
+//! from `martite-builtin`, the deterministic text printer
 //! ([`Printer`]) for dumps and golden tests, the shared tree traversal in
 //! [`walk`], the verifier ([`verify`]) that enforces the contract between
 //! lowering and every pass, the on-demand slot analyses in [`analysis`], and
@@ -62,7 +63,8 @@ pub mod walk;
 pub const MAX_NODE_DEPTH: u32 = 1024;
 
 pub use builtin::{
-    BuiltinFnDef, BuiltinItemDef, BuiltinItemKind, BuiltinMethodDef, BuiltinReceiver,
+    BUILTIN_FNS, BUILTIN_ITEMS, BUILTIN_METHODS, BuiltinEffects, BuiltinFnDef, BuiltinFnSig,
+    BuiltinGenerics, BuiltinItemDef, BuiltinItemKind, BuiltinMethodDef, BuiltinReceiver, BuiltinTy,
 };
 pub use charge::Charge;
 pub use effects::{
@@ -85,5 +87,7 @@ pub use program::{
     IrProgram, ParamInfo, PreludeVariant, SlotInfo,
 };
 pub use types::{FieldDef, Ty, TyId, TypeDef, TypeDefKind, TypeId, TypeTable, VariantDef};
-pub use verify::{VerifyError, VerifyErrorKind, verify, verify_after_pass};
+pub use verify::{
+    VerifyError, VerifyErrorKind, VerifyMode, verify, verify_after_pass, verify_with,
+};
 pub use walk::children_of;

@@ -1,17 +1,13 @@
 use martite_base::Span;
-use martite_check::{
-    BuiltinFn, BuiltinItem, BuiltinReceiver as CheckBuiltinReceiver, DefId, DefKind, PatResolution,
-    Resolution,
-};
+use martite_check::{BuiltinItem, DefId, DefKind, PatResolution, Resolution};
 use martite_syntax::{
     Arg, BinaryOp as SyntaxBinaryOp, Expr, ExprKind, FieldInit, FieldPat,
     MatchArm as SyntaxMatchArm, MatchBody, PatKind, Pattern as SyntaxPattern, PrimTy, StrExprPart,
     UnaryOp as SyntaxUnaryOp,
 };
 
-use crate::builtin::BuiltinReceiver as IrBuiltinReceiver;
 use crate::charge::Charge;
-use crate::id::{BuiltinFnId, BuiltinItemId, BuiltinMethodId, IrId, Slot};
+use crate::id::{BuiltinFnId, BuiltinMethodId, IrId, Slot};
 use crate::node::{AccessMode, NodeKind, StrPart};
 use crate::pattern::{MatchArm, MatchSet, Pattern};
 use crate::program::{
@@ -281,7 +277,7 @@ impl FnLowerer<'_, '_> {
                 NodeKind::FnRef(self.fn_ref(def, expr.span)?)
             }
             Resolution::ModuleItem(def) => self.def_ref_node(def, expr.span)?,
-            Resolution::BuiltinFn(function) => NodeKind::BuiltinFnRef(builtin_fn_id(function)),
+            Resolution::BuiltinFn(function) => NodeKind::BuiltinFnRef(function),
             Resolution::BuiltinItem(item) => self.builtin_item_node(&item, expr.span)?,
             Resolution::Variant(type_id, index) => {
                 let type_id = TypeId::new(type_id.0);
@@ -479,9 +475,8 @@ impl FnLowerer<'_, '_> {
                 Some(Resolution::Method(def)) => {
                     return self.lower_method_call(base, def, args, ty, expr.span);
                 }
-                Some(Resolution::BuiltinMethod { receiver, name }) => {
-                    return self
-                        .lower_builtin_method_call(base, receiver, name, args, ty, expr.span);
+                Some(Resolution::BuiltinMethod { method }) => {
+                    return self.lower_builtin_method_call(base, method, args, ty, expr.span);
                 }
                 Some(Resolution::Variant(type_id, index)) => {
                     return self.lower_variant_call(type_id, index, args, ty, expr.span);
@@ -619,16 +614,11 @@ impl FnLowerer<'_, '_> {
     fn lower_builtin_method_call(
         &mut self,
         receiver: &Expr,
-        receiver_kind: CheckBuiltinReceiver,
-        name: &str,
+        method: BuiltinMethodId,
         args: &[Arg],
         ty: TyId,
         span: Span,
     ) -> Result<IrId, LowerError> {
-        let receiver_kind = convert_builtin_receiver(receiver_kind);
-        let Some(method) = BuiltinMethodId::lookup(receiver_kind, name) else {
-            return Err(self.internal(span, "unknown builtin method"));
-        };
         let Some(def) = method.def() else {
             return Err(self.internal(span, "builtin method has no definition"));
         };
@@ -641,10 +631,6 @@ impl FnLowerer<'_, '_> {
         children.push(receiver);
         children.extend(self.lower_plain_args(args)?);
         let first_child = self.append_children(children).start;
-        // The sort family checks the deadline after sorting.
-        let safepoint = method
-            .def()
-            .is_some_and(|def| matches!(def.name, "sorted" | "sorted_by" | "sort"));
         Ok(self.push(
             NodeKind::CallBuiltinMethod {
                 method,
@@ -653,64 +639,38 @@ impl FnLowerer<'_, '_> {
             ty,
             Charge::expression(),
             span,
-            safepoint,
+            def.safepoint,
         ))
     }
 
     fn lower_builtin_fn_call(
         &mut self,
-        function: BuiltinFn,
+        function: BuiltinFnId,
         args: &[Arg],
         ty: TyId,
         span: Span,
     ) -> Result<IrId, LowerError> {
-        match function {
-            BuiltinFn::Assert => {
-                let children = self.lower_plain_args(args)?;
-                if children.len() != 2 {
-                    return Err(self.internal(span, "assert arity mismatch"));
-                }
-                let range = self.append_children(children);
-                Ok(self.push(
-                    NodeKind::Assert(range),
-                    ty,
-                    Charge::expression(),
-                    span,
-                    false,
-                ))
-            }
-            BuiltinFn::Panic => {
-                let children = self.lower_plain_args(args)?;
-                if children.len() != 1 {
-                    return Err(self.internal(span, "panic arity mismatch"));
-                }
-                let range = self.append_children(children);
-                Ok(self.push(
-                    NodeKind::Panic(range),
-                    ty,
-                    Charge::expression(),
-                    span,
-                    false,
-                ))
-            }
-            BuiltinFn::Print => {
-                let children = self.lower_plain_args(args)?;
-                if children.len() != 1 {
-                    return Err(self.internal(span, "print arity mismatch"));
-                }
-                let first_arg = self.append_children(children).start;
-                Ok(self.push(
-                    NodeKind::CallBuiltinFn {
-                        builtin: BuiltinFnId::PRINT,
-                        first_arg,
-                    },
-                    ty,
-                    Charge::expression(),
-                    span,
-                    true,
-                ))
-            }
+        let Some(def) = function.def() else {
+            return Err(self.internal(span, "unknown builtin function"));
+        };
+        let children = self.lower_plain_args(args)?;
+        if children.len() != def.sig.params.len() {
+            return Err(self.internal(span, "builtin function arity mismatch"));
         }
+        let range = self.append_children(children);
+        let (kind, safepoint) = match function {
+            BuiltinFnId::ASSERT => (NodeKind::Assert(range), false),
+            BuiltinFnId::PANIC => (NodeKind::Panic(range), false),
+            BuiltinFnId::PRINT => (
+                NodeKind::CallBuiltinFn {
+                    builtin: BuiltinFnId::PRINT,
+                    first_arg: range.start,
+                },
+                def.safepoint,
+            ),
+            _ => return Err(self.internal(span, "unknown builtin function")),
+        };
+        Ok(self.push(kind, ty, Charge::expression(), span, safepoint))
     }
 
     fn lower_builtin_module_call(
@@ -723,13 +683,10 @@ impl FnLowerer<'_, '_> {
         if item.kind != DefKind::Fn {
             return Err(self.unsupported(span, "builtin item value"));
         }
-        let Some(id) = BuiltinItemId::lookup(item.module, item.name) else {
-            return Err(self.internal(span, "unknown builtin module item"));
-        };
+        let id = item.id;
         let children = self.lower_plain_args(args)?;
         let first_arg = self.append_children(children).start;
-        // `std.json.parse` checks the input size against the memory cap.
-        let safepoint = id == BuiltinItemId::JSON_PARSE;
+        let safepoint = id.item().is_some_and(|def| def.safepoint);
         Ok(self.push(
             NodeKind::CallBuiltinModule {
                 item: id,
@@ -1235,11 +1192,8 @@ impl FnLowerer<'_, '_> {
         item: &BuiltinItem,
         span: Span,
     ) -> Result<NodeKind, LowerError> {
-        let Some(id) = BuiltinItemId::lookup(item.module, item.name) else {
-            return Err(self.internal(span, "unknown builtin module item"));
-        };
         match item.kind {
-            DefKind::Const | DefKind::Fn => Ok(NodeKind::BuiltinModuleRef(id)),
+            DefKind::Const | DefKind::Fn => Ok(NodeKind::BuiltinModuleRef(item.id)),
             _ => Err(self.unsupported(span, "builtin item value")),
         }
     }
@@ -1290,27 +1244,6 @@ fn binary_node(op: SyntaxBinaryOp, lhs: IrId, rhs: IrId) -> NodeKind {
         SyntaxBinaryOp::And => NodeKind::And { lhs, rhs },
         SyntaxBinaryOp::Or => NodeKind::Or { lhs, rhs },
         SyntaxBinaryOp::Coalesce => NodeKind::Coalesce { lhs, rhs },
-    }
-}
-
-fn builtin_fn_id(function: BuiltinFn) -> BuiltinFnId {
-    match function {
-        BuiltinFn::Print => BuiltinFnId::PRINT,
-        BuiltinFn::Panic => BuiltinFnId::PANIC,
-        BuiltinFn::Assert => BuiltinFnId::ASSERT,
-    }
-}
-
-fn convert_builtin_receiver(receiver: CheckBuiltinReceiver) -> IrBuiltinReceiver {
-    match receiver {
-        CheckBuiltinReceiver::List => IrBuiltinReceiver::List,
-        CheckBuiltinReceiver::Map => IrBuiltinReceiver::Map,
-        CheckBuiltinReceiver::Str => IrBuiltinReceiver::Str,
-        CheckBuiltinReceiver::Int => IrBuiltinReceiver::Int,
-        CheckBuiltinReceiver::Float => IrBuiltinReceiver::Float,
-        CheckBuiltinReceiver::Range => IrBuiltinReceiver::Range,
-        CheckBuiltinReceiver::Option => IrBuiltinReceiver::Option,
-        CheckBuiltinReceiver::Result => IrBuiltinReceiver::Result,
     }
 }
 

@@ -6,6 +6,8 @@ use std::rc::Rc;
 use martite_base::{
     Code, Diagnostic, LoadLimits, Severity, SourceId, SourceMap, SourceProvider, Span,
 };
+pub use martite_builtin::BuiltinItemId;
+use martite_builtin::{BuiltinItemKind, builtin_module};
 use martite_syntax::*;
 use rustc_hash::FxHashMap;
 
@@ -65,124 +67,38 @@ pub struct BuiltinItem {
     pub kind: DefKind,
 }
 
-/// Compact identity for a canonical builtin module item.
-///
-/// Runtime values store this instead of the module/name strings so using a
-/// builtin function as a value never allocates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct BuiltinItemId(u8);
-
-impl BuiltinItemId {
-    pub fn item(self) -> &'static BuiltinItem {
-        BUILTIN_ITEMS
-            .get(self.0 as usize)
-            .expect("builtin item id is in range")
+impl BuiltinItem {
+    /// The canonical definition for this resolved item.
+    pub fn def(self) -> &'static martite_builtin::BuiltinItemDef {
+        self.id.item().expect("builtin item id is in range")
     }
 }
 
-static BUILTIN_ITEMS: [BuiltinItem; 15] = [
-    BuiltinItem {
-        id: BuiltinItemId(0),
-        module: "std.math",
-        name: "PI",
-        kind: DefKind::Const,
-    },
-    BuiltinItem {
-        id: BuiltinItemId(1),
-        module: "std.math",
-        name: "EULER",
-        kind: DefKind::Const,
-    },
-    BuiltinItem {
-        id: BuiltinItemId(2),
-        module: "std.math",
-        name: "min",
-        kind: DefKind::Fn,
-    },
-    BuiltinItem {
-        id: BuiltinItemId(3),
-        module: "std.math",
-        name: "max",
-        kind: DefKind::Fn,
-    },
-    BuiltinItem {
-        id: BuiltinItemId(4),
-        module: "std.math",
-        name: "clamp",
-        kind: DefKind::Fn,
-    },
-    BuiltinItem {
-        id: BuiltinItemId(5),
-        module: "std.math",
-        name: "sin",
-        kind: DefKind::Fn,
-    },
-    BuiltinItem {
-        id: BuiltinItemId(6),
-        module: "std.math",
-        name: "cos",
-        kind: DefKind::Fn,
-    },
-    BuiltinItem {
-        id: BuiltinItemId(7),
-        module: "std.math",
-        name: "tan",
-        kind: DefKind::Fn,
-    },
-    BuiltinItem {
-        id: BuiltinItemId(8),
-        module: "std.math",
-        name: "atan2",
-        kind: DefKind::Fn,
-    },
-    BuiltinItem {
-        id: BuiltinItemId(9),
-        module: "std.math",
-        name: "exp",
-        kind: DefKind::Fn,
-    },
-    BuiltinItem {
-        id: BuiltinItemId(10),
-        module: "std.math",
-        name: "ln",
-        kind: DefKind::Fn,
-    },
-    BuiltinItem {
-        id: BuiltinItemId(11),
-        module: "std.math",
-        name: "log10",
-        kind: DefKind::Fn,
-    },
-    BuiltinItem {
-        id: BuiltinItemId(12),
-        module: "std.json",
-        name: "Json",
-        kind: DefKind::Enum,
-    },
-    BuiltinItem {
-        id: BuiltinItemId(13),
-        module: "std.json",
-        name: "parse",
-        kind: DefKind::Fn,
-    },
-    BuiltinItem {
-        id: BuiltinItemId(14),
-        module: "std.json",
-        name: "stringify",
-        kind: DefKind::Fn,
-    },
-];
+impl From<BuiltinItemKind> for DefKind {
+    fn from(kind: BuiltinItemKind) -> Self {
+        match kind {
+            BuiltinItemKind::Const => Self::Const,
+            BuiltinItemKind::Fn => Self::Fn,
+            BuiltinItemKind::Enum => Self::Enum,
+        }
+    }
+}
 
 /// Look up a builtin module item by its canonical name.
 ///
 /// The returned names are always `'static`, so `BuiltinItem` stays `Copy` and
-/// resolution never allocates when recording a builtin lookup.
+/// resolution never allocates when recording a builtin lookup. The table itself
+/// lives in `martite-builtin`; this wrapper only carries the resolver's
+/// [`DefKind`] view.
 pub fn builtin_item(module: &str, name: &str) -> Option<BuiltinItem> {
-    BUILTIN_ITEMS
-        .iter()
-        .find(|item| item.module == module && item.name == name)
-        .copied()
+    let id = BuiltinItemId::lookup(module, name)?;
+    let def = id.item()?;
+    Some(BuiltinItem {
+        id,
+        module: def.module,
+        name: def.name,
+        kind: def.kind.into(),
+    })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -446,7 +362,7 @@ impl<'a> Loader<'a> {
     }
 
     fn is_builtin_module(path: &str) -> bool {
-        matches!(path, "std.math" | "std.json")
+        builtin_module(path).is_some()
     }
 
     fn module_exists(&mut self, path: &str) -> bool {
@@ -987,14 +903,8 @@ impl<'a> Loader<'a> {
                 continue;
             };
             let full = use_decl.path.join(".");
-            let target = if Self::is_builtin_module(&full) {
-                Some(UseResolved::Module(ModuleTarget::Builtin(
-                    match full.as_str() {
-                        "std.math" => "std.math",
-                        "std.json" => "std.json",
-                        _ => unreachable!(),
-                    },
-                )))
+            let target = if let Some(module) = builtin_module(&full) {
+                Some(UseResolved::Module(ModuleTarget::Builtin(module)))
             } else if self.module_exists(&full) {
                 let is_iface = self.interfaces.contains_key(&full);
                 let mid = self.ensure_module(&full, is_iface);
@@ -1659,13 +1569,25 @@ mod tests {
         assert_eq!(euler.module, "std.math");
         assert_eq!(euler.name, "EULER");
         assert_eq!(euler.kind, DefKind::Const);
-        assert_eq!(euler.id.item(), &euler);
+        assert_eq!(euler.id.item().expect("canonical EULER").name, "EULER");
 
         let parse = symbols.builtin_items.get("parse").copied().expect("parse");
         assert_eq!(parse.module, "std.json");
         assert_eq!(parse.name, "parse");
         assert_eq!(parse.kind, DefKind::Fn);
-        assert_eq!(parse.id.item(), &parse);
+        assert_eq!(parse.id.item().expect("canonical parse").name, "parse");
+    }
+
+    #[test]
+    fn every_canonical_item_resolves() {
+        for (index, def) in martite_builtin::BUILTIN_ITEMS.iter().enumerate() {
+            let item = builtin_item(def.module, def.name)
+                .unwrap_or_else(|| panic!("missing {}.{}", def.module, def.name));
+            assert_eq!(item.id, BuiltinItemId::new(index as u32));
+            assert_eq!(item.module, def.module);
+            assert_eq!(item.name, def.name);
+            assert_eq!(item.kind, DefKind::from(def.kind));
+        }
     }
 
     #[test]
