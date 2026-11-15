@@ -52,6 +52,11 @@ pub struct Manifest {
     pub memory: Option<u64>,
     pub depth: Option<u32>,
     pub deadline_ms: Option<u64>,
+    /// Validated `[settings]` table.
+    ///
+    /// TOML datetimes are rejected: the settings `Json` vocabulary has no
+    /// datetime variant, so mapping one to `Null` would hide it from the
+    /// plugin and mapping it to `Str` would invent a convention.
     pub settings: toml::Value,
 }
 
@@ -145,6 +150,9 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, ManifestError> {
     })
 }
 
+/// Datetimes stay rejected because the settings `Json` vocabulary has no
+/// datetime variant. The snapshot codec is unrelated: it encodes plugin state,
+/// not manifest settings.
 fn contains_datetime(value: &toml::Value) -> bool {
     match value {
         toml::Value::Datetime(_) => true,
@@ -310,6 +318,25 @@ fn parse_fmt_config(section: FmtSection) -> Result<FmtConfig, ManifestError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_datetimes_are_rejected() {
+        let err = parse_manifest(
+            r#"
+            [plugin]
+            name = "datetime"
+            version = "0.1.0"
+            lang = "1"
+            api = "1.0"
+            entry = "main.mt"
+
+            [settings]
+            when = 1979-05-27T07:32:00Z
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("TOML datetimes"));
+    }
 
     #[test]
     fn manifest_round_trip() {

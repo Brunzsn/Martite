@@ -9,6 +9,8 @@ fn maybe() -> str?
 fn stale_text(doc: Doc) -> str?
 on saved(doc: Doc) -> Result[(), str]
 on lookup(doc: Doc) -> Result[(), str]
+on remember(doc: Doc)
+on recall() -> Result[(), str]
 on create() -> Result[(), str]
 on tick()
 on fail() -> Result[(), str]
@@ -83,6 +85,29 @@ on mutate(mut x: int) -> int {
 }
 
 on shutdown(self) {}
+"#;
+
+const DOC_STATE_PLUGIN: &str = r#"
+use app.editor
+use app.editor.Doc
+
+struct State { doc: Doc? }
+
+on init() -> State { State { doc: None } }
+
+on remember(mut self, doc: Doc) {
+    self.doc = Some(doc)
+}
+
+on recall(self) -> Result[(), str] {
+    match self.doc {
+        Some(doc) => match editor.stale_text(doc) {
+            Some(_) => Ok(()),
+            None => Err("stale handle"),
+        },
+        None => Err("no doc"),
+    }
+}
 "#;
 
 fn editor_engine() -> Engine {
@@ -277,6 +302,7 @@ fn snapshots_round_trip_and_validate_their_type_fingerprint() {
     let mut instance = plugin.instantiate().expect("init");
     instance.call("saved", vec![doc]).expect("call");
     let snapshot = instance.snapshot();
+    assert_eq!(snapshot.format_version, 1);
     assert_ne!(snapshot.type_fingerprint, [0u8; 32]);
     assert!(!snapshot.bytes.is_empty());
 
@@ -291,9 +317,54 @@ fn snapshots_round_trip_and_validate_their_type_fingerprint() {
     let mut corrupt = snapshot.clone();
     corrupt.bytes.truncate(3);
     assert!(restored.restore(&corrupt).is_err());
+    let mut corrupt = snapshot.clone();
+    corrupt.bytes.push(0);
+    assert!(restored.restore(&corrupt).is_err());
     let mut wrong_type = snapshot.clone();
     wrong_type.type_fingerprint = [1u8; 32];
     assert!(restored.restore(&wrong_type).is_err());
+}
+
+#[test]
+fn stateless_snapshots_are_empty_and_restore_to_no_state() {
+    let plugin = load("on check() {}\n", MANIFEST).expect("stateless plugin");
+    let snapshot = plugin.instantiate().expect("instantiate").snapshot();
+    assert_eq!(snapshot.format_version, 1);
+    assert!(snapshot.bytes.is_empty());
+
+    let mut restored = plugin.instantiate().expect("instantiate");
+    restored.restore(&snapshot).expect("restore");
+    assert!(restored.state().is_none());
+}
+
+#[test]
+fn snapshots_preserve_handles_and_report_stale_tokens_after_restore() {
+    let plugin = load(DOC_STATE_PLUGIN, MANIFEST).expect("load");
+    let doc = plugin.make_handle("Doc", "stale-token").expect("handle");
+    let mut instance = plugin.instantiate().expect("init");
+    instance.call("remember", vec![doc]).expect("remember");
+    let snapshot = instance.snapshot();
+
+    let mut restored = plugin.instantiate().expect("init");
+    restored.restore(&snapshot).expect("restore");
+    let Some(Value::Struct(state)) = restored.state() else {
+        panic!("expected struct state");
+    };
+    let Value::Option(Some(handle)) = &state.fields[0] else {
+        panic!("expected handle field");
+    };
+    let Value::Handle(handle) = &**handle else {
+        panic!("expected handle");
+    };
+    assert_eq!(handle.token, "stale-token");
+
+    let Outcome::Handled(value) = restored.call("recall", vec![]).expect("call") else {
+        panic!("handler missing");
+    };
+    match value {
+        Value::Result(Err(message)) => assert_eq!(message.as_str(), Some("stale handle")),
+        other => panic!("unexpected {other:?}"),
+    }
 }
 
 #[test]
