@@ -92,8 +92,8 @@ fn every_golden_fixture_is_idempotent_and_ast_preserving() {
         );
         if !interface {
             assert!(
-                structurally_equal(&parse(&source), &parse(&actual)),
-                "AST changed for {}",
+                structurally_equal(&source, &parse(&source), &actual, &parse(&actual)),
+                "AST or comment placement changed for {}",
                 before.display()
             );
         }
@@ -194,8 +194,8 @@ fn comments_survive_every_grammar_position() {
             );
         }
         assert!(
-            structurally_equal(&parse(source), &parse(&formatted)),
-            "AST changed for:\n{source}"
+            structurally_equal(source, &parse(source), &formatted, &parse(&formatted)),
+            "AST or comment placement changed for:\n{source}"
         );
     }
 }

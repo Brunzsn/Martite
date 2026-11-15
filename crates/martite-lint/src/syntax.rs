@@ -9,7 +9,7 @@ use martite_syntax::{
 
 use crate::registry;
 use crate::settings::ResolvedSettings;
-use crate::trivia::{self, doc_comments, find_name_span, operator_span};
+use crate::trivia::{self, doc_comments};
 
 pub struct SyntaxCtx<'a> {
     source: SourceId,
@@ -38,7 +38,7 @@ pub fn run(
 
 struct DocElement {
     start: u32,
-    span: Span,
+    name_span: Span,
     kind: &'static str,
     name: String,
     is_pub: bool,
@@ -116,7 +116,7 @@ impl<'a> SyntaxCtx<'a> {
             Item::Use(_) => {
                 docs.push(DocElement {
                     start: item.span().start,
-                    span: item.span(),
+                    name_span: item.span(),
                     kind: "import",
                     name: String::new(),
                     is_pub: false,
@@ -127,7 +127,7 @@ impl<'a> SyntaxCtx<'a> {
                 let start = trivia::item_start(self.text, constant.span.start);
                 docs.push(DocElement {
                     start,
-                    span: Span::new(start, constant.span.end),
+                    name_span: self.name_span(constant.id, constant.span),
                     kind: "constant",
                     name: constant.name.clone(),
                     is_pub: constant.is_pub,
@@ -141,7 +141,7 @@ impl<'a> SyntaxCtx<'a> {
                 let start = trivia::item_start(self.text, decl.span.start);
                 docs.push(DocElement {
                     start,
-                    span: Span::new(start, decl.span.end),
+                    name_span: decl.span,
                     kind: "impl",
                     name: decl.type_name.clone(),
                     is_pub: false,
@@ -149,6 +149,7 @@ impl<'a> SyntaxCtx<'a> {
                 });
                 for method in &decl.methods {
                     self.walk_fn_like(
+                        method.id,
                         "method",
                         &method.name,
                         method.span,
@@ -168,6 +169,7 @@ impl<'a> SyntaxCtx<'a> {
 
     fn walk_fn(&mut self, decl: &FnDecl, docs: &mut Vec<DocElement>) {
         self.walk_fn_like(
+            decl.id,
             "function",
             &decl.name,
             decl.span,
@@ -181,6 +183,7 @@ impl<'a> SyntaxCtx<'a> {
 
     fn walk_fn_like(
         &mut self,
+        node: martite_syntax::NodeId,
         kind: &'static str,
         name: &str,
         span: Span,
@@ -191,9 +194,10 @@ impl<'a> SyntaxCtx<'a> {
         docs: &mut Vec<DocElement>,
     ) {
         let start = trivia::item_start(self.text, span.start);
+        let name_span = self.name_span(node, span);
         docs.push(DocElement {
             start,
-            span: Span::new(start, span.end),
+            name_span,
             kind,
             name: name.to_string(),
             is_pub,
@@ -208,7 +212,6 @@ impl<'a> SyntaxCtx<'a> {
             .filter(|param| !matches!(param.kind, martite_syntax::ParamKind::SelfParam { .. }))
             .count();
         let metrics = measure(body, param_count);
-        let name_span = find_name_span(self.text, span, name);
         self.report_metrics(
             kind,
             name,
@@ -223,9 +226,10 @@ impl<'a> SyntaxCtx<'a> {
     }
 
     fn walk_on(&mut self, decl: &OnDecl, docs: &mut Vec<DocElement>) {
+        let name_span = self.name_span(decl.id, decl.span);
         docs.push(DocElement {
             start: decl.span.start,
-            span: decl.span,
+            name_span,
             kind: "handler",
             name: decl.name.clone(),
             is_pub: false,
@@ -238,7 +242,6 @@ impl<'a> SyntaxCtx<'a> {
             .filter(|param| !matches!(param.kind, martite_syntax::ParamKind::SelfParam { .. }))
             .count();
         let metrics = measure(&decl.body, param_count);
-        let name_span = find_name_span(self.text, decl.span, &decl.name);
         self.report_metrics(
             "handler",
             &decl.name,
@@ -253,16 +256,16 @@ impl<'a> SyntaxCtx<'a> {
     }
 
     fn walk_test(&mut self, decl: &TestDecl, docs: &mut Vec<DocElement>) {
+        let name_span = self.name_span(decl.id, decl.span);
         docs.push(DocElement {
             start: decl.span.start,
-            span: decl.span,
+            name_span,
             kind: "test",
             name: decl.name.clone(),
             is_pub: false,
             is_main: false,
         });
         let metrics = measure(&decl.body, 0);
-        let name_span = find_name_span(self.text, decl.span, &decl.name);
         self.report_metrics(
             "test",
             &decl.name,
@@ -278,9 +281,10 @@ impl<'a> SyntaxCtx<'a> {
 
     fn walk_struct(&mut self, decl: &StructDecl, docs: &mut Vec<DocElement>) {
         let start = trivia::item_start(self.text, decl.span.start);
+        let name_span = self.name_span(decl.id, decl.span);
         docs.push(DocElement {
             start,
-            span: Span::new(start, decl.span.end),
+            name_span,
             kind: "struct",
             name: decl.name.clone(),
             is_pub: decl.is_pub,
@@ -289,7 +293,7 @@ impl<'a> SyntaxCtx<'a> {
         for field in &decl.fields {
             docs.push(DocElement {
                 start: field.span.start,
-                span: field.span,
+                name_span: self.name_span(field.id, field.span),
                 kind: "field",
                 name: field.name.clone(),
                 is_pub: false,
@@ -300,9 +304,10 @@ impl<'a> SyntaxCtx<'a> {
 
     fn walk_enum(&mut self, decl: &EnumDecl, docs: &mut Vec<DocElement>) {
         let start = trivia::item_start(self.text, decl.span.start);
+        let name_span = self.name_span(decl.id, decl.span);
         docs.push(DocElement {
             start,
-            span: Span::new(start, decl.span.end),
+            name_span,
             kind: "enum",
             name: decl.name.clone(),
             is_pub: decl.is_pub,
@@ -311,13 +316,17 @@ impl<'a> SyntaxCtx<'a> {
         for variant in &decl.variants {
             docs.push(DocElement {
                 start: variant.span.start,
-                span: variant.span,
+                name_span: self.name_span(variant.id, variant.span),
                 kind: "variant",
                 name: variant.name.clone(),
                 is_pub: false,
                 is_main: false,
             });
         }
+    }
+
+    fn name_span(&self, node: martite_syntax::NodeId, fallback: Span) -> Span {
+        self.program.name_span(node).unwrap_or(fallback)
     }
 
     fn check_docs(&mut self, docs: &[DocElement]) {
@@ -337,7 +346,7 @@ impl<'a> SyntaxCtx<'a> {
             if !doc_comments(self.program, self.text, element.start).is_empty() {
                 continue;
             }
-            let span = find_name_span(self.text, element.span, &element.name);
+            let span = element.name_span;
             let message = format!(
                 "missing documentation for public {} `{}`",
                 element.kind, element.name
@@ -560,7 +569,12 @@ impl<'a> SyntaxCtx<'a> {
                     self.check_bool_comparison(expr, *op, lhs, rhs);
                 }
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
-                    emitted_l024 = self.check_mixed_boolean(*op, lhs, rhs, walk.suppress_l024);
+                    let op_span = self
+                        .program
+                        .operator_span(expr.id)
+                        .unwrap_or_else(|| Span::empty(lhs.span.end));
+                    emitted_l024 =
+                        self.check_mixed_boolean(*op, op_span, lhs, rhs, walk.suppress_l024);
                 }
                 self.walk_expr(
                     lhs,
@@ -659,7 +673,7 @@ impl<'a> SyntaxCtx<'a> {
         if is_screaming_switch(cond) {
             return false;
         }
-        let Some((value, span)) = const_bool(self.text, cond) else {
+        let Some((value, span)) = const_bool(self.program, cond) else {
             return false;
         };
         let fix = replacement.map(|replacement| Fix {
@@ -683,7 +697,7 @@ impl<'a> SyntaxCtx<'a> {
         else_branch: Option<&Expr>,
         statement: bool,
     ) -> Option<String> {
-        let (value, _) = const_bool(self.text, cond)?;
+        let (value, _) = const_bool(self.program, cond)?;
         if value {
             if statement {
                 Some(self.block_inner(then_branch))
@@ -729,7 +743,7 @@ impl<'a> SyntaxCtx<'a> {
         if suppressed {
             return false;
         }
-        let Some((value, span)) = const_bool(self.text, expr) else {
+        let Some((value, span)) = const_bool(self.program, expr) else {
             return false;
         };
         self.emit(
@@ -838,7 +852,10 @@ impl<'a> SyntaxCtx<'a> {
         let StmtKind::Return(value) = &last.kind else {
             return;
         };
-        let keyword = keyword_span(self.text, last.span, "return");
+        let keyword = self
+            .program
+            .keyword_span(last.id)
+            .unwrap_or_else(|| Span::empty(last.span.start));
         match value {
             Some(value) => {
                 let replacement = self.slice(value.span).to_string();
@@ -869,6 +886,7 @@ impl<'a> SyntaxCtx<'a> {
     fn check_mixed_boolean(
         &mut self,
         op: BinaryOp,
+        op_span: Span,
         lhs: &Expr,
         rhs: &Expr,
         suppressed: bool,
@@ -892,7 +910,6 @@ impl<'a> SyntaxCtx<'a> {
         if mixed.is_empty() {
             return false;
         }
-        let span = operator_span(self.text, lhs.span.end, rhs.span.start, op.as_str());
         let mut edits = Vec::new();
         for child in &mixed {
             edits.push(FixEdit::new(Span::empty(child.span.start), "(".to_string()));
@@ -900,7 +917,7 @@ impl<'a> SyntaxCtx<'a> {
         }
         self.emit(
             Code::L024,
-            span,
+            op_span,
             "mixed `and` and `or` without parentheses",
             Some("add parentheses to make the grouping explicit".into()),
             Some(Fix::machine(edits)),
@@ -979,10 +996,6 @@ impl<'a> SyntaxCtx<'a> {
 
 // ----- helpers ----------------------------------------------------------
 
-fn keyword_span(text: &str, span: Span, keyword: &str) -> Span {
-    find_name_span(text, span, keyword)
-}
-
 fn is_screaming_switch(expr: &Expr) -> bool {
     let ExprKind::Var(name) = &expr.kind else {
         return false;
@@ -993,20 +1006,22 @@ fn is_screaming_switch(expr: &Expr) -> bool {
             .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
 }
 
-fn const_bool(text: &str, expr: &Expr) -> Option<(bool, Span)> {
+fn const_bool(program: &Program, expr: &Expr) -> Option<(bool, Span)> {
     match &expr.kind {
         ExprKind::Bool(value) => Some((*value, expr.span)),
         ExprKind::Unary {
             op: UnaryOp::Not,
             expr: inner,
         } => {
-            let (value, _) = const_bool(text, inner)?;
+            let (value, _) = const_bool(program, inner)?;
             Some((!value, expr.span))
         }
         ExprKind::Binary { op, lhs, rhs } => {
-            let left = const_bool(text, lhs);
-            let right = const_bool(text, rhs);
-            let span = operator_span(text, lhs.span.end, rhs.span.start, op.as_str());
+            let left = const_bool(program, lhs);
+            let right = const_bool(program, rhs);
+            let span = program
+                .operator_span(expr.id)
+                .unwrap_or_else(|| Span::empty(lhs.span.end));
             match op {
                 BinaryOp::And => match (left, right) {
                     (Some((false, _)), _) | (_, Some((false, _))) => Some((false, span)),

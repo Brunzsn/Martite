@@ -32,8 +32,8 @@ fn assert_equivalent(before: &str, after: &str, interface: bool) {
         parse_source_with(after, LoadLimits::default(), ParseOptions::TOOLING).program
     };
     assert!(
-        structurally_equal(&left, &right),
-        "AST changed\nbefore:\n{before}\nafter:\n{after}"
+        structurally_equal(before, &left, after, &right),
+        "AST or comment placement changed\nbefore:\n{before}\nafter:\n{after}"
     );
 }
 
@@ -295,6 +295,22 @@ use b.four
         "use a.two\nuse z.one\n\nuse b.four\n// b comment\nuse z.three\n"
     );
     assert_eq!(format_ok(&first, false), first);
+    assert_equivalent(source, &first, false);
+}
+
+#[test]
+fn comment_anchors_survive_formatting() {
+    let cases = [
+        "// bravo\nuse b.mod\n// alpha\nuse a.mod\n",
+        "fn main(x: int) {\n    match x {\n        // one\n        1 => print(\"one\"),\n        // two\n        _ => print(\"two\"),\n    }\n}\n",
+        "fn main() {\n    let value = 1\n    value // trailing\n}\n",
+    ];
+    for source in cases {
+        let first = format_ok(source, false);
+        let second = format_ok(&first, false);
+        assert_eq!(first, second);
+        assert_equivalent(source, &first, false);
+    }
 }
 
 #[test]

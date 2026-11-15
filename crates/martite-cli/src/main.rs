@@ -329,11 +329,13 @@ fn print_rendered(diagnostics: &mut [RenderedDiagnostic], json: bool) {
             .then_with(|| left.code.cmp(&right.code))
             .then_with(|| left.message.cmp(&right.message))
     });
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<(String, u32, Code, String)> = HashSet::new();
     for diagnostic in diagnostics.iter() {
-        let key = format!(
-            "{}\0{}\0{}\0{}",
-            diagnostic.file, diagnostic.start, diagnostic.code, diagnostic.message
+        let key = (
+            diagnostic.file.clone(),
+            diagnostic.start,
+            diagnostic.code,
+            diagnostic.message.clone(),
         );
         if !seen.insert(key) {
             continue;
@@ -671,7 +673,7 @@ fn verify_format(before: &str, after: &str, interface: bool) -> Result<(), Strin
     }) {
         return Err("formatted output does not parse".into());
     }
-    if !martite_fmt::structurally_equal(&left.program, &right.program) {
+    if !martite_fmt::structurally_equal(before, &left.program, after, &right.program) {
         return Err("formatted output has a different AST".into());
     }
     Ok(())

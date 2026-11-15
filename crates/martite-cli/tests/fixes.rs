@@ -347,6 +347,37 @@ fn l020_removes_an_unused_manifest_grant() {
 }
 
 #[test]
+fn l020_removes_only_the_intended_grant_when_names_share_a_prefix() {
+    let dir = TempDir::new("l020-prefix");
+    let manifest = dir.file(
+        "plugin.toml",
+        "[plugin]\nname = \"grant-prefix\"\nversion = \"0.1.0\"\nlang = \"1\"\napi = \"1.0\"\nentry = \"main.mt\"\n\n[permissions]\ngrant = [\"app.editor\", \"a\\u0070p\"]\n",
+    );
+    dir.file("main.mt", "use app.editor\non check() {}\n");
+    let interface = dir.file("app/editor.mti", "on check()\n");
+    let unused = dir.file("app.mti", "struct Placeholder\n");
+    let fixed = martite(&[
+        s("lint"),
+        s("--fix"),
+        s("--suggested"),
+        s("--rule"),
+        s("L020"),
+        s("--interface"),
+        interface.as_os_str(),
+        s("--interface"),
+        unused.as_os_str(),
+        dir.path().as_os_str(),
+    ]);
+    assert!(fixed.status.success(), "{}", stderr(&fixed));
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    assert!(text.contains("\"app.editor\""), "{text}");
+    assert!(
+        !text.contains("\\u0070"),
+        "unused grant was not removed: {text}"
+    );
+}
+
+#[test]
 fn lint_fix_followed_by_fmt_is_stable() {
     let dir = TempDir::new("fix-fmt");
     let script = dir.file(

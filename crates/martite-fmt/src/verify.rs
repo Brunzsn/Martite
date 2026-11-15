@@ -1,39 +1,39 @@
 //! Structural AST comparison used by `martite fmt --verify`.
 
 use martite_syntax::{
-    Arg, AssignOp, BinaryOp, Block, Bound, ConstDecl, EnumDecl, Expr, ExprKind, Field, FieldInit,
-    FieldName, FnDecl, GenericParam, ImplDecl, Item, LambdaBody, LambdaParam, MatchArm, MatchBody,
-    OnDecl, Param, ParamKind, PatKind, Pattern, PrimTy, Program, Stmt, StmtKind, StrExprPart,
-    StructDecl, TestDecl, TyExpr, TyKind, UnaryOp, UseDecl, Variant,
+    Block, Bound, ConstDecl, EnumDecl, Expr, ExprKind, Field, FieldInit, FieldName, FnDecl,
+    GenericParam, ImplDecl, Item, LambdaBody, LambdaParam, MatchArm, MatchBody, OnDecl, Param,
+    ParamKind, PatKind, Pattern, Program, Stmt, StmtKind, StrExprPart, StructDecl, TestDecl,
+    TyExpr, TyKind, UseDecl, Variant,
 };
 
-use crate::normalize;
+use crate::comments::{canonical_items, comments_equivalent};
 
 /// Compare two programs without considering spans or node IDs. Import runs are
 /// compared after sorting, because the formatter canonically sorts them.
-pub fn structurally_equal(left: &Program, right: &Program) -> bool {
+///
+/// Comments are compared by attachment as well as text: a comment that moves to
+/// a different item, statement, or match arm is a mismatch. Sources are needed
+/// to tell a same-line trailing comment from an own-line leading one.
+pub fn structurally_equal(
+    before_source: &str,
+    before: &Program,
+    after_source: &str,
+    after: &Program,
+) -> bool {
     assert!(
-        left.records_parentheses() && right.records_parentheses(),
+        before.records_parentheses() && after.records_parentheses(),
         "structurally_equal requires programs parsed with ParseOptions::TOOLING"
     );
-    if left.is_interface != right.is_interface {
+    if before.is_interface != after.is_interface {
         return false;
     }
-    if comment_multiset(left) != comment_multiset(right) {
-        return false;
-    }
-    let cmp = Cmp { left, right };
-    cmp.items(&left.items, &right.items)
-}
-
-pub fn comment_multiset(program: &Program) -> Vec<(bool, String)> {
-    let mut comments: Vec<(bool, String)> = program
-        .comments
-        .iter()
-        .map(|comment| (comment.doc, normalize::comment(comment)))
-        .collect();
-    comments.sort();
-    comments
+    let cmp = Cmp {
+        left: before,
+        right: after,
+    };
+    cmp.items(&before.items, &after.items)
+        && comments_equivalent(before_source, before, after_source, after)
 }
 
 struct Cmp<'a> {
@@ -43,49 +43,13 @@ struct Cmp<'a> {
 
 impl Cmp<'_> {
     fn items(&self, left: &[Item], right: &[Item]) -> bool {
-        let mut left_index = 0;
-        let mut right_index = 0;
-        while left_index < left.len() && right_index < right.len() {
-            if matches!(left[left_index], Item::Use(_))
-                && matches!(right[right_index], Item::Use(_))
-            {
-                let mut left_run = Vec::new();
-                while left_index < left.len() {
-                    if let Item::Use(item) = &left[left_index] {
-                        left_run.push(item);
-                        left_index += 1;
-                    } else {
-                        break;
-                    }
-                }
-                let mut right_run = Vec::new();
-                while right_index < right.len() {
-                    if let Item::Use(item) = &right[right_index] {
-                        right_run.push(item);
-                        right_index += 1;
-                    } else {
-                        break;
-                    }
-                }
-                left_run.sort_by(|a, b| a.path.cmp(&b.path));
-                right_run.sort_by(|a, b| a.path.cmp(&b.path));
-                if left_run.len() != right_run.len()
-                    || !left_run
-                        .iter()
-                        .zip(right_run.iter())
-                        .all(|(a, b)| self.use_decl(a, b))
-                {
-                    return false;
-                }
-                continue;
-            }
-            if !self.item(&left[left_index], &right[right_index]) {
-                return false;
-            }
-            left_index += 1;
-            right_index += 1;
-        }
-        left_index == left.len() && right_index == right.len()
+        let left = canonical_items(left);
+        let right = canonical_items(right);
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right.iter())
+                .all(|(left, right)| self.item(left, right))
     }
 
     fn item(&self, left: &Item, right: &Item) -> bool {
@@ -613,10 +577,6 @@ fn field_name_eq(left: &FieldName, right: &FieldName) -> bool {
     }
 }
 
-// Keep the imports used by the comparison exhaustive helpers.
-#[allow(dead_code)]
-fn _types(_: AssignOp, _: BinaryOp, _: UnaryOp, _: PrimTy, _: Bound, _: Arg) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,16 +584,18 @@ mod tests {
     use martite_syntax::{ParseOptions, parse_source_with};
 
     fn equal(left: &str, right: &str) -> bool {
-        let left = parse_source_with(left, LoadLimits::default(), ParseOptions::TOOLING).program;
-        let right = parse_source_with(right, LoadLimits::default(), ParseOptions::TOOLING).program;
-        structurally_equal(&left, &right)
+        let left_program =
+            parse_source_with(left, LoadLimits::default(), ParseOptions::TOOLING).program;
+        let right_program =
+            parse_source_with(right, LoadLimits::default(), ParseOptions::TOOLING).program;
+        structurally_equal(left, &left_program, right, &right_program)
     }
 
     #[test]
     fn ignores_spans_comments_and_import_order() {
         assert!(equal(
-            "use z\nuse a\nfn main(){let x=0xff}",
-            "use a\nuse z\n\nfn main() {\n    let x = 0xFF\n}"
+            "// c\nuse z\nuse a\nfn main(){let x=0xff}",
+            "use a\n// c\nuse z\n\nfn main() {\n    let x = 0xFF\n}"
         ));
     }
 
@@ -641,5 +603,49 @@ mod tests {
     fn detects_parenthesis_and_ast_changes() {
         assert!(!equal("fn main(){let x=(1)}", "fn main(){let x=1}"));
         assert!(!equal("fn main(){let x=1+2}", "fn main(){let x=1-2}"));
+    }
+
+    #[test]
+    fn comments_keep_their_sorted_import() {
+        assert!(equal(
+            "// bravo\nuse b.mod\n// alpha\nuse a.mod",
+            "// alpha\nuse a.mod\n// bravo\nuse b.mod"
+        ));
+        assert!(!equal(
+            "// bravo\nuse b.mod\n// alpha\nuse a.mod",
+            "// bravo\nuse a.mod\n// alpha\nuse b.mod"
+        ));
+    }
+
+    #[test]
+    fn detects_comment_moves_between_items() {
+        assert!(!equal(
+            "// one\nfn one() {}\n// two\nfn two() {}",
+            "// two\nfn one() {}\n// one\nfn two() {}"
+        ));
+    }
+
+    #[test]
+    fn detects_comment_moves_between_statements() {
+        assert!(!equal(
+            "fn main() {\n    // one\n    let a = 1\n    // two\n    let b = 2\n}",
+            "fn main() {\n    // two\n    let a = 1\n    // one\n    let b = 2\n}"
+        ));
+    }
+
+    #[test]
+    fn detects_comment_moves_between_match_arms() {
+        assert!(!equal(
+            "fn main(x: int) {\n    match x {\n        // one\n        1 => print(\"one\"),\n        // two\n        _ => print(\"two\"),\n    }\n}",
+            "fn main(x: int) {\n    match x {\n        // two\n        1 => print(\"one\"),\n        // one\n        _ => print(\"two\"),\n    }\n}"
+        ));
+    }
+
+    #[test]
+    fn detects_comment_moves_after_a_trailing_expression() {
+        assert!(!equal(
+            "fn main() {\n    let a = 1\n    a // tail\n}",
+            "fn main() {\n    // tail\n    let a = 1\n    a\n}"
+        ));
     }
 }

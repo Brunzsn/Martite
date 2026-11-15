@@ -87,6 +87,15 @@ pub fn literal_text(source: &str, span: martite_base::Span, fallback: &str) -> S
     fallback.to_string()
 }
 
+/// True when the comment follows non-whitespace on its source line.
+pub fn is_trailing_comment(source: &str, comment: &Comment) -> bool {
+    let start = (comment.span.start as usize).min(source.len());
+    let line_start = source[..start].rfind('\n').map_or(0, |index| index + 1);
+    source[line_start..start]
+        .chars()
+        .any(|ch| !ch.is_whitespace())
+}
+
 pub fn token_text(kind: &TokenKind) -> Option<&'static str> {
     kind.keyword_text().or_else(|| match kind {
         TokenKind::Comma => Some(","),
