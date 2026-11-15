@@ -586,6 +586,52 @@ fn load_still_returns_diagnostics_only() {
     assert!(!diagnostics.is_empty());
 }
 
+const BROKEN_SCRIPT: &str = r#"
+fn main() {
+    let value: int = "not an int"
+}
+"#;
+
+#[test]
+fn try_load_script_keeps_sources_for_rendering() {
+    let engine = Engine::new();
+    let mut provider = MemoryProvider::new();
+    provider.insert("main.mt", BROKEN_SCRIPT);
+    let error = match engine.try_load_script("main.mt", &provider) {
+        Ok(_) => panic!("expected a load error"),
+        Err(error) => error,
+    };
+    let diagnostic = error
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.source.is_some() && diagnostic.span.is_some())
+        .expect("expected a sourced diagnostic");
+    let file = error
+        .sources
+        .get(diagnostic.source.unwrap())
+        .expect("source map retained");
+    assert_eq!(file.name(), "main.mt");
+    let (line, _) = file.line_col(diagnostic.span.unwrap().start);
+    assert!(
+        file.line_text(line).contains("\"not an int\""),
+        "unexpected source line: {}",
+        file.line_text(line)
+    );
+    assert!(diagnostic.render(&error.sources).contains("main.mt:"));
+}
+
+#[test]
+fn load_script_still_returns_diagnostics_only() {
+    let engine = Engine::new();
+    let mut provider = MemoryProvider::new();
+    provider.insert("main.mt", BROKEN_SCRIPT);
+    let diagnostics = match engine.load_script("main.mt", &provider) {
+        Ok(_) => panic!("expected a load error"),
+        Err(diagnostics) => diagnostics,
+    };
+    assert!(!diagnostics.is_empty());
+}
+
 #[test]
 fn unregistered_host_functions_still_trap() {
     let mut engine = Engine::new();

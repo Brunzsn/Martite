@@ -115,6 +115,10 @@ struct Checker<'a> {
     struct_lit_fields: FxHashMap<NodeId, Vec<(usize, usize)>>,
     struct_pattern_fields: FxHashMap<NodeId, Vec<(usize, usize)>>,
     bindings: FxHashMap<BindingId, BindingInfo>,
+    /// Immutable locals that directly alias a builtin function item. Calls
+    /// through the alias use the item's generic signature instead of the
+    /// rigid `Ty::Param` placeholder stored in the binding type.
+    builtin_fn_aliases: FxHashMap<BindingId, BuiltinItem>,
     pattern_bindings: NodeTable<BindingId>,
     param_bindings: FxHashMap<NodeId, BindingId>,
     lambdas: FxHashMap<NodeId, LambdaInfo>,
@@ -151,6 +155,7 @@ impl<'a> Checker<'a> {
             struct_lit_fields: FxHashMap::default(),
             struct_pattern_fields: FxHashMap::default(),
             bindings: FxHashMap::default(),
+            builtin_fn_aliases: FxHashMap::default(),
             pattern_bindings: NodeTable::with_capacity(node_capacity),
             param_bindings: FxHashMap::default(),
             lambdas: FxHashMap::default(),

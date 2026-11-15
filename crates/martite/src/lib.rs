@@ -483,11 +483,25 @@ impl Engine {
             .collect()
     }
 
+    /// Load a script, keeping only the diagnostics on failure.
+    ///
+    /// Use [`Engine::try_load_script`] when the host needs the [`SourceMap`] to
+    /// render the failure.
     pub fn load_script(
         &self,
         entry: impl Into<String>,
         provider: &dyn SourceProvider,
     ) -> Result<Plugin, Vec<Diagnostic>> {
+        self.try_load_script(entry, provider)
+            .map_err(|error| error.diagnostics)
+    }
+
+    /// Load a script and keep the sources used to compile it when loading fails.
+    pub fn try_load_script(
+        &self,
+        entry: impl Into<String>,
+        provider: &dyn SourceProvider,
+    ) -> Result<Plugin, LoadError> {
         let loaded = load(
             provider,
             &LoadOptions {
@@ -500,11 +514,20 @@ impl Engine {
             },
         );
         if loaded.has_errors() {
-            return Err(loaded.diagnostics);
+            return Err(LoadError {
+                diagnostics: loaded.diagnostics,
+                sources: loaded.sources,
+            });
         }
-        let program = loaded
-            .program
-            .ok_or_else(|| vec![Diagnostic::error(Code::E508, "program failed to load")])?;
+        let LoadedProgram {
+            program, sources, ..
+        } = loaded;
+        let Some(program) = program else {
+            return Err(LoadError {
+                diagnostics: vec![Diagnostic::error(Code::E508, "program failed to load")],
+                sources,
+            });
+        };
         let mut diagnostics = Vec::new();
         for module in &program.resolved.modules {
             if !module.is_interface {
@@ -539,16 +562,30 @@ impl Engine {
             }
         }
         if !diagnostics.is_empty() {
-            return Err(diagnostics);
+            return Err(LoadError {
+                diagnostics,
+                sources,
+            });
         }
-        let lowered = lower(&program, &loaded.sources);
+        let lowered = lower(&program, &sources);
         if lowered.has_errors() {
-            return Err(lowered.diagnostics);
+            return Err(LoadError {
+                diagnostics: lowered.diagnostics,
+                sources,
+            });
         }
-        let mut ir = lowered
-            .program
-            .ok_or_else(|| vec![Diagnostic::error(Code::E508, "program failed to lower")])?;
-        self.optimize_ir(&mut ir)?;
+        let Some(mut ir) = lowered.program else {
+            return Err(LoadError {
+                diagnostics: vec![Diagnostic::error(Code::E508, "program failed to lower")],
+                sources,
+            });
+        };
+        if let Err(diagnostics) = self.optimize_ir(&mut ir) {
+            return Err(LoadError {
+                diagnostics,
+                sources,
+            });
+        }
         let host_by_id = self.host_map(&ir);
         let manifest = Manifest {
             name: "script".into(),
@@ -567,7 +604,7 @@ impl Engine {
         Ok(Plugin::from_inner(PluginInner {
             program,
             ir,
-            sources: loaded.sources,
+            sources,
             host_by_id,
             settings: toml::Value::Table(Default::default()),
             limits: clamp_limits(self.default_limits, self.max_limits),

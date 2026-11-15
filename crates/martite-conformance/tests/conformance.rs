@@ -248,6 +248,18 @@ fn std_math_surface_uses_euler() {
 }
 
 #[test]
+fn std_math_atan2_types_as_float() {
+    let logs = run(r#"
+        use std.math
+        fn main() {
+            let angle: float = math.atan2(1.0, 2.0)
+            print("{angle}")
+        }
+        "#);
+    assert_eq!(logs, ["0.4636476090008061"]);
+}
+
+#[test]
 fn runtime_panics() {
     assert!(matches!(
         trap("fn main() { let xs = [1]\nprint(\"{xs[3]}\") }"),
