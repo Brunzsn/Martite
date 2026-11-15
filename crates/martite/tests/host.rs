@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use martite::{Engine, HostSignature, HostType, Instance, Outcome};
+use martite::{Engine, HostSignature, HostType, Instance, Limits, Outcome};
 use martite_base::MemoryProvider;
 use martite_runtime::{HostFault, Trap, Value};
 
@@ -68,7 +68,7 @@ fn load_plugin() -> martite::Plugin {
         })
 }
 
-fn state_saves(instance: &Instance<'_>) -> i64 {
+fn state_saves(instance: &Instance) -> i64 {
     let Some(Value::Struct(state)) = instance.state() else {
         panic!("expected struct state");
     };
@@ -82,7 +82,7 @@ fn state_saves(instance: &Instance<'_>) -> i64 {
 fn plugin_init_hook_and_state() {
     let plugin = load_plugin();
     let doc = plugin.make_handle("Doc", "doc-1").expect("handle");
-    let mut instance: Instance<'_> = plugin.instantiate().expect("init");
+    let mut instance: Instance = plugin.instantiate().expect("init");
     match instance.call("saved", vec![doc]).expect("hook") {
         Outcome::Handled(value) => {
             assert!(
@@ -121,6 +121,7 @@ fn reload_keeps_snapshot_when_the_state_type_is_unchanged() {
         .expect("reload");
     assert!(reloaded.snapshot_kept);
     let restored = reloaded.instantiate().expect("restore");
+    drop(reloaded);
     assert_eq!(state_saves(&restored), 1, "init must not reset the state");
 }
 
@@ -462,7 +463,7 @@ fn doc_type_id(plugin: &martite::Plugin) -> u32 {
         .expect("Doc interface type")
 }
 
-fn handle_state_text<'a>(instance: &'a Instance<'_>) -> &'a str {
+fn handle_state_text(instance: &Instance) -> &str {
     let Some(Value::Struct(state)) = instance.state() else {
         panic!("expected struct state");
     };
@@ -472,7 +473,7 @@ fn handle_state_text<'a>(instance: &'a Instance<'_>) -> &'a str {
     text
 }
 
-fn handle_state_count(instance: &Instance<'_>) -> i64 {
+fn handle_state_count(instance: &Instance) -> i64 {
     let Some(Value::Struct(state)) = instance.state() else {
         panic!("expected struct state");
     };
@@ -632,4 +633,302 @@ fn test_doubles_can_construct_handles() {
     let reports = plugin.run_tests();
     assert_eq!(reports.len(), 1);
     assert!(reports[0].passed(), "test failed: {:?}", reports[0].outcome);
+}
+
+const CALLER_INTERFACE: &str =
+    "fn caller_name() -> str\nfn caller_version() -> str\non refresh()\n";
+
+const CALLER_MANIFEST: &str = r#"
+[plugin]
+name = "caller-test"
+version = "1.2.3"
+lang = "1"
+api = "1.0"
+entry = "main.mt"
+
+[permissions]
+grant = ["app.meta"]
+"#;
+
+const CALLER_PLUGIN: &str = r#"
+use app.meta
+
+struct State { name: str, version: str }
+
+on init() -> State {
+    State { name: meta.caller_name(), version: meta.caller_version() }
+}
+
+on refresh(mut self) {
+    self.name = meta.caller_name()
+    self.version = meta.caller_version()
+}
+"#;
+
+const CALLER_TEST_PLUGIN: &str = r#"
+use app.meta
+
+test "host functions see the plugin caller" {
+    assert(meta.caller_name() == "caller-test", "wrong caller name")
+    assert(meta.caller_version() == "1.2.3", "wrong caller version")
+}
+"#;
+
+fn caller_engine() -> Engine {
+    let mut engine = Engine::new();
+    engine.interface("app.meta", CALLER_INTERFACE);
+    engine.host_fn(
+        "app.meta.caller_name",
+        HostSignature::new(vec![], HostType::Str),
+        |cx, _args| Ok(Value::str(cx.plugin_name().unwrap_or("<none>"))),
+    );
+    engine.host_fn(
+        "app.meta.caller_version",
+        HostSignature::new(vec![], HostType::Str),
+        |cx, _args| Ok(Value::str(cx.plugin_version().unwrap_or("<none>"))),
+    );
+    engine
+}
+
+fn load_caller_plugin(source: &str) -> martite::Plugin {
+    let engine = caller_engine();
+    let mut provider = MemoryProvider::new();
+    provider.insert("main.mt", source);
+    engine.load(CALLER_MANIFEST, &provider).expect("load")
+}
+
+fn caller_state_str(instance: &Instance, index: usize) -> &str {
+    let Some(Value::Struct(state)) = instance.state() else {
+        panic!("expected struct state");
+    };
+    let Value::Str(value) = &state.fields[index] else {
+        panic!("expected string field");
+    };
+    value
+}
+
+#[test]
+fn host_functions_see_the_calling_plugin() {
+    let mut instance = load_caller_plugin(CALLER_PLUGIN)
+        .instantiate()
+        .expect("init");
+    assert_eq!(caller_state_str(&instance, 0), "caller-test");
+    assert_eq!(caller_state_str(&instance, 1), "1.2.3");
+
+    let Outcome::Handled(value) = instance.call("refresh", vec![]).expect("call") else {
+        panic!("handler missing");
+    };
+    assert!(matches!(value, Value::Unit));
+    assert_eq!(caller_state_str(&instance, 0), "caller-test");
+    assert_eq!(caller_state_str(&instance, 1), "1.2.3");
+}
+
+#[test]
+fn test_blocks_see_the_calling_plugin() {
+    let plugin = load_caller_plugin(CALLER_TEST_PLUGIN);
+    let reports = plugin.run_tests();
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].passed(), "test failed: {:?}", reports[0].outcome);
+}
+
+const SPIN_INTERFACE: &str = "on spin() -> int\n";
+
+const SPIN_MANIFEST: &str = r#"
+[plugin]
+name = "limits-test"
+version = "0.1.0"
+lang = "1"
+api = "1.0"
+entry = "main.mt"
+
+[permissions]
+grant = ["app.limits"]
+"#;
+
+const SPIN_PLUGIN: &str = r#"
+use app.limits
+
+on spin() -> int {
+    var i = 0
+    while i < 20000 {
+        i += 1
+    }
+    i
+}
+"#;
+
+const SPIN_INIT_PLUGIN: &str = r#"
+on init() -> int {
+    var i = 0
+    while i < 20000 {
+        i += 1
+    }
+    i
+}
+"#;
+
+const SPIN_INIT_STATE_PLUGIN: &str = r#"
+struct State { value: int }
+
+on init() -> State {
+    var i = 0
+    while i < 20000 {
+        i += 1
+    }
+    State { value: i }
+}
+"#;
+
+const SHUTDOWN_PLUGIN: &str = r#"
+on shutdown() {
+    var i = 0
+    while i < 20000 {
+        i += 1
+    }
+}
+"#;
+
+fn tight_limits() -> Limits {
+    Limits {
+        fuel: 1_000,
+        ..Limits::default()
+    }
+}
+
+fn roomy_limits() -> Limits {
+    Limits {
+        fuel: 1_000_000,
+        ..Limits::default()
+    }
+}
+
+fn load_spin_plugin(source: &str, max: Limits, default: Limits) -> martite::Plugin {
+    let mut engine = Engine::new();
+    engine.interface("app.limits", SPIN_INTERFACE);
+    engine.set_limits(max, default);
+    let mut provider = MemoryProvider::new();
+    provider.insert("main.mt", source);
+    engine.load(SPIN_MANIFEST, &provider).expect("load")
+}
+
+#[test]
+fn call_with_limits_can_raise_a_tight_default() {
+    let plugin = load_spin_plugin(SPIN_PLUGIN, roomy_limits(), tight_limits());
+    let mut instance = plugin.instantiate().expect("init");
+
+    let error = instance
+        .call("spin", vec![])
+        .expect_err("the tight default must trap");
+    assert!(matches!(error, Trap::OutOfFuel), "unexpected {error:?}");
+
+    let Outcome::Handled(value) = instance
+        .call_with_limits("spin", vec![], roomy_limits())
+        .expect("the override must succeed")
+    else {
+        panic!("handler missing");
+    };
+    assert!(matches!(value, Value::Int(20_000)));
+}
+
+#[test]
+fn per_call_limits_are_clamped_to_the_engine_maximum() {
+    let plugin = load_spin_plugin(SPIN_PLUGIN, tight_limits(), tight_limits());
+    let mut instance = plugin.instantiate().expect("init");
+    let mut request = roomy_limits();
+    request.fuel = 10_000_000;
+
+    let error = instance
+        .call_with_limits("spin", vec![], request)
+        .expect_err("the engine maximum must clamp the request");
+    assert!(matches!(error, Trap::OutOfFuel), "unexpected {error:?}");
+}
+
+#[test]
+fn instantiate_with_limits_can_raise_a_tight_init_default() {
+    let plugin = load_spin_plugin(SPIN_INIT_PLUGIN, roomy_limits(), tight_limits());
+
+    let error = match plugin.instantiate() {
+        Ok(_) => panic!("the tight init default must trap"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, Trap::OutOfFuel), "unexpected {error:?}");
+
+    let instance = plugin
+        .instantiate_with_limits(roomy_limits())
+        .expect("the override must succeed");
+    assert!(matches!(instance.state(), Some(Value::Int(20_000))));
+}
+
+#[test]
+fn reload_can_use_a_different_init_budget() {
+    let mut engine = Engine::new();
+    engine.interface("app.limits", SPIN_INTERFACE);
+    engine.set_limits(roomy_limits(), tight_limits());
+    let mut provider = MemoryProvider::new();
+    provider.insert("main.mt", SPIN_INIT_PLUGIN);
+    let plugin = engine.load(SPIN_MANIFEST, &provider).expect("load");
+    let snapshot = plugin
+        .instantiate_with_limits(roomy_limits())
+        .expect("init")
+        .snapshot();
+
+    provider.insert("main.mt", SPIN_INIT_STATE_PLUGIN);
+    let reloaded = engine
+        .reload(SPIN_MANIFEST, &provider, &plugin, &snapshot)
+        .expect("reload");
+    assert!(!reloaded.snapshot_kept);
+
+    let error = match reloaded.instantiate() {
+        Ok(_) => panic!("the tight init default must trap"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, Trap::OutOfFuel), "unexpected {error:?}");
+
+    let instance = reloaded
+        .instantiate_with_limits(roomy_limits())
+        .expect("the override must succeed");
+    assert!(matches!(instance.state(), Some(Value::Struct(_))));
+}
+
+#[test]
+fn shutdown_with_limits_can_raise_a_tight_default() {
+    let plugin = load_spin_plugin(SHUTDOWN_PLUGIN, roomy_limits(), tight_limits());
+    let mut instance = plugin.instantiate().expect("init");
+
+    let error = instance
+        .shutdown()
+        .expect_err("the tight default must trap");
+    assert!(matches!(error, Trap::OutOfFuel), "unexpected {error:?}");
+
+    instance
+        .shutdown_with_limits(roomy_limits())
+        .expect("the override must succeed");
+}
+
+#[test]
+fn plugin_and_instance_live_in_one_slot() {
+    struct Slot {
+        plugin: martite::Plugin,
+        instance: Instance,
+    }
+
+    let plugin = load_plugin();
+    let instance = plugin.instantiate().expect("init");
+    let slot = Slot { plugin, instance };
+    assert_eq!(slot.plugin.manifest().name, "word-count");
+    assert!(matches!(slot.instance.state(), Some(Value::Struct(_))));
+}
+
+#[test]
+fn instance_outlives_the_plugin_handle() {
+    let mut instance = load_plugin().instantiate().expect("init");
+    let doc = instance
+        .plugin()
+        .make_handle("Doc", "doc-1")
+        .expect("handle");
+    let Outcome::Handled(value) = instance.call("saved", vec![doc]).expect("call") else {
+        panic!("handler missing");
+    };
+    assert!(matches!(value, Value::Result(Ok(_))), "{value:?}");
+    assert_eq!(state_saves(&instance), 1);
 }

@@ -12,7 +12,8 @@ use martite_driver::{LoadOptions, LoadedProgram, load, lower};
 use martite_ir::{HostId, IrProgram, TypeDefKind, TypeId, TypeTable};
 use martite_resolve::InterfaceSource;
 use martite_runtime::{
-    ExecLimits, HostContext, HostFault, IrHostDispatcher, IrRuntime, MAX_VALUE_DEPTH, Trap, Value,
+    ExecLimits, HostCaller, HostContext, HostFault, IrHostDispatcher, IrRuntime, MAX_VALUE_DEPTH,
+    Trap, Value,
 };
 use martite_syntax::ParseOptions;
 
@@ -442,26 +443,30 @@ impl Engine {
             });
         }
         let host_by_id = self.host_map(&ir);
-        Ok(Plugin {
+        let limits = clamp_limits(
+            ExecLimits {
+                fuel: manifest.fuel.unwrap_or(self.default_limits.fuel),
+                memory: manifest.memory.unwrap_or(self.default_limits.memory),
+                depth: manifest.depth.unwrap_or(self.default_limits.depth),
+                deadline: manifest
+                    .deadline_ms
+                    .map(std::time::Duration::from_millis)
+                    .or(self.default_limits.deadline),
+            },
+            self.max_limits,
+        );
+        let caller = HostCaller::new(manifest.name.clone(), manifest.version.clone());
+        Ok(Plugin::from_inner(PluginInner {
             program,
             ir,
             sources,
             host_by_id,
             settings: manifest.settings.clone(),
-            limits: clamp_limits(
-                ExecLimits {
-                    fuel: manifest.fuel.unwrap_or(self.default_limits.fuel),
-                    memory: manifest.memory.unwrap_or(self.default_limits.memory),
-                    depth: manifest.depth.unwrap_or(self.default_limits.depth),
-                    deadline: manifest
-                        .deadline_ms
-                        .map(std::time::Duration::from_millis)
-                        .or(self.default_limits.deadline),
-                },
-                self.max_limits,
-            ),
+            limits,
+            max_limits: self.max_limits,
+            caller,
             manifest,
-        })
+        }))
     }
 
     /// Map the IR host table onto the registered host functions.
@@ -545,27 +550,31 @@ impl Engine {
             .ok_or_else(|| vec![Diagnostic::error(Code::E508, "program failed to lower")])?;
         self.optimize_ir(&mut ir)?;
         let host_by_id = self.host_map(&ir);
-        Ok(Plugin {
+        let manifest = Manifest {
+            name: "script".into(),
+            version: "0.0.0".into(),
+            lang: LANG_EDITION.into(),
+            api: "1.0".into(),
+            entry: "main.mt".into(),
+            grants: Vec::new(),
+            fuel: None,
+            memory: None,
+            depth: None,
+            deadline_ms: None,
+            settings: toml::Value::Table(Default::default()),
+        };
+        let caller = HostCaller::new(manifest.name.clone(), manifest.version.clone());
+        Ok(Plugin::from_inner(PluginInner {
             program,
             ir,
             sources: loaded.sources,
             host_by_id,
             settings: toml::Value::Table(Default::default()),
             limits: clamp_limits(self.default_limits, self.max_limits),
-            manifest: Manifest {
-                name: "script".into(),
-                version: "0.0.0".into(),
-                lang: LANG_EDITION.into(),
-                api: "1.0".into(),
-                entry: "main.mt".into(),
-                grants: Vec::new(),
-                fuel: None,
-                memory: None,
-                depth: None,
-                deadline_ms: None,
-                settings: toml::Value::Table(Default::default()),
-            },
-        })
+            max_limits: self.max_limits,
+            caller,
+            manifest,
+        }))
     }
 }
 
@@ -591,14 +600,36 @@ fn parse_api(api: &str) -> Result<(u32, u32), ()> {
     Ok((major, minor))
 }
 
-pub struct Plugin {
+struct PluginInner {
     program: CheckedProgram,
     ir: IrProgram,
     sources: SourceMap,
     host_by_id: Vec<Option<RegisteredFn>>,
     settings: toml::Value,
     limits: ExecLimits,
+    max_limits: ExecLimits,
+    caller: HostCaller,
     manifest: Manifest,
+}
+
+impl PluginInner {
+    fn has_handler(&self, name: &str) -> bool {
+        self.ir
+            .entries
+            .handlers
+            .iter()
+            .any(|(handler, _)| handler.as_ref() == name)
+    }
+}
+
+/// A loaded, immutable plugin program.
+///
+/// `Plugin` is a cheap handle to shared program data. Instances own a clone of
+/// the handle, so a host may store a plugin and its instances together or drop
+/// the original load handle while instances remain alive.
+#[derive(Clone)]
+pub struct Plugin {
+    inner: Rc<PluginInner>,
 }
 
 /// The result of [`Engine::reload`].
@@ -611,10 +642,18 @@ pub struct Reload {
 }
 
 impl Reload {
-    pub fn instantiate(&self) -> Result<Instance<'_>, Trap> {
+    pub fn instantiate(&self) -> Result<Instance, Trap> {
+        self.instantiate_with_limits(self.plugin.limits())
+    }
+
+    /// Instantiate with a per-call budget if `init` must run.
+    ///
+    /// When the snapshot is kept, this only restores it and the limits are
+    /// unused.
+    pub fn instantiate_with_limits(&self, limits: ExecLimits) -> Result<Instance, Trap> {
         match &self.snapshot {
             Some(snapshot) => self.plugin.instantiate_restored(snapshot),
-            None => self.plugin.instantiate(),
+            None => self.plugin.instantiate_with_limits(limits),
         }
     }
 }
@@ -633,13 +672,19 @@ impl TestReport {
 }
 
 impl Plugin {
+    fn from_inner(inner: PluginInner) -> Self {
+        Self {
+            inner: Rc::new(inner),
+        }
+    }
+
     pub fn program(&self) -> &CheckedProgram {
-        &self.program
+        &self.inner.program
     }
 
     /// The lowered, self-contained program executed by the IR evaluator.
     pub fn ir(&self) -> &IrProgram {
-        &self.ir
+        &self.inner.ir
     }
 
     /// Re-lower the checked program without running optimizer passes.
@@ -647,7 +692,7 @@ impl Plugin {
     /// Used by the CLI's `--dump-ir=before` stage; normal execution uses
     /// [`Self::ir`].
     pub fn lowered_ir(&self) -> Option<IrProgram> {
-        lower(&self.program, &self.sources).program
+        lower(&self.inner.program, &self.inner.sources).program
     }
 
     /// IR-owned type definitions for this program.
@@ -655,29 +700,33 @@ impl Plugin {
     /// Values, `show`, JSON conversion and snapshot validation use this table;
     /// the checker table stays available for tooling through [`Self::program`].
     pub fn types(&self) -> &TypeTable {
-        &self.ir.types
+        &self.inner.ir.types
     }
 
     pub fn sources(&self) -> &SourceMap {
-        &self.sources
+        &self.inner.sources
     }
 
     pub fn manifest(&self) -> &Manifest {
-        &self.manifest
+        &self.inner.manifest
     }
 
     /// Execution limits resolved from the manifest and engine maximum.
+    ///
+    /// These are the defaults used by [`Self::instantiate`] and
+    /// [`Instance::call`]. The `*_with_limits` variants override them for one
+    /// invocation; the engine maximum still clamps the request.
     pub fn limits(&self) -> ExecLimits {
-        self.limits
+        self.inner.limits
     }
 
     /// Arguments passed to `init`, including the settings JSON value when the
     /// hook declares a parameter.
     pub fn init_args(&self) -> Vec<Value> {
-        let Some(init) = self.ir.entries.init else {
+        let Some(init) = self.inner.ir.entries.init else {
             return Vec::new();
         };
-        match self.ir.function(init) {
+        match self.inner.ir.function(init) {
             Some(function) if function.params.is_empty() => Vec::new(),
             _ => vec![self.settings_json()],
         }
@@ -705,26 +754,27 @@ impl Plugin {
     /// Fingerprint of the state type, used to decide whether a snapshot can
     /// survive a reload.
     pub fn type_fingerprint(&self) -> [u8; 32] {
-        self.program
+        self.inner
+            .program
             .state_type
             .as_ref()
-            .map(|ty| fingerprint_type(ty, &self.program))
+            .map(|ty| fingerprint_type(ty, &self.inner.program))
             .unwrap_or([0u8; 32])
     }
 
     /// Run `fn main` in a script, using the registered host functions.
     pub fn run_main(&self) -> Result<martite_runtime::MainResult, Trap> {
         let mut dispatcher = IrDispatch {
-            fns: &self.host_by_id,
+            fns: &self.inner.host_by_id,
         };
-        let mut runtime = IrRuntime::with_host(&self.ir, self.limits, &mut dispatcher);
+        let mut runtime = self.runtime(self.inner.limits, &mut dispatcher);
         runtime.run_main()
     }
 
     /// Instantiate by restoring a snapshot instead of running `init`.
-    pub fn instantiate_restored(&self, snapshot: &Snapshot) -> Result<Instance<'_>, Trap> {
+    pub fn instantiate_restored(&self, snapshot: &Snapshot) -> Result<Instance, Trap> {
         let mut instance = Instance {
-            plugin: self,
+            plugin: self.clone(),
             state: None,
         };
         instance.restore(snapshot).map_err(|message| Trap::Panic {
@@ -740,12 +790,18 @@ impl Plugin {
     /// doubles. Tests that call an unregistered host function fail with a trap.
     pub fn run_tests(&self) -> Vec<TestReport> {
         let mut reports = Vec::new();
-        for (def, function) in self.program.tests.iter().zip(&self.ir.entries.tests) {
-            let name = self.program.resolved.def(*def).name.clone();
+        for (def, function) in self
+            .inner
+            .program
+            .tests
+            .iter()
+            .zip(&self.inner.ir.entries.tests)
+        {
+            let name = self.inner.program.resolved.def(*def).name.clone();
             let mut dispatcher = IrDispatch {
-                fns: &self.host_by_id,
+                fns: &self.inner.host_by_id,
             };
-            let mut runtime = IrRuntime::with_host(&self.ir, self.limits, &mut dispatcher);
+            let mut runtime = self.runtime(self.inner.limits, &mut dispatcher);
             let outcome = runtime
                 .invoke(*function, Vec::new())
                 .map(|result| result.value);
@@ -758,31 +814,64 @@ impl Plugin {
         reports
     }
 
-    pub fn instantiate(&self) -> Result<Instance<'_>, Trap> {
-        let state = if let Some(init) = self.ir.entries.init {
+    pub fn instantiate(&self) -> Result<Instance, Trap> {
+        self.instantiate_with_limits(self.limits())
+    }
+
+    /// Instantiate with a per-call budget for `init`.
+    ///
+    /// The request applies to the `init` run only and is clamped by the engine
+    /// maximum. Subsequent [`Instance::call`] invocations use [`Self::limits`]
+    /// unless they use [`Instance::call_with_limits`].
+    pub fn instantiate_with_limits(&self, limits: ExecLimits) -> Result<Instance, Trap> {
+        let state = if let Some(init) = self.inner.ir.entries.init {
             let args = self.init_args();
             let mut dispatcher = IrDispatch {
-                fns: &self.host_by_id,
+                fns: &self.inner.host_by_id,
             };
-            let mut runtime = IrRuntime::with_host(&self.ir, self.limits, &mut dispatcher);
+            let mut runtime = self.runtime(limits, &mut dispatcher);
             Some(runtime.invoke(init, args)?.value)
         } else {
             None
         };
         Ok(Instance {
-            plugin: self,
+            plugin: self.clone(),
             state,
         })
     }
 
+    /// Create a runtime for one plugin invocation.
+    ///
+    /// This is the single place where caller identity and the limit ceiling are
+    /// applied, so every execution path reports the same identity and no path
+    /// can exceed the engine maximum.
+    fn runtime<'a, 'h>(
+        &'a self,
+        limits: ExecLimits,
+        dispatcher: &'h mut IrDispatch<'a>,
+    ) -> IrRuntime<'a, 'h> {
+        let mut runtime = IrRuntime::with_host(
+            &self.inner.ir,
+            clamp_limits(limits, self.inner.max_limits),
+            dispatcher,
+        );
+        runtime.set_caller(self.inner.caller.clone());
+        runtime
+    }
+
     fn settings_json(&self) -> Value {
-        let json_type = self.ir.entries.json_type.unwrap_or(TypeId(0));
-        toml_to_json(&self.settings, json_type, self.types())
+        let json_type = self.inner.ir.entries.json_type.unwrap_or(TypeId(0));
+        toml_to_json(&self.inner.settings, json_type, self.types())
     }
 }
 
-pub struct Instance<'p> {
-    plugin: &'p Plugin,
+/// A live plugin instance: its state plus an owned handle to its plugin.
+///
+/// Instances do not borrow the [`Plugin`] that created them, so hosts can keep
+/// plugins and instances in the same registry, drop the original load handle,
+/// or swap a reloaded plugin into a slot without self-referential types.
+pub struct Instance {
+    plugin: Plugin,
     state: Option<Value>,
 }
 
@@ -792,48 +881,55 @@ pub enum Outcome {
     NoHandler,
 }
 
-impl<'p> Instance<'p> {
+impl Instance {
+    /// The plugin program this instance was created from.
+    pub fn plugin(&self) -> &Plugin {
+        &self.plugin
+    }
+
     pub fn state(&self) -> Option<&Value> {
         self.state.as_ref()
     }
 
     pub fn call(&mut self, hook: &str, args: Vec<Value>) -> Result<Outcome, Trap> {
-        if !self
-            .plugin
-            .ir
-            .entries
-            .handlers
-            .iter()
-            .any(|(name, _)| name.as_ref() == hook)
-        {
+        self.call_with_limits(hook, args, self.plugin.limits())
+    }
+
+    /// Run one hook with a per-call limit override.
+    ///
+    /// The request is clamped by the engine maximum. A trap leaves the instance
+    /// state unchanged.
+    pub fn call_with_limits(
+        &mut self,
+        hook: &str,
+        args: Vec<Value>,
+        limits: ExecLimits,
+    ) -> Result<Outcome, Trap> {
+        if !self.plugin.inner.has_handler(hook) {
             return Ok(Outcome::NoHandler);
         }
         let mut dispatcher = IrDispatch {
-            fns: &self.plugin.host_by_id,
+            fns: &self.plugin.inner.host_by_id,
         };
-        let mut runtime =
-            IrRuntime::with_host(&self.plugin.ir, self.plugin.limits, &mut dispatcher);
+        let mut runtime = self.plugin.runtime(limits, &mut dispatcher);
         let value = runtime.invoke_handler(hook, &mut self.state, args)?;
         Ok(value.map(Outcome::Handled).unwrap_or(Outcome::NoHandler))
     }
 
     pub fn shutdown(&mut self) -> Result<(), Trap> {
-        if !self
-            .plugin
-            .ir
-            .entries
-            .handlers
-            .iter()
-            .any(|(name, _)| name.as_ref() == "shutdown")
-        {
+        self.shutdown_with_limits(self.plugin.limits())
+    }
+
+    /// Run the `shutdown` hook with a per-call limit override.
+    pub fn shutdown_with_limits(&mut self, limits: ExecLimits) -> Result<(), Trap> {
+        if self.plugin.inner.ir.entries.shutdown.is_none() {
             return Ok(());
         }
         let mut dispatcher = IrDispatch {
-            fns: &self.plugin.host_by_id,
+            fns: &self.plugin.inner.host_by_id,
         };
-        let mut runtime =
-            IrRuntime::with_host(&self.plugin.ir, self.plugin.limits, &mut dispatcher);
-        let _ = runtime.invoke_handler("shutdown", &mut self.state, Vec::new())?;
+        let mut runtime = self.plugin.runtime(limits, &mut dispatcher);
+        let _ = runtime.invoke_shutdown(&mut self.state)?;
         Ok(())
     }
 
@@ -843,7 +939,7 @@ impl<'p> Instance<'p> {
         let bytes = self
             .state
             .as_ref()
-            .map(|state| encode_value(state, &self.plugin.program))
+            .map(|state| encode_value(state, self.plugin.program()))
             .unwrap_or_default();
         Snapshot {
             format_version: SNAPSHOT_FORMAT_VERSION,
@@ -865,7 +961,7 @@ impl<'p> Instance<'p> {
             return Ok(());
         }
         let mut pos = 0;
-        let value = decode_value(&snapshot.bytes, &mut pos, &self.plugin.program, 0)?;
+        let value = decode_value(&snapshot.bytes, &mut pos, self.plugin.program(), 0)?;
         if pos != snapshot.bytes.len() {
             return Err("trailing bytes in snapshot".into());
         }

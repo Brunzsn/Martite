@@ -43,22 +43,72 @@ impl HostFault {
     }
 }
 
+/// Identity of the plugin whose code is currently running.
+///
+/// The embedding attaches a caller to [`crate::IrRuntime`] before invoking
+/// plugin code. A runtime used directly without an attached caller reports
+/// `None` through [`HostContext::caller`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostCaller {
+    name: Rc<str>,
+    version: Rc<str>,
+}
+
+impl HostCaller {
+    /// Create a caller identity from the plugin's manifest name and version.
+    pub fn new(name: impl Into<Rc<str>>, version: impl Into<Rc<str>>) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+        }
+    }
+
+    /// The manifest name of the calling plugin.
+    pub fn name(&self) -> &str {
+        self.name.as_ref()
+    }
+
+    /// The manifest version of the calling plugin.
+    pub fn version(&self) -> &str {
+        self.version.as_ref()
+    }
+}
+
 /// Per-call context passed to a host function.
 ///
 /// The runtime constructs this value. `handle_type` records the opaque type
-/// the host function is allowed to create, if any.
+/// the host function is allowed to create, if any, and `caller` identifies the
+/// plugin whose call is in progress.
 #[derive(Debug, Clone)]
 pub struct HostContext {
     pub charged: u64,
     handle_type: Option<TypeId>,
+    caller: Option<HostCaller>,
 }
 
 impl HostContext {
-    pub(crate) fn new(handle_type: Option<TypeId>) -> Self {
+    pub(crate) fn new(handle_type: Option<TypeId>, caller: Option<HostCaller>) -> Self {
         Self {
             charged: 0,
             handle_type,
+            caller,
         }
+    }
+
+    /// The plugin that invoked this host function, when the embedding attached
+    /// an identity to the runtime.
+    pub fn caller(&self) -> Option<&HostCaller> {
+        self.caller.as_ref()
+    }
+
+    /// The manifest name of the calling plugin, when known.
+    pub fn plugin_name(&self) -> Option<&str> {
+        self.caller().map(HostCaller::name)
+    }
+
+    /// The manifest version of the calling plugin, when known.
+    pub fn plugin_version(&self) -> Option<&str> {
+        self.caller().map(HostCaller::version)
     }
 
     pub fn charge(&mut self, units: u64) {
@@ -124,4 +174,26 @@ pub struct CallResult {
 pub struct MainResult {
     pub value: Value,
     pub log: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_context_reports_the_attached_caller() {
+        let caller = HostCaller::new("word-count", "1.2.3");
+        let cx = HostContext::new(None, Some(caller));
+        assert_eq!(cx.plugin_name(), Some("word-count"));
+        assert_eq!(cx.plugin_version(), Some("1.2.3"));
+        assert_eq!(cx.caller().map(HostCaller::name), Some("word-count"));
+    }
+
+    #[test]
+    fn host_context_without_a_caller_reports_none() {
+        let cx = HostContext::new(None, None);
+        assert!(cx.caller().is_none());
+        assert!(cx.plugin_name().is_none());
+        assert!(cx.plugin_version().is_none());
+    }
 }

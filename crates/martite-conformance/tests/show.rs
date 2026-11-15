@@ -170,7 +170,7 @@ grant = ["app.api"]
     let mut provider = MemoryProvider::new();
     provider.insert("main.mt", source);
     let plugin = engine.load(manifest, &provider).expect("plugin loads");
-    let mut instance: Instance<'_> = plugin.instantiate().expect("instantiate");
+    let mut instance: Instance = plugin.instantiate().expect("instantiate");
     let handle = plugin.make_handle("Doc", "doc-1").expect("handle");
     let Outcome::Handled(value) = instance.call("describe", vec![handle]).expect("hook") else {
         panic!("handler missing");

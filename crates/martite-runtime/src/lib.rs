@@ -12,7 +12,7 @@ pub mod json;
 pub mod ops;
 pub mod value;
 
-pub use exec::{CallResult, ExecLimits, HostContext, HostFault, MainResult, Trap};
+pub use exec::{CallResult, ExecLimits, HostCaller, HostContext, HostFault, MainResult, Trap};
 pub use ir_eval::{IrHostDispatcher, IrRuntime};
 pub use ops::{show, value_eq, value_ord};
 pub use value::{

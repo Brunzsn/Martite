@@ -133,11 +133,11 @@ fn load(source: &str, manifest: &str) -> Result<martite::Plugin, Vec<Diagnostic>
     editor_engine().load(manifest, &provider)
 }
 
-fn state<'a, 'p>(instance: &'a Instance<'p>) -> &'a Value {
+fn state(instance: &Instance) -> &Value {
     instance.state().expect("stateful plugin")
 }
 
-fn state_int(instance: &Instance<'_>, index: usize) -> i64 {
+fn state_int(instance: &Instance, index: usize) -> i64 {
     let Value::Struct(state) = state(instance) else {
         panic!("expected struct state");
     };
@@ -147,7 +147,7 @@ fn state_int(instance: &Instance<'_>, index: usize) -> i64 {
     *value
 }
 
-fn state_str<'a, 'p>(instance: &'a Instance<'p>, index: usize) -> &'a str {
+fn state_str(instance: &Instance, index: usize) -> &str {
     let Value::Struct(state) = state(instance) else {
         panic!("expected struct state");
     };

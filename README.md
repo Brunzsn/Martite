@@ -127,6 +127,52 @@ An embedding that deliberately wants ambient access must opt in with
 `FileSystemProvider::unrestricted` (and should document that decision).
 `std.io`/`std.env` are not registered for embeddings automatically.
 
+## Embedding plugins
+
+`Plugin` is a cheap handle to an immutable loaded program, and `Instance` owns a
+clone of that handle. A host can keep plugins and instances in one registry
+without self-referential types, leaks, or `Box::leak`:
+
+```rust
+use martite::{Instance, Plugin};
+
+struct Slot {
+    plugin: Plugin,
+    instance: Instance,
+}
+
+let plugin = engine.load(manifest, &provider)?;
+let instance = plugin.instantiate()?;
+let slot = Slot { plugin, instance };
+```
+
+Host functions can attribute effects to the calling plugin without thread-local
+state. The caller is the manifest identity of the plugin whose code is running:
+
+```rust
+engine.host_fn("app.host.notify", signature, |cx, args| {
+    let source = cx.plugin_name().unwrap_or("<unknown>");
+    let version = cx.plugin_version().unwrap_or("<unknown>");
+    // log, store, or queue the effect with `source`/`version`
+    Ok(martite::HostValue::Unit)
+});
+```
+
+Limits default to `Plugin::limits()`. A host can tighten one query hook, or give
+activation and reload a larger budget, without changing the instance:
+
+```rust
+let tight = martite::Limits {
+    deadline: Some(std::time::Duration::from_millis(10)),
+    ..slot.plugin.limits()
+};
+slot.instance.call_with_limits("query", vec![], tight)?;
+```
+
+Per-call limits are clamped by the engine maximum configured with
+`Engine::set_limits`. The same overrides exist for `instantiate`,
+`Reload::instantiate`, and `shutdown`.
+
 ## Tests
 
 ```sh

@@ -29,7 +29,7 @@ use martite_ir::{
 };
 use smallvec::SmallVec;
 
-use crate::exec::{CallResult, ExecLimits, HostContext, HostFault, MainResult, Trap};
+use crate::exec::{CallResult, ExecLimits, HostCaller, HostContext, HostFault, MainResult, Trap};
 use crate::ops::{show, value_eq, value_ord, write_show};
 use crate::value::{
     Closure, EnumValue, FnValue, MAX_VALUE_DEPTH, MapValue, OrderedMap, SeqValue, StructValue,
@@ -98,6 +98,7 @@ pub struct IrRuntime<'p, 'h> {
     mutable_params: Vec<bool>,
     log: Vec<String>,
     host: Option<&'h mut dyn IrHostDispatcher>,
+    caller: Option<HostCaller>,
     /// Live bytes at the last exact scan.
     census_bytes: u64,
     /// Allocation bytes recorded since the last exact scan.
@@ -133,6 +134,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 .collect(),
             log: Vec::new(),
             host: None,
+            caller: None,
             census_bytes: 0,
             pending_bytes: 0,
             const_values: vec![None; program.consts.len()],
@@ -152,6 +154,12 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 
     pub fn set_host(&mut self, host: &'h mut dyn IrHostDispatcher) {
         self.host = Some(host);
+    }
+
+    /// Attach the identity reported by [`HostContext::caller`] for every host
+    /// function invoked by this runtime.
+    pub fn set_caller(&mut self, caller: HostCaller) {
+        self.caller = Some(caller);
     }
 
     pub fn limits(&self) -> ExecLimits {
@@ -198,6 +206,26 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         else {
             return Ok(None);
         };
+        Ok(Some(self.invoke_entry(function, state, args)?))
+    }
+
+    /// Run the `shutdown` entry when the plugin declares one.
+    ///
+    /// Returns `false` when the plugin has no `shutdown` handler.
+    pub fn invoke_shutdown(&mut self, state: &mut Option<Value>) -> Result<bool, Trap> {
+        let Some(function) = self.program.entries.shutdown else {
+            return Ok(false);
+        };
+        self.invoke_entry(function, state, Vec::new())?;
+        Ok(true)
+    }
+
+    fn invoke_entry(
+        &mut self,
+        function: FnId,
+        state: &mut Option<Value>,
+        args: Vec<Value>,
+    ) -> Result<Value, Trap> {
         self.reset();
         if let Some(state) = state.as_ref() {
             self.note_values(std::slice::from_ref(state));
@@ -206,7 +234,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let program = self.program;
         let info = program
             .function(function)
-            .ok_or_else(|| self.internal_panic("missing handler function"))?;
+            .ok_or_else(|| self.internal_panic("missing entry function"))?;
         let has_self = info.params.first().is_some_and(|param| param.is_self);
         let self_mutable = info.params.first().is_some_and(|param| param.mutable);
         let mut call_args = CallArgs::with_capacity(args.len() + usize::from(has_self));
@@ -218,7 +246,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         if has_self && self_mutable {
             *state = take_writeback(&mut updated, 0);
         }
-        Ok(Some(value))
+        Ok(value)
     }
 
     pub fn run_main(&mut self) -> Result<MainResult, Trap> {
@@ -651,6 +679,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let Some(info) = program.host(host) else {
             return Err(self.internal_panic(format!("missing host function #{:?}", host)));
         };
+        let caller = self.caller.clone();
         let Some(dispatcher) = self.host.as_deref_mut() else {
             return Err(Trap::Panic {
                 message: "no test double".into(),
@@ -659,7 +688,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 trace: Vec::new(),
             });
         };
-        let mut cx = HostContext::new(info.opaque_return);
+        let mut cx = HostContext::new(info.opaque_return, caller);
         let result = dispatcher.call(host, args, &mut cx);
         self.fuel = self.fuel.saturating_sub(fuel::host_call_cost(cx.charged));
         if self.fuel == 0 {
