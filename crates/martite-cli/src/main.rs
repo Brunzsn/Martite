@@ -673,7 +673,7 @@ fn verify_format(before: &str, after: &str, interface: bool) -> Result<(), Strin
     }) {
         return Err("formatted output does not parse".into());
     }
-    if !martite_fmt::structurally_equal(&left.program, &right.program) {
+    if !martite_fmt::structurally_equal(before, &left.program, after, &right.program) {
         return Err("formatted output has a different AST".into());
     }
     Ok(())

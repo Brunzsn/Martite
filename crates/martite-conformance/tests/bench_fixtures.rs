@@ -177,7 +177,7 @@ fn syntax_fixtures_parse_and_format_idempotently() {
                     martite_syntax::ParseOptions::TOOLING,
                 );
                 assert!(
-                    structurally_equal(&parsed.program, &reparsed.program),
+                    structurally_equal(&source, &parsed.program, &first, &reparsed.program),
                     "{name} changed the AST"
                 );
             }

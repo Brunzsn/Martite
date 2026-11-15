@@ -1,5 +1,6 @@
 //! Canonical formatter for Martite.
 
+mod comments;
 mod doc;
 mod format;
 mod normalize;
@@ -13,7 +14,7 @@ use martite_syntax::{
     parse_source_normalized_with_tokens_with_options,
 };
 
-pub use verify::{comment_multiset, structurally_equal};
+pub use verify::structurally_equal;
 
 #[derive(Debug, Clone)]
 pub struct FormatOutput {
