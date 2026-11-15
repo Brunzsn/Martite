@@ -122,6 +122,7 @@ pub struct Engine {
     max_limits: ExecLimits,
     default_limits: ExecLimits,
     optimize: bool,
+    require_host_impls: bool,
     verification: VerifyMode,
 }
 
@@ -137,14 +138,10 @@ impl Engine {
             interfaces: Vec::new(),
             host_fns: HashMap::new(),
             load_limits: LoadLimits::default(),
-            max_limits: ExecLimits {
-                fuel: 1_000_000,
-                memory: 8 << 20,
-                depth: 200,
-                deadline: None,
-            },
+            max_limits: ExecLimits::default(),
             default_limits: ExecLimits::default(),
             optimize: true,
+            require_host_impls: true,
             verification: VerifyMode::Always,
         }
     }
@@ -152,6 +149,17 @@ impl Engine {
     pub fn set_limits(&mut self, max: ExecLimits, default: ExecLimits) {
         self.max_limits = max;
         self.default_limits = default;
+    }
+
+    /// Allow interface functions with no registered Rust implementation.
+    ///
+    /// By default every interface function must have an implementation or the
+    /// load fails with E509. Test hosts opt out so a plugin can be loaded
+    /// without a test double for every host function; calling an unregistered
+    /// host function from a test then traps with `no test double`.
+    pub fn set_allow_missing_host_impls(&mut self, allow: bool) -> &mut Self {
+        self.require_host_impls = !allow;
+        self
     }
 
     pub fn set_load_limits(&mut self, limits: LoadLimits) {
@@ -438,10 +446,12 @@ impl Engine {
             }
         }
         for name in missing {
-            diagnostics.push(Diagnostic::error(
-                Code::E509,
-                format!("host function `{name}` has no Rust implementation"),
-            ));
+            if self.require_host_impls {
+                diagnostics.push(Diagnostic::error(
+                    Code::E509,
+                    format!("host function `{name}` has no Rust implementation"),
+                ));
+            }
         }
         if !diagnostics.is_empty() {
             return Err(LoadError {
@@ -851,6 +861,7 @@ impl Plugin {
     pub fn run_main(&self) -> Result<martite_runtime::MainResult, Trap> {
         let mut dispatcher = IrDispatch {
             fns: &self.inner.host_by_id,
+            missing: MISSING_HOST,
         };
         let mut runtime = self.runtime(self.inner.limits, &mut dispatcher);
         runtime.run_main()
@@ -885,6 +896,7 @@ impl Plugin {
             let name = self.inner.program.resolved.def(*def).name.clone();
             let mut dispatcher = IrDispatch {
                 fns: &self.inner.host_by_id,
+                missing: MISSING_TEST_DOUBLE,
             };
             let mut runtime = self.runtime(self.inner.limits, &mut dispatcher);
             let outcome = runtime
@@ -913,6 +925,7 @@ impl Plugin {
             let args = self.init_args();
             let mut dispatcher = IrDispatch {
                 fns: &self.inner.host_by_id,
+                missing: MISSING_HOST,
             };
             let mut runtime = self.runtime(limits, &mut dispatcher);
             Some(runtime.invoke(init, args)?.value)
@@ -995,6 +1008,7 @@ impl Instance {
         }
         let mut dispatcher = IrDispatch {
             fns: &self.plugin.inner.host_by_id,
+            missing: MISSING_HOST,
         };
         let mut runtime = self.plugin.runtime(limits, &mut dispatcher);
         let value = runtime.invoke_handler(hook, &mut self.state, args)?;
@@ -1012,6 +1026,7 @@ impl Instance {
         }
         let mut dispatcher = IrDispatch {
             fns: &self.plugin.inner.host_by_id,
+            missing: MISSING_HOST,
         };
         let mut runtime = self.plugin.runtime(limits, &mut dispatcher);
         let _ = runtime.invoke_shutdown(&mut self.state)?;
@@ -1065,8 +1080,12 @@ pub struct Snapshot {
     pub bytes: Vec<u8>,
 }
 
+const MISSING_HOST: &str = "host function is not registered";
+const MISSING_TEST_DOUBLE: &str = "no test double";
+
 struct IrDispatch<'a> {
     fns: &'a [Option<RegisteredFn>],
+    missing: &'static str,
 }
 
 impl IrHostDispatcher for IrDispatch<'_> {
@@ -1080,7 +1099,7 @@ impl IrHostDispatcher for IrDispatch<'_> {
             .fns
             .get(host.index())
             .and_then(Option::as_ref)
-            .ok_or_else(|| HostFault::new("host function is not registered"))?;
+            .ok_or_else(|| HostFault::new(self.missing))?;
         (registered.function)(cx, args)
     }
 }
