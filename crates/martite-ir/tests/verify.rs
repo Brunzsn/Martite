@@ -5,6 +5,7 @@ use martite_ir::{
     Entries, EntryKind, FieldDef, FnId, FnKind, HostFnInfo, IrFn, IrId, IrProgram, MatchArm,
     MatchSet, MatchSetId, Node, NodeKind, Pattern, PatternId, Slot, SlotInfo, SourceId, Span,
     StructLayout, StructLayoutId, Ty, TyId, TypeDef, TypeDefKind, TypeTable, VerifyErrorKind,
+    VerifyMode, verify_with,
 };
 
 fn types() -> (TypeTable, TyId, TyId, TyId, TyId) {
@@ -210,6 +211,18 @@ fn valid_program() -> IrProgram {
 #[test]
 fn valid_program_verifies() {
     valid_program().verify().expect("valid program");
+}
+
+#[test]
+fn always_verification_rejects_corrupted_ir_in_any_build() {
+    let mut broken = valid_program();
+    broken.entries.main = Some(FnId::new(u32::MAX));
+    assert!(verify_with(&broken, VerifyMode::Always).is_err());
+    assert_eq!(
+        verify_with(&broken, VerifyMode::DebugOnly).is_err(),
+        cfg!(debug_assertions)
+    );
+    assert!(verify_with(&valid_program(), VerifyMode::Never).is_ok());
 }
 
 fn error_kind(program: IrProgram) -> VerifyErrorKind {
@@ -2026,13 +2039,12 @@ fn valid_zero_payload_enum_value_verifies() {
     program.verify().expect("enum value program");
 }
 
-#[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "IR verification failed after pass")]
 fn verify_after_pass_panics_on_invalid_ir() {
     let mut program = valid_program();
     program.fns[0].spans.pop();
-    martite_ir::verify_after_pass(&program);
+    martite_ir::verify_after_pass(&program, VerifyMode::Always);
 }
 
 #[test]

@@ -4,7 +4,8 @@ use std::collections::BTreeSet;
 
 use martite_ir::walk::children_of;
 use martite_ir::{
-    ConstId, ConstValue, IrFn, IrId, IrProgram, StrId, Ty, TyId, recompute_effects, verify,
+    ConstId, ConstValue, IrFn, IrId, IrProgram, StrId, Ty, TyId, VerifyMode, recompute_effects,
+    verify_with,
 };
 
 use crate::error::{OptimizeError, RewriteError};
@@ -269,8 +270,8 @@ pub struct OptimizeOptions {
     pub max_iterations: u32,
     pub edition: String,
     pub allow_reduce: bool,
-    /// Force the verifier after every pass even in release builds.
-    pub verify: bool,
+    /// Verification policy applied after every pass that changes the program.
+    pub verify: VerifyMode,
     pub disabled: BTreeSet<String>,
 }
 
@@ -282,7 +283,7 @@ impl Default for OptimizeOptions {
             max_iterations: 8,
             edition: "1".into(),
             allow_reduce: false,
-            verify: false,
+            verify: VerifyMode::Always,
             disabled: BTreeSet::new(),
         }
     }
@@ -495,11 +496,9 @@ fn verify_after(
     pass: &'static str,
     options: &OptimizeOptions,
 ) -> Result<(), OptimizeError> {
-    if cfg!(debug_assertions) || options.verify {
-        verify(program).map_err(|error| OptimizeError::Verify {
-            pass,
-            error: Box::new(error),
-        })?;
-    }
+    verify_with(program, options.verify).map_err(|error| OptimizeError::Verify {
+        pass,
+        error: Box::new(error),
+    })?;
     Ok(())
 }

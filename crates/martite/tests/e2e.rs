@@ -1,4 +1,4 @@
-use martite::Engine;
+use martite::{Engine, VerifyMode};
 use martite_base::{LoadLimits, MemoryProvider};
 use martite_driver::{LoadOptions, load};
 use martite_runtime::{ExecLimits, IrRuntime};
@@ -350,5 +350,31 @@ fn engine_optimizes_by_default_and_can_opt_out() {
     assert_eq!(
         optimized.run_main().expect("optimized run").log,
         plain.run_main().expect("plain run").log
+    );
+}
+
+#[test]
+fn engine_verification_opt_out_preserves_behavior() {
+    let source = r#"
+        fn main() {
+            let value = (1 + 2) * 3
+            print(value)
+        }
+    "#;
+    let mut provider = MemoryProvider::new();
+    provider.insert("main.mt", source);
+
+    let verified = Engine::new()
+        .load_script("main.mt", &provider)
+        .expect("verified script loads");
+    let mut unverified_engine = Engine::new();
+    unverified_engine.set_verification(VerifyMode::Never);
+    let unverified = unverified_engine
+        .load_script("main.mt", &provider)
+        .expect("unverified script loads");
+
+    assert_eq!(
+        verified.run_main().expect("verified run").log,
+        unverified.run_main().expect("unverified run").log
     );
 }

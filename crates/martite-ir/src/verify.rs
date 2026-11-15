@@ -6,9 +6,9 @@
 //! assignment, one-initialization-site-per-slot and the on-demand slot
 //! analyses are provided by [`crate::analysis`].
 //!
-//! [`verify`] returns the first error. [`verify_after_pass`] is the hook for the
-//! pass manager: it verifies in tests and debug builds and is a no-op in
-//! release builds.
+//! [`verify`] returns the first error. [`verify_with`] applies an explicit
+//! [`VerifyMode`] policy; lowering and the optimizer use it so release builds
+//! verify by default. [`verify_after_pass`] is the pass-manager test hook.
 
 use std::fmt;
 
@@ -32,18 +32,54 @@ use crate::program::{
 use crate::types::{Ty, TyId, TypeDefKind, TypeId};
 use crate::walk::children_of;
 
+/// When lowering and the optimizer run [`verify`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum VerifyMode {
+    /// Verify on every build, including release.
+    #[default]
+    Always,
+    /// Verify only when `debug_assertions` is enabled.
+    DebugOnly,
+    /// Never verify. Intended for benchmarks and fuzzing, where verification
+    /// cost is measured separately; it does not change observable behavior.
+    Never,
+}
+
+impl VerifyMode {
+    /// Whether this policy runs the verifier in the current build.
+    pub const fn should_verify(self) -> bool {
+        match self {
+            Self::Always => true,
+            Self::DebugOnly => cfg!(debug_assertions),
+            Self::Never => false,
+        }
+    }
+}
+
+/// Verify one lowered program if `mode` enables it.
+///
+/// This is the single policy application point for lowering and the optimizer.
+pub fn verify_with(program: &IrProgram, mode: VerifyMode) -> Result<(), VerifyError> {
+    if mode.should_verify() {
+        verify(program)
+    } else {
+        Ok(())
+    }
+}
+
 /// Verify one lowered program.
 pub fn verify(program: &IrProgram) -> Result<(), VerifyError> {
     Verifier { program }.run()
 }
 
-/// Verify after a pass mutation in tests and debug builds.
+/// Verify after a pass mutation under an explicit policy.
 ///
-/// The pass manager in `martite-opt` calls this after every rewrite. Release
-/// builds do not pay for verification here.
+/// The pass manager in `martite-opt` reports verifier failures as
+/// `OptimizeError` values instead; this hook is for tests that want a panic on
+/// invalid IR.
 #[track_caller]
-pub fn verify_after_pass(program: &IrProgram) {
-    if cfg!(debug_assertions)
+pub fn verify_after_pass(program: &IrProgram, mode: VerifyMode) {
+    if mode.should_verify()
         && let Err(error) = verify(program)
     {
         panic!("IR verification failed after pass: {error}");

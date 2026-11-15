@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use martite_base::{Severity, SourceMap};
 use martite_check::CheckedProgram;
-use martite_ir::{FnId, IrProgram, LowerOptions, lower_with, verify};
+use martite_ir::{FnId, IrProgram, LowerOptions, VerifyMode, lower_with, verify};
 use martite_opt::{OptimizeOptions, optimize};
 use martite_runtime::{ExecLimits, IrRuntime};
 
@@ -388,7 +388,13 @@ fn lower_once(
     source: &str,
 ) -> Result<IrProgram, PropertyFailure> {
     match catch_unwind(AssertUnwindSafe(|| {
-        lower_with(program, sources, LowerOptions { verify: false })
+        lower_with(
+            program,
+            sources,
+            LowerOptions {
+                verify: VerifyMode::Never,
+            },
+        )
     })) {
         Ok(Ok(ir)) => Ok(ir),
         Ok(Err(error)) => Err(PropertyFailure::new(
@@ -406,7 +412,13 @@ fn lower_once(
 
 fn optimize_once(ir: &IrProgram, source: &str, dump: String) -> Result<IrProgram, PropertyFailure> {
     let mut optimized = ir.clone();
-    if let Err(error) = optimize(&mut optimized, OptimizeOptions::default()) {
+    if let Err(error) = optimize(
+        &mut optimized,
+        OptimizeOptions {
+            verify: VerifyMode::Never,
+            ..Default::default()
+        },
+    ) {
         return Err(PropertyFailure::new(
             "optimize",
             source,
