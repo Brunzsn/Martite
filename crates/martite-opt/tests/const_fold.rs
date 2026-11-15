@@ -15,7 +15,6 @@ fn checked(source: &str) -> (IrProgram, SourceMap) {
             grants: Vec::new(),
             limits: LoadLimits::default(),
             edition: "1".into(),
-            parse: martite_syntax::ParseOptions::default(),
         },
     );
     assert!(

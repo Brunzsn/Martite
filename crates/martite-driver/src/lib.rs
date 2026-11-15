@@ -4,7 +4,6 @@ use martite_base::{Code, Diagnostic, LoadLimits, Severity, SourceMap, SourceProv
 use martite_check::{CheckedProgram, check};
 use martite_ir::IrProgram;
 use martite_resolve::{InterfaceSource, ResolveOptions, resolve};
-use martite_syntax::ParseOptions;
 
 pub use martite_ir::{LowerOptions, VerifyMode};
 
@@ -19,8 +18,6 @@ pub struct LoadOptions {
     pub limits: LoadLimits,
     /// Language edition; edition 1 is the only supported edition.
     pub edition: String,
-    /// Parser switches. Tooling that needs source parentheses opts in here.
-    pub parse: ParseOptions,
 }
 
 #[derive(Debug, Clone)]
@@ -58,7 +55,6 @@ pub fn load(provider: &dyn SourceProvider, options: &LoadOptions) -> LoadedProgr
             interfaces: options.interfaces.clone(),
             grants: options.grants.clone(),
             limits: options.limits,
-            parse: options.parse,
         },
         &mut sources,
     );

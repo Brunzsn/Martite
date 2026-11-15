@@ -8,23 +8,6 @@ use crate::ast::*;
 use crate::lexer::{Lexed, lex, lex_fragment};
 use crate::token::{IdentClass, StrLit, StrPart, Token, TokenKind, TypeName};
 
-/// Parser switches that callers normally leave at their defaults.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ParseOptions {
-    /// Record source parentheses for the formatter and style linting.
-    pub keep_parentheses: bool,
-    /// Record exact name, keyword, and operator spans for tooling fixes.
-    pub keep_spans: bool,
-}
-
-impl ParseOptions {
-    /// Options used by tooling that needs to reproduce or inspect source syntax.
-    pub const TOOLING: Self = Self {
-        keep_parentheses: true,
-        keep_spans: true,
-    };
-}
-
 /// Allocates `NodeId`s for one parse session.
 ///
 /// IDs start at 1 and increase by one for every AST node. A load session shares
@@ -59,8 +42,8 @@ impl NodeIdAllocator {
     }
 }
 
-/// Parenthesis metadata recorded only when [`ParseOptions::keep_parentheses`]
-/// is enabled. Nested pairs are recorded innermost first.
+/// Parenthesis metadata recorded while parsing. Nested pairs are recorded
+/// innermost first.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParenthesisTables {
     expressions: HashMap<NodeId, Vec<ParenPair>>,
@@ -90,8 +73,7 @@ impl ParenthesisTables {
 
 /// Exact source spans for names, keywords, and operators, keyed by AST node.
 ///
-/// These are recorded only when [`ParseOptions::keep_spans`] is enabled. Tools
-/// use them instead of searching the source text, which can match inside
+/// Tools use them instead of searching the source text, which can match inside
 /// comments or string literals.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SpanTables {
@@ -128,45 +110,35 @@ pub struct Program {
     /// Comments in source order. Tokens themselves do not carry trivia in this
     /// implementation, so the lint and format tools read them from here.
     pub comments: Vec<crate::token::Comment>,
-    /// Present only when the program was parsed with parenthesis recording on.
-    parentheses: Option<ParenthesisTables>,
-    /// Present only when the program was parsed with span recording on.
-    spans: Option<SpanTables>,
+    /// Parenthesis metadata for every expression, type, and pattern.
+    parentheses: ParenthesisTables,
+    /// Exact name, keyword, and operator spans for tooling fixes.
+    spans: SpanTables,
 }
 
 impl Program {
-    pub fn parentheses(&self) -> Option<&ParenthesisTables> {
-        self.parentheses.as_ref()
+    pub fn parentheses(&self) -> &ParenthesisTables {
+        &self.parentheses
     }
 
-    pub fn records_parentheses(&self) -> bool {
-        self.parentheses.is_some()
-    }
-
-    pub fn spans(&self) -> Option<&SpanTables> {
-        self.spans.as_ref()
-    }
-
-    pub fn records_spans(&self) -> bool {
-        self.spans.is_some()
+    pub fn spans(&self) -> &SpanTables {
+        &self.spans
     }
 
     pub fn name_span(&self, id: NodeId) -> Option<Span> {
-        self.spans.as_ref()?.name(id)
+        self.spans.name(id)
     }
 
     pub fn keyword_span(&self, id: NodeId) -> Option<Span> {
-        self.spans.as_ref()?.keyword(id)
+        self.spans.keyword(id)
     }
 
     pub fn operator_span(&self, id: NodeId) -> Option<Span> {
-        self.spans.as_ref()?.operator(id)
+        self.spans.operator(id)
     }
 
     pub fn is_parenthesized(&self, id: NodeId) -> bool {
-        self.parentheses
-            .as_ref()
-            .is_some_and(|tables| !tables.expression_parens(id).is_empty())
+        !self.parentheses.expression_parens(id).is_empty()
     }
 }
 
@@ -177,13 +149,8 @@ pub struct ParseOutput {
 }
 
 pub fn parse_source(source: &str, limits: LoadLimits) -> ParseOutput {
-    parse_source_with(source, limits, ParseOptions::default())
-}
-
-/// Parse a source file with explicit options.
-pub fn parse_source_with(source: &str, limits: LoadLimits, options: ParseOptions) -> ParseOutput {
     let source = normalize_source(source);
-    parse_normalized(&source, limits, false, options, &mut NodeIdAllocator::new())
+    parse_normalized(&source, limits, false, &mut NodeIdAllocator::new())
 }
 
 /// Parse a source file, allocating its nodes from a shared session.
@@ -193,76 +160,34 @@ pub fn parse_source_with(source: &str, limits: LoadLimits, options: ParseOptions
 pub fn parse_source_with_allocator(
     source: &str,
     limits: LoadLimits,
-    options: ParseOptions,
     ids: &mut NodeIdAllocator,
 ) -> ParseOutput {
     let source = normalize_source(source);
-    parse_normalized(&source, limits, false, options, ids)
-}
-
-/// Parse source that has already been normalized with
-/// [`normalize_source`](martite_base::normalize_source).
-pub fn parse_source_normalized(source: &str, limits: LoadLimits) -> ParseOutput {
-    parse_source_normalized_with_options(source, limits, ParseOptions::default())
-}
-
-/// Parse already-normalized source with explicit options.
-pub fn parse_source_normalized_with_options(
-    source: &str,
-    limits: LoadLimits,
-    options: ParseOptions,
-) -> ParseOutput {
-    parse_normalized(source, limits, false, options, &mut NodeIdAllocator::new())
+    parse_normalized(&source, limits, false, ids)
 }
 
 pub fn parse_interface(source: &str, limits: LoadLimits) -> ParseOutput {
-    parse_interface_with(source, limits, ParseOptions::default())
-}
-
-/// Parse an interface file with explicit options.
-pub fn parse_interface_with(
-    source: &str,
-    limits: LoadLimits,
-    options: ParseOptions,
-) -> ParseOutput {
     let source = normalize_source(source);
-    parse_normalized(&source, limits, true, options, &mut NodeIdAllocator::new())
+    parse_normalized(&source, limits, true, &mut NodeIdAllocator::new())
 }
 
 /// Parse an interface file, allocating its nodes from a shared session.
 pub fn parse_interface_with_allocator(
     source: &str,
     limits: LoadLimits,
-    options: ParseOptions,
     ids: &mut NodeIdAllocator,
 ) -> ParseOutput {
     let source = normalize_source(source);
-    parse_normalized(&source, limits, true, options, ids)
-}
-
-/// Parse an interface that has already been normalized with
-/// [`normalize_source`](martite_base::normalize_source).
-pub fn parse_interface_normalized(source: &str, limits: LoadLimits) -> ParseOutput {
-    parse_interface_normalized_with_options(source, limits, ParseOptions::default())
-}
-
-/// Parse an already-normalized interface with explicit options.
-pub fn parse_interface_normalized_with_options(
-    source: &str,
-    limits: LoadLimits,
-    options: ParseOptions,
-) -> ParseOutput {
-    parse_normalized(source, limits, true, options, &mut NodeIdAllocator::new())
+    parse_normalized(&source, limits, true, ids)
 }
 
 fn parse_normalized(
     source: &str,
     limits: LoadLimits,
     interface: bool,
-    options: ParseOptions,
     ids: &mut NodeIdAllocator,
 ) -> ParseOutput {
-    Parser::new(source, ids, limits, interface, options).parse_program()
+    Parser::new(source, ids, limits, interface).parse_program()
 }
 
 /// Parse already-normalized source and return the token stream for the
@@ -271,18 +196,8 @@ pub fn parse_source_normalized_with_tokens(
     source: &str,
     limits: LoadLimits,
 ) -> (ParseOutput, Vec<Token>) {
-    parse_source_normalized_with_tokens_with_options(source, limits, ParseOptions::default())
-}
-
-/// Parse already-normalized source with explicit options and return the token
-/// stream for the formatter.
-pub fn parse_source_normalized_with_tokens_with_options(
-    source: &str,
-    limits: LoadLimits,
-    options: ParseOptions,
-) -> (ParseOutput, Vec<Token>) {
     let mut ids = NodeIdAllocator::new();
-    Parser::new(source, &mut ids, limits, false, options).parse_program_with_tokens()
+    Parser::new(source, &mut ids, limits, false).parse_program_with_tokens()
 }
 
 /// Parse an already-normalized interface and return the token stream for the
@@ -291,18 +206,8 @@ pub fn parse_interface_normalized_with_tokens(
     source: &str,
     limits: LoadLimits,
 ) -> (ParseOutput, Vec<Token>) {
-    parse_interface_normalized_with_tokens_with_options(source, limits, ParseOptions::default())
-}
-
-/// Parse an already-normalized interface with explicit options and return the
-/// token stream for the formatter.
-pub fn parse_interface_normalized_with_tokens_with_options(
-    source: &str,
-    limits: LoadLimits,
-    options: ParseOptions,
-) -> (ParseOutput, Vec<Token>) {
     let mut ids = NodeIdAllocator::new();
-    Parser::new(source, &mut ids, limits, true, options).parse_program_with_tokens()
+    Parser::new(source, &mut ids, limits, true).parse_program_with_tokens()
 }
 
 type PResult<T> = Result<T, ()>;
@@ -351,8 +256,8 @@ struct Parser<'a> {
     depth: usize,
     limit_hit: bool,
     comments: Vec<crate::token::Comment>,
-    parentheses: Option<ParenthesisTables>,
-    spans: Option<SpanTables>,
+    parentheses: ParenthesisTables,
+    spans: SpanTables,
 }
 
 impl<'a> Parser<'a> {
@@ -361,10 +266,9 @@ impl<'a> Parser<'a> {
         ids: &'a mut NodeIdAllocator,
         limits: LoadLimits,
         interface: bool,
-        options: ParseOptions,
     ) -> Self {
         let lexed = lex(source, limits);
-        Self::with_lexed(source, ids, lexed, limits, interface, options)
+        Self::with_lexed(source, ids, lexed, limits, interface)
     }
 
     fn with_lexed(
@@ -373,7 +277,6 @@ impl<'a> Parser<'a> {
         lexed: Lexed,
         limits: LoadLimits,
         interface: bool,
-        options: ParseOptions,
     ) -> Self {
         Self {
             source,
@@ -388,8 +291,8 @@ impl<'a> Parser<'a> {
             depth: 0,
             limit_hit: false,
             comments: lexed.comments,
-            parentheses: options.keep_parentheses.then(ParenthesisTables::default),
-            spans: options.keep_spans.then(SpanTables::default),
+            parentheses: ParenthesisTables::default(),
+            spans: SpanTables::default(),
         }
     }
 
@@ -464,21 +367,15 @@ impl<'a> Parser<'a> {
     }
 
     fn record_name(&mut self, id: NodeId, span: Span) {
-        if let Some(spans) = self.spans.as_mut() {
-            spans.names.insert(id, span);
-        }
+        self.spans.names.insert(id, span);
     }
 
     fn record_keyword(&mut self, id: NodeId, span: Span) {
-        if let Some(spans) = self.spans.as_mut() {
-            spans.keywords.insert(id, span);
-        }
+        self.spans.keywords.insert(id, span);
     }
 
     fn record_operator(&mut self, id: NodeId, span: Span) {
-        if let Some(spans) = self.spans.as_mut() {
-            spans.operators.insert(id, span);
-        }
+        self.spans.operators.insert(id, span);
     }
 
     /// Move an identifier out of the token stream, leaving a payload-free
@@ -771,21 +668,19 @@ impl<'a> Parser<'a> {
     }
 
     fn record_expression_parens(&mut self, id: NodeId, pair: ParenPair) {
-        if let Some(parentheses) = &mut self.parentheses {
-            parentheses.expressions.entry(id).or_default().push(pair);
-        }
+        self.parentheses
+            .expressions
+            .entry(id)
+            .or_default()
+            .push(pair);
     }
 
     fn record_type_parens(&mut self, id: NodeId, pair: ParenPair) {
-        if let Some(parentheses) = &mut self.parentheses {
-            parentheses.types.entry(id).or_default().push(pair);
-        }
+        self.parentheses.types.entry(id).or_default().push(pair);
     }
 
     fn record_pattern_parens(&mut self, id: NodeId, pair: ParenPair) {
-        if let Some(parentheses) = &mut self.parentheses {
-            parentheses.patterns.entry(id).or_default().push(pair);
-        }
+        self.parentheses.patterns.entry(id).or_default().push(pair);
     }
 
     // ----- items ---------------------------------------------------------
@@ -2097,18 +1992,8 @@ impl<'a> Parser<'a> {
                 StrPart::Text(t) => parts.push(StrExprPart::Text(t)),
                 StrPart::Expr(expr_span) => {
                     let lexed = lex_fragment(self.source, expr_span, self.limits);
-                    let options = ParseOptions {
-                        keep_parentheses: self.parentheses.is_some(),
-                        keep_spans: self.spans.is_some(),
-                    };
-                    let mut sub = Parser::with_lexed(
-                        self.source,
-                        &mut *self.ids,
-                        lexed,
-                        self.limits,
-                        false,
-                        options,
-                    );
+                    let mut sub =
+                        Parser::with_lexed(self.source, &mut *self.ids, lexed, self.limits, false);
                     let expr = match sub.parse_expr() {
                         Ok(expr) => expr,
                         Err(()) => {
@@ -2132,15 +2017,8 @@ impl<'a> Parser<'a> {
                         );
                     }
                     self.diagnostics.extend(sub.diagnostics);
-                    if let (Some(parentheses), Some(sub_parentheses)) =
-                        (self.parentheses.as_mut(), sub.parentheses.take())
-                    {
-                        parentheses.merge(sub_parentheses);
-                    }
-                    if let (Some(spans), Some(sub_spans)) = (self.spans.as_mut(), sub.spans.take())
-                    {
-                        spans.merge(sub_spans);
-                    }
+                    self.parentheses.merge(std::mem::take(&mut sub.parentheses));
+                    self.spans.merge(std::mem::take(&mut sub.spans));
                     parts.push(StrExprPart::Expr(expr));
                 }
             }
@@ -2770,20 +2648,13 @@ mod tests {
     }
 
     #[test]
-    fn parentheses_are_recorded_only_on_request() {
+    fn parentheses_are_always_recorded() {
         let source = "fn f(x: (int)) { let (y): (int) = (x + 1) }";
         let limits = LoadLimits::default();
-        let plain = parse_source(source, limits);
-        assert!(plain.diagnostics.is_empty(), "{:?}", plain.diagnostics);
-        assert!(!plain.program.records_parentheses());
-
-        let tooling = parse_source_with(source, limits, ParseOptions::TOOLING);
-        assert!(tooling.diagnostics.is_empty(), "{:?}", tooling.diagnostics);
-        let tables = tooling
-            .program
-            .parentheses()
-            .expect("tooling parse records parentheses");
-        let Item::Fn(function) = &tooling.program.items[0] else {
+        let parsed = parse_source(source, limits);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let tables = parsed.program.parentheses();
+        let Item::Fn(function) = &parsed.program.items[0] else {
             panic!("expected a function");
         };
         let body = function.body.as_ref().expect("function body");
@@ -2799,7 +2670,7 @@ mod tests {
         assert!(!tables.expression_parens(value.id).is_empty());
         assert!(!tables.type_parens(ty.id).is_empty());
         assert!(!tables.pattern_parens(pattern.id).is_empty());
-        assert!(tooling.program.is_parenthesized(value.id));
+        assert!(parsed.program.is_parenthesized(value.id));
     }
 
     #[test]
@@ -2812,7 +2683,7 @@ mod tests {
         assert_eq!(first.program, second.program);
 
         let mut ids = NodeIdAllocator::new();
-        let parsed = parse_source_with_allocator(source, limits, ParseOptions::default(), &mut ids);
+        let parsed = parse_source_with_allocator(source, limits, &mut ids);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         assert!(ids.next_id() > 1);
         assert_eq!(first.program, parsed.program);
@@ -2828,13 +2699,10 @@ mod tests {
     }
 
     #[test]
-    fn tooling_records_exact_name_keyword_and_operator_spans() {
+    fn records_exact_name_keyword_and_operator_spans() {
         let source = "use app.editor.Doc as Doc\n\nfn pick(mut value: int) -> int {\n    var total = 0\n    total = total + value\n    while true {\n        return total\n    }\n}\n";
         let limits = LoadLimits::default();
-        let plain = parse_source(source, limits);
-        assert!(plain.program.spans().is_none());
-
-        let parsed = parse_source_with(source, limits, ParseOptions::TOOLING);
+        let parsed = parse_source(source, limits);
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let program = &parsed.program;
         let slice = |span: Span| &source[span.start as usize..span.end as usize];

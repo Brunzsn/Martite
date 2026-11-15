@@ -3,7 +3,7 @@ use std::path::Path;
 use martite_base::LoadLimits;
 use martite_config::FmtConfig;
 use martite_fmt::{format_interface, format_source, structurally_equal};
-use martite_syntax::{ParseOptions, parse_interface_with, parse_source_with};
+use martite_syntax::{parse_interface, parse_source};
 
 fn format_ok(source: &str, interface: bool) -> String {
     let config = FmtConfig::default();
@@ -22,14 +22,14 @@ fn format_ok(source: &str, interface: bool) -> String {
 
 fn assert_equivalent(before: &str, after: &str, interface: bool) {
     let left = if interface {
-        parse_interface_with(before, LoadLimits::default(), ParseOptions::TOOLING).program
+        parse_interface(before, LoadLimits::default()).program
     } else {
-        parse_source_with(before, LoadLimits::default(), ParseOptions::TOOLING).program
+        parse_source(before, LoadLimits::default()).program
     };
     let right = if interface {
-        parse_interface_with(after, LoadLimits::default(), ParseOptions::TOOLING).program
+        parse_interface(after, LoadLimits::default()).program
     } else {
-        parse_source_with(after, LoadLimits::default(), ParseOptions::TOOLING).program
+        parse_source(after, LoadLimits::default()).program
     };
     assert!(
         structurally_equal(before, &left, after, &right),

@@ -15,7 +15,6 @@ use martite_config::{Manifest, parse_manifest};
 use martite_driver::{LoadOptions, LoadedProgram, load};
 use martite_resolve::InterfaceSource;
 use martite_runtime::{ExecLimits, Value};
-use martite_syntax::ParseOptions;
 
 /// Generous execution limits so benchmark fixtures never trap.
 pub const BENCH_LIMITS: ExecLimits = ExecLimits {
@@ -139,17 +138,12 @@ impl Fixture {
     }
 
     pub fn load_options(&self) -> LoadOptions {
-        self.load_options_with_parse(ParseOptions::default())
-    }
-
-    pub fn load_options_with_parse(&self, parse: ParseOptions) -> LoadOptions {
         LoadOptions {
             entry: self.entry.clone(),
             interfaces: self.interfaces.clone(),
             grants: self.grants.clone(),
             limits: LoadLimits::default(),
             edition: "1".into(),
-            parse,
         }
     }
 
@@ -169,12 +163,7 @@ impl Fixture {
 
     /// Load and check a fixture, panicking if it has compile errors.
     pub fn checked(&self) -> (CheckedProgram, SourceMap) {
-        self.checked_with_parse(ParseOptions::default())
-    }
-
-    /// Load and check a fixture with explicit parser options.
-    pub fn checked_with_parse(&self, parse: ParseOptions) -> (CheckedProgram, SourceMap) {
-        let loaded = load(&self.provider(), &self.load_options_with_parse(parse));
+        let loaded = load(&self.provider(), &self.load_options());
         if let Some(error) = loaded
             .diagnostics
             .iter()
