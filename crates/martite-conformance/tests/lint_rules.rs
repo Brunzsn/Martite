@@ -523,13 +523,12 @@ fn registry_tiers_and_defaults_match_the_specification() {
 fn syntax_only_runs_only_syntax_tier_rules() {
     for row in ROWS {
         let fixture = row.fail.case();
-        let parsed = martite_syntax::parse_source_with(
+        let parsed = martite_syntax::parse_source(
             match &row.fail {
                 Fixture::Script(source) => source,
                 Fixture::Plugin { main, .. } => main,
             },
             Default::default(),
-            martite_syntax::ParseOptions::TOOLING,
         );
         if !parsed.diagnostics.is_empty() {
             continue;

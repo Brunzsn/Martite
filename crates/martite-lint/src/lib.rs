@@ -55,14 +55,6 @@ pub fn lint(
 ) -> LintOutput {
     let prefix = normalize_path(path_prefix);
     let mut diagnostics = Vec::new();
-    assert!(
-        program
-            .resolved
-            .modules
-            .iter()
-            .all(|module| module.ast.records_parentheses() && module.ast.records_spans()),
-        "lint requires programs loaded with LoadOptions::parse = martite_syntax::ParseOptions::TOOLING"
-    );
     let analysis = analysis::Analysis::new(program, sources);
     for module in &program.resolved.modules {
         if module.is_interface {
@@ -106,10 +98,6 @@ pub fn lint_syntax_only(
     program: &Program,
     settings: &ResolvedSettings,
 ) -> Vec<Diagnostic> {
-    assert!(
-        program.records_parentheses() && program.records_spans(),
-        "lint_syntax_only requires a program parsed with martite_syntax::ParseOptions::TOOLING"
-    );
     let diagnostics = syntax::run(source, text, program, settings);
     suppress::apply(source, text, program, settings, diagnostics, false)
 }

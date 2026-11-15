@@ -15,11 +15,10 @@ use crate::normalize;
 pub(crate) fn format_program(
     source: &str,
     program: &Program,
-    parentheses: &ParenthesisTables,
     tokens: Vec<Token>,
     config: &FmtConfig,
 ) -> String {
-    let mut formatter = Formatter::new(source, program, parentheses, tokens, config);
+    let mut formatter = Formatter::new(source, program, tokens, config);
     let doc = formatter.program_doc();
     let eol = match config.end_of_line {
         EndOfLine::Lf => "\n",
@@ -98,14 +97,13 @@ impl<'a> Formatter<'a> {
     fn new(
         source: &'a str,
         program: &'a Program,
-        parentheses: &'a ParenthesisTables,
         tokens: Vec<Token>,
         config: &'a FmtConfig,
     ) -> Self {
         Self {
             source,
             program,
-            parentheses,
+            parentheses: program.parentheses(),
             tokens,
             config,
             used: vec![false; program.comments.len()],
