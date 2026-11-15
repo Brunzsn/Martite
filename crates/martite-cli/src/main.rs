@@ -1370,10 +1370,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
     engine.set_optimize(!parsed.no_optimize);
     register_std(&mut engine, parsed.script_args.clone());
     apply_limits(&mut engine, &parsed);
-    let plugin = match engine.load_script(name, &provider) {
+    let plugin = match engine.try_load_script(name, &provider) {
         Ok(plugin) => plugin,
-        Err(diagnostics) => {
-            print_diagnostics(&diagnostics, &SourceMap::new(), parsed.json);
+        Err(error) => {
+            print_diagnostics(&error.diagnostics, &error.sources, parsed.json);
             return ExitCode::from(2);
         }
     };

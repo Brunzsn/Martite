@@ -137,6 +137,24 @@ fn check_reports_e201_and_json_on_stdout() {
 }
 
 #[test]
+fn run_reports_load_errors_with_source_location() {
+    let dir = TempDir::new("run-load-error");
+    let script = dir.file("main.mt", "fn main() {\n    let x: int = \"no\"\n}\n");
+    let output = martite(&[s("run"), script.as_os_str()]);
+    assert_eq!(output.status.code(), Some(2));
+    let error = stderr(&output);
+    assert!(error.contains("E201"), "stderr: {error}");
+    assert!(error.contains("main.mt:2:"), "stderr: {error}");
+
+    let json = martite(&[s("run"), s("--json"), script.as_os_str()]);
+    assert_eq!(json.status.code(), Some(2));
+    let text = stdout(&json);
+    assert!(text.contains("\"file\":\"main.mt\""), "stdout: {text}");
+    assert!(text.contains("\"line\":2"), "stdout: {text}");
+    assert!(text.contains("\"span\":"), "stdout: {text}");
+}
+
+#[test]
 fn check_accepts_a_valid_file() {
     let dir = TempDir::new("ok");
     let script = dir.file("main.mt", "fn main() { print(\"ok\") }\n");
