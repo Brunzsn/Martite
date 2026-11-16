@@ -48,7 +48,6 @@ pub enum FnKind {
     Method(TypeId),
     Handler,
     Test,
-    Hook,
     Lambda,
     /// A host/interface function. Its body is absent; signature metadata is in
     /// [`IrProgram::hosts`].

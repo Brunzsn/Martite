@@ -9,7 +9,6 @@ use martite_ir::{
 };
 
 use crate::error::{OptimizeError, RewriteError};
-use crate::passes::const_fold::ConstFold;
 
 /// How a pass treats fuel, memory and sharing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -95,7 +94,6 @@ pub struct PassCx<'p> {
     pending_strs: Vec<Box<str>>,
     error: Option<RewriteError>,
     stats: RewriteStats,
-    analyses_revision: u64,
 }
 
 impl<'p> PassCx<'p> {
@@ -108,7 +106,6 @@ impl<'p> PassCx<'p> {
             pending_strs: Vec::new(),
             error: None,
             stats: RewriteStats::default(),
-            analyses_revision: 0,
         }
     }
 
@@ -121,7 +118,6 @@ impl<'p> PassCx<'p> {
             pending_strs: Vec::new(),
             error: None,
             stats: RewriteStats::default(),
-            analyses_revision: 0,
         }
     }
 
@@ -244,15 +240,6 @@ impl<'p> PassCx<'p> {
             .map(|program| program.consts.len())
             .unwrap_or_default()
     }
-
-    /// Invalidate every cached analysis for the next query.
-    pub fn invalidate_analyses(&mut self) {
-        self.analyses_revision = self.analyses_revision.wrapping_add(1);
-    }
-
-    pub fn analyses_revision(&self) -> u64 {
-        self.analyses_revision
-    }
 }
 
 fn const_eq(left: &ConstValue, right: &ConstValue) -> bool {
@@ -353,13 +340,6 @@ impl PassManager {
         }
     }
 
-    /// The default optimizer: one ordered `const-fold` pass under `Preserve`.
-    pub fn with_defaults() -> Self {
-        let mut manager = Self::new(OptimizeOptions::default());
-        manager.add_fn_pass(ConstFold);
-        manager
-    }
-
     pub fn options(&self) -> &OptimizeOptions {
         &self.options
     }
@@ -426,9 +406,6 @@ impl PassManager {
                             let (changed, error, pending, stats) = {
                                 let mut cx = PassCx::for_function(program, &self.options);
                                 let changed = pass.run(&mut function, &mut cx);
-                                if changed.is_changed() {
-                                    cx.invalidate_analyses();
-                                }
                                 (changed, cx.take_error(), cx.take_pending(), cx.stats())
                             };
                             if let Some(error) = error {
@@ -451,9 +428,6 @@ impl PassManager {
                         let (changed, error, stats) = {
                             let mut cx = PassCx::for_program(&self.options);
                             let changed = pass.run(program, &mut cx);
-                            if changed.is_changed() {
-                                cx.invalidate_analyses();
-                            }
                             (changed, cx.take_error(), cx.stats())
                         };
                         if let Some(error) = error {

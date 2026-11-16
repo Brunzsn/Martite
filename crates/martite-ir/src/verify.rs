@@ -27,7 +27,7 @@ use crate::id::{
     MatchSetId, PatternId, Slot, StrId, StructLayoutId,
 };
 use crate::node::{AccessMode, ChildRange, Node, NodeKind, StrPart};
-use crate::pattern::{MatchSet, Pattern, StructLayout};
+use crate::pattern::{MatchSet, Pattern};
 use crate::program::{
     CaptureSource, ConstValue, FnKind, IrFn, IrProgram, ParamInfo, PreludeVariant,
 };
@@ -558,8 +558,7 @@ impl<'a> Verifier<'a> {
         for index in 0..self.program.types.tys.len() {
             self.check_ty_id(TyId::new(index as u32), &mut states)?;
         }
-        for (index, def) in self.program.types.defs.iter().enumerate() {
-            let type_id = TypeId::new(index as u32);
+        for def in &self.program.types.defs {
             match &def.kind {
                 TypeDefKind::Struct { fields } => {
                     for field in fields {
@@ -575,7 +574,6 @@ impl<'a> Verifier<'a> {
                 }
                 TypeDefKind::Opaque => {}
             }
-            let _ = type_id;
         }
         Ok(())
     }
@@ -950,9 +948,8 @@ impl<'a> Verifier<'a> {
             }));
         }
         self.ty_id(function.ret, "function return")?;
-        for (index, slot) in function.slot_info.iter().enumerate() {
+        for slot in &function.slot_info {
             self.ty_id(slot.ty, "slot type")?;
-            let _ = index;
         }
         let mut param_slots = Vec::new();
         for (index, param) in function.params.iter().enumerate() {
@@ -964,20 +961,16 @@ impl<'a> Verifier<'a> {
                 context: "captures on a non-lambda function",
             }));
         }
-        for (index, capture) in function.captures.iter().enumerate() {
+        for capture in &function.captures {
             self.ty_id(capture.ty, "capture type")?;
-            let _ = index;
         }
         for (index, pattern) in function.patterns.iter().enumerate() {
             self.check_pattern_structure(function, PatternId::new(index as u32), pattern)?;
         }
-        for (index, set) in function.matches.iter().enumerate() {
-            self.check_match_set(function, MatchSetId::new(index as u32), set)?;
+        for set in &function.matches {
+            self.check_match_set(function, set)?;
         }
-        for (index, layout) in function.struct_layouts.iter().enumerate() {
-            self.check_layout(function, StructLayoutId::new(index as u32), layout)?;
-        }
-        for (index, part) in function.str_parts.iter().enumerate() {
+        for part in &function.str_parts {
             match part {
                 StrPart::Text(str) => self.check_str(*str)?,
                 StrPart::Expr(expr) => {
@@ -989,14 +982,12 @@ impl<'a> Verifier<'a> {
                     }
                 }
             }
-            let _ = index;
         }
-        for (index, node) in function.nodes.iter().enumerate() {
+        for node in &function.nodes {
             self.ty_id(node.ty, "node type")?;
-            let _ = index;
         }
 
-        let expected_body = !matches!(function.kind, FnKind::Host(_) | FnKind::Hook);
+        let expected_body = !matches!(function.kind, FnKind::Host(_));
         if expected_body && function.body.is_none() {
             return Err(error(VerifyErrorKind::BodyPresence {
                 expected: true,
@@ -1125,12 +1116,7 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
-    fn check_match_set(
-        &self,
-        function: &IrFn,
-        id: MatchSetId,
-        set: &MatchSet,
-    ) -> Result<(), VerifyError> {
+    fn check_match_set(&self, function: &IrFn, set: &MatchSet) -> Result<(), VerifyError> {
         let error = |kind| verify_error(function, kind);
         let mut arm_slots = Vec::new();
         for arm in &set.arms {
@@ -1165,18 +1151,7 @@ impl<'a> Verifier<'a> {
                     arm_slots.push(slot);
                 }
             }
-            let _ = id;
         }
-        Ok(())
-    }
-
-    fn check_layout(
-        &self,
-        function: &IrFn,
-        id: StructLayoutId,
-        layout: &StructLayout,
-    ) -> Result<(), VerifyError> {
-        let _ = (function, id, layout);
         Ok(())
     }
 
@@ -2534,8 +2509,7 @@ impl<'p> FnCheck<'p> {
             }
             NodeKind::Assign { place, value } => {
                 let place_ty = self.check_node(place, NodeRole::Place)?;
-                let (root, mutable) = self.place_root(place)?;
-                let _ = root;
+                let (_, mutable) = self.place_root(place)?;
                 if !mutable {
                     return Err(self.error(
                         Some(id),
@@ -2555,8 +2529,7 @@ impl<'p> FnCheck<'p> {
             | NodeKind::RemAssign { place, value } => {
                 let op = node.kind.compound_op().expect("compound assignment");
                 let place_ty = self.check_node(place, NodeRole::Place)?;
-                let (root, mutable) = self.place_root(place)?;
-                let _ = root;
+                let (_, mutable) = self.place_root(place)?;
                 if !mutable {
                     return Err(self.error(
                         Some(id),
@@ -2587,7 +2560,7 @@ impl<'p> FnCheck<'p> {
                 pattern,
                 first_child,
             } => {
-                self.check_child_count(first_child, 2, "for")?;
+                self.check_child_count(first_child, 2)?;
                 let iterable = self.function.children[first_child as usize];
                 let body = self.function.children[first_child as usize + 1];
                 let iterable_ty = self.check_node(iterable, NodeRole::Value)?;
@@ -2601,7 +2574,7 @@ impl<'p> FnCheck<'p> {
                 Ok(Ty::Unit)
             }
             NodeKind::Return(value) => {
-                let ret = self.ty(self.function.ret)?;
+                self.ty(self.function.ret)?;
                 match value {
                     Some(value) => {
                         let value_ty = self.check_node(value, NodeRole::Value)?;
@@ -2609,7 +2582,6 @@ impl<'p> FnCheck<'p> {
                     }
                     None => self.expect_ty_value(self.function.ret, &Ty::Unit, "return value")?,
                 }
-                let _ = ret;
                 Ok(Ty::Unit)
             }
             NodeKind::Break => {
@@ -2885,7 +2857,6 @@ impl<'p> FnCheck<'p> {
         pattern: &Pattern,
         expected: &Ty,
     ) -> Result<(), VerifyError> {
-        let _ = id;
         match pattern {
             Pattern::Wild => Ok(()),
             Pattern::Bind { ty, .. } => {
@@ -3346,12 +3317,7 @@ impl<'p> FnCheck<'p> {
         self.expect_ty_value(actual, expected, context)
     }
 
-    fn check_child_count(
-        &self,
-        first: u32,
-        count: u32,
-        context: &'static str,
-    ) -> Result<(), VerifyError> {
+    fn check_child_count(&self, first: u32, count: u32) -> Result<(), VerifyError> {
         let end = first as usize + count as usize;
         if end > self.function.children.len() {
             return Err(self.error(
@@ -3362,7 +3328,6 @@ impl<'p> FnCheck<'p> {
                 },
             ));
         }
-        let _ = context;
         Ok(())
     }
 
@@ -3613,7 +3578,7 @@ impl<'p> FnCheck<'p> {
                 VerifyErrorKind::StructLayout { layout: layout_id },
             ));
         }
-        self.check_child_count(first_child, layout_fields.len() as u32, "struct literal")?;
+        self.check_child_count(first_child, layout_fields.len() as u32)?;
         let mut seen = Vec::new();
         for (index, field) in layout_fields.iter().enumerate() {
             if *field as usize >= field_types.len() || seen.contains(field) {
@@ -3693,7 +3658,7 @@ impl<'p> FnCheck<'p> {
         let args = args.clone();
         let first_child = layout.first_child;
         let layout_fields = layout.fields.clone();
-        self.check_child_count(first_child, layout_fields.len() as u32 + 1, "struct update")?;
+        self.check_child_count(first_child, layout_fields.len() as u32 + 1)?;
         let base = self.function.children[first_child as usize];
         let base_ty = self.check_node(base, NodeRole::Value)?;
         self.expect_ty_value(base_ty, &ty, "struct update base")?;
@@ -3765,7 +3730,7 @@ impl<'p> FnCheck<'p> {
         };
         let payload: Vec<TyId> = def_variant.payload.clone();
         let args = args.clone();
-        self.check_child_count(first_payload, payload.len() as u32, "enum variant")?;
+        self.check_child_count(first_payload, payload.len() as u32)?;
         for (index, payload_ty) in payload.iter().enumerate() {
             let child = self.function.children[first_payload as usize + index];
             let expected = self.substitute(*payload_ty, &args);
@@ -3878,7 +3843,7 @@ impl<'p> FnCheck<'p> {
                 ));
             }
         };
-        self.check_child_count(first_payload, count, "prelude variant")?;
+        self.check_child_count(first_payload, count)?;
         if let Some(expected) = expected {
             let child = self.function.children[first_payload as usize];
             self.expect_child_type(child, &expected, "prelude payload")?;
@@ -4068,7 +4033,7 @@ impl<'p> FnCheck<'p> {
                 },
             ));
         }
-        self.check_child_count(first_arg, params.len() as u32, "direct call")?;
+        self.check_child_count(first_arg, params.len() as u32)?;
         let mut subst = Vec::new();
         let mut roots = Vec::new();
         for (index, param) in params.iter().enumerate() {
@@ -4126,7 +4091,7 @@ impl<'p> FnCheck<'p> {
             ));
         };
         let self_param = self_param.clone();
-        self.check_child_count(first_child, params.len() as u32, "method call")?;
+        self.check_child_count(first_child, params.len() as u32)?;
         let mut subst = Vec::new();
         let mut roots = Vec::new();
         let receiver = self.function.children[first_child as usize];
@@ -4176,7 +4141,7 @@ impl<'p> FnCheck<'p> {
         argc: u32,
         node_ty: TyId,
     ) -> Result<Ty, VerifyError> {
-        self.check_child_count(first_child, argc + 1, "value call")?;
+        self.check_child_count(first_child, argc + 1)?;
         let callee = self.function.children[first_child as usize];
         let callee_ty = self.check_node(callee, NodeRole::Value)?;
         let callee_ty = self.ty(callee_ty)?;
@@ -4248,7 +4213,7 @@ impl<'p> FnCheck<'p> {
         expected: &[Ty],
         context: &'static str,
     ) -> Result<Vec<TyId>, VerifyError> {
-        self.check_child_count(first_arg, expected.len() as u32, context)?;
+        self.check_child_count(first_arg, expected.len() as u32)?;
         let mut actuals = Vec::with_capacity(expected.len());
         for (index, expected) in expected.iter().enumerate() {
             let child = self.function.children[first_arg as usize + index];
@@ -4275,11 +4240,7 @@ impl<'p> FnCheck<'p> {
             ));
         };
         let sig = def.sig;
-        self.check_child_count(
-            first_arg,
-            sig.params.len() as u32,
-            "builtin function arguments",
-        )?;
+        self.check_child_count(first_arg, sig.params.len() as u32)?;
         let mut subst = Vec::new();
         for (index, param) in sig.params.iter().enumerate() {
             let child = self.function.children[first_arg as usize + index];
@@ -4332,8 +4293,7 @@ impl<'p> FnCheck<'p> {
                 },
             ));
         };
-        let values =
-            self.check_any_args(first_arg, sig.params.len() as u32, "builtin item arguments")?;
+        let values = self.check_any_args(first_arg, sig.params.len() as u32)?;
         let mut subst = Vec::new();
         match def.generics {
             BuiltinGenerics::SameOrd => {
@@ -4739,13 +4699,8 @@ impl<'p> FnCheck<'p> {
         }
         self.ty(node_ty)
     }
-    fn check_any_args(
-        &mut self,
-        first_arg: u32,
-        count: u32,
-        context: &'static str,
-    ) -> Result<Vec<TyId>, VerifyError> {
-        self.check_child_count(first_arg, count, context)?;
+    fn check_any_args(&mut self, first_arg: u32, count: u32) -> Result<Vec<TyId>, VerifyError> {
+        self.check_child_count(first_arg, count)?;
         let mut values = Vec::with_capacity(count as usize);
         for index in 0..count {
             let child = self.function.children[first_arg as usize + index as usize];
@@ -4770,7 +4725,7 @@ impl<'p> FnCheck<'p> {
                 },
             ));
         };
-        self.check_child_count(first_child, 1, "builtin method receiver")?;
+        self.check_child_count(first_child, 1)?;
         let receiver = self.function.children[first_child as usize];
         let (receiver_ty, _) = self.check_arg(receiver, def.mut_self, 0)?;
         let arity = method.arity().ok_or_else(|| {
@@ -4782,7 +4737,7 @@ impl<'p> FnCheck<'p> {
                 },
             )
         })?;
-        self.check_child_count(first_child + 1, arity, "builtin method arguments")?;
+        self.check_child_count(first_child + 1, arity)?;
         let mut args = Vec::with_capacity(arity as usize);
         for index in 0..arity {
             let child = self.function.children[(first_child + 1 + index) as usize];
@@ -4801,7 +4756,7 @@ impl<'p> FnCheck<'p> {
         node_ty: TyId,
     ) -> Result<(), VerifyError> {
         let receiver_ty = self.ty(receiver)?;
-        let mut result = match def.receiver {
+        let result = match def.receiver {
             BuiltinReceiver::List => {
                 let Ty::List(item) = receiver_ty else {
                     return Err(self.bad_builtin_receiver(def, &Ty::List(receiver)));
@@ -5057,8 +5012,7 @@ impl<'p> FnCheck<'p> {
                         t
                     }
                     "ok_or" => {
-                        let err = self.ty(args[0])?;
-                        let _ = err;
+                        self.ty(args[0])?;
                         Ty::Result(item, args[0])
                     }
                     "expect" => {
@@ -5112,7 +5066,6 @@ impl<'p> FnCheck<'p> {
                 }
             }
         };
-        let _ = &mut result;
         self.expect_ty_value(node_ty, &result, "builtin method result")
     }
 

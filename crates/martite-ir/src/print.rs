@@ -875,7 +875,6 @@ fn write_fn_kind(out: &mut impl Write, kind: FnKind) -> fmt::Result {
         FnKind::Method(type_id) => write!(out, "method(type#{})", type_id.0),
         FnKind::Handler => out.write_str("handler"),
         FnKind::Test => out.write_str("test"),
-        FnKind::Hook => out.write_str("hook"),
         FnKind::Lambda => out.write_str("lambda"),
         FnKind::Host(host) => write!(out, "host(host#{})", host.0),
     }

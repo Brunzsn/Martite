@@ -84,7 +84,7 @@ Sketch only; names are illustrative.
 
 ```rust
 pub struct IrProgram {
-    pub fns: Vec<IrFn>,            // FnId; includes lambdas, handlers, tests, hooks
+    pub fns: Vec<IrFn>,            // FnId; includes lambdas, handlers, tests and host functions
     pub consts: Vec<ConstValue>,   // const pool (see 6.7)
     pub strs: Vec<Box<str>>,       // static string literals, interned
     pub types: TypeTable,          // IR-owned, erased generics
@@ -98,7 +98,7 @@ pub struct IrFn {
     pub id: FnId,
     pub name: Box<str>,            // appears in panic traces; lambdas are "<lambda>"
     pub source: SourceId,          // per function: fixes the lambda source-file bug
-    pub kind: FnKind,              // Free | Method(TypeId) | Handler | Test | Hook | Lambda | Host
+    pub kind: FnKind,              // Free | Method(TypeId) | Handler | Test | Lambda | Host
     pub params: Vec<ParamInfo>,    // slot, mutability, type; self first if present
     pub ret: TyId,                 // declared or inferred return type
     pub locals: u32,               // frame size in slots
