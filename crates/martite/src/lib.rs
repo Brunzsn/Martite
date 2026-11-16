@@ -19,6 +19,7 @@ use martite_runtime::{
 use snapshot::{SNAPSHOT_FORMAT_VERSION, ValueCodec};
 
 pub use martite_base::{Code, Diagnostic, SourceId, SourceMap, Span};
+pub use martite_driver::{InterfacePackage, InterfacePackageError};
 pub use martite_ir::VerifyMode;
 pub use martite_runtime::{ExecLimits as Limits, Value as HostValue, show};
 
@@ -219,6 +220,15 @@ impl Engine {
             path: path.into(),
             text: text.into(),
         });
+        self
+    }
+
+    /// Register every module from a loaded interface package.
+    ///
+    /// The package loader derives module names from the package name and the
+    /// `.mti` layout, so hosts do not repeat `include_str!` and module strings.
+    pub fn interface_package(&mut self, package: &InterfacePackage) -> &mut Self {
+        self.interfaces.extend(package.modules.iter().cloned());
         self
     }
 

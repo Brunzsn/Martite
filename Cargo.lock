@@ -687,6 +687,7 @@ version = "0.1.0"
 dependencies = [
  "martite-base",
  "martite-check",
+ "martite-config",
  "martite-ir",
  "martite-resolve",
  "martite-syntax",

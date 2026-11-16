@@ -158,6 +158,23 @@ impl SourceMap {
         id
     }
 
+    /// Clone this map with every file name prefixed by `prefix/`.
+    ///
+    /// Source IDs keep their order, so diagnostics from the original map can be
+    /// rendered against the prefixed map. Used by workspace commands to make
+    /// `main.mt` unambiguous across members.
+    pub fn prefixed(&self, prefix: &str) -> SourceMap {
+        if prefix.is_empty() {
+            return self.clone();
+        }
+        let prefix = prefix.trim_end_matches(['/', '\\']);
+        let mut out = SourceMap::new();
+        for (_, file) in self.files() {
+            out.add(format!("{prefix}/{}", file.name()), file.text());
+        }
+        out
+    }
+
     pub fn get(&self, id: SourceId) -> Option<&SourceFile> {
         self.files.get(id.0 as usize)
     }
@@ -416,6 +433,19 @@ mod tests {
         let crlf = normalize_source("a\r\nb");
         assert!(matches!(crlf, Cow::Owned(_)));
         assert_eq!(crlf, "a\nb");
+    }
+
+    #[test]
+    fn prefixed_source_map_preserves_ids_and_text() {
+        let mut sources = SourceMap::new();
+        let first = sources.add("main.mt", "fn main() {}");
+        let second = sources.add("lib.mt", "fn helper() {}");
+
+        let prefixed = sources.prefixed("plugins/app");
+        assert_eq!(prefixed.file(first).name(), "plugins/app/main.mt");
+        assert_eq!(prefixed.file(second).name(), "plugins/app/lib.mt");
+        assert_eq!(prefixed.file(second).text(), "fn helper() {}");
+        assert_eq!(sources.file(first).name(), "main.mt");
     }
 
     #[test]

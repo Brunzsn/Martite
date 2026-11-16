@@ -755,3 +755,86 @@ fn fmt_uses_martite_toml_settings_and_walks_projects() {
     let mti = std::fs::read_to_string(&interface).unwrap();
     assert_eq!(mti, "struct Doc\r\n\r\nfn text(d: Doc) -> str\r\n");
 }
+
+fn workspace_fixture(dir: &TempDir) {
+    dir.file(
+        "martite.toml",
+        "[workspace]\nmembers = [\"plugins/*\"]\ninterface-packages = [\"interfaces/nvlaunch\"]\n",
+    );
+    dir.file(
+        "interfaces/nvlaunch/interface.toml",
+        "[interface]\nname = \"nvlaunch\"\n",
+    );
+    dir.file(
+        "interfaces/nvlaunch/launcher.mti",
+        "struct Item { id: str, title: str, detail: str, glyph: str }\n\non query(text: str) -> list[Item]\non activate(id: str, text: str) -> Result[(), str]\n",
+    );
+    for name in ["calculator", "github"] {
+        dir.file(
+            &format!("plugins/{name}/plugin.toml"),
+            &format!(
+                "[plugin]\nname = \"{name}\"\nversion = \"0.1.0\"\nlang = \"1\"\napi = \"1.0\"\nentry = \"main.mt\"\n\n[permissions]\ngrant = [\"nvlaunch.launcher\"]\n"
+            ),
+        );
+        dir.file(
+            &format!("plugins/{name}/main.mt"),
+            "use nvlaunch.launcher\nuse nvlaunch.launcher.Item\n\non query(_text: str) -> list[Item] { [] }\n\non activate(_id: str, _text: str) -> Result[(), str] { Ok(()) }\n\ntest \"works\" { assert(1 + 1 == 2, \"math\") }\n",
+        );
+    }
+}
+
+#[test]
+fn workspace_check_uses_shared_interfaces_for_every_member() {
+    let dir = TempDir::new("workspace-check");
+    workspace_fixture(&dir);
+
+    let output = martite_in(dir.path(), &[s("check")]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let output = martite_in(dir.path(), &[s("check"), s("plugins/calculator")]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+}
+
+#[test]
+fn workspace_test_runs_every_member_and_aggregates() {
+    let dir = TempDir::new("workspace-test");
+    workspace_fixture(&dir);
+
+    let output = martite_in(dir.path(), &[s("test")]);
+    assert!(output.status.success(), "stdout: {}", stdout(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("calculator: 1/1 tests passed"),
+        "stdout: {text}"
+    );
+    assert!(text.contains("github: 1/1 tests passed"), "stdout: {text}");
+    assert!(text.contains("2/2 tests passed"), "stdout: {text}");
+}
+
+#[test]
+fn workspace_lint_treats_members_as_plugins() {
+    let dir = TempDir::new("workspace-lint");
+    workspace_fixture(&dir);
+
+    let output = martite_in(dir.path(), &[s("lint")]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+}
+
+#[test]
+fn workspace_diagnostics_are_prefixed_with_the_member() {
+    let dir = TempDir::new("workspace-prefix");
+    workspace_fixture(&dir);
+    dir.file(
+        "plugins/github/main.mt",
+        "use nvlaunch.launcher\nuse nvlaunch.launcher.Item\n\non query(_text: str) -> list[Item] { missing }\n\non activate(_id: str, _text: str) -> Result[(), str] { Ok(()) }\n",
+    );
+
+    let output = martite_in(dir.path(), &[s("check")]);
+    assert_eq!(output.status.code(), Some(1));
+    let error = stderr(&output);
+    assert!(error.contains("plugins/github/main.mt"), "stderr: {error}");
+    assert!(
+        !error.contains("plugins/calculator/main.mt"),
+        "stderr: {error}"
+    );
+}

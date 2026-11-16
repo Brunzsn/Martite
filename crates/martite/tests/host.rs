@@ -1025,3 +1025,43 @@ fn instance_outlives_the_plugin_handle() {
     assert!(matches!(value, Value::Result(Ok(_))), "{value:?}");
     assert_eq!(state_saves(&instance), 1);
 }
+
+#[test]
+fn interface_package_registers_named_modules() {
+    let root =
+        std::env::temp_dir().join(format!("martite-engine-interface-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create package");
+    std::fs::write(
+        root.join("interface.toml"),
+        "[interface]\nname = \"nvlaunch\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(root.join("launcher.mti"), "on query(text: str) -> ()\n").expect("interface");
+
+    let package = martite::InterfacePackage::load(&root).expect("load package");
+    let mut engine = Engine::new();
+    engine.interface_package(&package);
+
+    let manifest = r#"
+[plugin]
+name = "package-test"
+version = "0.1.0"
+lang = "1"
+api = "1.0"
+entry = "main.mt"
+
+[permissions]
+grant = ["nvlaunch.launcher"]
+"#;
+    let plugin = r#"
+use nvlaunch.launcher
+
+on query(_text: str) -> () {}
+"#;
+    let mut provider = MemoryProvider::new();
+    provider.insert("main.mt", plugin);
+    engine
+        .load(manifest, &provider)
+        .expect("load package plugin");
+}

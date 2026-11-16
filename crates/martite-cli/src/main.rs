@@ -9,7 +9,10 @@ use martite_base::{
 };
 use martite_check::CheckedProgram;
 use martite_config::{Manifest, ToolConfig, parse_manifest, parse_tool_config};
-use martite_driver::{LoadOptions, LoadedProgram, LowerOptions, load, lower_with};
+use martite_driver::{
+    LoadOptions, LoadedProgram, LowerOptions, Workspace, discover_workspace,
+    discover_workspace_root, load, lower_with,
+};
 use martite_ir::{IrProgram, Printer};
 use martite_lint::{LintInputs, ManifestInput, SettingsResolver, normalize_path, sort_diagnostics};
 use martite_resolve::InterfaceSource;
@@ -466,6 +469,13 @@ fn relative_to(base: &Path, path: &Path) -> String {
     normalize_path(&relative.to_string_lossy())
 }
 
+fn same_path(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
 fn scan_martite_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     scan_martite_files_into(root, &mut out);
@@ -585,10 +595,17 @@ fn fmt_config_for(start: &Path) -> Result<martite_config::FmtConfig, String> {
 fn collect_fmt_files(args: &FmtArgs, cwd: &Path) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
     if args.paths.is_empty() {
-        let Some(root) = find_project_root(cwd) else {
-            return Err(
-                "fmt requires a path when no `martite.toml` or `plugin.toml` is present".into(),
-            );
+        let root = if let Some(root) =
+            discover_workspace_root(cwd).map_err(|error| error.message)?
+        {
+            root
+        } else {
+            let Some(root) = find_project_root(cwd) else {
+                return Err(
+                    "fmt requires a path when no `martite.toml` or `plugin.toml` is present".into(),
+                );
+            };
+            root
         };
         scan_format_files(&root, &mut files);
     } else {
@@ -783,17 +800,24 @@ struct ProjectSpec {
     root: PathBuf,
     entry: String,
     edition: String,
-    /// `.mti` files supplied on the command line, keyed by module path.
+    /// Host interfaces available to the load, from the workspace and
+    /// repeatable `--interface` flags.
     interfaces: Vec<InterfaceSource>,
     /// Modules granted by a plugin manifest.
     grants: Vec<String>,
     manifest: Option<Manifest>,
     manifest_text: Option<String>,
+    /// Prefix used when rendering source names from a workspace member.
+    display_prefix: String,
 }
 
 impl ProjectSpec {
     fn is_script(&self) -> bool {
         self.manifest.is_none()
+    }
+
+    fn display_sources(&self, sources: &SourceMap) -> SourceMap {
+        sources.prefixed(&self.display_prefix)
     }
 
     /// Interfaces a static load sees: the caller's `.mti` files plus the
@@ -865,16 +889,31 @@ fn interface_paths(interfaces: &[InterfaceSource]) -> Vec<String> {
         .collect()
 }
 
-fn script_spec(root: PathBuf, entry: String, cli: &[PathBuf]) -> ProjectSpec {
-    ProjectSpec {
-        interfaces: load_interfaces(cli, Some(&root)),
-        grants: Vec::new(),
+fn script_spec(
+    root: PathBuf,
+    entry: String,
+    cli: &[PathBuf],
+    workspace: Option<&Workspace>,
+) -> Result<ProjectSpec, String> {
+    let interfaces = merge_interfaces(
+        workspace
+            .map(|workspace| workspace.interfaces.clone())
+            .unwrap_or_default(),
+        load_interfaces(cli, Some(&root))?,
+    )?;
+    let display_prefix = workspace
+        .map(|workspace| relative_to(&workspace.root, &root))
+        .unwrap_or_default();
+    Ok(ProjectSpec {
         root,
         entry,
         edition: LANG_EDITION.to_string(),
+        interfaces,
+        grants: Vec::new(),
         manifest: None,
         manifest_text: None,
-    }
+        display_prefix,
+    })
 }
 
 /// Why a single-project path could not be resolved.
@@ -886,8 +925,9 @@ enum ProjectError {
 }
 
 fn resolve_project(path: &Path, interfaces: &[PathBuf]) -> Result<ProjectSpec, ProjectError> {
+    let workspace = discover_workspace(path).map_err(|error| ProjectError::Usage(error.message))?;
     if path.is_dir() {
-        return load_plugin_spec(path, interfaces);
+        return load_plugin_spec(path, interfaces, workspace.as_ref());
     }
     if !path.is_file() {
         return Err(ProjectError::Usage(format!(
@@ -905,25 +945,43 @@ fn resolve_project(path: &Path, interfaces: &[PathBuf]) -> Result<ProjectSpec, P
         .and_then(|name| name.to_str())
         .ok_or_else(|| ProjectError::Usage(format!("invalid path `{}`", path.display())))?
         .to_string();
-    Ok(script_spec(root, entry, interfaces))
+    script_spec(root, entry, interfaces, workspace.as_ref()).map_err(ProjectError::Usage)
 }
 
-fn load_plugin_spec(root: &Path, interfaces: &[PathBuf]) -> Result<ProjectSpec, ProjectError> {
+fn load_plugin_spec(
+    root: &Path,
+    cli: &[PathBuf],
+    workspace: Option<&Workspace>,
+) -> Result<ProjectSpec, ProjectError> {
     let manifest_path = root.join("plugin.toml");
     let text = std::fs::read_to_string(&manifest_path).map_err(|error| {
         ProjectError::Usage(format!("cannot read {}: {error}", manifest_path.display()))
     })?;
     let manifest = parse_manifest(&text).map_err(|error| {
-        ProjectError::Diagnostic(Diagnostic::error(Code::E508, error.to_string()))
+        ProjectError::Diagnostic(Diagnostic::error(
+            Code::E508,
+            format!("{}: {}", manifest_path.display(), error.message),
+        ))
     })?;
+    let interfaces = merge_interfaces(
+        workspace
+            .map(|workspace| workspace.interfaces.clone())
+            .unwrap_or_default(),
+        load_interfaces(cli, Some(root)).map_err(ProjectError::Usage)?,
+    )
+    .map_err(ProjectError::Usage)?;
+    let display_prefix = workspace
+        .map(|workspace| relative_to(&workspace.root, root))
+        .unwrap_or_default();
     Ok(ProjectSpec {
         root: root.to_path_buf(),
         entry: manifest.entry.clone(),
         edition: manifest.lang.clone(),
         grants: manifest.grants.clone(),
-        interfaces: load_interfaces(interfaces, Some(root)),
+        interfaces,
         manifest: Some(manifest),
         manifest_text: Some(text),
+        display_prefix,
     })
 }
 
@@ -976,19 +1034,40 @@ fn collect_projects(
     let mut specs = Vec::new();
 
     if args.paths.is_empty() {
-        let Some(root) = find_project_root(&cwd) else {
-            return Err(
-                "lint requires a path when no `martite.toml` or `plugin.toml` is present".into(),
-            );
-        };
-        if root.join("plugin.toml").is_file() {
-            if let Some(spec) = plugin_spec(&root, &args.interfaces, diagnostics) {
-                specs.push(spec);
+        if let Some(workspace) = discover_workspace(&cwd).map_err(|error| error.message)? {
+            if workspace.members.is_empty() {
+                return Err("workspace has no members".into());
             }
+            specs.extend(workspace_default_specs(
+                &workspace,
+                &cwd,
+                &args.interfaces,
+                diagnostics,
+            ));
         } else {
-            for file in scan_martite_files(&root) {
-                let entry = relative_to(&root, &file);
-                specs.push(script_spec(root.clone(), entry, &args.interfaces));
+            let Some(root) = find_project_root(&cwd) else {
+                return Err(
+                    "lint requires a path when no `martite.toml` or `plugin.toml` is present"
+                        .into(),
+                );
+            };
+            let workspace = discover_workspace(&root).map_err(|error| error.message)?;
+            if root.join("plugin.toml").is_file() {
+                if let Some(spec) =
+                    plugin_spec(&root, &args.interfaces, workspace.as_ref(), diagnostics)
+                {
+                    specs.push(spec);
+                }
+            } else {
+                for file in scan_martite_files(&root) {
+                    let entry = relative_to(&root, &file);
+                    specs.push(script_spec(
+                        root.clone(),
+                        entry,
+                        &args.interfaces,
+                        workspace.as_ref(),
+                    )?);
+                }
             }
         }
     } else {
@@ -1008,16 +1087,39 @@ fn collect_projects(
                     .and_then(|name| name.to_str())
                     .ok_or_else(|| format!("invalid path `{raw}`"))?
                     .to_string();
-                specs.push(script_spec(root, entry, &args.interfaces));
+                let workspace = discover_workspace(&path).map_err(|error| error.message)?;
+                specs.push(script_spec(
+                    root,
+                    entry,
+                    &args.interfaces,
+                    workspace.as_ref(),
+                )?);
             } else if path.is_dir() {
+                let workspace = discover_workspace(&path).map_err(|error| error.message)?;
+                if let Some(workspace) = workspace.as_ref()
+                    && same_path(&path, &workspace.root)
+                {
+                    if workspace.members.is_empty() {
+                        return Err("workspace has no members".into());
+                    }
+                    specs.extend(workspace_specs(workspace, &args.interfaces, diagnostics));
+                    continue;
+                }
                 if path.join("plugin.toml").is_file() {
-                    if let Some(spec) = plugin_spec(&path, &args.interfaces, diagnostics) {
+                    if let Some(spec) =
+                        plugin_spec(&path, &args.interfaces, workspace.as_ref(), diagnostics)
+                    {
                         specs.push(spec);
                     }
                 } else {
                     for file in scan_martite_files(&path) {
                         let entry = relative_to(&path, &file);
-                        specs.push(script_spec(path.clone(), entry, &args.interfaces));
+                        specs.push(script_spec(
+                            path.clone(),
+                            entry,
+                            &args.interfaces,
+                            workspace.as_ref(),
+                        )?);
                     }
                 }
             } else {
@@ -1038,10 +1140,11 @@ fn collect_projects(
 
 fn plugin_spec(
     root: &Path,
-    interfaces: &[PathBuf],
+    cli: &[PathBuf],
+    workspace: Option<&Workspace>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<ProjectSpec> {
-    match load_plugin_spec(root, interfaces) {
+    match load_plugin_spec(root, cli, workspace) {
         Ok(spec) => Some(spec),
         Err(ProjectError::Diagnostic(diagnostic)) => {
             diagnostics.push(diagnostic);
@@ -1052,6 +1155,56 @@ fn plugin_spec(
             None
         }
     }
+}
+
+fn workspace_specs(
+    workspace: &Workspace,
+    cli: &[PathBuf],
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<ProjectSpec> {
+    let mut specs = Vec::new();
+    let mut names: HashMap<String, PathBuf> = HashMap::new();
+    for member in &workspace.members {
+        let Some(spec) = plugin_spec(member, cli, Some(workspace), diagnostics) else {
+            continue;
+        };
+        if let Some(manifest) = &spec.manifest {
+            if let Some(previous) = names.get(&manifest.name) {
+                diagnostics.push(Diagnostic::error(
+                    Code::E508,
+                    format!(
+                        "duplicate plugin name `{}` in {} and {}",
+                        manifest.name,
+                        previous.display(),
+                        member.display()
+                    ),
+                ));
+                continue;
+            }
+            names.insert(manifest.name.clone(), member.clone());
+        }
+        specs.push(spec);
+    }
+    specs
+}
+
+/// Specs for a no-path command. At the workspace root this is every member;
+/// from inside a member it is that member, like Cargo.
+fn workspace_default_specs(
+    workspace: &Workspace,
+    cwd: &Path,
+    cli: &[PathBuf],
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<ProjectSpec> {
+    if !same_path(cwd, &workspace.root)
+        && let Some(root) = find_project_root(cwd)
+        && !same_path(&root, &workspace.root)
+    {
+        return plugin_spec(&root, cli, Some(workspace), diagnostics)
+            .into_iter()
+            .collect();
+    }
+    workspace_specs(workspace, cli, diagnostics)
 }
 
 struct OverlayProvider<'a> {
@@ -1140,7 +1293,8 @@ fn fix_project(
             },
         );
         last.clear();
-        render_all(&loaded.diagnostics, &loaded.sources, &mut last);
+        let display_sources = spec.display_sources(&loaded.sources);
+        render_all(&loaded.diagnostics, &display_sources, &mut last);
         if loaded
             .diagnostics
             .iter()
@@ -1172,7 +1326,8 @@ fn fix_project(
         };
         let prefix = relative_to(config_dir, &spec.root);
         let output = martite_lint::lint(program, &loaded.sources, resolver, &prefix, &inputs);
-        render_all(&output.diagnostics, &loaded.sources, &mut last);
+        let display_sources = spec.display_sources(&loaded.sources);
+        render_all(&output.diagnostics, &display_sources, &mut last);
 
         if pass == 5 {
             break;
@@ -1378,7 +1533,8 @@ fn cmd_lint(args: &[String]) -> ExitCode {
             continue;
         }
         let mut loaded = spec.load_static();
-        render_all(&loaded.diagnostics, &loaded.sources, &mut rendered);
+        let display_sources = spec.display_sources(&loaded.sources);
+        render_all(&loaded.diagnostics, &display_sources, &mut rendered);
         if loaded
             .diagnostics
             .iter()
@@ -1406,7 +1562,8 @@ fn cmd_lint(args: &[String]) -> ExitCode {
         };
         let prefix = relative_to(&config_dir, &spec.root);
         let output = martite_lint::lint(program, &loaded.sources, &resolver, &prefix, &inputs);
-        render_all(&output.diagnostics, &loaded.sources, &mut rendered);
+        let display_sources = spec.display_sources(&loaded.sources);
+        render_all(&output.diagnostics, &display_sources, &mut rendered);
     }
     print_rendered(&mut rendered, parsed.json);
     if had_load_error || lint_fails(&rendered, parsed.deny_warnings) {
@@ -1420,9 +1577,21 @@ fn lint_syntax_only_mode(args: &LintArgs) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut files = Vec::new();
     if args.paths.is_empty() {
-        let Some(root) = find_project_root(&cwd) else {
-            eprintln!("error: --syntax-only requires a path when no project file is present");
-            return ExitCode::from(2);
+        let root = match discover_workspace_root(&cwd) {
+            Ok(Some(root)) => root,
+            Ok(None) => {
+                let Some(root) = find_project_root(&cwd) else {
+                    eprintln!(
+                        "error: --syntax-only requires a path when no project file is present"
+                    );
+                    return ExitCode::from(2);
+                };
+                root
+            }
+            Err(error) => {
+                eprintln!("error: {}", error.message);
+                return ExitCode::from(2);
+            }
         };
         files.extend(scan_martite_files(&root));
     } else {
@@ -1526,7 +1695,13 @@ fn cmd_run(raw: &[String]) -> ExitCode {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .to_path_buf();
-    let spec = script_spec(root.clone(), name.to_string(), &args.interfaces);
+    let spec = match script_spec(root.clone(), name.to_string(), &args.interfaces, None) {
+        Ok(spec) => spec,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return ExitCode::from(2);
+        }
+    };
     let engine = build_engine(&spec, &args, args.script_args.clone());
     // `martite run` is the standalone host: it is intentionally unrestricted.
     let provider = FileSystemProvider::unrestricted(root);
@@ -1560,6 +1735,34 @@ fn cmd_run(raw: &[String]) -> ExitCode {
     }
 }
 
+fn command_specs(
+    command: &str,
+    path: Option<&str>,
+    cli: &[PathBuf],
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<Vec<ProjectSpec>, String> {
+    if let Some(path) = path {
+        let path = PathBuf::from(path);
+        return match resolve_project(&path, cli) {
+            Ok(spec) => Ok(vec![spec]),
+            Err(ProjectError::Usage(message)) => Err(message),
+            Err(ProjectError::Diagnostic(diagnostic)) => {
+                diagnostics.push(diagnostic);
+                Ok(Vec::new())
+            }
+        };
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let Some(workspace) = discover_workspace(&cwd).map_err(|error| error.message)? else {
+        return Err(format!("{command} requires a path"));
+    };
+    if workspace.members.is_empty() {
+        return Err("workspace has no members".into());
+    }
+    Ok(workspace_default_specs(&workspace, &cwd, cli, diagnostics))
+}
+
 fn cmd_check(raw: &[String]) -> ExitCode {
     let args = match parse_args(raw, Command::Check) {
         Ok(args) => args,
@@ -1568,25 +1771,29 @@ fn cmd_check(raw: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let Some(path) = args.path.clone() else {
-        eprintln!("error: check requires a path");
-        return ExitCode::from(2);
-    };
-    let path = PathBuf::from(&path);
-    let spec = match resolve_project(&path, &args.interfaces) {
-        Ok(spec) => spec,
-        Err(ProjectError::Usage(message)) => {
+    let mut project_diagnostics = Vec::new();
+    let specs = match command_specs(
+        "check",
+        args.path.as_deref(),
+        &args.interfaces,
+        &mut project_diagnostics,
+    ) {
+        Ok(specs) => specs,
+        Err(message) => {
             eprintln!("error: {message}");
             return ExitCode::from(2);
         }
-        Err(ProjectError::Diagnostic(diagnostic)) => {
-            print_diagnostics(&[diagnostic], &SourceMap::new(), args.json);
-            return ExitCode::from(1);
-        }
     };
-    let loaded = spec.load_static();
-    print_diagnostics(&loaded.diagnostics, &loaded.sources, args.json);
-    if loaded.has_errors() {
+
+    print_diagnostics(&project_diagnostics, &SourceMap::new(), args.json);
+    let mut failed = !project_diagnostics.is_empty();
+    for spec in specs {
+        let loaded = spec.load_static();
+        let sources = spec.display_sources(&loaded.sources);
+        print_diagnostics(&loaded.diagnostics, &sources, args.json);
+        failed |= loaded.has_errors();
+    }
+    if failed {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
@@ -1619,7 +1826,13 @@ fn cmd_lower(raw: &[String]) -> ExitCode {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .to_path_buf();
-    let spec = script_spec(root, name.to_string(), &args.interfaces);
+    let spec = match script_spec(root, name.to_string(), &args.interfaces, None) {
+        Ok(spec) => spec,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return ExitCode::from(2);
+        }
+    };
     let loaded = spec.load_static();
     print_diagnostics(&loaded.diagnostics, &loaded.sources, args.json);
     if loaded.has_errors() {
@@ -1664,58 +1877,105 @@ fn cmd_test(raw: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let Some(path) = args.path.clone() else {
-        eprintln!("error: test requires a path\n");
-        return ExitCode::from(2);
-    };
-    let path = PathBuf::from(&path);
-    let spec = match resolve_project(&path, &args.interfaces) {
-        Ok(spec) => spec,
-        Err(ProjectError::Usage(message)) => {
+    let mut project_diagnostics = Vec::new();
+    let specs = match command_specs(
+        "test",
+        args.path.as_deref(),
+        &args.interfaces,
+        &mut project_diagnostics,
+    ) {
+        Ok(specs) => specs,
+        Err(message) => {
             eprintln!("error: {message}");
             return ExitCode::from(2);
         }
-        Err(ProjectError::Diagnostic(diagnostic)) => {
-            print_diagnostics(&[diagnostic], &SourceMap::new(), args.json);
-            return ExitCode::from(1);
-        }
     };
-    let mut engine = build_engine(&spec, &args, Vec::new());
-    // Tests run without a double for every host function: an unregistered
-    // call traps with `no test double` instead of failing the load.
-    engine.set_allow_missing_host_impls(true);
-    let provider = FileSystemProvider::new(spec.root.clone());
-    let plugin = match load_executable(&spec, &engine, &provider) {
-        Ok(plugin) => plugin,
-        Err(error) => {
-            print_diagnostics(&error.diagnostics, &error.sources, args.json);
-            return ExitCode::from(1);
+
+    print_diagnostics(&project_diagnostics, &SourceMap::new(), args.json);
+    let mut failed_run = !project_diagnostics.is_empty();
+    let multiple = specs.len() > 1;
+    let mut total_all = 0usize;
+    let mut failed_all = 0usize;
+
+    for spec in specs {
+        let label = spec
+            .manifest
+            .as_ref()
+            .map(|manifest| manifest.name.clone())
+            .unwrap_or_else(|| spec.entry.clone());
+        let mut engine = build_engine(&spec, &args, Vec::new());
+        // Tests run without a double for every host function: an unregistered
+        // call traps with `no test double` instead of failing the load.
+        engine.set_allow_missing_host_impls(true);
+        let provider = FileSystemProvider::new(spec.root.clone());
+        let plugin = match load_executable(&spec, &engine, &provider) {
+            Ok(plugin) => plugin,
+            Err(error) => {
+                let sources = spec.display_sources(&error.sources);
+                print_diagnostics(&error.diagnostics, &sources, args.json);
+                failed_run = true;
+                continue;
+            }
+        };
+        if let Some(stage) = args.dump_ir {
+            dump_ir(stage, plugin.lowered_ir().as_ref(), plugin.ir());
         }
-    };
-    if let Some(stage) = args.dump_ir {
-        dump_ir(stage, plugin.lowered_ir().as_ref(), plugin.ir());
-    }
-    let mut failed = 0usize;
-    let mut total = 0usize;
-    for report in plugin.run_tests() {
-        total += 1;
-        for line in report.log {
-            println!("{line}");
-        }
-        match report.outcome {
-            Ok(_) => println!("test {} ... ok", report.name),
-            Err(trap) => {
-                failed += 1;
-                println!("test {} ... FAILED: {}", report.name, trap.panic_message());
+        let mut failed = 0usize;
+        let mut total = 0usize;
+        for report in plugin.run_tests() {
+            total += 1;
+            for line in report.log {
+                println!("{line}");
+            }
+            match report.outcome {
+                Ok(_) => {
+                    if multiple {
+                        println!("{label}: test {} ... ok", report.name);
+                    } else {
+                        println!("test {} ... ok", report.name);
+                    }
+                }
+                Err(trap) => {
+                    failed += 1;
+                    if multiple {
+                        println!(
+                            "{label}: test {} ... FAILED: {}",
+                            report.name,
+                            trap.panic_message()
+                        );
+                    } else {
+                        println!("test {} ... FAILED: {}", report.name, trap.panic_message());
+                    }
+                }
             }
         }
+        if multiple {
+            if total == 0 {
+                println!("{label}: no tests found");
+            } else {
+                println!("{label}: {}/{} tests passed", total - failed, total);
+            }
+        }
+        total_all += total;
+        failed_all += failed;
+        if failed > 0 {
+            failed_run = true;
+        }
     }
-    if total == 0 {
+
+    if multiple {
+        if total_all == 0 {
+            println!("no tests found");
+        } else {
+            println!("{}/{} tests passed", total_all - failed_all, total_all);
+        }
+    } else if total_all == 0 {
         println!("no tests found");
     } else {
-        println!("{}/{} tests passed", total - failed, total);
+        println!("{}/{} tests passed", total_all - failed_all, total_all);
     }
-    if failed > 0 {
+
+    if failed_run {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
@@ -1791,16 +2051,11 @@ fn print_trap(trap: &Trap, sources: &SourceMap) {
     }
 }
 
-fn load_interfaces(paths: &[PathBuf], root: Option<&Path>) -> Vec<InterfaceSource> {
+fn load_interfaces(paths: &[PathBuf], root: Option<&Path>) -> Result<Vec<InterfaceSource>, String> {
     let mut out = Vec::new();
     for path in paths {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(error) => {
-                eprintln!("error: cannot read {}: {error}", path.display());
-                continue;
-            }
-        };
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
         let relative = root
             .and_then(|root| path.strip_prefix(root).ok())
             .unwrap_or(path.as_path());
@@ -1812,7 +2067,26 @@ fn load_interfaces(paths: &[PathBuf], root: Option<&Path>) -> Vec<InterfaceSourc
             .replace('/', ".");
         out.push(InterfaceSource { path: module, text });
     }
-    out
+    Ok(out)
+}
+
+fn merge_interfaces(
+    mut base: Vec<InterfaceSource>,
+    extra: Vec<InterfaceSource>,
+) -> Result<Vec<InterfaceSource>, String> {
+    for source in extra {
+        if let Some(existing) = base.iter().find(|existing| existing.path == source.path) {
+            if existing.text != source.text {
+                return Err(format!(
+                    "interface module `{}` is defined more than once with different text",
+                    source.path
+                ));
+            }
+            continue;
+        }
+        base.push(source);
+    }
+    Ok(base)
 }
 
 impl StandaloneHost {

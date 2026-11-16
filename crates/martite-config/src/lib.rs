@@ -28,6 +28,72 @@ pub struct LimitsSection {
     pub deadline_ms: Option<u64>,
 }
 
+/// `[workspace]` in `martite.toml`.
+///
+/// Paths are relative to the directory containing `martite.toml`. Members are
+/// plugin projects; interface packages are directories discovered by the same
+/// loader the embedding API uses.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceSection {
+    #[serde(default)]
+    pub members: Vec<String>,
+    #[serde(default, rename = "interface-packages", alias = "interface_packages")]
+    pub interface_packages: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceConfig {
+    pub members: Vec<String>,
+    pub interface_packages: Vec<String>,
+}
+
+/// `interface.toml` inside an interface package directory.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct InterfaceFile {
+    interface: InterfaceSection,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct InterfaceSection {
+    pub name: Option<String>,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InterfaceManifest {
+    pub name: String,
+    pub version: Option<String>,
+}
+
+/// A module segment is one component of a dotted module path, for example
+/// `launcher` in `nvlaunch.launcher`.
+pub fn is_valid_module_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+pub fn parse_interface_manifest(text: &str) -> Result<InterfaceManifest, ManifestError> {
+    let file: InterfaceFile = toml::from_str(text).map_err(|e| ManifestError {
+        message: format!("malformed interface.toml: {e}"),
+    })?;
+    let name = file.interface.name.ok_or_else(|| ManifestError {
+        message: "interface.name is required".into(),
+    })?;
+    if !is_valid_module_segment(&name) {
+        return Err(ManifestError {
+            message: "interface.name must be a lowercase module segment ([a-z][a-z0-9_]*)".into(),
+        });
+    }
+    Ok(InterfaceManifest {
+        name,
+        version: file.interface.version,
+    })
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestFile {
@@ -166,6 +232,8 @@ fn contains_datetime(value: &toml::Value) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct ToolFile {
     #[serde(default)]
+    pub workspace: Option<WorkspaceSection>,
+    #[serde(default)]
     pub tool: ToolSection,
     #[serde(default)]
     pub lint: LintSection,
@@ -258,6 +326,7 @@ impl Default for FmtConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct ToolConfig {
+    pub workspace: Option<WorkspaceConfig>,
     pub lang: Option<String>,
     pub lint_preset: Option<String>,
     pub lint_groups: std::collections::HashMap<String, String>,
@@ -274,6 +343,10 @@ pub fn parse_tool_config(text: &str) -> Result<ToolConfig, ManifestError> {
     })?;
     let fmt = parse_fmt_config(file.fmt)?;
     Ok(ToolConfig {
+        workspace: file.workspace.map(|workspace| WorkspaceConfig {
+            members: workspace.members,
+            interface_packages: workspace.interface_packages,
+        }),
         lang: file.tool.lang,
         lint_preset: file.lint.preset,
         lint_groups: file.lint.groups,
@@ -417,5 +490,71 @@ mod tests {
         ] {
             assert!(parse_tool_config(text).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn workspace_section_is_parsed() {
+        let config = parse_tool_config(
+            r#"
+            [workspace]
+            members = ["plugins/*"]
+            interface-packages = ["interfaces/nvlaunch"]
+
+            [lint]
+            preset = "strict"
+            "#,
+        )
+        .unwrap();
+        let workspace = config.workspace.unwrap();
+        assert_eq!(workspace.members, vec!["plugins/*"]);
+        assert_eq!(workspace.interface_packages, vec!["interfaces/nvlaunch"]);
+        assert_eq!(config.lint_preset.as_deref(), Some("strict"));
+    }
+
+    #[test]
+    fn workspace_absent_is_distinct_from_empty() {
+        assert!(parse_tool_config("").unwrap().workspace.is_none());
+        assert!(
+            parse_tool_config("[workspace]\n")
+                .unwrap()
+                .workspace
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn unknown_workspace_keys_are_rejected() {
+        let err = parse_tool_config("[workspace]\nplugin = [\"x\"]\n").unwrap_err();
+        assert!(err.message.contains("unknown field"));
+    }
+
+    #[test]
+    fn interface_manifest_is_parsed() {
+        let manifest = parse_interface_manifest(
+            r#"
+            [interface]
+            name = "nvlaunch"
+            version = "0.1.0"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(manifest.name, "nvlaunch");
+        assert_eq!(manifest.version.as_deref(), Some("0.1.0"));
+    }
+
+    #[test]
+    fn interface_manifest_validates_names() {
+        for text in [
+            "[interface]\nname = \"NVLaunch\"\n",
+            "[interface]\nname = \"open-plugin-folder\"\n",
+            "[interface]\n",
+            "[interface]\nname = \"nvlaunch\"\nextra = true\n",
+        ] {
+            assert!(parse_interface_manifest(text).is_err(), "{text}");
+        }
+        assert!(is_valid_module_segment("std"));
+        assert!(is_valid_module_segment("app_2"));
+        assert!(!is_valid_module_segment(""));
+        assert!(!is_valid_module_segment("2app"));
     }
 }

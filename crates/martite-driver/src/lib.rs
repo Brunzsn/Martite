@@ -1,11 +1,16 @@
 //! Load pipeline: sources → parse → resolve → check → lower.
 
+mod interfaces;
+mod workspace;
+
 use martite_base::{Code, Diagnostic, LoadLimits, Severity, SourceMap, SourceProvider};
 use martite_check::{CheckedProgram, check};
 use martite_ir::IrProgram;
 use martite_resolve::{InterfaceSource, ResolveOptions, resolve};
 
+pub use interfaces::{InterfacePackage, InterfacePackageError};
 pub use martite_ir::{LowerOptions, VerifyMode};
+pub use workspace::{Workspace, WorkspaceError, discover_workspace, discover_workspace_root};
 
 #[derive(Debug, Clone, Default)]
 pub struct LoadOptions {

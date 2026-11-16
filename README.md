@@ -123,6 +123,52 @@ after the whole project still type-checks.
 Exit codes follow the specification: `0` success, `1` diagnostics or `main` returned `Err`,
 `2` usage/load errors, and `101` for script panics.
 
+## Workspaces and interface packages
+
+A workspace root is a `martite.toml` with a `[workspace]` section. Each member is
+a plugin project, and interface packages are directories of `.mti` files shared
+by the workspace:
+
+```toml
+[workspace]
+members = ["plugins/*"]
+interface-packages = ["interfaces/nvlaunch"]
+
+[lint]
+preset = "recommended"
+```
+
+```text
+interfaces/nvlaunch/
+  interface.toml        # [interface] name = "nvlaunch"
+  launcher.mti          # module nvlaunch.launcher
+  host.mti              # module nvlaunch.host
+```
+
+An interface package name comes from `interface.toml`, or from the directory
+name when that file is absent. Module names are the package name plus the `.mti`
+path inside the package. A plugin still declares only the modules it needs:
+
+```toml
+[permissions]
+grant = ["nvlaunch.launcher", "nvlaunch.host"]
+```
+
+With no path at a workspace root, `martite check`, `martite test`, and
+`martite lint` operate on every member, and `martite fmt` walks the whole
+workspace. An explicit path checks one member but still inherits the workspace
+interfaces. `--interface` remains available as an override.
+
+Hosts can register the same package without repeating `include_str!` pairs:
+
+```rust
+let package = martite::InterfacePackage::load("interfaces/nvlaunch")?;
+engine.interface_package(&package);
+```
+
+The host should load the package from a trusted embedded or installed location;
+runtime plugin manifests never choose interface file paths.
+
 ## Host policy
 
 `martite run` is the standalone host and is intentionally unrestricted: it has
