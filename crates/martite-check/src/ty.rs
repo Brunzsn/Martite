@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fmt;
 
 use martite_resolve::{DefId, ModuleId};
@@ -372,7 +371,6 @@ pub struct TypeResolver<'a> {
     pub def_to_type: &'a FxHashMap<DefId, TypeId>,
     pub builtin_json: Option<TypeId>,
     pub type_param_names: &'a [String],
-    pub imported_builtin_types: &'a HashMap<String, TypeId>,
 }
 
 impl TypeResolver<'_> {
@@ -467,8 +465,6 @@ impl TypeResolver<'_> {
                                 ));
                             }
                             Ok(Ty::Named(id, resolved_args))
-                        } else if let Some(id) = self.imported_builtin_types.get(name) {
-                            Ok(Ty::Named(*id, resolved_args))
                         } else {
                             Err(format!("unknown type `{name}`"))
                         }

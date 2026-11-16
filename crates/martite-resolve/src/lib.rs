@@ -108,9 +108,6 @@ pub struct Symbols {
     pub consts: HashMap<String, DefId>,
     pub modules: HashMap<String, ModuleTarget>,
     pub builtin_items: HashMap<String, BuiltinItem>,
-    pub imported_values: HashMap<String, DefId>,
-    pub imported_types: HashMap<String, DefId>,
-    pub imported_consts: HashMap<String, DefId>,
 }
 
 impl Symbols {
@@ -1037,15 +1034,12 @@ impl<'a> Loader<'a> {
                         match kind {
                             DefKind::Fn | DefKind::Handler | DefKind::Method => {
                                 symbols.values.insert(alias.clone(), def);
-                                symbols.imported_values.insert(alias.clone(), def);
                             }
                             DefKind::Struct | DefKind::Enum => {
                                 symbols.types.insert(alias.clone(), def);
-                                symbols.imported_types.insert(alias.clone(), def);
                             }
                             DefKind::Const => {
                                 symbols.consts.insert(alias.clone(), def);
-                                symbols.imported_consts.insert(alias.clone(), def);
                             }
                             DefKind::Test => {}
                         }

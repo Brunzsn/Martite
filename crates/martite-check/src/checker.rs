@@ -34,7 +34,6 @@ pub fn check(resolved: ResolvedProgram) -> crate::CheckOutput {
         struct_pattern_fields,
         bindings,
         pattern_bindings,
-        param_bindings,
         lambdas,
         handlers,
         hooks,
@@ -62,7 +61,6 @@ pub fn check(resolved: ResolvedProgram) -> crate::CheckOutput {
         struct_pattern_fields,
         bindings,
         pattern_bindings,
-        param_bindings,
         lambdas,
         handlers,
         hooks,
@@ -121,7 +119,6 @@ struct Checker<'a> {
     /// rigid `Ty::Param` placeholder stored in the binding type.
     builtin_fn_aliases: FxHashMap<BindingId, BuiltinItem>,
     pattern_bindings: NodeTable<BindingId>,
-    param_bindings: FxHashMap<NodeId, BindingId>,
     lambdas: FxHashMap<NodeId, LambdaInfo>,
     handlers: HashMap<String, DefId>,
     hooks: HashMap<String, HookSig>,
@@ -158,7 +155,6 @@ impl<'a> Checker<'a> {
             bindings: FxHashMap::default(),
             builtin_fn_aliases: FxHashMap::default(),
             pattern_bindings: NodeTable::with_capacity(node_capacity),
-            param_bindings: FxHashMap::default(),
             lambdas: FxHashMap::default(),
             handlers: HashMap::new(),
             hooks: HashMap::new(),
@@ -362,13 +358,11 @@ impl<'a> Checker<'a> {
     ) -> Result<Ty, String> {
         let symbols = &self.resolved.module(module).symbols;
         let names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
-        let imported = HashMap::new();
         TypeResolver {
             types: &self.types,
             def_to_type: &self.def_to_type,
             builtin_json: self.json_type,
             type_param_names: &names,
-            imported_builtin_types: &imported,
         }
         .resolve(ty, symbols)
     }

@@ -378,13 +378,6 @@ impl Fix {
             edits,
         }
     }
-
-    pub fn maybe(edits: Vec<FixEdit>) -> Self {
-        Self {
-            applicability: Applicability::Maybe,
-            edits,
-        }
-    }
 }
 
 /// A compiler or linter diagnostic with a primary span.
@@ -631,72 +624,6 @@ fn json_str(s: &str) -> String {
     }
     out.push('"');
     out
-}
-
-/// A diagnostic sink. Output is kept in insertion order and can be sorted by
-/// the driver before rendering.
-#[derive(Debug, Clone, Default)]
-pub struct Emit {
-    diagnostics: Vec<Diagnostic>,
-}
-
-impl Emit {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn error(&mut self, code: Code, source: SourceId, span: Span, message: impl Into<String>) {
-        self.diagnostics
-            .push(Diagnostic::at(code, source, span, message));
-    }
-
-    pub fn warning(
-        &mut self,
-        code: Code,
-        source: SourceId,
-        span: Span,
-        message: impl Into<String>,
-    ) {
-        self.diagnostics
-            .push(Diagnostic::lint(code, source, span, message));
-    }
-
-    pub fn push(&mut self, diagnostic: Diagnostic) {
-        self.diagnostics.push(diagnostic);
-    }
-
-    pub fn extend(&mut self, other: impl IntoIterator<Item = Diagnostic>) {
-        self.diagnostics.extend(other);
-    }
-
-    pub fn has_errors(&self) -> bool {
-        self.diagnostics
-            .iter()
-            .any(|d| d.severity == Severity::Error)
-    }
-
-    pub fn has_diagnostics(&self) -> bool {
-        !self.diagnostics.is_empty()
-    }
-
-    pub fn as_slice(&self) -> &[Diagnostic] {
-        &self.diagnostics
-    }
-
-    pub fn into_vec(self) -> Vec<Diagnostic> {
-        self.diagnostics
-    }
-
-    pub fn sorted(mut self) -> Vec<Diagnostic> {
-        self.diagnostics.sort_by_key(|d| {
-            (
-                d.source.map(|s| s.0).unwrap_or(u32::MAX),
-                d.span.map(|s| s.start).unwrap_or(0),
-                d.code,
-            )
-        });
-        self.diagnostics
-    }
 }
 
 #[cfg(test)]

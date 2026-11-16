@@ -186,7 +186,6 @@ pub struct CheckedProgram {
     pub struct_pattern_fields: FxHashMap<NodeId, Vec<(usize, usize)>>,
     pub bindings: FxHashMap<BindingId, BindingInfo>,
     pub pattern_bindings: NodeTable<BindingId>,
-    pub param_bindings: FxHashMap<NodeId, BindingId>,
     pub lambdas: FxHashMap<NodeId, LambdaInfo>,
     pub handlers: HashMap<String, DefId>,
     pub hooks: HashMap<String, HookSig>,
