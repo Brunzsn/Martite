@@ -80,6 +80,5 @@ as its snapshot record exists.
   handler fixture, the host-call fixture and the load/plugin fixture.
 - `limits`, `traps`, `closures`, `patterns`, `e2e`, `plugins` and `host` cover
   the runtime-executable programs from those test files.
-- `plugin_errors` cases assert load diagnostics (E501-E509). They do not
-  produce a checked program, so they have no runtime snapshot; their executable
-  cases live in `plugins.jsonl`.
+- Plugin load diagnostics (E501-E509) are covered by `tests/plugin_errors.rs`.
+  They do not produce a checked program, so they have no runtime snapshot.

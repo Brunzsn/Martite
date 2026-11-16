@@ -127,14 +127,6 @@ pub fn sort_diagnostics(diagnostics: &mut [Diagnostic], sources: &SourceMap) {
     });
 }
 
-/// True when a diagnostic should make `martite lint` exit with 1.
-pub fn has_failing_diagnostics(diagnostics: &[Diagnostic], deny_warnings: bool) -> bool {
-    diagnostics.iter().any(|diagnostic| {
-        diagnostic.severity == martite_base::Severity::Error
-            || (deny_warnings && diagnostic.severity == martite_base::Severity::Warning)
-    })
-}
-
 /// Whether a code participates in the selected rule set.
 pub fn selected(settings: &ResolvedSettings, code: Code) -> bool {
     settings.selected(code)

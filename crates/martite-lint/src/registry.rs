@@ -395,7 +395,9 @@ pub const RULES: &[RuleMeta] = &[
     ),
 ];
 
-/// Rule IDs that are reserved as tombstones. Edition 1 has none yet.
+/// Rule IDs reserved as tombstones. Retired IDs stay accepted and ignored, are
+/// rejected by `--rule`, and are marked by `--list-rules` (Rules 12.1, 12.2 and
+/// 12.8). Edition 1 has none yet.
 pub const RETIRED: &[Code] = &[];
 
 pub fn rule(code: Code) -> Option<&'static RuleMeta> {

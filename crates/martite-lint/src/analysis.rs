@@ -422,11 +422,9 @@ impl<'a> Analysis<'a> {
         &mut self,
         pattern: &Pattern,
         kind: DeclKind,
-        mutable: bool,
         keyword_span: Option<Span>,
         walk: Walk<'a>,
     ) {
-        let _ = mutable;
         self.collect_pattern_type_names(walk.module.id, pattern);
         match &pattern.kind {
             PatKind::Bind(_) => {
@@ -447,17 +445,17 @@ impl<'a> Analysis<'a> {
             }
             PatKind::Tuple(items) | PatKind::Or(items) => {
                 for item in items {
-                    self.declare_pattern(item, kind, mutable, keyword_span, walk);
+                    self.declare_pattern(item, kind, keyword_span, walk);
                 }
             }
             PatKind::Variant { args, .. } => {
                 for item in args {
-                    self.declare_pattern(item, kind, mutable, keyword_span, walk);
+                    self.declare_pattern(item, kind, keyword_span, walk);
                 }
             }
             PatKind::Struct { fields, .. } => {
                 for field in fields {
-                    self.declare_pattern(&field.pattern, kind, mutable, keyword_span, walk);
+                    self.declare_pattern(&field.pattern, kind, keyword_span, walk);
                 }
             }
             _ => {}
@@ -562,7 +560,6 @@ impl<'a> Analysis<'a> {
                     } else {
                         DeclKind::Let
                     },
-                    *mutable,
                     walk.module.ast.keyword_span(stmt.id),
                     walk,
                 );
@@ -577,7 +574,7 @@ impl<'a> Analysis<'a> {
                 iter,
                 body,
             } => {
-                self.declare_pattern(pattern, DeclKind::For, false, None, walk);
+                self.declare_pattern(pattern, DeclKind::For, None, walk);
                 self.walk_expr(iter, walk.read());
                 self.walk_block(body, walk.in_loop());
             }
@@ -673,7 +670,7 @@ impl<'a> Analysis<'a> {
             ExprKind::Match { scrutinee, arms } => {
                 self.walk_expr(scrutinee, walk.read());
                 for arm in arms {
-                    self.declare_pattern(&arm.pattern, DeclKind::Match, false, None, walk);
+                    self.declare_pattern(&arm.pattern, DeclKind::Match, None, walk);
                     if let Some(guard) = &arm.guard {
                         self.walk_expr(guard, walk.read());
                     }
@@ -688,7 +685,7 @@ impl<'a> Analysis<'a> {
                     if let Some(ty) = &param.ty {
                         self.collect_ty_names(walk.module.id, ty);
                     }
-                    self.declare_pattern(&param.pattern, DeclKind::Lambda, false, None, walk);
+                    self.declare_pattern(&param.pattern, DeclKind::Lambda, None, walk);
                 }
                 match body {
                     martite_syntax::LambdaBody::Block(block) => self.walk_block(block, walk),

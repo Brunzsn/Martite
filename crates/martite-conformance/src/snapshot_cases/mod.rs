@@ -9,7 +9,6 @@ pub mod e2e;
 pub mod host;
 pub mod limits;
 pub mod patterns;
-pub mod plugin_errors;
 pub mod plugins;
 pub mod traps;
 
@@ -23,7 +22,6 @@ pub fn all_cases() -> Vec<SnapshotCase> {
     cases.extend(patterns::cases());
     cases.extend(plugins::cases());
     cases.extend(host::cases());
-    cases.extend(plugin_errors::cases());
     cases.sort_by(|left, right| left.id().cmp(right.id()));
     cases
 }
