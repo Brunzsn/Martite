@@ -118,6 +118,14 @@ struct Checker<'a> {
     /// through the alias use the item's generic signature instead of the
     /// rigid `Ty::Param` placeholder stored in the binding type.
     builtin_fn_aliases: FxHashMap<BindingId, BuiltinItem>,
+    /// Immutable locals that directly alias a generic function item. Calls
+    /// through the alias check the item's declared bounds exactly as a direct
+    /// call would.
+    generic_fn_aliases: FxHashMap<BindingId, DefId>,
+    /// Declared bounds for inference variables that stand in for a generic
+    /// function's type parameters while one call is being checked. Keyed by
+    /// `Ty::Var`; cleared for each body so ids cannot collide across bodies.
+    var_bounds: FxHashMap<u32, Vec<Bound>>,
     pattern_bindings: NodeTable<BindingId>,
     lambdas: FxHashMap<NodeId, LambdaInfo>,
     handlers: HashMap<String, DefId>,
@@ -154,6 +162,8 @@ impl<'a> Checker<'a> {
             struct_pattern_fields: FxHashMap::default(),
             bindings: FxHashMap::default(),
             builtin_fn_aliases: FxHashMap::default(),
+            generic_fn_aliases: FxHashMap::default(),
+            var_bounds: FxHashMap::default(),
             pattern_bindings: NodeTable::with_capacity(node_capacity),
             lambdas: FxHashMap::default(),
             handlers: HashMap::new(),
@@ -1073,6 +1083,7 @@ impl<'a> Checker<'a> {
             let ty = self.const_types.get(&def).cloned().unwrap_or(Ty::Error);
             let saved_ctx = self.ctx.take();
             let saved_scopes = std::mem::take(&mut self.scopes);
+            let saved_var_bounds = std::mem::take(&mut self.var_bounds);
             self.ctx = Some(FnCtx {
                 module: module_id,
                 return_ty: Ty::Unit,
@@ -1106,6 +1117,7 @@ impl<'a> Checker<'a> {
             }
             self.ctx = saved_ctx;
             self.scopes = saved_scopes;
+            self.var_bounds = saved_var_bounds;
         }
     }
 
@@ -1283,6 +1295,7 @@ impl<'a> Checker<'a> {
     fn check_function_body(&mut self, sig: &FnSig, body: &Block) {
         let saved_ctx = self.ctx.take();
         let saved_scopes = std::mem::take(&mut self.scopes);
+        let saved_var_bounds = std::mem::take(&mut self.var_bounds);
         let mut names = HashMap::new();
         for (i, p) in sig.type_params.iter().enumerate() {
             names.insert(p.name.clone(), i);
@@ -1329,6 +1342,7 @@ impl<'a> Checker<'a> {
         }
         self.ctx = saved_ctx;
         self.scopes = saved_scopes;
+        self.var_bounds = saved_var_bounds;
     }
 
     fn check_param_shadow(&mut self, module: ModuleId, param: &ParamSig) {
@@ -1365,34 +1379,15 @@ fn prelude_names() -> &'static [&'static str] {
 }
 
 fn is_show(ty: &Ty, types: &TypeTable) -> bool {
-    is_data_type(ty, types)
+    has_bound_ty(ty, Bound::Show, &[], types, None)
 }
 
+/// Whether a type can cross the host boundary or be plugin state: it must not
+/// contain a function type anywhere inside it. Recursive definitions are
+/// allowed; the shared visitor memoizes completed definitions and treats
+/// cycles as satisfying the bound.
 pub(crate) fn is_data_type(ty: &Ty, types: &TypeTable) -> bool {
-    match ty {
-        Ty::Fn(_, _) => false,
-        Ty::Tuple(items) => items.iter().all(|t| is_data_type(t, types)),
-        Ty::List(t) | Ty::Option(t) => is_data_type(t, types),
-        Ty::Map(k, v) | Ty::Result(k, v) => is_data_type(k, types) && is_data_type(v, types),
-        Ty::Named(id, args) => {
-            let Some(def) = types.get(*id) else {
-                return true;
-            };
-            match &def.kind {
-                TypeDefKind::Opaque => true,
-                TypeDefKind::Struct { fields } => fields
-                    .iter()
-                    .all(|f| is_data_type(&instantiate_params(&f.ty, args), types)),
-                TypeDefKind::Enum { variants } => variants.iter().all(|v| {
-                    v.payload
-                        .iter()
-                        .all(|t| is_data_type(&instantiate_params(t, args), types))
-                }),
-            }
-        }
-        Ty::Error | Ty::Param(_) | Ty::Var(_) => true,
-        _ => true,
-    }
+    has_bound_ty(ty, Bound::Eq, &[], types, None)
 }
 
 fn eval_const_binary(op: BinaryOp, a: ConstValue, b: ConstValue) -> Result<ConstValue, String> {
