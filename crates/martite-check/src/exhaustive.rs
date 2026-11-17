@@ -825,6 +825,7 @@ mod tests {
                 id: NodeId(0),
                 span: Span::new(0, 0),
                 name: "x".into(),
+                explicit: true,
                 pattern: pattern(or(vec![PatKind::Int(0), PatKind::Int(1)])),
             }],
             rest: true,
