@@ -484,7 +484,7 @@ impl Renderer {
         let suffixes = std::mem::take(&mut self.line_suffixes);
         self.line_suffix_width = 0;
         for suffix in suffixes {
-            if !self.line_start && self.column > 0 {
+            if !self.line_start && self.column > 0 && !self.out.ends_with(' ') {
                 self.out.push(' ');
                 self.column += 1;
             }
@@ -605,6 +605,17 @@ mod tests {
         let doc = doc.append(Doc::HardLine);
         assert_eq!(doc.flat_width(), None);
         assert!(doc.layout().forced_break);
+    }
+
+    #[test]
+    fn line_suffix_after_a_space_keeps_one_separator() {
+        let doc = Doc::concat([
+            Doc::text("if cond "),
+            Doc::LineSuffix("// note".into()),
+            Doc::HardLine,
+            Doc::text("{"),
+        ]);
+        assert_eq!(render(&doc, 80), "if cond // note\n{\n");
     }
 
     #[test]

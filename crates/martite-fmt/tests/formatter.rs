@@ -355,6 +355,127 @@ fn repository_examples_are_idempotent() {
     }
 }
 
+#[test]
+fn comment_before_field_colon_keeps_initializer_explicit() {
+    let source = r#"struct P { x: int }
+fn main() {
+    let x = 1
+    let p = P { x // note
+    : 2 }
+    print("{p.x}")
+}
+"#;
+    let first = format_ok(source, false);
+    println!("{first}");
+    assert_eq!(first.matches("// note").count(), 1, "{first}");
+    assert!(first.contains("x: 2"), "{first}");
+    assert!(!first.contains("x,"), "{first}");
+    assert_eq!(format_ok(&first, false), first);
+    assert_equivalent(source, &first, false);
+}
+
+#[test]
+fn comment_before_pattern_colon_keeps_field_pattern_explicit() {
+    let source = r#"enum Opt { Some(int), None }
+struct P { x: Opt }
+fn main() {
+    let p = P { x: Opt.Some(2) }
+    match p {
+        P { x // note
+        : Opt.Some(y) } => print("{y}"),
+        _ => print("none"),
+    }
+}
+"#;
+    let first = format_ok(source, false);
+    println!("{first}");
+    assert_eq!(first.matches("// note").count(), 1, "{first}");
+    assert!(first.contains("Opt.Some(y)"), "{first}");
+    assert_eq!(format_ok(&first, false), first);
+    assert_equivalent(source, &first, false);
+}
+
+#[test]
+fn shorthand_struct_fields_stay_shorthand() {
+    let source = r#"struct P { x: int }
+fn main() {
+    let x = 1
+    let p = P { x }
+    match p {
+        P { x } => print("{x}"),
+    }
+}
+"#;
+    let first = format_ok(source, false);
+    println!("{first}");
+    assert!(first.contains("P { x }"), "{first}");
+    assert!(first.contains("P { x } =>"), "{first}");
+    assert!(!first.contains("x: x"), "{first}");
+    assert_eq!(format_ok(&first, false), first);
+    assert_equivalent(source, &first, false);
+}
+
+#[test]
+fn trailing_comment_after_if_survives() {
+    let source = r#"fn main() {
+    let x = true
+    if x { print("a") } // stop here
+}
+"#;
+    let first = format_ok(source, false);
+    println!("{first}");
+    assert_eq!(first.matches("// stop here").count(), 1, "{first}");
+    assert!(first.contains("} // stop here"), "{first}");
+    assert_eq!(format_ok(&first, false), first);
+    assert_equivalent(source, &first, false);
+}
+
+#[test]
+fn trailing_comment_after_block_lambda_call_survives() {
+    let source = r#"fn main() {
+    let xs = [1, 2]
+    let ys = xs.map(fn(x) { x }) // after
+    print("{ys.len()}")
+}
+"#;
+    let first = format_ok(source, false);
+    println!("{first}");
+    assert_eq!(first.matches("// after").count(), 1, "{first}");
+    assert!(first.contains("}) // after"), "{first}");
+    assert_eq!(format_ok(&first, false), first);
+    assert_equivalent(source, &first, false);
+}
+
+#[test]
+fn comments_before_brace_stay_outside_the_block() {
+    let source = r#"fn main() // header
+{
+    if true
+    // own line
+    {
+        print("a")
+    }
+    while false // trailing
+    {
+        break
+    }
+}
+"#;
+    let first = format_ok(source, false);
+    println!("{first}");
+    assert!(first.contains("fn main() // header\n{"), "{first}");
+    assert!(first.contains("if true // own line\n    {"), "{first}");
+    assert!(first.contains("while false // trailing\n    {"), "{first}");
+    assert!(
+        first.find("// own line") < first.find("print(\"a\")"),
+        "{first}"
+    );
+    assert_eq!(first.matches("// own line").count(), 1, "{first}");
+    assert_eq!(first.matches("// trailing").count(), 1, "{first}");
+    assert_eq!(format_ok(&first, false), first);
+    assert_equivalent(source, &first, false);
+}
+
 fn walk(root: &Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let mut pending = vec![root.to_path_buf()];

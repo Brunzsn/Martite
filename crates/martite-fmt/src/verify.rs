@@ -428,6 +428,7 @@ impl Cmp<'_> {
         left.len() == right.len()
             && left.iter().zip(right.iter()).all(|(a, b)| {
                 a.name == b.name
+                    && a.explicit == b.explicit
                     && match (&a.value, &b.value) {
                         (Some(a), Some(b)) => self.expr(a, b),
                         (None, None) => true,
@@ -496,10 +497,11 @@ impl Cmp<'_> {
                 an == bn
                     && ar == br
                     && af.len() == bf.len()
-                    && af
-                        .iter()
-                        .zip(bf.iter())
-                        .all(|(a, b)| a.name == b.name && self.pattern(&a.pattern, &b.pattern))
+                    && af.iter().zip(bf.iter()).all(|(a, b)| {
+                        a.name == b.name
+                            && a.explicit == b.explicit
+                            && self.pattern(&a.pattern, &b.pattern)
+                    })
             }
             (PatKind::Or(a), PatKind::Or(b)) => {
                 a.len() == b.len() && a.iter().zip(b.iter()).all(|(a, b)| self.pattern(a, b))
