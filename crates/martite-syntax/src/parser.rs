@@ -2118,7 +2118,8 @@ impl<'a> Parser<'a> {
             while !p.at(&TokenKind::RBrace) && !p.at(&TokenKind::Eof) {
                 let field_start = p.span();
                 let (field_name, _) = p.expect_snake()?;
-                let value = if p.eat(&TokenKind::Colon) {
+                let explicit = p.eat(&TokenKind::Colon);
+                let value = if explicit {
                     Some(p.with_struct_lit(true, |p| p.parse_expr())?)
                 } else {
                     Some(Expr {
@@ -2131,6 +2132,7 @@ impl<'a> Parser<'a> {
                     id: p.id(),
                     span: field_start.merge(p.span_before()),
                     name: field_name,
+                    explicit,
                     value,
                 });
                 if !p.eat(&TokenKind::Comma) {
@@ -2523,7 +2525,8 @@ impl<'a> Parser<'a> {
                 }
                 let field_start = p.span();
                 let (field_name, _) = p.expect_snake()?;
-                let pattern = if p.eat(&TokenKind::Colon) {
+                let explicit = p.eat(&TokenKind::Colon);
+                let pattern = if explicit {
                     p.parse_pattern()?
                 } else {
                     Pattern {
@@ -2536,6 +2539,7 @@ impl<'a> Parser<'a> {
                     id: p.id(),
                     span: field_start.merge(pattern.span),
                     name: field_name,
+                    explicit,
                     pattern,
                 });
                 if !p.eat(&TokenKind::Comma) {
@@ -2671,6 +2675,68 @@ mod tests {
         assert!(!tables.type_parens(ty.id).is_empty());
         assert!(!tables.pattern_parens(pattern.id).is_empty());
         assert!(parsed.program.is_parenthesized(value.id));
+    }
+
+    #[test]
+    fn field_initializers_and_patterns_record_explicit_colon() {
+        let source = "struct P { x: int }\nfn main() {\n    let a = P { x }\n    let b = P { x: 2 }\n    match a {\n        P { x } => print(\"{x}\"),\n        P { x: y } => print(\"{y}\"),\n    }\n}\n";
+        let parsed = parse_source(source, LoadLimits::default());
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let Item::Fn(function) = &parsed.program.items[1] else {
+            panic!("expected a function");
+        };
+        let body = function.body.as_ref().expect("function body");
+
+        fn struct_fields(stmt: &Stmt) -> &[FieldInit] {
+            let StmtKind::Let {
+                value:
+                    Expr {
+                        kind: ExprKind::StructLit { fields, .. },
+                        ..
+                    },
+                ..
+            } = &stmt.kind
+            else {
+                panic!("expected a struct literal");
+            };
+            fields
+        }
+        let shorthand = struct_fields(&body.stmts[0]);
+        assert!(!shorthand[0].explicit);
+        assert!(
+            matches!(&shorthand[0].value, Some(Expr { kind: ExprKind::Var(name), .. }) if name == "x")
+        );
+        let explicit = struct_fields(&body.stmts[1]);
+        assert!(explicit[0].explicit);
+        assert!(matches!(
+            &explicit[0].value,
+            Some(Expr {
+                kind: ExprKind::Int(2),
+                ..
+            })
+        ));
+
+        let StmtKind::Expr {
+            expr:
+                Expr {
+                    kind: ExprKind::Match { arms, .. },
+                    ..
+                },
+            ..
+        } = &body.stmts[2].kind
+        else {
+            panic!("expected a match expression");
+        };
+        let PatKind::Struct { fields, .. } = &arms[0].pattern.kind else {
+            panic!("expected a struct pattern");
+        };
+        assert!(!fields[0].explicit);
+        assert!(matches!(&fields[0].pattern.kind, PatKind::Bind(name) if name == "x"));
+        let PatKind::Struct { fields, .. } = &arms[1].pattern.kind else {
+            panic!("expected a struct pattern");
+        };
+        assert!(fields[0].explicit);
+        assert!(matches!(&fields[0].pattern.kind, PatKind::Bind(name) if name == "y"));
     }
 
     #[test]

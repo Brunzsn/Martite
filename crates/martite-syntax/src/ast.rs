@@ -442,6 +442,8 @@ pub struct FieldInit {
     pub id: NodeId,
     pub span: Span,
     pub name: String,
+    /// Whether the source wrote `name: value` (as opposed to shorthand `name`).
+    pub explicit: bool,
     pub value: Option<Expr>,
 }
 
@@ -566,6 +568,8 @@ pub struct FieldPat {
     pub id: NodeId,
     pub span: Span,
     pub name: String,
+    /// Whether the source wrote `name: pattern` (as opposed to shorthand `name`).
+    pub explicit: bool,
     pub pattern: Pattern,
 }
 

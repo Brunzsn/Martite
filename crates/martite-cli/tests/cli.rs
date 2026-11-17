@@ -445,6 +445,35 @@ fn fmt_stdin_writes_to_stdout() {
 }
 
 #[test]
+fn fmt_stdin_verify_preserves_field_initializers_and_choice_comments() {
+    let field = "struct P { x: int }\nfn main() {\n    let x = 1\n    let p = P { x // note\n    : 2 }\n    print(\"{p.x}\")\n}\n";
+    let formatted = martite_stdin(&[s("fmt"), s("--stdin"), s("--verify")], field);
+    assert!(formatted.status.success(), "stderr: {}", stderr(&formatted));
+    let text = stdout(&formatted);
+    assert!(text.contains("// note"), "{text}");
+    assert!(text.contains("x: 2"), "{text}");
+
+    let dir = TempDir::new("fmt-trivia");
+    let script = dir.file("main.mt", &text);
+    let run = martite(&[s("run"), script.as_os_str()]);
+    assert!(run.status.success(), "stderr: {}", stderr(&run));
+    assert_eq!(stdout(&run).trim(), "2");
+
+    let if_source = "fn main() {\n    let x = true\n    if x { print(\"a\") } // stop here\n}\n";
+    let call = "fn main() {\n    let xs = [1, 2]\n    let ys = xs.map(fn(x) { x }) // after\n    print(\"{ys.len()}\")\n}\n";
+    for source in [if_source, call] {
+        let output = martite_stdin(&[s("fmt"), s("--stdin"), s("--verify")], source);
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+        let text = stdout(&output);
+        assert_eq!(
+            text.matches("// stop here").count() + text.matches("// after").count(),
+            1,
+            "{text}"
+        );
+    }
+}
+
+#[test]
 fn fmt_leaves_syntax_errors_untouched() {
     let dir = TempDir::new("fmt-bad");
     let source = "fn main( {\n";

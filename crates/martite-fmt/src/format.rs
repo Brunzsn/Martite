@@ -205,6 +205,14 @@ impl<'a> Formatter<'a> {
             .map(|token| token.span.start)
     }
 
+    fn next_significant_is_brace(&self, pos: u32) -> bool {
+        let low = self.tokens.partition_point(|token| token.span.start < pos);
+        self.tokens[low..]
+            .iter()
+            .find(|token| !matches!(token.kind, TokenKind::Newline | TokenKind::Eof))
+            .is_some_and(|token| matches!(token.kind, TokenKind::LBrace))
+    }
+
     fn is_trailing(&self, comment: &Comment) -> bool {
         normalize::is_trailing_comment(self.source, comment)
     }
@@ -278,6 +286,11 @@ impl<'a> Formatter<'a> {
         let next = self
             .next_significant_start(pos)
             .unwrap_or_else(|| self.source.len() as u32);
+        // A comment immediately before `{` is emitted by the block's brace,
+        // whose hard line already flushes the suffix. Keeping BreakParent here
+        // would break the header group it happens to sit in (an empty
+        // parameter list, for example).
+        let next_is_brace = self.next_significant_is_brace(pos);
         let mut docs = Vec::new();
         let mut any = false;
         loop {
@@ -295,7 +308,9 @@ impl<'a> Formatter<'a> {
             }
             let comment = self.take_pending(self.cursor);
             docs.push(Doc::LineSuffix(normalize::comment(&comment)));
-            docs.push(Doc::BreakParent);
+            if !next_is_brace {
+                docs.push(Doc::BreakParent);
+            }
             any = true;
         }
         (Doc::concat(docs), any)
@@ -308,6 +323,51 @@ impl<'a> Formatter<'a> {
             doc = doc.append(suffix);
         }
         doc
+    }
+
+    /// Snapshot the comment cursor so a layout alternative can be built
+    /// without consuming trivia the other alternative also needs.
+    fn trivia_state(&self) -> (usize, Vec<bool>) {
+        (self.cursor, self.used.clone())
+    }
+
+    fn restore_trivia(&mut self, state: (usize, Vec<bool>)) {
+        self.cursor = state.0;
+        self.used = state.1;
+    }
+
+    /// Keep every comment consumed by either alternative consumed, so later
+    /// constructs cannot emit a duplicate.
+    fn merge_trivia(&mut self, state: (usize, Vec<bool>)) {
+        for (used, other) in self.used.iter_mut().zip(state.1) {
+            *used |= other;
+        }
+        self.cursor = self.cursor.max(state.0);
+    }
+
+    /// Leading comments between a header and an opening brace stay outside the
+    /// block. A trailing comment already attached to the last header token also
+    /// forces the brace onto its own line so it is not flushed inside the body.
+    fn brace_leading(&mut self, open: Span) -> Doc {
+        let leading = self.leading_before(open.start);
+        let previous = self
+            .tokens
+            .iter()
+            .rev()
+            .filter(|token| !matches!(token.kind, TokenKind::Newline | TokenKind::Eof))
+            .find(|token| token.span.end <= open.start)
+            .map(|token| token.span.end)
+            .unwrap_or(0);
+        let has_comment = self
+            .program
+            .comments
+            .iter()
+            .any(|comment| comment.span.start >= previous && comment.span.end <= open.start);
+        if has_comment {
+            Doc::concat([leading, Doc::HardLine])
+        } else {
+            leading
+        }
     }
 
     fn open_with_leading(&mut self, text: &'static str, open: Span, next: u32) -> Doc {
@@ -531,6 +591,7 @@ impl<'a> Formatter<'a> {
             })
             .unwrap_or_else(|| Span::empty(decl.span.end));
         docs.push(Doc::text(" "));
+        docs.push(self.brace_leading(open));
         let (open_suffix, open_had_trailing) = self.take_trailing(open.end);
         let open_doc = Doc::text("{").append(open_suffix);
         docs.push(open_doc);
@@ -920,7 +981,13 @@ impl<'a> Formatter<'a> {
         single_flat_comma: bool,
         broken_comma: bool,
     ) -> Doc {
-        let open = self.token(open_text, open_span);
+        let open = match open_span {
+            Some(span) if open_text == "{" => {
+                let leading = self.brace_leading(span);
+                leading.append(self.token(open_text, Some(span)))
+            }
+            _ => self.token(open_text, open_span),
+        };
         let close_start = close_span
             .map(|span| span.start)
             .unwrap_or_else(|| items.last().map(|(span, _)| span.end).unwrap_or(0));
@@ -1241,13 +1308,11 @@ impl<'a> Formatter<'a> {
     }
 
     fn field_pat(&mut self, field: &FieldPat) -> Doc {
-        let explicit = self
-            .text(field.span)
-            .trim_start()
-            .strip_prefix(&field.name)
-            .is_some_and(|rest| rest.trim_start().starts_with(':'));
         let mut docs = vec![Doc::text(field.name.clone())];
-        if explicit {
+        let mut suffix = Doc::Nil;
+        if field.explicit {
+            let (before_colon, _) = self.take_trailing(field.span.start + field.name.len() as u32);
+            suffix = before_colon;
             let colon = self.token_between(
                 field.span.start + field.name.len() as u32,
                 field.pattern.span.start,
@@ -1258,7 +1323,7 @@ impl<'a> Formatter<'a> {
                 Doc::concat([Doc::Line, self.pattern(&field.pattern)]).indent(),
             ])));
         }
-        Doc::concat(docs)
+        Doc::concat(docs).append(suffix)
     }
 
     // ----- expressions ---------------------------------------------------
@@ -1498,24 +1563,19 @@ impl<'a> Formatter<'a> {
     }
 
     fn field_init(&mut self, field: &FieldInit) -> Doc {
-        let explicit = self
-            .text(field.span)
-            .trim_start()
-            .strip_prefix(&field.name)
-            .is_some_and(|rest| rest.trim_start().starts_with(':'));
         let mut docs = vec![Doc::text(field.name.clone())];
-        if explicit {
+        let mut suffix = Doc::Nil;
+        if field.explicit {
+            let name_end = field.span.start + field.name.len() as u32;
+            let (before_colon, _) = self.take_trailing(name_end);
+            suffix = before_colon;
             if let Some(value) = &field.value {
-                let colon = self.token_between(
-                    field.span.start + field.name.len() as u32,
-                    value.span.start,
-                    ":",
-                );
+                let colon = self.token_between(name_end, value.span.start, ":");
                 docs.push(self.token(":", colon));
                 docs.push(Doc::concat([Doc::Line, self.expr(value)]).indent());
             }
         }
-        Doc::group(Doc::concat(docs))
+        Doc::group(Doc::concat(docs)).append(suffix)
     }
 
     fn binary_doc(&mut self, expr: &Expr, op: BinaryOp, lhs: &Expr, rhs: &Expr) -> Doc {
@@ -1753,8 +1813,65 @@ impl<'a> Formatter<'a> {
     }
 
     fn args_doc(&mut self, args: &[Arg], open: Span, close: Option<Span>) -> Doc {
+        let Some((last, earlier)) = args.split_last() else {
+            return self.args_list(args, open, close);
+        };
+        let ExprKind::Lambda {
+            params,
+            ret,
+            body: LambdaBody::Block(block),
+        } = &last.expr.kind
+        else {
+            return self.args_list(args, open, close);
+        };
+        if earlier
+            .iter()
+            .any(|arg| matches!(arg.expr.kind, ExprKind::Lambda { .. }))
+            || self.arguments_have_comments(open, close, args)
+        {
+            return self.args_list(args, open, close);
+        }
+        let Some(close) = close else {
+            return self.args_list(args, open, close);
+        };
+        let lambda_expr = &last.expr;
+        let header = self.lambda_header_doc(lambda_expr, params, ret.as_ref(), block.span.start);
+        let header_width = header.flat_width();
+        let width = earlier
+            .iter()
+            .try_fold(0usize, |total, arg| {
+                Some(total + self.arg_doc(arg).flat_width()? + 2)
+            })
+            .and_then(|width| Some(width + header_width?));
+        let Some(width) = width else {
+            return self.args_list(args, open, Some(close));
+        };
+        if width > self.config.max_width {
+            return self.args_list(args, open, Some(close));
+        }
+
+        let checkpoint = self.trivia_state();
+        let normal = self.args_list(args, open, Some(close));
+        let normal_state = self.trivia_state();
+        self.restore_trivia(checkpoint);
+
+        let mut hug = vec![self.token("(", Some(open))];
+        for arg in earlier {
+            hug.push(Doc::Flat(Box::new(self.arg_doc(arg))));
+            hug.push(Doc::text(", "));
+        }
+        hug.push(header);
+        hug.push(Doc::text(" "));
+        hug.push(self.block_expanded(block));
+        hug.push(self.token(")", Some(close)));
+        let hug = Doc::concat(hug);
+        self.merge_trivia(normal_state);
+        Doc::choice(normal, hug)
+    }
+
+    fn args_list(&mut self, args: &[Arg], open: Span, close: Option<Span>) -> Doc {
         let items: Vec<(Span, &Arg)> = args.iter().map(|arg| (arg.span, arg)).collect();
-        let normal = self.comma_list(
+        self.comma_list(
             "(",
             ")",
             Some(open),
@@ -1764,52 +1881,7 @@ impl<'a> Formatter<'a> {
             false,
             false,
             true,
-        );
-        let Some((last, earlier)) = args.split_last() else {
-            return normal;
-        };
-        let ExprKind::Lambda {
-            params,
-            ret,
-            body: LambdaBody::Block(block),
-        } = &last.expr.kind
-        else {
-            return normal;
-        };
-        if earlier
-            .iter()
-            .any(|arg| matches!(arg.expr.kind, ExprKind::Lambda { .. }))
-            || self.arguments_have_comments(open, close, args)
-        {
-            return normal;
-        }
-        let Some(close) = close else {
-            return normal;
-        };
-        let lambda_expr = &last.expr;
-        let header = self.lambda_header_doc(lambda_expr, params, ret.as_ref(), block.span.start);
-        let header_width = header.flat_width();
-        let mut hug = vec![self.token("(", Some(open))];
-        for arg in earlier {
-            hug.push(Doc::Flat(Box::new(self.arg_doc(arg))));
-            hug.push(Doc::text(", "));
-        }
-        let mut lambda = vec![header];
-        lambda.push(Doc::text(" "));
-        lambda.push(self.block_expanded(block));
-        hug.push(Doc::concat(lambda));
-        hug.push(self.token(")", Some(close)));
-        let hug = Doc::concat(hug);
-        let width = earlier
-            .iter()
-            .try_fold(0usize, |total, arg| {
-                Some(total + self.arg_doc(arg).flat_width()? + 2)
-            })
-            .and_then(|width| Some(width + header_width?));
-        match width {
-            Some(width) if width <= self.config.max_width => Doc::choice(normal, hug),
-            _ => normal,
-        }
+        )
     }
 
     fn arguments_have_comments(&self, open: Span, close: Option<Span>, args: &[Arg]) -> bool {
@@ -1958,8 +2030,12 @@ impl<'a> Formatter<'a> {
         if !can_flat {
             return self.if_broken(cond, then_branch, else_branch.as_deref());
         }
+        let checkpoint = self.trivia_state();
         let flat = self.if_flat(cond, then_branch, else_branch.as_deref());
+        let flat_state = self.trivia_state();
+        self.restore_trivia(checkpoint);
         let broken = self.if_broken(cond, then_branch, else_branch.as_deref());
+        self.merge_trivia(flat_state);
         Doc::choice(flat, broken)
     }
 
@@ -2082,13 +2158,9 @@ impl<'a> Formatter<'a> {
             return Doc::concat([Doc::text("match "), self.expr(scrutinee)]);
         };
         let close = close.unwrap_or_else(|| Span::empty(expr.span.end));
-        let open_doc = self.token("{", Some(open));
-        let mut docs = vec![
-            Doc::text("match "),
-            self.expr(scrutinee),
-            Doc::text(" "),
-            open_doc,
-        ];
+        let scrutinee_doc = self.expr(scrutinee);
+        let open_doc = Doc::concat([self.brace_leading(open), self.token("{", Some(open))]);
+        let mut docs = vec![Doc::text("match "), scrutinee_doc, Doc::text(" "), open_doc];
         let mut arm_docs = Vec::new();
         for (index, arm) in arms.iter().enumerate() {
             if !arm_docs.is_empty() {
@@ -2175,7 +2247,7 @@ impl<'a> Formatter<'a> {
         if block.stmts.is_empty() {
             return self.block(block);
         }
-        let open_doc = self.token("{", Some(open));
+        let open_doc = Doc::concat([self.brace_leading(open), self.token("{", Some(open))]);
         let mut item_docs = Vec::new();
         let mut previous: Option<u32> = None;
         for stmt in &block.stmts {
@@ -2217,8 +2289,9 @@ impl<'a> Formatter<'a> {
             })
             .unwrap_or_else(|| Span::empty(block.span.end));
         if block.stmts.is_empty() {
+            let leading = self.brace_leading(open);
             let (suffix, had_trailing) = self.take_trailing(open.end);
-            let open_doc = Doc::text("{").append(suffix);
+            let open_doc = Doc::concat([leading, Doc::text("{"), suffix]);
             if !had_trailing && !self.has_pending_before(close.start) {
                 return Doc::concat([open_doc, self.token("}", Some(close))]);
             }
@@ -2235,7 +2308,7 @@ impl<'a> Formatter<'a> {
         if can_one_line {
             return self.block_one_line(block);
         }
-        let open_doc = self.token("{", Some(open));
+        let open_doc = Doc::concat([self.brace_leading(open), self.token("{", Some(open))]);
         let mut item_docs = Vec::new();
         let mut previous: Option<(u32, bool)> = None;
         for stmt in &block.stmts {
@@ -2281,6 +2354,7 @@ impl<'a> Formatter<'a> {
         let (suffix, _) = self.take_trailing(stmt.span.end);
         let (close_suffix, _) = self.take_trailing(close.end);
         let block = Doc::group(Doc::concat([
+            self.brace_leading(open),
             self.token("{", Some(open)),
             Doc::concat([Doc::Line, lead.append(body).append(suffix)]).indent(),
             Doc::Line,
