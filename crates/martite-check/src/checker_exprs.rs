@@ -737,6 +737,11 @@ impl<'a> Checker<'a> {
                 } else {
                     None
                 };
+                let fn_alias = if !*mutable && matches!(&pattern.kind, PatKind::Bind(_)) {
+                    self.generic_fn_alias(value)
+                } else {
+                    None
+                };
                 let bindings =
                     self.check_pattern(pattern, &bind_ty, PatMode::Let, *mutable, infer);
                 for (name, (id, _)) in &bindings {
@@ -745,6 +750,11 @@ impl<'a> Checker<'a> {
                 if let Some(item) = alias {
                     for (_, (id, _)) in &bindings {
                         self.builtin_fn_aliases.insert(*id, item);
+                    }
+                }
+                if let Some(def) = fn_alias {
+                    for (_, (id, _)) in &bindings {
+                        self.generic_fn_aliases.insert(*id, def);
                     }
                 }
             }
@@ -1118,6 +1128,19 @@ impl<'a> Checker<'a> {
         } else {
             None
         }
+    }
+
+    /// Resolves a value expression that refers to a generic function item, or
+    /// an immutable local alias of one.
+    fn generic_fn_alias(&self, expr: &Expr) -> Option<DefId> {
+        let def = match self.resolutions.get(&expr.id)? {
+            Resolution::Fn(def) | Resolution::ModuleItem(def) => *def,
+            Resolution::Local(id) => return self.generic_fn_aliases.get(id).copied(),
+            _ => return None,
+        };
+        self.fn_sig(def)
+            .filter(|sig| !sig.type_params.is_empty())
+            .map(|_| def)
     }
 
     // ------------------------------------------------------------------
@@ -1631,6 +1654,11 @@ impl<'a> Checker<'a> {
         {
             return self.check_builtin_module_call(expr, &item, args, expected, infer);
         }
+        if let Some(Resolution::Local(id)) = self.resolutions.get(&callee.id).copied()
+            && let Some(def) = self.generic_fn_aliases.get(&id).copied()
+        {
+            return self.check_fn_call(expr, def, args, expected, None, infer);
+        }
         let Ty::Fn(params, ret) = callee_ty else {
             if !callee_ty.is_error() {
                 let module = self.current_module();
@@ -1945,6 +1973,13 @@ impl<'a> Checker<'a> {
         let mut vars = Vec::new();
         for _ in &sig.type_params {
             vars.push(infer.fresh());
+        }
+        for (var, param) in vars.iter().zip(&sig.type_params) {
+            if !param.bounds.is_empty()
+                && let Ty::Var(id) = var
+            {
+                self.var_bounds.insert(*id, param.bounds.clone());
+            }
         }
         let param_tys: Vec<Ty> = sig
             .params

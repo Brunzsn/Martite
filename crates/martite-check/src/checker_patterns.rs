@@ -1026,11 +1026,16 @@ impl<'a> Checker<'a> {
             .as_ref()
             .map(|c| c.type_params.clone())
             .unwrap_or_default();
-        has_bound_ty(ty, bound, &params, &self.types, &mut HashSet::new())
+        has_bound_ty(ty, bound, &params, &self.types, Some(&self.var_bounds))
     }
 
     fn map_key_ok(&self, ty: &Ty) -> bool {
-        map_key_ok_ty(ty, &self.types, &mut HashSet::new())
+        let params = self
+            .ctx
+            .as_ref()
+            .map(|c| c.type_params.clone())
+            .unwrap_or_default();
+        map_key_ok_ty(ty, &self.types, &params)
     }
 
     fn is_data_type(&self, ty: &Ty) -> bool {
@@ -1042,111 +1047,200 @@ fn payload_ty(payload: &[Ty]) -> Vec<Ty> {
     payload.to_vec()
 }
 
+/// Which structural bound a [`BoundVisitor`] walk is checking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundCheck {
+    Eq,
+    Show,
+    Ord,
+    MapKey,
+}
+
+impl BoundCheck {
+    fn from_bound(bound: Bound) -> Self {
+        match bound {
+            Bound::Eq => BoundCheck::Eq,
+            Bound::Ord => BoundCheck::Ord,
+            Bound::Show => BoundCheck::Show,
+        }
+    }
+}
+
+/// Backstop against pathological type graphs. Memoization keeps ordinary
+/// diamond and recursive graphs linear; these limits only bound the work if a
+/// future type-table shape defeats the memo.
+const BOUND_VISIT_LIMIT: usize = 50_000;
+const BOUND_DEPTH_LIMIT: usize = 1_024;
+
+/// Shared structural-bound walk over types.
+///
+/// `done` is never popped during a query, so a definition reachable through
+/// several paths is expanded once. `active` detects cycles: re-entering a
+/// definition that is still on the current path conservatively reports
+/// success, matching the greatest-fixed-point reading of a recursive type.
+/// Parameters resolve against the bounds declared by the function or impl
+/// currently being checked.
+struct BoundVisitor<'a> {
+    types: &'a TypeTable,
+    params: &'a [TypeParam],
+    var_bounds: Option<&'a FxHashMap<u32, Vec<Bound>>>,
+    check: BoundCheck,
+    done: HashMap<(TypeId, Vec<Ty>), bool>,
+    active: HashSet<(TypeId, Vec<Ty>)>,
+    visits: usize,
+    depth: usize,
+}
+
+impl<'a> BoundVisitor<'a> {
+    fn new(
+        types: &'a TypeTable,
+        params: &'a [TypeParam],
+        var_bounds: Option<&'a FxHashMap<u32, Vec<Bound>>>,
+        check: BoundCheck,
+    ) -> Self {
+        Self {
+            types,
+            params,
+            var_bounds,
+            check,
+            done: HashMap::new(),
+            active: HashSet::new(),
+            visits: 0,
+            depth: 0,
+        }
+    }
+
+    fn check(&mut self, ty: &Ty) -> bool {
+        self.visits = self.visits.saturating_add(1);
+        if self.visits > BOUND_VISIT_LIMIT {
+            return true;
+        }
+        match self.check {
+            BoundCheck::Eq | BoundCheck::Show => self.visit_data(ty),
+            BoundCheck::Ord => self.visit_ord(ty),
+            BoundCheck::MapKey => self.visit_map_key(ty),
+        }
+    }
+
+    fn visit_data(&mut self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Fn(_, _) => false,
+            Ty::Tuple(items) => items.iter().all(|t| self.check(t)),
+            Ty::List(t) | Ty::Option(t) => self.check(t),
+            Ty::Map(k, v) | Ty::Result(k, v) => self.check(k) && self.check(v),
+            Ty::Named(id, args) => self.visit_named(*id, args),
+            Ty::Param(i) => self.param_ok(*i),
+            Ty::Var(i) => self.var_ok(*i),
+            Ty::Error => true,
+            _ => true,
+        }
+    }
+
+    fn visit_ord(&mut self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Bool | Ty::Int | Ty::Float | Ty::Str => true,
+            Ty::Tuple(items) => items.iter().all(|t| self.check(t)),
+            Ty::List(t) | Ty::Option(t) => self.check(t),
+            Ty::Result(a, b) => self.check(a) && self.check(b),
+            Ty::Named(id, args) => self.visit_named(*id, args),
+            Ty::Param(i) => self.param_ok(*i),
+            Ty::Var(i) => self.var_ok(*i),
+            Ty::Error => true,
+            Ty::Unit | Ty::Range | Ty::Never | Ty::Map(_, _) | Ty::Fn(_, _) => false,
+        }
+    }
+
+    fn visit_map_key(&mut self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Int | Ty::Str | Ty::Bool => true,
+            Ty::Tuple(items) => items.iter().all(|t| self.check(t)),
+            Ty::Option(t) => self.check(t),
+            Ty::Result(a, b) => self.check(a) && self.check(b),
+            Ty::Named(id, args) => self.visit_named(*id, args),
+            // There is no map-key bound, so an opaque parameter or unresolved
+            // inference variable cannot be proven to be a valid key.
+            Ty::Param(_) | Ty::Var(_) => false,
+            Ty::Error => true,
+            _ => false,
+        }
+    }
+
+    fn visit_named(&mut self, id: TypeId, args: &[Ty]) -> bool {
+        let key = (id, args.to_vec());
+        if let Some(result) = self.done.get(&key) {
+            return *result;
+        }
+        if !self.active.insert(key.clone()) {
+            return true;
+        }
+        self.depth += 1;
+        let result = if self.depth > BOUND_DEPTH_LIMIT {
+            true
+        } else {
+            match self.types.get(id).map(|def| def.kind.clone()) {
+                Some(TypeDefKind::Opaque) | None => true,
+                Some(TypeDefKind::Struct { fields }) => fields
+                    .iter()
+                    .all(|f| self.check(&instantiate_params(&f.ty, args))),
+                Some(TypeDefKind::Enum { variants }) => variants.iter().all(|v| {
+                    v.payload
+                        .iter()
+                        .all(|t| self.check(&instantiate_params(t, args)))
+                }),
+            }
+        };
+        self.depth -= 1;
+        self.active.remove(&key);
+        self.done.insert(key, result);
+        result
+    }
+
+    fn param_ok(&self, index: u32) -> bool {
+        let Some(param) = self.params.get(index as usize) else {
+            // Builtin signatures carry placeholders without declarations.
+            // They are checked by their own call paths, so stay conservative.
+            return true;
+        };
+        match self.check {
+            BoundCheck::Eq => param.bounds.contains(&Bound::Eq),
+            BoundCheck::Ord => param.bounds.contains(&Bound::Ord),
+            BoundCheck::Show => param.bounds.contains(&Bound::Show),
+            BoundCheck::MapKey => false,
+        }
+    }
+
+    fn var_ok(&self, index: u32) -> bool {
+        if self.check == BoundCheck::MapKey {
+            return false;
+        }
+        let Some(bounds) = self.var_bounds.and_then(|bounds| bounds.get(&index)) else {
+            // An inference variable without a recorded constraint is treated
+            // like an opaque parameter that satisfies every structural bound.
+            return true;
+        };
+        match self.check {
+            BoundCheck::Eq => bounds.contains(&Bound::Eq),
+            BoundCheck::Ord => bounds.contains(&Bound::Ord),
+            BoundCheck::Show => bounds.contains(&Bound::Show),
+            BoundCheck::MapKey => false,
+        }
+    }
+}
+
 fn has_bound_ty(
     ty: &Ty,
     bound: Bound,
     params: &[TypeParam],
     types: &TypeTable,
-    visited: &mut HashSet<TypeId>,
+    var_bounds: Option<&FxHashMap<u32, Vec<Bound>>>,
 ) -> bool {
-    if let Ty::Param(i) = ty {
-        return params
-            .get(*i as usize)
-            .is_some_and(|p| p.bounds.contains(&bound));
-    }
-    match bound {
-        Bound::Eq | Bound::Show => is_data_type_visit(ty, types, visited),
-        Bound::Ord => is_ord_visit(ty, types, visited),
-    }
+    stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
+        BoundVisitor::new(types, params, var_bounds, BoundCheck::from_bound(bound)).check(ty)
+    })
 }
 
-fn is_data_type_visit(ty: &Ty, types: &TypeTable, visited: &mut HashSet<TypeId>) -> bool {
-    match ty {
-        Ty::Fn(_, _) => false,
-        Ty::Tuple(items) => items.iter().all(|t| is_data_type_visit(t, types, visited)),
-        Ty::List(t) | Ty::Option(t) => is_data_type_visit(t, types, visited),
-        Ty::Map(k, v) | Ty::Result(k, v) => {
-            is_data_type_visit(k, types, visited) && is_data_type_visit(v, types, visited)
-        }
-        Ty::Named(id, args) => {
-            if !visited.insert(*id) {
-                return true;
-            }
-            let result = match types.get(*id).map(|d| &d.kind) {
-                Some(TypeDefKind::Opaque) | None => true,
-                Some(TypeDefKind::Struct { fields }) => fields
-                    .iter()
-                    .all(|f| is_data_type_visit(&instantiate_params(&f.ty, args), types, visited)),
-                Some(TypeDefKind::Enum { variants }) => variants.iter().all(|v| {
-                    v.payload
-                        .iter()
-                        .all(|t| is_data_type_visit(&instantiate_params(t, args), types, visited))
-                }),
-            };
-            visited.remove(id);
-            result
-        }
-        Ty::Param(_) | Ty::Var(_) | Ty::Error => true,
-        _ => true,
-    }
-}
-
-fn is_ord_visit(ty: &Ty, types: &TypeTable, visited: &mut HashSet<TypeId>) -> bool {
-    match ty {
-        Ty::Bool | Ty::Int | Ty::Float | Ty::Str => true,
-        Ty::Tuple(items) => items.iter().all(|t| is_ord_visit(t, types, visited)),
-        Ty::List(t) | Ty::Option(t) => is_ord_visit(t, types, visited),
-        Ty::Result(a, b) => is_ord_visit(a, types, visited) && is_ord_visit(b, types, visited),
-        Ty::Named(id, args) => {
-            if !visited.insert(*id) {
-                return true;
-            }
-            let result = match types.get(*id).map(|d| &d.kind) {
-                Some(TypeDefKind::Opaque) | None => true,
-                Some(TypeDefKind::Struct { fields }) => fields
-                    .iter()
-                    .all(|f| is_ord_visit(&instantiate_params(&f.ty, args), types, visited)),
-                Some(TypeDefKind::Enum { variants }) => variants.iter().all(|v| {
-                    v.payload
-                        .iter()
-                        .all(|t| is_ord_visit(&instantiate_params(t, args), types, visited))
-                }),
-            };
-            visited.remove(id);
-            result
-        }
-        Ty::Param(_) | Ty::Var(_) | Ty::Error => true,
-        Ty::Unit | Ty::Range | Ty::Never | Ty::Map(_, _) | Ty::Fn(_, _) => false,
-    }
-}
-
-fn map_key_ok_ty(ty: &Ty, types: &TypeTable, visited: &mut HashSet<TypeId>) -> bool {
-    match ty {
-        Ty::Int | Ty::Str | Ty::Bool => true,
-        Ty::Tuple(items) => items.iter().all(|t| map_key_ok_ty(t, types, visited)),
-        Ty::Option(t) => map_key_ok_ty(t, types, visited),
-        Ty::Result(a, b) => {
-            map_key_ok_ty(a, types, visited) && map_key_ok_ty(b, types, visited)
-        }
-        Ty::Named(id, args) => {
-            if !visited.insert(*id) {
-                return true;
-            }
-            let result = match types.get(*id).map(|d| &d.kind) {
-                Some(TypeDefKind::Opaque) | None => true,
-                Some(TypeDefKind::Struct { fields }) => fields
-                    .iter()
-                    .all(|f| map_key_ok_ty(&instantiate_params(&f.ty, args), types, visited)),
-                Some(TypeDefKind::Enum { variants }) => variants.iter().all(|v| {
-                    v.payload
-                        .iter()
-                        .all(|t| map_key_ok_ty(&instantiate_params(t, args), types, visited))
-                }),
-            };
-            visited.remove(id);
-            result
-        }
-        Ty::Param(_) | Ty::Var(_) | Ty::Error => true,
-        _ => false,
-    }
+fn map_key_ok_ty(ty: &Ty, types: &TypeTable, params: &[TypeParam]) -> bool {
+    stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
+        BoundVisitor::new(types, params, None, BoundCheck::MapKey).check(ty)
+    })
 }
