@@ -10,7 +10,7 @@ pub use martite_builtin::{BuiltinFnId, BuiltinMethodId, BuiltinReceiver};
 pub use martite_resolve::{BuiltinItem, BuiltinItemId, DefId, DefKind, ModuleId, ModuleTarget};
 pub use program::{
     BindingInfo, CheckedProgram, ConstInfo, ConstValue, EntryKind, FnKind, FnSig, HookSig,
-    LambdaInfo, ParamSig, PatResolution, PreludeVariant, Resolution,
+    LambdaInfo, MAX_CONST_BYTES, ParamSig, PatResolution, PreludeVariant, Resolution,
 };
 pub use ty::{
     BindingId, FieldDef, Infer, Ty, TypeDef, TypeDefKind, TypeId, TypeParam, TypeTable, VariantDef,

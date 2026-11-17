@@ -10,6 +10,8 @@
 //! [`VerifyMode`] policy; lowering and the optimizer use it so release builds
 //! verify by default. [`verify_after_pass`] is the pass-manager test hook.
 
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use martite_base::{SourceId, Span};
@@ -649,8 +651,9 @@ impl<'a> Verifier<'a> {
     }
 
     fn check_consts(&self) -> Result<(), VerifyError> {
+        let mut seen = HashSet::new();
         for (index, value) in self.program.consts.iter().enumerate() {
-            self.check_const_value(ConstId::new(index as u32), value, "const pool")?;
+            self.check_const_value(ConstId::new(index as u32), value, "const pool", &mut seen)?;
         }
         Ok(())
     }
@@ -661,22 +664,28 @@ impl<'a> Verifier<'a> {
         id: ConstId,
         value: &ConstValue,
         context: &'static str,
+        seen: &mut HashSet<usize>,
     ) -> Result<(), VerifyError> {
+        if let Some(addr) = const_payload_addr(value)
+            && !seen.insert(addr)
+        {
+            return Ok(());
+        }
         match value {
             ConstValue::Unit | ConstValue::Int(_) | ConstValue::Float(_) | ConstValue::Bool(_) => {
                 Ok(())
             }
             ConstValue::Str(str) => self.check_str(*str),
             ConstValue::Tuple(items) | ConstValue::List(items) => {
-                for item in items {
-                    self.check_const_value(id, item, context)?;
+                for item in items.iter() {
+                    self.check_const_value(id, item, context, seen)?;
                 }
                 Ok(())
             }
             ConstValue::Map(entries) => {
-                for (key, value) in entries {
-                    self.check_const_value(id, key, context)?;
-                    self.check_const_value(id, value, context)?;
+                for (key, value) in entries.iter() {
+                    self.check_const_value(id, key, context, seen)?;
+                    self.check_const_value(id, value, context, seen)?;
                 }
                 Ok(())
             }
@@ -699,8 +708,8 @@ impl<'a> Verifier<'a> {
                         context: "constant struct field count",
                     }));
                 }
-                for value in fields {
-                    self.check_const_value(id, value, context)?;
+                for value in fields.iter() {
+                    self.check_const_value(id, value, context, seen)?;
                 }
                 Ok(())
             }
@@ -729,8 +738,8 @@ impl<'a> Verifier<'a> {
                         context: "constant payload count",
                     }));
                 }
-                for value in payload {
-                    self.check_const_value(id, value, context)?;
+                for value in payload.iter() {
+                    self.check_const_value(id, value, context, seen)?;
                 }
                 Ok(())
             }
@@ -745,8 +754,8 @@ impl<'a> Verifier<'a> {
                         context: "prelude payload count",
                     }));
                 }
-                for value in payload {
-                    self.check_const_value(id, value, context)?;
+                for value in payload.iter() {
+                    self.check_const_value(id, value, context, seen)?;
                 }
                 Ok(())
             }
@@ -1445,6 +1454,8 @@ struct FnCheck<'p> {
     /// `ExprBlock`. The interpreter evaluates a block's tail directly and
     /// skips the memory check after it, so these are not safepoints.
     tail_exprs: Vec<bool>,
+    /// Cached `const_matches` results for shared constant payloads.
+    const_match_cache: RefCell<HashMap<(usize, Ty), bool>>,
 }
 
 impl<'p> FnCheck<'p> {
@@ -1478,6 +1489,7 @@ impl<'p> FnCheck<'p> {
             loop_depth: 0,
             depth: 0,
             tail_exprs,
+            const_match_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -2669,6 +2681,20 @@ impl<'p> FnCheck<'p> {
     }
 
     fn const_matches(&self, ty: &Ty, value: &ConstValue) -> Result<bool, VerifyError> {
+        let key = const_payload_addr(value).map(|addr| (addr, ty.clone()));
+        if let Some(key) = key.as_ref()
+            && let Some(result) = self.const_match_cache.borrow().get(key)
+        {
+            return Ok(*result);
+        }
+        let result = self.const_matches_value(ty, value)?;
+        if let Some(key) = key {
+            self.const_match_cache.borrow_mut().insert(key, result);
+        }
+        Ok(result)
+    }
+
+    fn const_matches_value(&self, ty: &Ty, value: &ConstValue) -> Result<bool, VerifyError> {
         if matches!(ty, Ty::Never | Ty::Param(_)) {
             return Ok(true);
         }
@@ -2686,7 +2712,7 @@ impl<'p> FnCheck<'p> {
                     false
                 } else {
                     let mut matches = true;
-                    for (ty, value) in items.iter().zip(values) {
+                    for (ty, value) in items.iter().zip(values.iter()) {
                         if !self.const_matches(&self.ty(*ty)?, value)? {
                             matches = false;
                             break;
@@ -2698,7 +2724,7 @@ impl<'p> FnCheck<'p> {
             (Ty::List(item), ConstValue::List(values)) => {
                 let item = self.ty(*item)?;
                 let mut matches = true;
-                for value in values {
+                for value in values.iter() {
                     if !self.const_matches(&item, value)? {
                         matches = false;
                         break;
@@ -2710,7 +2736,7 @@ impl<'p> FnCheck<'p> {
                 let key = self.ty(*key)?;
                 let value = self.ty(*value)?;
                 let mut matches = true;
-                for (entry_key, entry_value) in entries {
+                for (entry_key, entry_value) in entries.iter() {
                     if !self.const_matches(&key, entry_key)?
                         || !self.const_matches(&value, entry_value)?
                     {
@@ -2729,7 +2755,7 @@ impl<'p> FnCheck<'p> {
                             false
                         } else {
                             let mut matches = true;
-                            for (field, value) in def_fields.iter().zip(fields) {
+                            for (field, value) in def_fields.iter().zip(fields.iter()) {
                                 let expected = self.substitute(field.ty, args);
                                 if !self.const_matches(&expected, value)? {
                                     matches = false;
@@ -2755,7 +2781,8 @@ impl<'p> FnCheck<'p> {
                                 false
                             } else {
                                 let mut matches = true;
-                                for (field, value) in def_variant.payload.iter().zip(payload) {
+                                for (field, value) in def_variant.payload.iter().zip(payload.iter())
+                                {
                                     let expected = self.substitute(*field, args);
                                     if !self.const_matches(&expected, value)? {
                                         matches = false;
@@ -5653,4 +5680,43 @@ fn mask_callee(effects: Effects) -> Effects {
 
 fn builtin_effects(effects: Option<BuiltinEffects>) -> Effects {
     effects.map(Effects::from).unwrap_or(Effects::NONE)
+}
+
+/// Address of a shared constant payload, or `None` for inline scalars.
+///
+/// Constant payloads are reference-counted and may be shared by several
+/// constants, so structural verification visits each allocation once.
+fn const_payload_addr(value: &ConstValue) -> Option<usize> {
+    let items = match value {
+        ConstValue::Tuple(items) | ConstValue::List(items) => {
+            if items.is_empty() {
+                return None;
+            }
+            items.as_ptr() as *const ()
+        }
+        ConstValue::Map(entries) => {
+            if entries.is_empty() {
+                return None;
+            }
+            entries.as_ptr() as *const ()
+        }
+        ConstValue::Struct(_, fields) => {
+            if fields.is_empty() {
+                return None;
+            }
+            fields.as_ptr() as *const ()
+        }
+        ConstValue::Enum(_, _, payload) | ConstValue::Prelude(_, payload) => {
+            if payload.is_empty() {
+                return None;
+            }
+            payload.as_ptr() as *const ()
+        }
+        ConstValue::Unit
+        | ConstValue::Int(_)
+        | ConstValue::Float(_)
+        | ConstValue::Bool(_)
+        | ConstValue::Str(_) => return None,
+    };
+    Some(items as usize)
 }

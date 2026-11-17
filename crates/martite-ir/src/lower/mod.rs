@@ -29,11 +29,12 @@ mod stmt;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::rc::Rc;
 
 use martite_base::{SourceId, SourceMap, Span};
 use martite_check::{
     CheckedProgram, ConstValue as CheckConstValue, DefId, EntryKind as CheckEntryKind,
-    FnKind as CheckFnKind, PreludeVariant as CheckPreludeVariant, Ty as CheckTy,
+    FnKind as CheckFnKind, MAX_CONST_BYTES, PreludeVariant as CheckPreludeVariant, Ty as CheckTy,
     TypeDefKind as CheckTypeDefKind,
 };
 use martite_syntax::{Block, LambdaBody, NodeId, PatKind, Pattern};
@@ -41,7 +42,7 @@ use martite_syntax::{Block, LambdaBody, NodeId, PatKind, Pattern};
 use crate::id::{ConstId, FnId, HostId, Slot, StrId};
 use crate::program::{
     ConstValue, Entries, EntryKind, FnKind, HookSig, HostFnInfo, IrFn, IrProgram, ParamInfo,
-    SlotInfo,
+    PreludeVariant, SlotInfo,
 };
 use crate::types::{Ty, TyId, TypeId, TypeTable};
 use crate::verify::VerifyMode;
@@ -159,12 +160,32 @@ impl fmt::Display for LowerError {
 
 impl std::error::Error for LowerError {}
 
+/// Identity of one shared checker payload, used while converting the constant
+/// pool into IR values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ConstPayloadKey {
+    Tuple(usize),
+    List(usize),
+    Map(usize),
+    Struct(u32, usize),
+    Enum(u32, u32, usize),
+    Prelude(PreludeVariant, usize),
+}
+
+fn payload_addr<T>(items: &Rc<[T]>) -> usize {
+    Rc::as_ptr(items) as *const () as usize
+}
+
 pub(crate) struct Lowerer<'p> {
     program: &'p CheckedProgram,
     types: TypeTable,
     unit: TyId,
     consts: Vec<ConstValue>,
     const_ids: HashMap<DefId, ConstId>,
+    /// Converted payloads keyed by the address of the checker's shared
+    /// allocation, so a constant referenced twice is materialized once.
+    const_payloads: HashMap<ConstPayloadKey, ConstValue>,
+    const_bytes: usize,
     strs: Vec<Box<str>>,
     str_ids: HashMap<Box<str>, StrId>,
     fns: Vec<IrFn>,
@@ -199,6 +220,8 @@ impl<'p> Lowerer<'p> {
             unit,
             consts: Vec::new(),
             const_ids: HashMap::new(),
+            const_payloads: HashMap::new(),
+            const_bytes: 0,
             strs: Vec::new(),
             str_ids: HashMap::new(),
             fns: Vec::new(),
@@ -266,32 +289,89 @@ impl<'p> Lowerer<'p> {
         Ok(())
     }
 
+    fn charge_const(&mut self, bytes: usize) -> Result<(), LowerError> {
+        self.const_bytes = self.const_bytes.saturating_add(bytes);
+        if self.const_bytes > MAX_CONST_BYTES {
+            return Err(LowerError::internal(format!(
+                "constant pool exceeds the {MAX_CONST_BYTES} byte constant budget"
+            )));
+        }
+        Ok(())
+    }
+
     fn convert_const(&mut self, value: &CheckConstValue) -> Result<ConstValue, LowerError> {
         Ok(match value {
-            CheckConstValue::Unit => ConstValue::Unit,
-            CheckConstValue::Int(value) => ConstValue::Int(*value),
-            CheckConstValue::Float(value) => ConstValue::Float(*value),
-            CheckConstValue::Bool(value) => ConstValue::Bool(*value),
-            CheckConstValue::Str(value) => ConstValue::Str(self.intern_str(value)),
-            CheckConstValue::Tuple(items) => ConstValue::Tuple(
-                items
-                    .iter()
-                    .map(|item| self.convert_const(item))
-                    .collect::<Result<_, _>>()?,
-            ),
-            CheckConstValue::List(items) => ConstValue::List(
-                items
-                    .iter()
-                    .map(|item| self.convert_const(item))
-                    .collect::<Result<_, _>>()?,
-            ),
-            CheckConstValue::Map(entries) => ConstValue::Map(
-                entries
-                    .iter()
-                    .map(|(key, value)| Ok((self.convert_const(key)?, self.convert_const(value)?)))
-                    .collect::<Result<_, LowerError>>()?,
-            ),
+            CheckConstValue::Unit => {
+                self.charge_const(16)?;
+                ConstValue::Unit
+            }
+            CheckConstValue::Int(value) => {
+                self.charge_const(16)?;
+                ConstValue::Int(*value)
+            }
+            CheckConstValue::Float(value) => {
+                self.charge_const(16)?;
+                ConstValue::Float(*value)
+            }
+            CheckConstValue::Bool(value) => {
+                self.charge_const(16)?;
+                ConstValue::Bool(*value)
+            }
+            CheckConstValue::Str(value) => {
+                let id = self.intern_str(value);
+                self.charge_const(16 + value.len())?;
+                ConstValue::Str(id)
+            }
+            CheckConstValue::Tuple(items) => {
+                let key = ConstPayloadKey::Tuple(payload_addr(items));
+                if let Some(value) = self.const_payloads.get(&key) {
+                    return Ok(value.clone());
+                }
+                let mut converted = Vec::with_capacity(items.len());
+                for item in items.iter() {
+                    converted.push(self.convert_const(item)?);
+                }
+                self.charge_const(16 + 8 * converted.len())?;
+                let value = ConstValue::Tuple(Rc::from(converted));
+                self.const_payloads.insert(key, value.clone());
+                value
+            }
+            CheckConstValue::List(items) => {
+                let key = ConstPayloadKey::List(payload_addr(items));
+                if let Some(value) = self.const_payloads.get(&key) {
+                    return Ok(value.clone());
+                }
+                let mut converted = Vec::with_capacity(items.len());
+                for item in items.iter() {
+                    converted.push(self.convert_const(item)?);
+                }
+                self.charge_const(16 + 8 * converted.len())?;
+                let value = ConstValue::List(Rc::from(converted));
+                self.const_payloads.insert(key, value.clone());
+                value
+            }
+            CheckConstValue::Map(entries) => {
+                let key = ConstPayloadKey::Map(payload_addr(entries));
+                if let Some(value) = self.const_payloads.get(&key) {
+                    return Ok(value.clone());
+                }
+                let mut converted = Vec::with_capacity(entries.len());
+                for (entry_key, entry_value) in entries.iter() {
+                    converted.push((
+                        self.convert_const(entry_key)?,
+                        self.convert_const(entry_value)?,
+                    ));
+                }
+                self.charge_const(16 + 16 * converted.len())?;
+                let value = ConstValue::Map(Rc::from(converted));
+                self.const_payloads.insert(key, value.clone());
+                value
+            }
             CheckConstValue::Struct(type_id, fields) => {
+                let key = ConstPayloadKey::Struct(type_id.0, payload_addr(fields));
+                if let Some(value) = self.const_payloads.get(&key) {
+                    return Ok(value.clone());
+                }
                 let declaration = match self.program.types.get(*type_id).map(|def| &def.kind) {
                     Some(CheckTypeDefKind::Struct { fields }) => fields,
                     _ => {
@@ -317,24 +397,42 @@ impl<'p> Lowerer<'p> {
                         "constant struct has fields outside its declaration",
                     ));
                 }
-                ConstValue::Struct(TypeId::new(type_id.0), ordered)
+                self.charge_const(16 + 8 * ordered.len())?;
+                let value = ConstValue::Struct(TypeId::new(type_id.0), Rc::from(ordered));
+                self.const_payloads.insert(key, value.clone());
+                value
             }
-            CheckConstValue::Enum(type_id, variant, payload) => ConstValue::Enum(
-                TypeId::new(type_id.0),
-                u32::try_from(*variant)
-                    .map_err(|_| LowerError::internal("constant enum variant exceeds u32"))?,
-                payload
-                    .iter()
-                    .map(|item| self.convert_const(item))
-                    .collect::<Result<_, _>>()?,
-            ),
-            CheckConstValue::Prelude(variant, payload) => ConstValue::Prelude(
-                convert_prelude(*variant),
-                payload
-                    .iter()
-                    .map(|item| self.convert_const(item))
-                    .collect::<Result<_, _>>()?,
-            ),
+            CheckConstValue::Enum(type_id, variant, payload) => {
+                let variant = u32::try_from(*variant)
+                    .map_err(|_| LowerError::internal("constant enum variant exceeds u32"))?;
+                let key = ConstPayloadKey::Enum(type_id.0, variant, payload_addr(payload));
+                if let Some(value) = self.const_payloads.get(&key) {
+                    return Ok(value.clone());
+                }
+                let mut converted = Vec::with_capacity(payload.len());
+                for item in payload.iter() {
+                    converted.push(self.convert_const(item)?);
+                }
+                self.charge_const(16 + 8 * converted.len())?;
+                let value = ConstValue::Enum(TypeId::new(type_id.0), variant, Rc::from(converted));
+                self.const_payloads.insert(key, value.clone());
+                value
+            }
+            CheckConstValue::Prelude(variant, payload) => {
+                let variant = convert_prelude(*variant);
+                let key = ConstPayloadKey::Prelude(variant, payload_addr(payload));
+                if let Some(value) = self.const_payloads.get(&key) {
+                    return Ok(value.clone());
+                }
+                let mut converted = Vec::with_capacity(payload.len());
+                for item in payload.iter() {
+                    converted.push(self.convert_const(item)?);
+                }
+                self.charge_const(16 + 8 * converted.len())?;
+                let value = ConstValue::Prelude(variant, Rc::from(converted));
+                self.const_payloads.insert(key, value.clone());
+                value
+            }
         })
     }
 

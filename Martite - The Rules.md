@@ -40,6 +40,7 @@ A feature only gets in if it passes five tests: a beginner can learn it in a few
   - source file size: 1 MiB
   - syntactic nesting depth (expressions, patterns, types, interpolations, blocks): 128
   - total source files per plugin: 256
+- **Constant budget** (compiled in). The checker caps the constant payloads it produces while evaluating a program at 8 MiB of nominal bytes, using the section 8 accounting. Shared payloads count once, so a constant that references an earlier one costs a reference rather than a copy. Exceeding the budget is E406.
 
 ## 1. Lexical rules
 
@@ -144,7 +145,7 @@ test "push then peek" {
 - **Associated functions** (no `self`) are called as `Stack.new()`. Type arguments are inferred from the arguments or from the expected type, never written at the call site.
 - **Struct literals:** `P { x: 1, y: 2 }`, shorthand `P { x, y }`, and update `P { ..p, x: 3 }`. In an update, `..p` must come first, the base is evaluated first, and later fields override. Unit variants are constructed `Color.Red`; payload variants `Shape.Circle(1.0)`. In **patterns** the enum qualifier may be dropped because the scrutinee type is known.
 - **Entry points:** a root file is a *script* if it defines `fn main()` or `fn main() -> Result[(), E]` where `E: Show` (an `Err` prints and exits with status 1), and a *plugin* if it defines `on` handlers (section 4). Otherwise it is a library module. A root file may not be both (E407). `on` handlers may appear only in a plugin's root file (E504), and in any other file `main` is an ordinary function.
-- **`const`:** the type is required and the initializer must be a constant expression: literals, other consts, operators, tuple/list/map/struct literals, and variant constructors built from constant expressions. No calls, no methods, no `if` or `match`. Consts are evaluated at load in dependency order, and a cycle (E105) or a panic during evaluation (such as `1 / 0` or overflow, E406) is a compile error. Consts may not be used in patterns. There is no mutable global state of any kind; plugin state lives only in `init`'s result.
+- **`const`:** the type is required and the initializer must be a constant expression: literals, other consts, operators, tuple/list/map/struct literals, and variant constructors built from constant expressions. No calls, no methods, no `if` or `match`. Consts are evaluated at load in dependency order and share nested payloads, so referencing a const costs a reference rather than a copy. A cycle is E105; a panic during evaluation (such as `1 / 0` or overflow) or exceeding the constant budget (section 0) is E406. Consts may not be used in patterns. There is no mutable global state of any kind; plugin state lives only in `init`'s result.
 - **`test` blocks:** `test "name" { … }` has a unique string name (no interpolation) per file, may reach private items of its own file, and is never exported. A test runs as a function returning `()`, so `?` in a test is E207, and a panic fails the test. Tests are checked at load but not instantiated by a host.
 
 ## 4. Plugins and the host boundary
@@ -374,7 +375,7 @@ Compile errors cover everything the language makes decidable. The linter only ev
 | E403 | Same variable passed twice where one use is `mut` |
 | E404 | Assignment to a captured variable inside a closure |
 | E405 | `break` or `continue` outside a loop (a closure body is a boundary) |
-| E406 | Constant initializer isn't constant, or panics when evaluated |
+| E406 | Constant initializer isn't constant, panics when evaluated, or exceeds the constant budget |
 | E407 | Missing or malformed `main`, or `main` and `on` in one root file |
 | E501 | `use` of a host module the manifest does not grant |
 | E502 | `on` handler names no hook in a granted interface |

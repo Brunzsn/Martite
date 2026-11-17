@@ -5,6 +5,8 @@
 //! [`crate::node`]. All of it is plain data: no references into the checker,
 //! and no interpreter state.
 
+use std::rc::Rc;
+
 use martite_base::{SourceId, Span};
 
 use crate::id::{
@@ -34,12 +36,12 @@ pub enum ConstValue {
     Float(f64),
     Bool(bool),
     Str(StrId),
-    Tuple(Vec<ConstValue>),
-    List(Vec<ConstValue>),
-    Map(Vec<(ConstValue, ConstValue)>),
-    Struct(TypeId, Vec<ConstValue>),
-    Enum(TypeId, u32, Vec<ConstValue>),
-    Prelude(PreludeVariant, Vec<ConstValue>),
+    Tuple(Rc<[ConstValue]>),
+    List(Rc<[ConstValue]>),
+    Map(Rc<[(ConstValue, ConstValue)]>),
+    Struct(TypeId, Rc<[ConstValue]>),
+    Enum(TypeId, u32, Rc<[ConstValue]>),
+    Prelude(PreludeVariant, Rc<[ConstValue]>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
