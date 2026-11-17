@@ -1079,6 +1079,7 @@ impl<'a> Checker<'a> {
             }
         }
 
+        let mut budget = ConstBudget::default();
         for (def, module_id, c) in defs {
             let ty = self.const_types.get(&def).cloned().unwrap_or(Ty::Error);
             let saved_ctx = self.ctx.take();
@@ -1099,21 +1100,8 @@ impl<'a> Checker<'a> {
             self.scopes = vec![HashMap::new()];
             let mut infer = Infer::default();
             self.check_expr(&c.value, Some(&ty), &mut infer);
-            match self.eval_const(def, &mut HashSet::new()) {
-                Ok(value) => {
-                    self.consts.insert(
-                        def,
-                        ConstInfo {
-                            def,
-                            ty,
-                            value,
-                            node: c.id,
-                        },
-                    );
-                }
-                Err(msg) => {
-                    self.err_at(module_id, c.value.span, Code::E406, msg);
-                }
+            if let Err(msg) = self.eval_const(def, &mut HashSet::new(), &mut budget) {
+                self.err_at(module_id, c.value.span, Code::E406, msg);
             }
             self.ctx = saved_ctx;
             self.scopes = saved_scopes;
@@ -1125,6 +1113,7 @@ impl<'a> Checker<'a> {
         &mut self,
         def: DefId,
         visiting: &mut HashSet<DefId>,
+        budget: &mut ConstBudget,
     ) -> Result<ConstValue, String> {
         if let Some(info) = self.consts.get(&def) {
             return Ok(info.value.clone());
@@ -1136,10 +1125,29 @@ impl<'a> Checker<'a> {
         let info = resolved.def(def);
         let module = resolved.module(info.module);
         let Some(Item::Const(c)) = module.ast.items.get(info.item_index) else {
+            visiting.remove(&def);
             return Err("not a constant".into());
         };
-        let value = self.eval_const_expr(&c.value, visiting)?;
+        let value = match self.eval_const_expr(&c.value, visiting, budget) {
+            Ok(value) => value,
+            Err(error) => {
+                visiting.remove(&def);
+                return Err(error);
+            }
+        };
         visiting.remove(&def);
+        // Publish the value before returning so a later reference sees the
+        // memoized payload instead of re-evaluating the whole tree.
+        let ty = self.const_types.get(&def).cloned().unwrap_or(Ty::Error);
+        self.consts.insert(
+            def,
+            ConstInfo {
+                def,
+                ty,
+                value: value.clone(),
+                node: c.id,
+            },
+        );
         Ok(value)
     }
 
@@ -1147,12 +1155,13 @@ impl<'a> Checker<'a> {
         &mut self,
         expr: &Expr,
         visiting: &mut HashSet<DefId>,
+        budget: &mut ConstBudget,
     ) -> Result<ConstValue, String> {
         match &expr.kind {
-            ExprKind::Int(v) => Ok(ConstValue::Int(*v)),
-            ExprKind::Float(v) => Ok(ConstValue::Float(*v)),
-            ExprKind::Bool(v) => Ok(ConstValue::Bool(*v)),
-            ExprKind::Unit => Ok(ConstValue::Unit),
+            ExprKind::Int(v) => produce_const(budget, ConstValue::Int(*v)),
+            ExprKind::Float(v) => produce_const(budget, ConstValue::Float(*v)),
+            ExprKind::Bool(v) => produce_const(budget, ConstValue::Bool(*v)),
+            ExprKind::Unit => produce_const(budget, ConstValue::Unit),
             ExprKind::Str(parts) => {
                 let mut text = String::new();
                 for part in parts {
@@ -1163,29 +1172,31 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
-                Ok(ConstValue::Str(text))
+                produce_const(budget, ConstValue::Str(text))
             }
-            ExprKind::Tuple(items) => Ok(ConstValue::Tuple(
-                items
-                    .iter()
-                    .map(|e| self.eval_const_expr(e, visiting))
-                    .collect::<Result<_, _>>()?,
-            )),
-            ExprKind::List(items) => Ok(ConstValue::List(
-                items
-                    .iter()
-                    .map(|e| self.eval_const_expr(e, visiting))
-                    .collect::<Result<_, _>>()?,
-            )),
+            ExprKind::Tuple(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.eval_const_expr(item, visiting, budget)?);
+                }
+                produce_const(budget, ConstValue::Tuple(Rc::from(values)))
+            }
+            ExprKind::List(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.eval_const_expr(item, visiting, budget)?);
+                }
+                produce_const(budget, ConstValue::List(Rc::from(values)))
+            }
             ExprKind::Map(entries) => {
-                let mut out = Vec::new();
+                let mut out = Vec::with_capacity(entries.len());
                 for (k, v) in entries {
                     out.push((
-                        self.eval_const_expr(k, visiting)?,
-                        self.eval_const_expr(v, visiting)?,
+                        self.eval_const_expr(k, visiting, budget)?,
+                        self.eval_const_expr(v, visiting, budget)?,
                     ));
                 }
-                Ok(ConstValue::Map(out))
+                produce_const(budget, ConstValue::Map(Rc::from(out)))
             }
             ExprKind::StructLit { fields, base, .. } => {
                 let type_id = match self.resolutions.get(&expr.id) {
@@ -1194,8 +1205,8 @@ impl<'a> Checker<'a> {
                 };
                 let mut values: Vec<(String, ConstValue)> = Vec::new();
                 if let Some(base) = base {
-                    match self.eval_const_expr(base, visiting)? {
-                        ConstValue::Struct(_, fields) => values = fields,
+                    match self.eval_const_expr(base, visiting, budget)? {
+                        ConstValue::Struct(_, fields) => values = fields.iter().cloned().collect(),
                         _ => return Err("invalid struct update".into()),
                     }
                 }
@@ -1204,51 +1215,58 @@ impl<'a> Checker<'a> {
                         .value
                         .as_ref()
                         .ok_or_else(|| "missing field value".to_string())?;
-                    let value = self.eval_const_expr(value, visiting)?;
+                    let value = self.eval_const_expr(value, visiting, budget)?;
                     if let Some(existing) = values.iter_mut().find(|(n, _)| n == &field.name) {
                         existing.1 = value;
                     } else {
                         values.push((field.name.clone(), value));
                     }
                 }
-                Ok(ConstValue::Struct(type_id, values))
+                produce_const(budget, ConstValue::Struct(type_id, Rc::from(values)))
             }
             ExprKind::Unary { op, expr } => {
-                let value = self.eval_const_expr(expr, visiting)?;
-                match (op, value) {
+                let value = self.eval_const_expr(expr, visiting, budget)?;
+                let value = match (op, value) {
                     (UnaryOp::Neg, ConstValue::Int(v)) => v
                         .checked_neg()
                         .map(ConstValue::Int)
-                        .ok_or_else(|| "integer overflow in constant".to_string()),
-                    (UnaryOp::Neg, ConstValue::Float(v)) => Ok(ConstValue::Float(-v)),
-                    (UnaryOp::Not, ConstValue::Bool(v)) => Ok(ConstValue::Bool(!v)),
-                    _ => Err("operator is not constant".into()),
-                }
+                        .ok_or_else(|| "integer overflow in constant".to_string())?,
+                    (UnaryOp::Neg, ConstValue::Float(v)) => ConstValue::Float(-v),
+                    (UnaryOp::Not, ConstValue::Bool(v)) => ConstValue::Bool(!v),
+                    _ => return Err("operator is not constant".into()),
+                };
+                produce_const(budget, value)
             }
             ExprKind::Binary { op, lhs, rhs } => {
-                let a = self.eval_const_expr(lhs, visiting)?;
-                let b = self.eval_const_expr(rhs, visiting)?;
-                eval_const_binary(*op, a, b)
+                let a = self.eval_const_expr(lhs, visiting, budget)?;
+                let b = self.eval_const_expr(rhs, visiting, budget)?;
+                let value = eval_const_binary(*op, a, b)?;
+                produce_const(budget, value)
             }
             ExprKind::Field { .. } | ExprKind::Index { .. } => {
                 Err("field and index access are not constant expressions".into())
             }
             ExprKind::Call { callee, args } => {
-                let mut values = Vec::new();
+                let mut values = Vec::with_capacity(args.len());
                 for arg in args {
-                    values.push(self.eval_const_expr(&arg.expr, visiting)?);
+                    values.push(self.eval_const_expr(&arg.expr, visiting, budget)?);
                 }
-                match self.resolutions.get(&callee.id) {
+                let value = match self.resolutions.get(&callee.id) {
                     Some(Resolution::Variant(id, index)) => {
-                        Ok(ConstValue::Enum(*id, *index, values))
+                        ConstValue::Enum(*id, *index, Rc::from(values))
                     }
-                    Some(Resolution::PreludeVariant(v)) => Ok(ConstValue::Prelude(*v, values)),
-                    _ => Err("function calls are not constant expressions".into()),
-                }
+                    Some(Resolution::PreludeVariant(v)) => {
+                        ConstValue::Prelude(*v, Rc::from(values))
+                    }
+                    _ => return Err("function calls are not constant expressions".into()),
+                };
+                produce_const(budget, value)
             }
             ExprKind::Var(_) => match self.resolutions.get(&expr.id) {
-                Some(Resolution::Const(def)) => self.eval_const(*def, visiting),
-                Some(Resolution::PreludeVariant(v)) => Ok(ConstValue::Prelude(*v, Vec::new())),
+                Some(Resolution::Const(def)) => self.eval_const(*def, visiting, budget),
+                Some(Resolution::PreludeVariant(v)) => {
+                    produce_const(budget, ConstValue::Prelude(*v, Rc::from(Vec::new())))
+                }
                 _ => Err("name is not a constant".into()),
             },
             _ => Err("not a constant expression".into()),
@@ -1390,6 +1408,47 @@ pub(crate) fn is_data_type(ty: &Ty, types: &TypeTable) -> bool {
     has_bound_ty(ty, Bound::Eq, &[], types, None)
 }
 
+/// Tracks the nominal cost of the constant payloads produced by evaluation.
+///
+/// Nested payloads are shared, so each distinct allocation is charged once.
+/// Memoized references cost nothing, which keeps a deep tree of shared
+/// constants proportional to its source rather than to the expanded value.
+#[derive(Default)]
+struct ConstBudget {
+    bytes: usize,
+}
+
+impl ConstBudget {
+    fn charge(&mut self, value: &ConstValue) -> Result<(), String> {
+        self.bytes = self.bytes.saturating_add(const_value_bytes(value));
+        if self.bytes > MAX_CONST_BYTES {
+            return Err(format!(
+                "constant value exceeds the {MAX_CONST_BYTES} byte constant budget"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn produce_const(budget: &mut ConstBudget, value: ConstValue) -> Result<ConstValue, String> {
+    budget.charge(&value)?;
+    Ok(value)
+}
+
+/// Nominal bytes of one constant payload, using the same accounting as the
+/// runtime memory limit (section 8 of the rules): a payload is 16 bytes plus
+/// 8 per slot, and a string is 16 plus its byte length.
+fn const_value_bytes(value: &ConstValue) -> usize {
+    match value {
+        ConstValue::Unit | ConstValue::Int(_) | ConstValue::Float(_) | ConstValue::Bool(_) => 16,
+        ConstValue::Str(text) => 16 + text.len(),
+        ConstValue::Tuple(items) | ConstValue::List(items) => 16 + 8 * items.len(),
+        ConstValue::Map(entries) => 16 + 16 * entries.len(),
+        ConstValue::Struct(_, fields) => 16 + 8 * fields.len(),
+        ConstValue::Enum(_, _, payload) | ConstValue::Prelude(_, payload) => 16 + 8 * payload.len(),
+    }
+}
+
 fn eval_const_binary(op: BinaryOp, a: ConstValue, b: ConstValue) -> Result<ConstValue, String> {
     use ConstValue::*;
     let overflow = || "integer overflow in constant".to_string();
@@ -1450,7 +1509,7 @@ fn eval_const_binary(op: BinaryOp, a: ConstValue, b: ConstValue) -> Result<Const
         },
         BinaryOp::Coalesce => match a {
             Prelude(PreludeVariant::Some, values) | Prelude(PreludeVariant::Ok, values) => {
-                Ok(values.into_iter().next().unwrap_or(Unit))
+                Ok(values.first().cloned().unwrap_or(Unit))
             }
             Prelude(PreludeVariant::None, _) | Prelude(PreludeVariant::Err, _) => Ok(b),
             _ => Err("invalid operands for ?? in constant".into()),

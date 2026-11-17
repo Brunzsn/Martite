@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use martite_base::{SourceId, Span};
 pub use martite_builtin::BuiltinReceiver;
@@ -134,6 +135,14 @@ pub struct HookSig {
     pub source: SourceId,
 }
 
+/// Maximum nominal bytes of constant payloads produced while checking a
+/// program, counted once per distinct allocation.
+///
+/// Constants share their nested payloads, so a value that references a large
+/// constant many times costs one reference rather than a copy. The budget
+/// bounds the checker's own growth on hostile input; exceeding it is E406.
+pub const MAX_CONST_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConstValue {
     Unit,
@@ -141,12 +150,12 @@ pub enum ConstValue {
     Float(f64),
     Bool(bool),
     Str(String),
-    Tuple(Vec<ConstValue>),
-    List(Vec<ConstValue>),
-    Map(Vec<(ConstValue, ConstValue)>),
-    Struct(TypeId, Vec<(String, ConstValue)>),
-    Enum(TypeId, usize, Vec<ConstValue>),
-    Prelude(PreludeVariant, Vec<ConstValue>),
+    Tuple(Rc<[ConstValue]>),
+    List(Rc<[ConstValue]>),
+    Map(Rc<[(ConstValue, ConstValue)]>),
+    Struct(TypeId, Rc<[(String, ConstValue)]>),
+    Enum(TypeId, usize, Rc<[ConstValue]>),
+    Prelude(PreludeVariant, Rc<[ConstValue]>),
 }
 
 #[derive(Debug, Clone)]

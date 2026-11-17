@@ -1,8 +1,10 @@
+use std::rc::Rc;
+
 use martite_base::{LoadLimits, MemoryProvider};
 use martite_driver::{LoadOptions, load};
 use martite_ir::{
-    IrFn, IrId, IrProgram, LowerError, LowerErrorKind, LowerOptions, Node, NodeKind, VerifyMode,
-    lower, verify,
+    ConstValue, IrFn, IrId, IrProgram, LowerError, LowerErrorKind, LowerOptions, Node, NodeKind,
+    VerifyMode, lower, verify,
 };
 use martite_resolve::InterfaceSource;
 
@@ -583,6 +585,46 @@ fn compute() -> int {
             .filter(|kind| matches!(kind, martite_ir::NodeKind::BuiltinFnRef(_)))
             .count()
             >= 2
+    );
+}
+
+fn nested_list_type(levels: usize) -> String {
+    format!("{}int{}", "list[".repeat(levels), "]".repeat(levels))
+}
+
+fn deep_shared_const_source(levels: usize) -> String {
+    let mut source = String::new();
+    for level in 1..=levels {
+        let ty = nested_list_type(level);
+        if level == 1 {
+            source.push_str(&format!("const C1: {ty} = [0]\n"));
+        } else {
+            source.push_str(&format!(
+                "const C{level}: {ty} = [C{}, C{}]\n",
+                level - 1,
+                level - 1
+            ));
+        }
+    }
+    source.push_str(&format!("fn main() {{ let _ = C{levels} }}\n"));
+    source
+}
+
+#[test]
+fn deep_shared_constants_lower_without_expanding_payloads() {
+    let ir = lower_source(&deep_shared_const_source(22));
+    assert_eq!(ir.consts.len(), 22);
+    let top = ir.consts.last().expect("C22");
+    let ConstValue::List(items) = top else {
+        panic!("top constant is not a list: {top:?}");
+    };
+    assert_eq!(items.len(), 2);
+    let (ConstValue::List(left), ConstValue::List(right)) = (&items[0], &items[1]) else {
+        panic!("nested constants are not lists");
+    };
+    assert!(
+        Rc::ptr_eq(left, right),
+        "lowering must preserve shared constant payloads"
     );
 }
 

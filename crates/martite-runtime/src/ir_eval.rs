@@ -987,21 +987,21 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             ConstValue::Str(id) => Value::str(self.program.string(*id).unwrap_or("")),
             ConstValue::Tuple(items) => {
                 let mut values = Vec::with_capacity(items.len());
-                for item in items {
+                for item in items.iter() {
                     values.push(self.const_to_value(item)?);
                 }
                 Value::tuple(values)
             }
             ConstValue::List(items) => {
                 let mut values = Vec::with_capacity(items.len());
-                for item in items {
+                for item in items.iter() {
                     values.push(self.const_to_value(item)?);
                 }
                 Value::list(values)
             }
             ConstValue::Map(entries) => {
                 let mut map = OrderedMap::new();
-                for (key, value) in entries {
+                for (key, value) in entries.iter() {
                     let key_value = self.const_to_value(key)?;
                     if let Ok(key) = key_from_value(&key_value) {
                         map.insert(key, self.const_to_value(value)?);
@@ -1011,21 +1011,21 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             }
             ConstValue::Struct(type_id, fields) => {
                 let mut values = Vec::with_capacity(fields.len());
-                for field in fields {
+                for field in fields.iter() {
                     values.push(self.const_to_value(field)?);
                 }
                 Value::Struct(Rc::new(StructValue::new(*type_id, values)))
             }
             ConstValue::Enum(type_id, variant, payload) => {
                 let mut values = Vec::with_capacity(payload.len());
-                for item in payload {
+                for item in payload.iter() {
                     values.push(self.const_to_value(item)?);
                 }
                 Value::Enum(Rc::new(EnumValue::new(*type_id, *variant as usize, values)))
             }
             ConstValue::Prelude(variant, payload) => {
                 let mut values = Vec::with_capacity(payload.len());
-                for item in payload {
+                for item in payload.iter() {
                     values.push(self.const_to_value(item)?);
                 }
                 let payload = values.into_iter().next().unwrap_or(Value::Unit);
