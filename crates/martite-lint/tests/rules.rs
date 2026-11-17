@@ -438,3 +438,23 @@ fn bump(mut state: State) -> Result[(), str] {
     let count = found.iter().filter(|code| **code == Code::L027).count();
     assert!(count >= 2, "expected helper and caller, got {found:?}");
 }
+
+#[test]
+fn l003_keeps_catch_all_needed_by_nested_or_pattern() {
+    let source = r#"
+enum E { A(int), B }
+
+fn score(e: E) -> int {
+    match e {
+        E.A(0 | 1) => 1,
+        _ => 2,
+    }
+}
+
+fn main() {
+    print("{score(E.A(5))}")
+}
+"#;
+    let found = lint_script(source, "recommended");
+    assert!(!found.contains(&Code::L003), "{found:?}");
+}
