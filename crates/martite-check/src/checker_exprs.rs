@@ -742,6 +742,11 @@ impl<'a> Checker<'a> {
                 } else {
                     None
                 };
+                let handler_alias = if !*mutable && matches!(&pattern.kind, PatKind::Bind(_)) {
+                    self.handler_alias(value)
+                } else {
+                    None
+                };
                 let bindings =
                     self.check_pattern(pattern, &bind_ty, PatMode::Let, *mutable, infer);
                 for (name, (id, _)) in &bindings {
@@ -755,6 +760,11 @@ impl<'a> Checker<'a> {
                 if let Some(def) = fn_alias {
                     for (_, (id, _)) in &bindings {
                         self.generic_fn_aliases.insert(*id, def);
+                    }
+                }
+                if let Some(def) = handler_alias {
+                    for (_, (id, _)) in &bindings {
+                        self.handler_aliases.insert(*id, def);
                     }
                 }
             }
@@ -1141,6 +1151,16 @@ impl<'a> Checker<'a> {
         self.fn_sig(def)
             .filter(|sig| !sig.type_params.is_empty())
             .map(|_| def)
+    }
+
+    /// Resolves a value expression that refers to a handler item, or an
+    /// immutable local alias of one.
+    fn handler_alias(&self, expr: &Expr) -> Option<DefId> {
+        match self.resolutions.get(&expr.id)? {
+            Resolution::Handler(def) => Some(*def),
+            Resolution::Local(id) => self.handler_aliases.get(id).copied(),
+            _ => None,
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1653,6 +1673,11 @@ impl<'a> Checker<'a> {
             && let Some(item) = self.builtin_fn_aliases.get(&id).copied()
         {
             return self.check_builtin_module_call(expr, &item, args, expected, infer);
+        }
+        if let Some(Resolution::Local(id)) = self.resolutions.get(&callee.id).copied()
+            && let Some(def) = self.handler_aliases.get(&id).copied()
+        {
+            return self.check_fn_call(expr, def, args, expected, None, infer);
         }
         if let Some(Resolution::Local(id)) = self.resolutions.get(&callee.id).copied()
             && let Some(def) = self.generic_fn_aliases.get(&id).copied()
