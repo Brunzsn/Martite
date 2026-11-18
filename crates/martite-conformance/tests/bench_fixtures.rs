@@ -283,7 +283,7 @@ fn runtime_plugin_fixture_handles_calls_and_snapshots() {
         .call("saved", vec![Value::str("hello")])
         .expect("saved handler");
     instance.call("tick", vec![]).expect("tick handler");
-    let snapshot = instance.snapshot();
+    let snapshot = instance.snapshot().expect("snapshot");
     assert!(!snapshot.bytes.is_empty());
 
     let mut restored = plugin.instantiate().expect("init");

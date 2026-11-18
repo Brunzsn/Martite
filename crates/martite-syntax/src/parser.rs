@@ -150,6 +150,12 @@ impl Program {
 }
 
 fn expression_source_span(parentheses: &ParenthesisTables, expr: &Expr) -> Span {
+    stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
+        expression_source_span_inner(parentheses, expr)
+    })
+}
+
+fn expression_source_span_inner(parentheses: &ParenthesisTables, expr: &Expr) -> Span {
     let mut span = expr.span;
     for pair in parentheses.expression_parens(expr.id) {
         span = span.merge(pair.open).merge(pair.close);
@@ -658,6 +664,15 @@ impl<'a> Parser<'a> {
         }
         self.depth += 1;
         Ok(())
+    }
+
+    /// Parses one nesting level deeper, counting it against the depth limit and
+    /// growing the stack when it runs low.
+    fn nested<T>(&mut self, parse: fn(&mut Self) -> PResult<T>) -> PResult<T> {
+        self.enter_depth()?;
+        let result = stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || parse(self));
+        self.depth -= 1;
+        result
     }
 
     fn skip_all_newlines(&mut self) {
@@ -1244,10 +1259,7 @@ impl<'a> Parser<'a> {
     // ----- types ---------------------------------------------------------
 
     fn parse_type(&mut self) -> PResult<TyExpr> {
-        self.enter_depth()?;
-        let result = stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || self.parse_type_inner());
-        self.depth -= 1;
-        result
+        self.nested(Self::parse_type_inner)
     }
 
     fn parse_type_inner(&mut self) -> PResult<TyExpr> {
@@ -1368,10 +1380,7 @@ impl<'a> Parser<'a> {
     // ----- statements and blocks ----------------------------------------
 
     fn parse_block(&mut self) -> PResult<Block> {
-        self.enter_depth()?;
-        let result = stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || self.parse_block_inner());
-        self.depth -= 1;
-        result
+        self.nested(Self::parse_block_inner)
     }
 
     fn parse_block_inner(&mut self) -> PResult<Block> {
@@ -1577,10 +1586,7 @@ impl<'a> Parser<'a> {
     // ----- expressions ---------------------------------------------------
 
     fn parse_expr(&mut self) -> PResult<Expr> {
-        self.enter_depth()?;
-        let result = stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || self.parse_expr_inner());
-        self.depth -= 1;
-        result
+        self.nested(Self::parse_expr_inner)
     }
 
     fn parse_expr_inner(&mut self) -> PResult<Expr> {
@@ -1666,7 +1672,7 @@ impl<'a> Parser<'a> {
         if self.at(&TokenKind::Not) {
             let keyword = self.advance();
             self.skip_continuation_newlines();
-            let expr = self.parse_not()?;
+            let expr = self.nested(Self::parse_not)?;
             let span = keyword.merge(expression_source_span(&self.parentheses, &expr));
             let id = self.id();
             self.record_keyword(id, keyword);
@@ -1822,7 +1828,7 @@ impl<'a> Parser<'a> {
                     kind: ExprKind::Int(i64::MIN),
                 });
             }
-            let expr = self.parse_unary()?;
+            let expr = self.nested(Self::parse_unary)?;
             let span = minus.merge(expr.span);
             return Ok(Expr {
                 id: self.id(),
@@ -2271,7 +2277,7 @@ impl<'a> Parser<'a> {
             self.expect(&TokenKind::Else)?;
             self.skip_all_newlines();
             let branch = if self.at(&TokenKind::If) {
-                self.parse_if_expr()?
+                self.nested(Self::parse_if_expr)?
             } else {
                 let block = self.parse_block()?;
                 Expr {
@@ -2399,11 +2405,7 @@ impl<'a> Parser<'a> {
     // ----- patterns ------------------------------------------------------
 
     fn parse_pattern(&mut self) -> PResult<Pattern> {
-        self.enter_depth()?;
-        let result =
-            stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || self.parse_pattern_inner());
-        self.depth -= 1;
-        result
+        self.nested(Self::parse_pattern_inner)
     }
 
     fn parse_pattern_inner(&mut self) -> PResult<Pattern> {
@@ -2759,6 +2761,112 @@ mod tests {
         };
         let out = parse_source(&source, limits);
         assert!(out.diagnostics.iter().any(|d| d.code == Code::E002));
+    }
+
+    fn expr_source(expr: &str) -> String {
+        format!("fn main() {{ let x = {expr} }}")
+    }
+
+    #[test]
+    fn long_prefix_and_else_if_chains_hit_e002() {
+        let cases = [
+            // A 500k unary-minus file must report E002 instead of overflowing
+            // the native stack.
+            expr_source(&format!("{}1", "-".repeat(500_000))),
+            expr_source(&format!("{}true", "not ".repeat(100_000))),
+            expr_source(&format!("{} {{ 1 }}", "if true {{}} else ".repeat(20_000))),
+        ];
+        for source in cases {
+            let out = parse_source(&source, LoadLimits::default());
+            let e002: Vec<_> = out
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == Code::E002)
+                .collect();
+            assert_eq!(e002.len(), 1, "{:?}", out.diagnostics);
+            assert!(e002[0].message.contains("nesting"), "{}", e002[0].message);
+        }
+    }
+
+    #[test]
+    fn prefix_operators_and_else_if_keep_their_shape() {
+        let source = "fn main() {\n    let a = -1\n    let b = not not true\n    let c = if true { 1 } else if false { 2 } else { 3 }\n    let d = not -1\n}\n";
+        let parsed = parse_source(source, LoadLimits::default());
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let Item::Fn(function) = &parsed.program.items[0] else {
+            panic!("expected a function");
+        };
+        let body = function.body.as_ref().expect("function body");
+        let value = |index: usize| {
+            let StmtKind::Let { value, .. } = &body.stmts[index].kind else {
+                panic!("expected a let statement");
+            };
+            value
+        };
+
+        assert!(matches!(
+            &value(0).kind,
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                expr,
+            } if matches!(&expr.kind, ExprKind::Int(1))
+        ));
+        let ExprKind::Unary {
+            op: UnaryOp::Not,
+            expr: inner,
+        } = &value(1).kind
+        else {
+            panic!("expected an outer `not`");
+        };
+        assert!(matches!(
+            &inner.kind,
+            ExprKind::Unary {
+                op: UnaryOp::Not,
+                expr,
+            } if matches!(&expr.kind, ExprKind::Bool(true))
+        ));
+        let ExprKind::If {
+            else_branch: Some(second),
+            ..
+        } = &value(2).kind
+        else {
+            panic!("expected an if expression");
+        };
+        let ExprKind::If {
+            else_branch: Some(third),
+            ..
+        } = &second.kind
+        else {
+            panic!("expected an else-if continuation");
+        };
+        assert!(matches!(&third.kind, ExprKind::Block(_)));
+        let ExprKind::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } = &value(3).kind
+        else {
+            panic!("expected a `not`");
+        };
+        assert!(matches!(
+            &expr.kind,
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn short_prefix_and_else_if_chains_stay_within_the_limit() {
+        let cases = [
+            expr_source(&format!("{}1", "-".repeat(100))),
+            expr_source(&format!("{}true", "not ".repeat(100))),
+            expr_source(&format!("{} {{ 1 }}", "if true {{}} else ".repeat(100))),
+        ];
+        for source in cases {
+            let out = parse_source(&source, LoadLimits::default());
+            assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        }
     }
 
     #[test]
