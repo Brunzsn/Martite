@@ -847,6 +847,7 @@ impl<'a> Checker<'a> {
             StmtKind::Expr { expr, assign } => {
                 if let Some((op, rhs)) = assign {
                     let lhs_ty = self.check_expr(expr, None, infer);
+                    self.check_place_indexes(expr);
                     let place = self.check_place(expr);
                     match place {
                         Some(p) => {
@@ -1392,6 +1393,14 @@ impl<'a> Checker<'a> {
                         kind: FieldKind::Value,
                     };
                 }
+                if sig.module != self.current_module() && !sig.is_pub {
+                    let module = self.current_module();
+                    self.err_at(module, expr.span, Code::E106, format!("`{name}` is private"));
+                    return FieldResult {
+                        ty: Ty::Error,
+                        kind: FieldKind::Value,
+                    };
+                }
                 let ty = Ty::Fn(
                     sig.call_params().iter().map(|p| p.ty.clone()).collect(),
                     Box::new(sig.ret.clone()),
@@ -1456,6 +1465,19 @@ impl<'a> Checker<'a> {
                 };
                 if let Some(def_id) = self.methods.get(&(*type_id, name.clone())).copied() {
                     if let Some(sig) = self.fn_sig(def_id).cloned() {
+                        if sig.module != self.current_module() && !sig.is_pub {
+                            let module = self.current_module();
+                            self.err_at(
+                                module,
+                                base.span,
+                                Code::E106,
+                                format!("`{name}` is private"),
+                            );
+                            return FieldResult {
+                                ty: Ty::Error,
+                                kind: FieldKind::Value,
+                            };
+                        }
                         let ty = Ty::Fn(
                             sig.call_params().iter().map(|p| p.ty.clone()).collect(),
                             Box::new(sig.ret.clone()),
@@ -2062,6 +2084,9 @@ impl<'a> Checker<'a> {
                 self.check_mut_arg(&arg.expr, arg.span);
             }
             self.check_expr(&arg.expr, Some(param_ty), infer);
+            if arg.mutable {
+                self.check_place_indexes(&arg.expr);
+            }
         }
         for i in lambda_indices {
             let Some(param_ty) = call_params.get(i) else {
@@ -2093,6 +2118,9 @@ impl<'a> Checker<'a> {
                 self.check_mut_arg(&call_args[i].expr, call_args[i].span);
             }
             self.check_expr(&call_args[i].expr, Some(param_ty), infer);
+            if call_args[i].mutable {
+                self.check_place_indexes(&call_args[i].expr);
+            }
         }
         if has_conflicting_alias(&roots) {
             let module = self.current_module();
@@ -2176,6 +2204,7 @@ impl<'a> Checker<'a> {
     }
 
     fn require_mutable_place(&mut self, expr: &Expr, span: Span) {
+        self.check_place_indexes(expr);
         match self.check_place(expr) {
             Some(place) => {
                 if !place.mutable {
@@ -2624,6 +2653,46 @@ impl<'a> Checker<'a> {
     // ------------------------------------------------------------------
     // Places and captures
     // ------------------------------------------------------------------
+
+    /// Reject place indices that can only produce a value slice.
+    ///
+    /// `check_index` allows ranges so that `xs[0..1]` reads a sublist, but the
+    /// lowering only accepts integer list indices and map keys as places.
+    /// Without this check `xs[0..1] = []` passes checking and then fails while
+    /// lowering with E508. The same applies to `mut` arguments and mutating
+    /// receivers, which also require a place.
+    fn check_place_indexes(&mut self, expr: &Expr) {
+        match &expr.kind {
+            ExprKind::Field { base, .. } => self.check_place_indexes(base),
+            ExprKind::Index { base, index } => {
+                let base_ty = self.expr_types.get(&base.id).cloned();
+                let index_ty = self.expr_types.get(&index.id).cloned();
+                match (base_ty, index_ty) {
+                    (Some(Ty::List(_)), Some(Ty::Range)) => {
+                        let module = self.current_module();
+                        self.err_at(
+                            module,
+                            index.span,
+                            Code::E201,
+                            "list index place must be int, not range",
+                        );
+                    }
+                    (Some(Ty::Str), Some(Ty::Range)) => {
+                        let module = self.current_module();
+                        self.err_at(
+                            module,
+                            expr.span,
+                            Code::E401,
+                            "a string slice is not a place",
+                        );
+                    }
+                    _ => {}
+                }
+                self.check_place_indexes(base);
+            }
+            _ => {}
+        }
+    }
 
     fn check_place(&mut self, expr: &Expr) -> Option<Place> {
         match &expr.kind {

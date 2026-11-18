@@ -163,6 +163,109 @@ fn check_accepts_a_valid_file() {
 }
 
 #[test]
+fn check_rejects_duplicate_bindings_in_one_pattern() {
+    let dir = TempDir::new("check-duplicate");
+    let script = dir.file(
+        "main.mt",
+        "fn main() {\n    let (x, x) = (1, 2)\n    print(\"{x}\")\n}\n",
+    );
+    let output = martite(&[s("check"), script.as_os_str()]);
+    assert_eq!(output.status.code(), Some(1));
+    let error = stderr(&output);
+    assert!(error.contains("E303"), "stderr: {error}");
+}
+
+#[test]
+fn check_rejects_range_assignment_before_lowering() {
+    let dir = TempDir::new("check-range-assign");
+    let script = dir.file(
+        "main.mt",
+        "fn main() {\n    var xs = [1, 2]\n    xs[0..1] = []\n    print(\"{xs.len()}\")\n}\n",
+    );
+    let checked = martite(&[s("check"), script.as_os_str()]);
+    assert_eq!(checked.status.code(), Some(1));
+    assert!(
+        stderr(&checked).contains("E201"),
+        "stderr: {}",
+        stderr(&checked)
+    );
+
+    let run = martite(&[s("run"), script.as_os_str()]);
+    let error = stderr(&run);
+    assert!(error.contains("E201"), "stderr: {error}");
+    assert!(!error.contains("E508"), "stderr: {error}");
+
+    let string = dir.file(
+        "string.mt",
+        "fn main() {\n    var s = \"ab\"\n    s[0..1] = \"x\"\n}\n",
+    );
+    let checked = martite(&[s("check"), string.as_os_str()]);
+    assert_eq!(checked.status.code(), Some(1));
+    assert!(
+        stderr(&checked).contains("E401"),
+        "stderr: {}",
+        stderr(&checked)
+    );
+
+    let run = martite(&[s("run"), string.as_os_str()]);
+    let error = stderr(&run);
+    assert!(error.contains("E401"), "stderr: {error}");
+    assert!(!error.contains("E508"), "stderr: {error}");
+
+    let mutable = dir.file(
+        "mutable.mt",
+        "fn bump(mut xs: list[int]) { xs.push(1) }\nfn main() {\n    var xs = [1, 2]\n    bump(mut xs[0..1])\n}\n",
+    );
+    let checked = martite(&[s("check"), mutable.as_os_str()]);
+    assert_eq!(checked.status.code(), Some(1));
+    assert!(
+        stderr(&checked).contains("E201"),
+        "stderr: {}",
+        stderr(&checked)
+    );
+
+    let run = martite(&[s("run"), mutable.as_os_str()]);
+    let error = stderr(&run);
+    assert!(error.contains("E201"), "stderr: {error}");
+    assert!(!error.contains("E508"), "stderr: {error}");
+}
+
+#[test]
+fn check_rejects_private_methods_from_another_module() {
+    let dir = TempDir::new("check-private-method");
+    dir.file(
+        "a.mt",
+        "pub struct Box { n: int }\nimpl Box {\n    fn secret(self) -> int { self.n }\n    pub fn make() -> Box { Box { n: 1 } }\n}\n",
+    );
+    let script = dir.file(
+        "main.mt",
+        "use a.Box\nfn main() {\n    let b = Box.make()\n    let n = b.secret()\n    print(\"{n}\")\n}\n",
+    );
+    let output = martite(&[s("check"), script.as_os_str()]);
+    assert_eq!(output.status.code(), Some(1));
+    let error = stderr(&output);
+    assert!(error.contains("E106"), "stderr: {error}");
+    assert!(error.contains("private"), "stderr: {error}");
+}
+
+#[cfg(windows)]
+#[test]
+fn case_insensitive_filesystem_keeps_type_imports_as_items() {
+    let dir = TempDir::new("check-type-import-case");
+    let script = dir.file("main.mt", "use a.Point\nfn main() { }\n");
+    dir.file("a.mt", "pub struct Point { x: int }\n");
+    dir.file("a/point.mt", "pub struct Broken {\n");
+
+    let output = martite(&[s("check"), script.as_os_str()]);
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        stderr(&output),
+        stdout(&output)
+    );
+}
+
+#[test]
 fn test_runs_passing_and_failing_blocks() {
     let dir = TempDir::new("tests");
     let passing = dir.file(
