@@ -13,7 +13,7 @@ mod suppress;
 mod syntax;
 mod trivia;
 
-use martite_base::{Code, Diagnostic, SourceId, SourceMap};
+use martite_base::{Code, Diagnostic, SourceId, SourceMap, cap_diagnostics};
 use martite_check::CheckedProgram;
 use martite_syntax::Program;
 
@@ -87,6 +87,7 @@ pub fn lint(
         diagnostics.extend(manifest::run(manifest, program, resolver, &prefix));
     }
     sort_diagnostics(&mut diagnostics, sources);
+    cap_diagnostics(&mut diagnostics);
     LintOutput { diagnostics }
 }
 
@@ -99,7 +100,9 @@ pub fn lint_syntax_only(
     settings: &ResolvedSettings,
 ) -> Vec<Diagnostic> {
     let diagnostics = syntax::run(source, text, program, settings);
-    suppress::apply(source, text, program, settings, diagnostics, false)
+    let mut diagnostics = suppress::apply(source, text, program, settings, diagnostics, false);
+    cap_diagnostics(&mut diagnostics);
+    diagnostics
 }
 
 pub fn sort_diagnostics(diagnostics: &mut [Diagnostic], sources: &SourceMap) {

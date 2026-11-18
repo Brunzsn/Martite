@@ -3,7 +3,9 @@
 mod interfaces;
 mod workspace;
 
-use martite_base::{Code, Diagnostic, LoadLimits, Severity, SourceMap, SourceProvider};
+use martite_base::{
+    Code, Diagnostic, LoadLimits, Severity, SourceMap, SourceProvider, cap_diagnostics,
+};
 use martite_check::{CheckedProgram, check};
 use martite_config::is_valid_entry_path;
 use martite_ir::IrProgram;
@@ -98,6 +100,7 @@ pub fn load(provider: &dyn SourceProvider, options: &LoadOptions) -> LoadedProgr
             d.code,
         )
     });
+    cap_diagnostics(&mut diagnostics);
     LoadedProgram {
         program,
         sources,
