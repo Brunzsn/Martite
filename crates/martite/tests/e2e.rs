@@ -50,6 +50,16 @@ fn arithmetic_and_interpolation() {
 }
 
 #[test]
+fn compound_subtraction_assignment() {
+    assert_eq!(
+        run_source(
+            "fn main() {\n    var x = 5\n    x -= 2\n    print(\"{x}\")\n    x -= -1\n    print(\"{x}\")\n}\n"
+        ),
+        ["3", "4"]
+    );
+}
+
+#[test]
 fn let_and_if() {
     assert_eq!(
         run_source(

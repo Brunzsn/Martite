@@ -83,19 +83,28 @@ impl<'a> Lexer<'a> {
         let src = self.src;
         let bytes = src.as_bytes();
         while self.pos < self.end {
-            let was_postfix_dot = self.postfix_dot;
-            self.postfix_dot = false;
-
             match bytes[self.pos] {
                 b' ' | b'\t' | b'\r' => {
                     self.pos += 1;
+                    continue;
                 }
                 b'\n' => {
                     let start = self.pos;
                     self.pos += 1;
                     self.push(TokenKind::Newline, Span::new(start as u32, self.pos as u32));
+                    continue;
                 }
-                b'/' if self.peek_n(1) == Some(b'/') => self.comment(),
+                b'/' if self.peek_n(1) == Some(b'/') => {
+                    self.comment();
+                    continue;
+                }
+                _ => {}
+            }
+
+            // Trivia must not clear the pending postfix `.`: `t. 0.1` still
+            // means `(t.0).1`, and a newline is ignored inside brackets.
+            let was_postfix_dot = std::mem::take(&mut self.postfix_dot);
+            match bytes[self.pos] {
                 b'"' => {
                     let start = self.pos;
                     let kind = self.string();
@@ -633,7 +642,17 @@ impl<'a> Lexer<'a> {
             ':' => one(self, TokenKind::Colon),
             '|' => one(self, TokenKind::Pipe),
             '+' => two(self, '=', TokenKind::PlusEq, TokenKind::Plus),
-            '-' => two(self, '>', TokenKind::Arrow, TokenKind::Minus),
+            '-' => {
+                if self.peek() == Some('>') {
+                    self.bump();
+                    self.push(TokenKind::Arrow, Span::new(start as u32, self.pos as u32));
+                } else if self.peek() == Some('=') {
+                    self.bump();
+                    self.push(TokenKind::MinusEq, Span::new(start as u32, self.pos as u32));
+                } else {
+                    one(self, TokenKind::Minus);
+                }
+            }
             '*' => two(self, '=', TokenKind::StarEq, TokenKind::Star),
             '/' => two(self, '=', TokenKind::SlashEq, TokenKind::Slash),
             '%' => two(self, '=', TokenKind::PercentEq, TokenKind::Percent),
@@ -997,6 +1016,57 @@ mod tests {
                 TokenKind::Int(1)
             ]
         );
+    }
+
+    #[test]
+    fn minus_equals_and_arrow_are_distinct() {
+        assert_eq!(
+            kinds("a -= -1")[..4],
+            [
+                TokenKind::Ident("a".into(), IdentClass::Snake),
+                TokenKind::MinusEq,
+                TokenKind::Minus,
+                TokenKind::Int(1)
+            ]
+        );
+        assert_eq!(
+            kinds("a -> b")[..3],
+            [
+                TokenKind::Ident("a".into(), IdentClass::Snake),
+                TokenKind::Arrow,
+                TokenKind::Ident("b".into(), IdentClass::Snake)
+            ]
+        );
+    }
+
+    #[test]
+    fn postfix_dot_survives_trivia_after_the_dot() {
+        for src in ["t. 0.1", "t.\t0.1", "t.\n0.1", "t. // comment\n0.1"] {
+            let ks: Vec<_> = kinds(src)
+                .into_iter()
+                .filter(|kind| !matches!(kind, TokenKind::Newline))
+                .collect();
+            assert_eq!(
+                ks[..5],
+                [
+                    TokenKind::Ident("t".into(), IdentClass::Snake),
+                    TokenKind::Dot,
+                    TokenKind::Int(0),
+                    TokenKind::Dot,
+                    TokenKind::Int(1)
+                ],
+                "{src:?}"
+            );
+        }
+
+        for src in [
+            "t. 9223372036854775809",
+            "t.\n9223372036854775809",
+            "t. // comment\n9223372036854775809",
+        ] {
+            let out = lex(src, LoadLimits::default());
+            assert!(out.diagnostics.is_empty(), "{src:?}: {:?}", out.diagnostics);
+        }
     }
 
     #[test]

@@ -2522,9 +2522,16 @@ impl<'a> Parser<'a> {
                 }
                 IdentClass::Pascal => {
                     let (name, _, token_span) = self.take_ident().expect("checked identifier");
+                    // A newline is ignored when the next token is `.`, so a
+                    // qualified variant may break before its qualifier dot.
+                    self.skip_continuation_newlines();
                     if self.eat(&TokenKind::Dot) {
                         let (variant, _variant_span) = self.expect_pascal()?;
-                        let args = self.parse_pat_payload()?;
+                        let args = if self.at(&TokenKind::LParen) {
+                            self.parse_pat_payload()?
+                        } else {
+                            Vec::new()
+                        };
                         Ok(Pattern {
                             id: self.id(),
                             span: token_span.merge(self.span_before()),
@@ -2630,6 +2637,7 @@ impl<'a> Parser<'a> {
             while !p.at(&TokenKind::RBrace) && !p.at(&TokenKind::Eof) {
                 if p.eat(&TokenKind::DotDot) {
                     rest = true;
+                    p.eat(&TokenKind::Comma);
                     if !p.at(&TokenKind::RBrace) {
                         return Err(p.error_at_current("`..` must be the last field pattern"));
                     }
@@ -2710,6 +2718,7 @@ fn is_continuation_prev(kind: &TokenKind) -> bool {
             | TokenKind::Ge
             | TokenKind::And
             | TokenKind::Or
+            | TokenKind::Pipe
             | TokenKind::QuestionQuestion
             | TokenKind::DotDot
             | TokenKind::DotDotEq
@@ -3068,5 +3077,57 @@ mod tests {
             slice(program.keyword_span(return_stmt.id).unwrap()),
             "return"
         );
+    }
+
+    #[test]
+    fn qualified_unit_variant_patterns_have_no_payload() {
+        let source = "enum Color { Red, Green }\nfn main(c: Color) {\n    match c {\n        Color.Red => print(\"red\"),\n        Color.Green => print(\"green\"),\n    }\n}\n";
+        let parsed = parse_source(source, LoadLimits::default());
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+        let Item::Fn(function) = &parsed.program.items[1] else {
+            panic!("expected a function");
+        };
+        let body = function.body.as_ref().expect("function body");
+        let StmtKind::Expr {
+            expr:
+                Expr {
+                    kind: ExprKind::Match { arms, .. },
+                    ..
+                },
+            ..
+        } = &body.stmts[0].kind
+        else {
+            panic!("expected a match expression");
+        };
+        let PatKind::Variant {
+            qualifier,
+            name,
+            args,
+        } = &arms[0].pattern.kind
+        else {
+            panic!("expected a variant pattern");
+        };
+        assert_eq!(qualifier.as_deref(), Some("Color"));
+        assert_eq!(name, "Red");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn pattern_continuations_cover_or_and_qualified_variants() {
+        let source = "enum Color { Red, Green }\nfn main(c: Color, cs: list[Color]) {\n    let Red |\n        Green = c\n    let Color\n        .Red = c\n    for Red |\n        Green in cs {}\n}\n";
+        let parsed = parse_source(source, LoadLimits::default());
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    }
+
+    #[test]
+    fn struct_pattern_rest_allows_a_trailing_comma() {
+        let source = "struct P { x: int, y: int }\nfn main(p: P) {\n    match p {\n        P { x, .., } => print(\"{x}\"),\n        P { .., } => print(\"p\"),\n    }\n}\n";
+        let parsed = parse_source(source, LoadLimits::default());
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+        let source = "struct P { x: int }\nfn main(p: P) {\n    match p {\n        P { .., x } => print(\"{x}\"),\n    }\n}\n";
+        let parsed = parse_source(source, LoadLimits::default());
+        assert!(parsed.diagnostics.iter().any(|d| d.code == Code::E003));
     }
 }

@@ -181,3 +181,23 @@ fn string_interpolation_is_parsed_as_a_nested_expression() {
     parse_ok("fn main() { print(\"{1 + 2}\") }\n");
     parse_error("fn main() { print(\"{1 + }\") }\n", Some(Code::E003));
 }
+
+#[test]
+fn minus_equals_and_arrow_are_distinct_tokens() {
+    parse_ok("fn main() {\n    var x = 5\n    x -= 1\n}\n");
+    parse_ok("fn f() -> int { 1 }\n");
+}
+
+#[test]
+fn qualified_unit_patterns_and_pattern_continuations_parse() {
+    parse_ok(
+        "enum Color { Red, Green }\nfn main(c: Color) {\n    match c {\n        Color.Red => print(\"red\"),\n        Color.Green => print(\"green\"),\n    }\n    let Red |\n        Green = c\n    let Color\n        .Red = c\n}\n",
+    );
+}
+
+#[test]
+fn struct_pattern_rest_allows_a_trailing_comma() {
+    parse_ok(
+        "struct P { x: int, y: int }\nfn main(p: P) {\n    match p {\n        P { x, .., } => print(\"{x}\"),\n        P { .., } => print(\"p\"),\n    }\n}\n",
+    );
+}
