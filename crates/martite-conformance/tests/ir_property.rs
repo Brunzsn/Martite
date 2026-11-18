@@ -22,8 +22,15 @@ proptest! {
     #[test]
     fn generated_programs_lower_verify_and_execute(ops in prop::collection::vec(any::<u64>(), 1..=64)) {
         let source = generate_program(&ops);
-        if let Err(failure) = check_source(&source) {
-            prop_assert!(false, "ops = {ops:?}\n{failure}");
+        match check_source(&source) {
+            Ok(PropertyOutcome::Passed { .. }) => {}
+            Ok(PropertyOutcome::Skipped { reason }) => {
+                // `Skipped` means a tiny generated program hit the deadline or
+                // the harness wall-clock cap. That is a hang regression, not a
+                // pass, so the property must fail.
+                prop_assert!(false, "ops = {ops:?}\nskipped: {reason}\n{source}");
+            }
+            Err(failure) => prop_assert!(false, "ops = {ops:?}\n{failure}"),
         }
     }
 }

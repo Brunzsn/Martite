@@ -392,7 +392,7 @@ impl SnapshotCase {
     }
 
     pub fn observe_with(&self, stage: ProgramStage) -> SnapshotRecord {
-        match self {
+        let mut record = match self {
             Self::Main {
                 id,
                 case,
@@ -431,7 +431,12 @@ impl SnapshotCase {
                     steps: observation.steps,
                 }
             }
-        }
+        };
+        // The note is part of the observable record: an observation only earns
+        // it when its outcome is limit-driven, so foreclosing comparisons can
+        // check it instead of dropping `thresholds` wholesale.
+        record.thresholds.note = limit_note(&record);
+        record
     }
 
     pub fn record(&self) -> SnapshotRecord {
@@ -507,11 +512,46 @@ impl SnapshotCase {
         expected: &SnapshotRecord,
         stage: ProgramStage,
     ) -> Result<(), Vec<ThresholdMismatch>> {
-        if expected.thresholds.note.is_some() {
-            return Ok(());
-        }
         let caps = self.caps();
         let outcomes = expected_outcomes(expected);
+        if let Some(note) = &expected.thresholds.note {
+            // A note opts out of the threshold search, so it is only accepted
+            // for a limit-driven outcome and must not hide numeric levels.
+            let allowed = limit_note(expected);
+            let mut mismatches = Vec::new();
+            if allowed.as_deref() != Some(note.as_str()) {
+                mismatches.push(ThresholdMismatch {
+                    field: "thresholds.note",
+                    expected: "only a limit-driven outcome may carry a note".into(),
+                    actual: format!("note {note:?} on {}", expected.id),
+                });
+            }
+            if expected.thresholds.fuel.is_some()
+                || expected.thresholds.memory.is_some()
+                || expected.thresholds.depth.is_some()
+            {
+                mismatches.push(ThresholdMismatch {
+                    field: "thresholds",
+                    expected: "a note-only record without numeric levels".into(),
+                    actual: format!("{}: {expected:?}", expected.id),
+                });
+            }
+            if mismatches.is_empty() {
+                let actual = self.outcomes_at_with(caps_to_limits(caps), stage);
+                if actual != outcomes {
+                    mismatches.push(ThresholdMismatch {
+                        field: "thresholds.note behavior",
+                        expected: format!("{outcomes:?}"),
+                        actual: format!("{actual:?}"),
+                    });
+                }
+            }
+            return if mismatches.is_empty() {
+                Ok(())
+            } else {
+                Err(mismatches)
+            };
+        }
         let Some(fuel) = expected.thresholds.fuel else {
             return Err(vec![missing_threshold(expected, "thresholds.fuel")]);
         };
@@ -530,13 +570,13 @@ impl SnapshotCase {
                 fuel,
                 memory: caps.memory,
                 depth: caps.depth,
-                deadline: None,
+                deadline: caps.deadline,
             },
             (fuel > 1).then(|| ExecLimits {
                 fuel: fuel - 1,
                 memory: caps.memory,
                 depth: caps.depth,
-                deadline: None,
+                deadline: caps.deadline,
             }),
             stage,
             &mut mismatches,
@@ -548,13 +588,13 @@ impl SnapshotCase {
                 fuel: caps.fuel,
                 memory,
                 depth: caps.depth,
-                deadline: None,
+                deadline: caps.deadline,
             },
             (memory > 0).then(|| ExecLimits {
                 fuel: caps.fuel,
                 memory: memory - 1,
                 depth: caps.depth,
-                deadline: None,
+                deadline: caps.deadline,
             }),
             stage,
             &mut mismatches,
@@ -566,13 +606,13 @@ impl SnapshotCase {
                 fuel: caps.fuel,
                 memory: caps.memory,
                 depth,
-                deadline: None,
+                deadline: caps.deadline,
             },
             (depth > 0).then(|| ExecLimits {
                 fuel: caps.fuel,
                 memory: caps.memory,
                 depth: depth - 1,
-                deadline: None,
+                deadline: caps.deadline,
             }),
             stage,
             &mut mismatches,
@@ -651,7 +691,7 @@ fn search_thresholds(
             fuel: value,
             memory: caps.memory,
             depth: caps.depth,
-            deadline: None,
+            deadline: caps.deadline,
         }) == expected
     });
     let memory = binary_min(caps.memory, |value| {
@@ -659,7 +699,7 @@ fn search_thresholds(
             fuel: caps.fuel,
             memory: value,
             depth: caps.depth,
-            deadline: None,
+            deadline: caps.deadline,
         }) == expected
     });
     let depth = binary_min(caps.depth as u64, |value| {
@@ -667,7 +707,7 @@ fn search_thresholds(
             fuel: caps.fuel,
             memory: caps.memory,
             depth: value as u32,
-            deadline: None,
+            deadline: caps.deadline,
         }) == expected
     }) as u32;
     ThresholdsRecord {
@@ -683,7 +723,7 @@ fn caps_to_limits(caps: ProbeCaps) -> ExecLimits {
         fuel: caps.fuel,
         memory: caps.memory,
         depth: caps.depth,
-        deadline: None,
+        deadline: caps.deadline,
     }
 }
 
@@ -708,19 +748,23 @@ fn missing_threshold(record: &SnapshotRecord, field: &'static str) -> ThresholdM
 }
 
 fn limit_note(record: &SnapshotRecord) -> Option<String> {
-    let outcome = record
-        .outcome
-        .as_ref()
-        .or_else(|| record.steps.iter().find_map(|step| step.outcome.as_ref()))?;
-    let OutcomeRecord::Trap { trap } = outcome else {
-        return None;
+    let is_limit_trap = |outcome: &OutcomeRecord| {
+        matches!(
+            outcome,
+            OutcomeRecord::Trap { trap }
+                if matches!(
+                    trap.kind.as_str(),
+                    "out_of_fuel" | "out_of_memory" | "depth_exceeded" | "deadline"
+                )
+        )
     };
-    match trap.kind.as_str() {
-        "out_of_fuel" | "out_of_memory" | "depth_exceeded" | "deadline" => {
-            Some("limit-driven outcome".into())
-        }
-        _ => None,
-    }
+    let limit_driven = record.outcome.as_ref().is_some_and(is_limit_trap)
+        || record
+            .steps
+            .iter()
+            .filter_map(|step| step.outcome.as_ref())
+            .any(is_limit_trap);
+    limit_driven.then(|| "limit-driven outcome".into())
 }
 
 fn binary_min(high: u64, ok: impl FnMut(u64) -> bool) -> u64 {
@@ -944,13 +988,17 @@ fn run_plugin(plugin: &Plugin, scenario: &PluginScenario, limits: ExecLimits) ->
                 });
             }
             PluginStep::Shutdown => {
+                // `shutdown` lives in `entries.shutdown`, not `entries.handlers`,
+                // so it must be driven through `invoke_shutdown`. The entry is
+                // unit-returning, so the body's observable effect is its state
+                // writeback and fuel, both recorded below.
                 let (result, log, fuel_used) = run_with_runtime(
                     &ir,
                     limits,
                     dispatcher
                         .as_mut()
                         .map(|dispatcher| dispatcher as &mut dyn IrHostDispatcher),
-                    |runtime| runtime.invoke_handler("shutdown", &mut state, Vec::new()),
+                    |runtime| runtime.invoke_shutdown(&mut state),
                 );
                 let host_calls = scenario
                     .hosts
@@ -964,8 +1012,8 @@ fn run_plugin(plugin: &Plugin, scenario: &PluginScenario, limits: ExecLimits) ->
                     args: Vec::new(),
                     state: state.as_ref().map(|value| value_repr(value, types, true)),
                     outcome: Some(match result {
-                        Ok(Some(value)) => outcome_from_value(&value, types),
-                        Ok(None) => OutcomeRecord::NoHandler,
+                        Ok(true) => outcome_from_value(&Value::Unit, types),
+                        Ok(false) => OutcomeRecord::NoHandler,
                         Err(trap) => outcome_from_trap(&trap, sources),
                     }),
                     log,

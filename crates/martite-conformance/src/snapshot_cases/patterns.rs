@@ -148,6 +148,26 @@ pub fn cases() -> Vec<SnapshotCase> {
             caps,
         ),
         main_case(
+            "patterns/recursive_type_match",
+            r#"
+            enum Tree { Leaf(int), Node(Tree, Tree) }
+
+            fn total(tree: Tree) -> int {
+                match tree {
+                    Leaf(value) => value,
+                    Node(left, right) => total(left) + total(right),
+                }
+            }
+
+            fn main() {
+                let tree = Tree.Node(Tree.Leaf(1), Tree.Node(Tree.Leaf(2), Tree.Leaf(3)))
+                print("{total(tree)}")
+            }
+            "#,
+            None,
+            caps,
+        ),
+        main_case(
             "patterns/nested_or_patterns_and_failed_guards_restore_bindings",
             r#"
             enum Shape { Pair(int, int), Single(int), Empty }

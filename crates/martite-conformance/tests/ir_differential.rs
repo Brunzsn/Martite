@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use martite_conformance::differential::run_all;
+use martite_conformance::differential::{CorpusReport, run_all};
 use martite_conformance::snapshot::read_snapshot_dir;
 
 fn snapshot_root() -> PathBuf {
@@ -17,4 +17,18 @@ fn snapshot_root() -> PathBuf {
 fn every_fixture_matches_the_snapshots() {
     let expected = read_snapshot_dir(&snapshot_root());
     run_all(&expected).assert_ok();
+}
+
+#[test]
+fn a_skipped_fixture_fails_the_report() {
+    let report = CorpusReport {
+        covered: 0,
+        skipped: 1,
+        failures: Vec::new(),
+    };
+    let result = std::panic::catch_unwind(|| report.assert_ok());
+    assert!(
+        result.is_err(),
+        "a skipped fixture must not pass as covered"
+    );
 }

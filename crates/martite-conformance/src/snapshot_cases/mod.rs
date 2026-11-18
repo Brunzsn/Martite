@@ -35,6 +35,7 @@ pub(crate) fn bench_caps() -> ProbeCaps {
         fuel: 100_000_000,
         memory: 64 << 20,
         depth: 200,
+        deadline: None,
     }
 }
 
