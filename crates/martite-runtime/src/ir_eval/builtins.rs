@@ -19,11 +19,21 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         match function {
             BuiltinFnId::PRINT => {
                 let value = values.first().cloned().unwrap_or(Value::Unit);
+                let epoch = self.scan_epoch;
                 self.charge(fuel::show_cost(value.meta().slots))?;
-                let mut text = String::new();
+                self.pin_value(&value, epoch)?;
+                // Reserve the string header and let the render buffer grow only
+                // into the remaining memory budget.
+                let limit = self.memory_headroom(Some(&value))?.saturating_sub(16);
+                let limit = limit.min(usize::MAX as u64) as usize;
+                let mut text = ShowOutput::new(limit);
                 write_show(&mut text, &value, &self.program.types, true);
+                if text.is_overflowed() {
+                    return self.trap(Trap::OutOfMemory);
+                }
+                let text = text.into_string();
                 self.charge(fuel::string_cost(text.len() as u64))?;
-                self.log.push(text);
+                self.note_log(text);
                 self.maybe_check_memory()?;
                 Ok(Value::Unit)
             }
@@ -107,32 +117,37 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 Ok(Value::Float(libm::atan2(y, x)))
             }
             ("std.json", "parse") => {
-                let text = values
-                    .first()
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                let Some(text) = values.first().and_then(|value| value.as_str()) else {
+                    return self.trap(self.internal_panic("expected str"));
+                };
                 self.charge(fuel::string_cost(text.len() as u64))?;
-                if text.len() as u64 > self.limits.memory {
-                    return Err(EvalError::Trap(Trap::OutOfMemory));
-                }
                 let json_type = self.program.entries.json_type;
-                match crate::json::parse(&text, json_type) {
+                let budget = self.memory_headroom(values.first())?;
+                match crate::json::parse_bounded(text, json_type, budget) {
                     Ok(value) => {
                         self.check_value_depth(&value, span)?;
+                        self.ensure_output_capacity(value.meta().bytes.saturating_add(16))?;
                         self.note_value(&value);
                         self.note_alloc(16);
+                        self.maybe_check_memory()?;
                         Ok(Value::Result(Ok(Box::new(value))))
                     }
-                    Err(message) => {
+                    Err(crate::json::ParseError::Invalid(message)) => {
                         self.note_alloc(16 + 16 + message.len() as u64);
                         Ok(Value::Result(Err(Box::new(Value::str(message)))))
                     }
+                    Err(crate::json::ParseError::TooLarge) => self.trap(Trap::OutOfMemory),
                 }
             }
             ("std.json", "stringify") => {
-                let value = values.first().cloned().unwrap_or(Value::Unit);
-                let text = crate::json::stringify(&value, &self.program.types);
+                let Some(value) = values.first() else {
+                    return self.trap(self.internal_panic("expected Json"));
+                };
+                let limit = self.memory_headroom(values.first())?;
+                let text = match crate::json::stringify_limited(value, &self.program.types, limit) {
+                    Ok(text) => text,
+                    Err(()) => return self.trap(Trap::OutOfMemory),
+                };
                 self.charge(fuel::string_cost(text.len() as u64))?;
                 self.note_alloc(16 + text.len() as u64);
                 Ok(Value::str(text))
@@ -280,10 +295,19 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 .unwrap_or(Value::Option(None))),
             "contains" => {
                 let needle = args.into_iter().next().unwrap_or(Value::Unit);
+                let needle_meta = needle.meta();
                 self.charge(fuel::slot_cost(items.len() as u64))?;
-                Ok(Value::Bool(
-                    items.iter().any(|value| value_eq(value, &needle)),
-                ))
+                for value in items.iter() {
+                    let meta = value.meta();
+                    self.charge(fuel::comparison_cost(
+                        meta.slots.max(needle_meta.slots),
+                        meta.string_slots.max(needle_meta.string_slots),
+                    ))?;
+                    if value_eq(value, &needle) {
+                        return Ok(Value::Bool(true));
+                    }
+                }
+                Ok(Value::Bool(false))
             }
             "map" => {
                 let closure = self.closure_arg(&args, 0)?;
@@ -471,7 +495,22 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     .first()
                     .and_then(|value| value.as_str())
                     .unwrap_or_default();
+                let projected = items.iter().fold(0u64, |total, item| {
+                    total.saturating_add(item.as_str().map_or(0, |text| text.len() as u64))
+                });
+                let projected = projected.saturating_add(
+                    (separator.len() as u64).saturating_mul(items.len().saturating_sub(1) as u64),
+                );
+                self.charge(fuel::slot_cost(items.len() as u64))?;
+                self.charge(fuel::string_cost(projected))?;
+                self.ensure_output_capacity(16u64.saturating_add(projected))?;
+                let Ok(capacity) = usize::try_from(projected) else {
+                    return self.trap(Trap::OutOfMemory);
+                };
                 let mut out = String::new();
+                if out.try_reserve_exact(capacity).is_err() {
+                    return self.trap(Trap::OutOfMemory);
+                }
                 for (index, item) in items.iter().enumerate() {
                     if index > 0 {
                         out.push_str(separator);
@@ -480,8 +519,6 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                         out.push_str(text);
                     }
                 }
-                self.charge(fuel::slot_cost(items.len() as u64))?;
-                self.charge(fuel::string_cost(out.len() as u64))?;
                 Ok(Value::str(out))
             }
             "push" => {
@@ -574,6 +611,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             "len" => Ok(Value::Int(map.len() as i64)),
             "get" => {
                 let key = args.first().cloned().unwrap_or(Value::Unit);
+                self.charge(map_key_cost(&key))?;
                 let key = key_from_value(&key)
                     .map_err(|message| EvalError::Trap(self.panic(message, span)))?;
                 Ok(map
@@ -584,6 +622,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             }
             "has" => {
                 let key = args.first().cloned().unwrap_or(Value::Unit);
+                self.charge(map_key_cost(&key))?;
                 let key = key_from_value(&key)
                     .map_err(|message| EvalError::Trap(self.panic(message, span)))?;
                 Ok(Value::Bool(map.get(&key).is_some()))
@@ -607,6 +646,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             }
             "remove" => {
                 let key = args.first().cloned().unwrap_or(Value::Unit);
+                self.charge(map_key_cost(&key))?;
                 let key = key_from_value(&key)
                     .map_err(|message| EvalError::Trap(self.panic(message, span)))?;
                 if map.get(&key).is_none() {
@@ -653,32 +693,56 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             }
             "chars" => {
                 self.charge(fuel::string_cost(text.len() as u64))?;
-                Ok(Value::list(
+                let count = text.chars().count();
+                let projected = 16u64
+                    .saturating_add(8u64.saturating_mul(count as u64))
+                    .saturating_add(16u64.saturating_mul(count as u64))
+                    .saturating_add(text.len() as u64);
+                self.ensure_output_capacity(projected)?;
+                let mut out = Vec::new();
+                if out.try_reserve_exact(count).is_err() {
+                    return self.trap(Trap::OutOfMemory);
+                }
+                out.extend(
                     text.chars()
-                        .map(|character| Value::str(character.to_string()))
-                        .collect(),
-                ))
+                        .map(|character| Value::str(character.to_string())),
+                );
+                Ok(Value::list(out))
             }
             "split" => {
                 let separator = args
                     .first()
                     .and_then(|value| value.as_str())
                     .unwrap_or_default();
-                let parts: Vec<Value> = if separator.is_empty() {
-                    text.chars()
-                        .map(|character| Value::str(character.to_string()))
-                        .collect()
-                } else {
-                    text.split(separator)
-                        .map(|part| Value::Str(Rc::from(part)))
-                        .collect()
-                };
                 self.charge(fuel::string_cost(text.len() as u64))?;
+                let count = if separator.is_empty() {
+                    text.chars().count()
+                } else {
+                    text.split(separator).count()
+                };
+                let projected = 16u64
+                    .saturating_add(8u64.saturating_mul(count as u64))
+                    .saturating_add(16u64.saturating_mul(count as u64))
+                    .saturating_add(text.len() as u64);
+                self.ensure_output_capacity(projected)?;
+                let mut parts = Vec::new();
+                if parts.try_reserve_exact(count).is_err() {
+                    return self.trap(Trap::OutOfMemory);
+                }
+                if separator.is_empty() {
+                    parts.extend(
+                        text.chars()
+                            .map(|character| Value::str(character.to_string())),
+                    );
+                } else {
+                    parts.extend(text.split(separator).map(|part| Value::Str(Rc::from(part))));
+                }
                 Ok(Value::list(parts))
             }
             "trim" => {
+                self.charge(fuel::string_cost(text.len() as u64))?;
                 let out = text.trim();
-                self.charge(fuel::string_cost(out.len() as u64))?;
+                self.ensure_output_capacity(16u64.saturating_add(out.len() as u64))?;
                 Ok(Value::Str(Rc::from(out)))
             }
             "contains" => {
@@ -729,8 +793,39 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 if from.is_empty() {
                     return self.trap(self.panic("replace with an empty `from`", span));
                 }
-                let out = text.replace(from, to);
-                self.charge(fuel::string_cost(out.len() as u64))?;
+                // Charge the input scan before doing it, then the extra output
+                // bytes when the replacement expands. `max(input, output)`
+                // keeps small-input fuel unchanged.
+                self.charge(fuel::string_cost(text.len() as u64))?;
+                let mut out_len = text.len() as u64;
+                let mut scan: &str = text;
+                while let Some(index) = scan.find(from) {
+                    let matched = from.len() as i64 - to.len() as i64;
+                    if matched > 0 {
+                        out_len = out_len.saturating_sub(matched as u64);
+                    } else {
+                        out_len = out_len.saturating_add((-matched) as u64);
+                    }
+                    scan = &scan[index + from.len()..];
+                }
+                let extra =
+                    fuel::string_cost(out_len).saturating_sub(fuel::string_cost(text.len() as u64));
+                self.charge(extra)?;
+                self.ensure_output_capacity(16u64.saturating_add(out_len))?;
+                let Ok(capacity) = usize::try_from(out_len) else {
+                    return self.trap(Trap::OutOfMemory);
+                };
+                let mut out = String::new();
+                if out.try_reserve_exact(capacity).is_err() {
+                    return self.trap(Trap::OutOfMemory);
+                }
+                let mut rest: &str = text;
+                while let Some(index) = rest.find(from) {
+                    out.push_str(&rest[..index]);
+                    out.push_str(to);
+                    rest = &rest[index + from.len()..];
+                }
+                out.push_str(rest);
                 Ok(Value::str(out))
             }
             "to_upper" => {
@@ -875,8 +970,17 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 Ok(Value::Bool(inside))
             }
             "to_list" => {
-                self.charge(fuel::slot_cost(len.max(0) as u64))?;
+                let count = len.max(0) as u64;
+                self.charge(fuel::slot_cost(count))?;
+                let projected = 16u64.saturating_add(8u64.saturating_mul(count));
+                self.ensure_output_capacity(projected)?;
+                let Ok(capacity) = usize::try_from(count) else {
+                    return self.trap(Trap::OutOfMemory);
+                };
                 let mut out = Vec::new();
+                if out.try_reserve_exact(capacity).is_err() {
+                    return self.trap(Trap::OutOfMemory);
+                }
                 let last = if *inclusive {
                     Some(*end)
                 } else {
@@ -1023,5 +1127,375 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             Some(Value::Fn(function)) => Ok(function),
             _ => self.trap(self.internal_panic("expected a function argument")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::KeyValue;
+    use smallvec::smallvec;
+
+    fn limits(fuel: u64, memory: u64) -> ExecLimits {
+        ExecLimits {
+            fuel,
+            memory,
+            depth: 200,
+            deadline: None,
+        }
+    }
+
+    fn trap_of(result: EvalResult<Value>) -> Trap {
+        match result {
+            Err(EvalError::Trap(trap)) => trap,
+            Ok(value) => panic!("expected a trap, got {value:?}"),
+            Err(other) => panic!("expected a trap, got {other:?}"),
+        }
+    }
+
+    fn span() -> martite_base::Span {
+        martite_base::Span::empty(0)
+    }
+
+    fn nested_json(levels: usize) -> String {
+        format!("{}0{}", "[".repeat(levels), "]".repeat(levels))
+    }
+
+    #[test]
+    fn print_log_is_counted_and_capped() {
+        let program = IrProgram::default();
+        let mut runtime = IrRuntime::new(&program, limits(1_000_000, 1024));
+        let text = Value::str("abcdefgh");
+        let mut trapped = false;
+        for _ in 0..100 {
+            match runtime.call_builtin_fn_values(
+                BuiltinFnId::PRINT,
+                std::slice::from_ref(&text),
+                span(),
+            ) {
+                Ok(_) => {}
+                Err(EvalError::Trap(Trap::OutOfMemory)) => {
+                    trapped = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert!(trapped, "the log must be capped by the memory limit");
+        assert!(runtime.log.len() < 100, "the log must stop growing");
+        assert!(
+            runtime.log_bytes <= 1024 + 24,
+            "the log census overshot by more than one push: {}",
+            runtime.log_bytes
+        );
+    }
+
+    #[test]
+    fn range_to_list_checks_projected_memory_before_allocating() {
+        let program = IrProgram::default();
+        let mut runtime = IrRuntime::new(&program, limits(1_000_000, 4096));
+        let mut range = Value::Range {
+            start: 0,
+            end: 300_000,
+            inclusive: false,
+        };
+        let result = runtime.apply_builtin_method(
+            BuiltinReceiver::Range,
+            "to_list",
+            &mut range,
+            CallArgs::new(),
+            span(),
+        );
+        assert!(matches!(trap_of(result), Trap::OutOfMemory));
+    }
+
+    #[test]
+    fn range_to_list_keeps_its_fuel_and_result_for_small_ranges() {
+        let program = IrProgram::default();
+        let mut runtime = IrRuntime::new(&program, limits(1000, 8 << 20));
+        let mut range = Value::Range {
+            start: 0,
+            end: 4,
+            inclusive: false,
+        };
+        let value = runtime
+            .apply_builtin_method(
+                BuiltinReceiver::Range,
+                "to_list",
+                &mut range,
+                CallArgs::new(),
+                span(),
+            )
+            .expect("small range");
+        let Value::List(items) = value else {
+            panic!("expected a list");
+        };
+        assert_eq!(items.len(), 4);
+        assert_eq!(runtime.fuel_used(), 4);
+    }
+
+    #[test]
+    fn json_parse_returns_recoverable_errors_for_deep_nesting() {
+        let program = IrProgram::default();
+        let mut runtime = IrRuntime::new(&program, limits(10_000_000, 8 << 20));
+
+        let parse = |runtime: &mut IrRuntime<'_, '_>, levels: usize| {
+            let text = Value::str(nested_json(levels));
+            runtime
+                .call_builtin_item_values(BuiltinItemId::JSON_PARSE, &[text], span())
+                .expect("JSON parse returns a Result")
+        };
+
+        let Value::Result(Err(message)) = parse(&mut runtime, 70) else {
+            panic!("70-level JSON must be a recoverable error");
+        };
+        assert_eq!(
+            message.as_str(),
+            Some("JSON nesting is too deep"),
+            "conversion must reject before the value-depth trap"
+        );
+
+        let Value::Result(Err(_)) = parse(&mut runtime, 130) else {
+            panic!("130-level JSON must stay a recoverable error");
+        };
+
+        let Value::Result(Ok(value)) = parse(&mut runtime, 63) else {
+            panic!("63-level JSON must convert below the value-depth ceiling");
+        };
+        assert!(!value_depth_exceeds(&value, MAX_VALUE_DEPTH));
+    }
+
+    #[test]
+    fn json_parse_traps_before_building_past_the_memory_limit() {
+        let program = IrProgram::default();
+        let mut runtime = IrRuntime::new(&program, limits(10_000_000, 4096));
+        let text = Value::str(format!("[{}]", vec!["0"; 50_000].join(",")));
+        let result = runtime.call_builtin_item_values(BuiltinItemId::JSON_PARSE, &[text], span());
+        assert!(matches!(trap_of(result), Trap::OutOfMemory));
+    }
+
+    #[test]
+    fn large_input_scans_trap_before_exceeding_fuel() {
+        let program = IrProgram::default();
+        let big = "x".repeat(100_000);
+
+        let mut runtime = IrRuntime::new(&program, limits(1000, 8 << 20));
+        let mut text = Value::str(big.clone());
+        let result = runtime.apply_builtin_method(
+            BuiltinReceiver::Str,
+            "trim",
+            &mut text,
+            CallArgs::new(),
+            span(),
+        );
+        assert!(matches!(trap_of(result), Trap::OutOfFuel), "trim");
+
+        let mut runtime = IrRuntime::new(&program, limits(1000, 8 << 20));
+        let mut text = Value::str(big.clone());
+        let args: CallArgs = smallvec![Value::str(big.clone()), Value::str("")];
+        let result =
+            runtime.apply_builtin_method(BuiltinReceiver::Str, "replace", &mut text, args, span());
+        assert!(matches!(trap_of(result), Trap::OutOfFuel), "replace");
+
+        let mut runtime = IrRuntime::new(&program, limits(1000, 8 << 20));
+        let result = runtime.index_value(
+            Value::str(big.clone()),
+            Value::Range {
+                start: 0,
+                end: 0,
+                inclusive: false,
+            },
+            span(),
+        );
+        assert!(matches!(trap_of(result), Trap::OutOfFuel), "slice");
+
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Str("k".into()), Value::Int(1));
+        let mut runtime = IrRuntime::new(&program, limits(1000, 8 << 20));
+        let mut receiver = Value::map(map);
+        let args: CallArgs = smallvec![Value::str(big.clone())];
+        let result =
+            runtime.apply_builtin_method(BuiltinReceiver::Map, "has", &mut receiver, args, span());
+        assert!(matches!(trap_of(result), Trap::OutOfFuel), "map key");
+
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Str("k".into()), Value::Int(1));
+        let mut runtime = IrRuntime::new(&program, limits(1000, 8 << 20));
+        let result = runtime.index_value(Value::map(map), Value::str(big.clone()), span());
+        assert!(matches!(trap_of(result), Trap::OutOfFuel), "map index key");
+
+        let items: Vec<Value> = (0..100).map(|_| Value::str("x".repeat(100))).collect();
+        let mut runtime = IrRuntime::new(&program, limits(500, 8 << 20));
+        let mut receiver = Value::list(items);
+        let args: CallArgs = smallvec![Value::str("y".repeat(100))];
+        let result = runtime.apply_builtin_method(
+            BuiltinReceiver::List,
+            "contains",
+            &mut receiver,
+            args,
+            span(),
+        );
+        assert!(matches!(trap_of(result), Trap::OutOfFuel), "contains");
+    }
+
+    #[test]
+    fn join_checks_projected_memory_before_building() {
+        let program = IrProgram::default();
+        let mut runtime = IrRuntime::new(&program, limits(1_000_000, 4096));
+        let items = (0..10).map(|_| Value::str("x".repeat(1000))).collect();
+        let mut receiver = Value::list(items);
+        let args: CallArgs = smallvec![Value::str(",")];
+        let result = runtime.apply_builtin_method(
+            BuiltinReceiver::List,
+            "join",
+            &mut receiver,
+            args,
+            span(),
+        );
+        assert!(matches!(trap_of(result), Trap::OutOfMemory));
+    }
+
+    #[test]
+    fn replace_checks_projected_memory_before_building() {
+        let program = IrProgram::default();
+        let mut runtime = IrRuntime::new(&program, limits(1_000_000, 4096));
+        let mut text = Value::str("a".repeat(1000));
+        let args: CallArgs = smallvec![Value::str("a"), Value::str("b".repeat(100))];
+        let result =
+            runtime.apply_builtin_method(BuiltinReceiver::Str, "replace", &mut text, args, span());
+        assert!(matches!(trap_of(result), Trap::OutOfMemory));
+    }
+
+    #[test]
+    fn large_input_fuel_scales_with_bytes_scanned() {
+        let program = IrProgram::default();
+
+        let mut runtime = IrRuntime::new(&program, limits(1_000_000, 8 << 20));
+        let mut text = Value::str(" ".repeat(8000));
+        runtime
+            .apply_builtin_method(
+                BuiltinReceiver::Str,
+                "trim",
+                &mut text,
+                CallArgs::new(),
+                span(),
+            )
+            .expect("trim");
+        assert_eq!(runtime.fuel_used(), 1000, "trim scans the input");
+
+        let mut runtime = IrRuntime::new(&program, limits(1_000_000, 8 << 20));
+        runtime
+            .index_value(
+                Value::str("x".repeat(8000)),
+                Value::Range {
+                    start: 0,
+                    end: 0,
+                    inclusive: false,
+                },
+                span(),
+            )
+            .expect("slice");
+        assert_eq!(runtime.fuel_used(), 1000, "slice scans the input");
+
+        let mut runtime = IrRuntime::new(&program, limits(1_000_000, 8 << 20));
+        let mut text = Value::str("x".repeat(8000));
+        let args: CallArgs = smallvec![Value::str("x".repeat(8000)), Value::str("")];
+        runtime
+            .apply_builtin_method(BuiltinReceiver::Str, "replace", &mut text, args, span())
+            .expect("replace");
+        assert_eq!(runtime.fuel_used(), 1000, "replace scans the input");
+
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Str("k".into()), Value::Int(1));
+        let mut runtime = IrRuntime::new(&program, limits(1_000_000, 8 << 20));
+        let mut receiver = Value::map(map);
+        let args: CallArgs = smallvec![Value::str("x".repeat(8000))];
+        runtime
+            .apply_builtin_method(BuiltinReceiver::Map, "has", &mut receiver, args, span())
+            .expect("map has");
+        assert_eq!(runtime.fuel_used(), 999, "map keys charge their bytes");
+
+        let items: Vec<Value> = (0..10).map(|_| Value::str("x".repeat(80))).collect();
+        let mut runtime = IrRuntime::new(&program, limits(1_000_000, 8 << 20));
+        let mut receiver = Value::list(items);
+        let args: CallArgs = smallvec![Value::str("y".repeat(80))];
+        runtime
+            .apply_builtin_method(
+                BuiltinReceiver::List,
+                "contains",
+                &mut receiver,
+                args,
+                span(),
+            )
+            .expect("contains");
+        assert_eq!(
+            runtime.fuel_used(),
+            110,
+            "contains charges a comparison per element"
+        );
+    }
+
+    #[test]
+    fn small_input_fuel_is_unchanged() {
+        let program = IrProgram::default();
+
+        let mut runtime = IrRuntime::new(&program, limits(1000, 8 << 20));
+        let mut text = Value::str("  hi  ");
+        runtime
+            .apply_builtin_method(
+                BuiltinReceiver::Str,
+                "trim",
+                &mut text,
+                CallArgs::new(),
+                span(),
+            )
+            .expect("small trim");
+        assert_eq!(runtime.fuel_used(), 1, "trim scan unit");
+
+        let mut runtime = IrRuntime::new(&program, limits(1000, 8 << 20));
+        runtime
+            .index_value(
+                Value::str("abcdefgh"),
+                Value::Range {
+                    start: 0,
+                    end: 4,
+                    inclusive: false,
+                },
+                span(),
+            )
+            .expect("small slice");
+        assert_eq!(runtime.fuel_used(), 1, "slice scan unit");
+
+        let mut runtime = IrRuntime::new(&program, limits(1000, 8 << 20));
+        let mut text = Value::str("Hello");
+        let args: CallArgs = smallvec![Value::str("Hello"), Value::str("Bye")];
+        runtime
+            .apply_builtin_method(BuiltinReceiver::Str, "replace", &mut text, args, span())
+            .expect("small replace");
+        assert_eq!(runtime.fuel_used(), 1, "replace scan unit");
+
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Str("a".into()), Value::Int(1));
+        let mut runtime = IrRuntime::new(&program, limits(1000, 8 << 20));
+        let mut receiver = Value::map(map);
+        let args: CallArgs = smallvec![Value::str("a")];
+        runtime
+            .apply_builtin_method(BuiltinReceiver::Map, "has", &mut receiver, args, span())
+            .expect("small map lookup");
+        assert_eq!(runtime.fuel_used(), 0, "small keys keep their old fuel");
+
+        let mut runtime = IrRuntime::new(&program, limits(1000, 8 << 20));
+        let mut receiver = Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        let args: CallArgs = smallvec![Value::Int(3)];
+        runtime
+            .apply_builtin_method(
+                BuiltinReceiver::List,
+                "contains",
+                &mut receiver,
+                args,
+                span(),
+            )
+            .expect("small contains");
+        assert_eq!(runtime.fuel_used(), 3, "one unit per element");
     }
 }

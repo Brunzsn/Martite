@@ -35,10 +35,10 @@ use martite_ir::{
 use smallvec::SmallVec;
 
 use crate::exec::{CallResult, ExecLimits, HostCaller, HostContext, HostFault, MainResult, Trap};
-use crate::ops::{show, value_eq, value_ord, write_show};
+use crate::ops::{ShowOutput, show, value_eq, value_ord, write_show};
 use crate::value::{
     Closure, EnumValue, FnValue, MAX_VALUE_DEPTH, MapValue, OrderedMap, SeqValue, StructValue,
-    Value, key_from_value, key_value_size, value_depth_exceeds,
+    Value, key_from_value, key_value_size, map_key_cost, value_depth_exceeds,
 };
 
 /// Host functions resolved by the IR. Dispatch is by [`HostId`]; the embedder
@@ -108,6 +108,12 @@ pub struct IrRuntime<'p, 'h> {
     census_bytes: u64,
     /// Allocation bytes recorded since the last exact scan.
     pending_bytes: u64,
+    /// Nominal bytes held by the host-visible print log.
+    log_bytes: u64,
+    /// Number of exact scans. Builders compare this before and after a build:
+    /// a scan while an aggregate lived only in a Rust local discarded the
+    /// pending bytes for its children, so the finished value must be scanned.
+    scan_epoch: u64,
     /// Immutable values materialized from the const pool, indexed by
     /// [`ConstId`]. Program data is not part of the memory census, but the
     /// first materialization is charged to `pending_bytes`.
@@ -142,6 +148,8 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             caller: None,
             census_bytes: 0,
             pending_bytes: 0,
+            log_bytes: 0,
+            scan_epoch: 0,
             const_values: vec![None; program.consts.len()],
             literal_values: vec![None; program.strs.len()],
         }
@@ -181,6 +189,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
     }
 
     pub fn take_log(&mut self) -> Vec<String> {
+        self.log_bytes = 0;
         std::mem::take(&mut self.log)
     }
 
@@ -278,6 +287,9 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         self.frames.clear();
         self.census_bytes = 0;
         self.pending_bytes = 0;
+        // The log survives a reset until the host takes it, so it stays part of
+        // the memory census for every call.
+        self.log_bytes = self.log.iter().map(|text| 16 + text.len() as u64).sum();
     }
 
     // ------------------------------------------------------------------
@@ -621,8 +633,19 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         }
     }
 
+    fn note_log(&mut self, text: String) {
+        self.log_bytes = self.log_bytes.saturating_add(16 + text.len() as u64);
+        self.log.push(text);
+    }
+
+    fn used_bytes(&self) -> u64 {
+        self.census_bytes
+            .saturating_add(self.pending_bytes)
+            .saturating_add(self.log_bytes)
+    }
+
     fn maybe_check_memory(&mut self) -> EvalResult<()> {
-        if self.census_bytes.saturating_add(self.pending_bytes) > self.limits.memory {
+        if self.used_bytes() > self.limits.memory {
             self.refresh_memory(None)
         } else {
             Ok(())
@@ -630,14 +653,59 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
     }
 
     fn maybe_check_returned_value(&mut self, value: &Value) -> EvalResult<()> {
-        if self.census_bytes.saturating_add(self.pending_bytes) > self.limits.memory {
+        if self.used_bytes() > self.limits.memory {
             self.refresh_memory(Some(value))
         } else {
             Ok(())
         }
     }
 
+    /// Bytes an output builder may still allocate without crossing the limit.
+    ///
+    /// If the running estimate is already over the limit, an exact scan is
+    /// attempted first: pending bytes can overestimate when a temporary was
+    /// dropped, and a builder should not fail because of a dead allocation.
+    fn memory_headroom(&mut self, extra: Option<&Value>) -> EvalResult<u64> {
+        if self.used_bytes() > self.limits.memory {
+            self.refresh_memory(extra)?;
+        }
+        Ok(self.limits.memory.saturating_sub(self.used_bytes()))
+    }
+
+    fn ensure_output_capacity(&mut self, bytes: u64) -> EvalResult<()> {
+        if bytes > self.memory_headroom(None)? {
+            return self.trap(Trap::OutOfMemory);
+        }
+        Ok(())
+    }
+
+    /// Scan an aggregate that just finished its Rust-local build.
+    ///
+    /// A scan that fires while the aggregate is under construction resets
+    /// `pending_bytes` without seeing the children, because they are reachable
+    /// only from the builder's local. Re-scanning the finished value recovers
+    /// those bytes before the aggregate escapes.
+    fn finish_aggregate(&mut self, value: &Value, build_epoch: u64) -> EvalResult<()> {
+        if self.scan_epoch != build_epoch || self.used_bytes() > self.limits.memory {
+            self.refresh_memory(Some(value))?;
+        }
+        Ok(())
+    }
+
+    /// Re-scan a value that stayed in a Rust local across an exact scan.
+    ///
+    /// Scans only see frames, so a value held by a builder or an interpolation
+    /// expression can lose its `pending_bytes` when a scan fires between its
+    /// evaluation and its first use.
+    fn pin_value(&mut self, value: &Value, eval_epoch: u64) -> EvalResult<()> {
+        if self.scan_epoch != eval_epoch {
+            self.refresh_memory(Some(value))?;
+        }
+        Ok(())
+    }
+
     fn refresh_memory(&mut self, extra: Option<&Value>) -> EvalResult<()> {
+        self.scan_epoch = self.scan_epoch.wrapping_add(1);
         let mut seen = HashSet::new();
         let mut total = 0u64;
         for frame in &self.frames {
@@ -655,7 +723,8 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         }
         self.census_bytes = total;
         self.pending_bytes = 0;
-        if total > self.limits.memory {
+        let live = total.saturating_add(self.log_bytes);
+        if live > self.limits.memory {
             Err(EvalError::Trap(Trap::OutOfMemory))
         } else {
             Ok(())
@@ -906,10 +975,11 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 }
             }
             NodeKind::ConvertStr(inner) => {
+                let epoch = self.scan_epoch;
                 let value = self.eval(inner)?;
                 self.charge(fuel::show_cost(value.meta().slots))?;
-                let mut text = String::new();
-                write_show(&mut text, &value, &self.program.types, true);
+                self.pin_value(&value, epoch)?;
+                let text = self.render_show(&value, true)?;
                 self.note_alloc(16 + text.len() as u64);
                 Ok(Value::str(text))
             }
@@ -1215,6 +1285,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         span: Span,
         post: u32,
     ) -> EvalResult<Value> {
+        let epoch = self.scan_epoch;
         let function = self.current_function();
         let mut values = Vec::with_capacity(range.len as usize);
         for offset in 0..range.len {
@@ -1235,10 +1306,12 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             Value::list(values)
         };
         self.check_value_depth(&value, span)?;
+        self.finish_aggregate(&value, epoch)?;
         Ok(value)
     }
 
     fn eval_map(&mut self, range: ChildRange, span: Span) -> EvalResult<Value> {
+        let epoch = self.scan_epoch;
         let function = self.current_function();
         let mut map = OrderedMap::new();
         for offset in (0..range.len).step_by(2) {
@@ -1259,6 +1332,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             let key = self.eval(key_id)?;
             let value = self.eval(value_id)?;
             let key_span = function.span(key_id).unwrap_or(span);
+            self.charge(map_key_cost(&key))?;
             let key = key_from_value(&key)
                 .map_err(|message| EvalError::Trap(self.panic(message, key_span)))?;
             map.insert(key, value);
@@ -1268,6 +1342,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         self.note_alloc(16 + 16 * map.len() as u64 + key_bytes);
         let value = Value::map(map);
         self.check_value_depth(&value, span)?;
+        self.finish_aggregate(&value, epoch)?;
         Ok(value)
     }
 
@@ -1279,6 +1354,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         span: Span,
         post: u32,
     ) -> EvalResult<Value> {
+        let epoch = self.scan_epoch;
         let program = self.program;
         let Some(def) = program.types.get(type_id) else {
             return self.trap(self.internal_panic("unknown struct type"));
@@ -1327,6 +1403,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         self.note_alloc(16 + 8 * declaration_len as u64);
         let value = Value::Struct(Rc::new(StructValue::new(type_id, fields)));
         self.check_value_depth(&value, span)?;
+        self.finish_aggregate(&value, epoch)?;
         Ok(value)
     }
 
@@ -1338,6 +1415,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         post: u32,
         span: Span,
     ) -> EvalResult<Value> {
+        let epoch = self.scan_epoch;
         let Some(Ty::Named(type_id, _)) = self.program.types.get_ty(ty) else {
             return self.trap(self.internal_panic("enum variant has no named type"));
         };
@@ -1364,6 +1442,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         self.note_alloc(16 + 8 * payload_count as u64);
         let value = Value::Enum(Rc::new(EnumValue::new(type_id, variant as usize, payload)));
         self.check_value_depth(&value, span)?;
+        self.finish_aggregate(&value, epoch)?;
         Ok(value)
     }
 
@@ -1863,11 +1942,25 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         }
     }
 
+    fn render_show(&mut self, value: &Value, top: bool) -> EvalResult<String> {
+        // Leave room for the string's own `Rc<str>` header; the text itself is
+        // the only allocation this builder may grow into.
+        let limit = self.memory_headroom(Some(value))?.saturating_sub(16);
+        let limit = limit.min(usize::MAX as u64) as usize;
+        let mut out = ShowOutput::new(limit);
+        write_show(&mut out, value, &self.program.types, top);
+        if out.is_overflowed() {
+            return self.trap(Trap::OutOfMemory);
+        }
+        Ok(out.into_string())
+    }
+
     fn eval_string(&mut self, range: ChildRange) -> EvalResult<Value> {
         let function = self.current_function();
         let parts = function.str_part_slice(range);
-        let mut out = String::new();
-        let mut show_slots = 0u64;
+        let limit = self.memory_headroom(None)?.saturating_sub(16);
+        let limit = limit.min(usize::MAX as u64) as usize;
+        let mut out = ShowOutput::new(limit);
         for part in parts {
             match part {
                 martite_ir::StrPart::Text(id) => {
@@ -1876,13 +1969,28 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     }
                 }
                 martite_ir::StrPart::Expr(expr) => {
+                    let epoch = self.scan_epoch;
                     let value = self.eval(*expr)?;
-                    show_slots += fuel::show_cost(value.meta().slots);
+                    // Charge the show cost before the expansion allocates. A
+                    // shared DAG can expand exponentially, so charging after
+                    // the write let it allocate far past the fuel budget.
+                    self.charge(fuel::show_cost(value.meta().slots))?;
+                    self.pin_value(&value, epoch)?;
+                    // Evaluating the expression may itself have grown the live
+                    // heap; tighten the output cap before writing.
+                    let limit = self.memory_headroom(Some(&value))?.saturating_sub(16);
+                    out.set_limit(limit.min(usize::MAX as u64) as usize);
                     write_show(&mut out, &value, &self.program.types, true);
                 }
             }
+            if out.is_overflowed() {
+                return self.trap(Trap::OutOfMemory);
+            }
         }
-        self.charge(show_slots)?;
+        if out.is_overflowed() {
+            return self.trap(Trap::OutOfMemory);
+        }
+        let out = out.into_string();
         self.charge(fuel::string_cost(out.len() as u64))?;
         self.note_alloc(16 + out.len() as u64);
         Ok(Value::str(out))
@@ -2097,7 +2205,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         }
     }
 
-    fn read_place(&self, place: &Place) -> EvalResult<Value> {
+    fn read_place(&mut self, place: &Place) -> EvalResult<Value> {
         let mut value = self
             .frames
             .last()
@@ -2124,6 +2232,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     items[*index as usize].clone()
                 }
                 (Value::Map(map), Accessor::Index(key)) => {
+                    self.charge(map_key_cost(key))?;
                     let key = key_from_value(key)
                         .map_err(|message| EvalError::Trap(self.internal_panic(message)))?;
                     map.get(&key)
@@ -2275,6 +2384,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     if value_depth_exceeds(index_value, child_remaining) {
                         return Err(EvalError::Trap(Trap::DepthExceeded));
                     }
+                    self.charge(map_key_cost(index_value))?;
                     let key = key_from_value(index_value)
                         .map_err(|message| EvalError::Trap(self.internal_panic(message)))?;
                     let slots = map.len().saturating_mul(2);
@@ -2379,6 +2489,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     Ok(taken)
                 }
                 Value::Map(map) => {
+                    self.charge(map_key_cost(index_value))?;
                     let key = key_from_value(index_value)
                         .map_err(|message| EvalError::Trap(self.internal_panic(message)))?;
                     let slots = map.len().saturating_mul(2);
@@ -2456,8 +2567,10 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 let Some((start, end)) = slice_bounds(start, end, inclusive, len) else {
                     return self.trap(self.panic("invalid list slice", span));
                 };
+                let slice_len = end - start;
+                self.charge(fuel::slot_cost(slice_len as u64))?;
+                self.ensure_output_capacity(16 + 8 * slice_len as u64)?;
                 let slice = items[start..end].to_vec();
-                self.charge(fuel::slot_cost(slice.len() as u64))?;
                 self.note_alloc(16 + 8 * slice.len() as u64);
                 let value = Value::list(slice);
                 self.check_value_depth(&value, span)?;
@@ -2471,17 +2584,35 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     inclusive,
                 },
             ) => {
-                let chars: Vec<char> = text.chars().collect();
-                let len = chars.len() as i64;
-                let Some((start, end)) = slice_bounds(start, end, inclusive, len) else {
+                // Slicing scans to find character boundaries. Validate first so
+                // an invalid slice keeps its panic (and its fuel) unchanged,
+                // then charge the input bytes the scan touched.
+                let char_count = text.chars().count() as i64;
+                let Some((start, end)) = slice_bounds(start, end, inclusive, char_count) else {
                     return self.trap(self.panic("invalid string slice", span));
                 };
-                let out: String = chars[start..end].iter().collect();
-                self.charge(fuel::string_cost(out.len() as u64))?;
+                self.charge(fuel::string_cost(text.len() as u64))?;
+                let start_byte = text
+                    .char_indices()
+                    .nth(start)
+                    .map(|(byte, _)| byte)
+                    .unwrap_or(text.len());
+                let end_byte = if end as i64 == char_count {
+                    text.len()
+                } else {
+                    text.char_indices()
+                        .nth(end)
+                        .map(|(byte, _)| byte)
+                        .unwrap_or(text.len())
+                };
+                let out = &text[start_byte..end_byte];
+                self.ensure_output_capacity(16 + out.len() as u64)?;
+                let out = out.to_string();
                 self.note_alloc(16 + out.len() as u64);
                 Ok(Value::str(out))
             }
             (Value::Map(map), key) => {
+                self.charge(map_key_cost(&key))?;
                 let key = key_from_value(&key)
                     .map_err(|message| EvalError::Trap(self.panic(message, span)))?;
                 map.get(&key)
@@ -2601,6 +2732,7 @@ mod tests {
         ParamInfo, Pattern, PatternId, Slot, SlotInfo, StrId, TyId,
     };
     use smallvec::SmallVec;
+    use std::collections::HashSet;
     use std::rc::Rc;
 
     fn expression(kind: NodeKind) -> Node {
@@ -3046,6 +3178,156 @@ mod tests {
                 .call_function(FnId::new(1), CallArgs::new())
                 .expect("the runtime recovers"),
             Value::Int(42)
+        );
+    }
+
+    fn accounting_limits(fuel: u64, memory: u64) -> ExecLimits {
+        ExecLimits {
+            fuel,
+            memory,
+            depth: 200,
+            deadline: None,
+        }
+    }
+
+    fn shared_dag(levels: usize) -> Value {
+        let mut value = Value::Unit;
+        for _ in 0..levels {
+            value = Value::list(vec![value.clone(), value]);
+        }
+        value
+    }
+
+    fn interpolation_program(levels: usize) -> IrProgram {
+        let mut function = empty_function(0);
+        function.name = "main".into();
+        let mut nodes = vec![expression(NodeKind::Int(ConstId::new(0)))];
+        let mut children = Vec::new();
+        let mut current = IrId::new(0);
+        for _ in 0..levels {
+            let start = children.len() as u32;
+            children.push(current);
+            children.push(current);
+            let id = IrId::new(nodes.len() as u32);
+            nodes.push(zero(NodeKind::List(ChildRange::new(start, 2))));
+            current = id;
+        }
+        let interp = IrId::new(nodes.len() as u32);
+        nodes.push(zero(NodeKind::StrInterp(ChildRange::new(0, 1))));
+        let mut function = finish(function, nodes, children);
+        function.str_parts = vec![martite_ir::StrPart::Expr(current)];
+        function.body = Some(interp);
+        IrProgram {
+            fns: vec![function],
+            consts: vec![ConstValue::Int(1)],
+            entries: Entries {
+                main: Some(FnId::new(0)),
+                ..Entries::default()
+            },
+            ..IrProgram::default()
+        }
+    }
+
+    #[test]
+    fn interpolation_charges_before_expanding_a_shared_dag() {
+        let program = interpolation_program(18);
+
+        let mut runtime = IrRuntime::new(&program, accounting_limits(10_000_000, 4096));
+        let error = runtime
+            .run_main()
+            .expect_err("the expansion must be capped");
+        assert!(
+            matches!(error, Trap::OutOfMemory),
+            "memory cap trap: {error:?}"
+        );
+
+        let mut runtime = IrRuntime::new(&program, accounting_limits(1000, 8 << 20));
+        let error = runtime
+            .run_main()
+            .expect_err("show fuel is charged before the write");
+        assert!(
+            matches!(error, Trap::OutOfFuel),
+            "fuel trap before allocation: {error:?}"
+        );
+    }
+
+    #[test]
+    fn interpolation_output_is_unchanged() {
+        let program = interpolation_program(3);
+        let mut runtime = IrRuntime::new(&program, accounting_limits(1_000_000, 8 << 20));
+        let result = runtime.run_main().expect("small interpolation");
+        assert_eq!(
+            super::show(&result.value, &program.types, true),
+            "[[[1, 1], [1, 1]], [[1, 1], [1, 1]]]"
+        );
+    }
+
+    #[test]
+    fn shared_dag_show_stays_inside_the_memory_limit() {
+        let program = IrProgram::default();
+        let value = shared_dag(18);
+        let mut runtime = IrRuntime::new(&program, accounting_limits(10_000_000, 4096));
+        let error = runtime
+            .render_show(&value, true)
+            .expect_err("the expansion must be capped");
+        assert!(
+            matches!(error, super::EvalError::Trap(Trap::OutOfMemory)),
+            "{error:?}"
+        );
+
+        let mut out = crate::ops::ShowOutput::new(4096);
+        super::write_show(&mut out, &value, &program.types, true);
+        assert!(out.is_overflowed());
+        assert!(
+            out.capacity() <= 4096,
+            "output capacity {} exceeded the memory cap",
+            out.capacity()
+        );
+    }
+
+    #[test]
+    fn bounded_show_matches_the_normative_format() {
+        let program = IrProgram::default();
+        let value = Value::list(vec![
+            Value::str("a\"b\n"),
+            Value::Int(7),
+            Value::tuple(vec![Value::Bool(false)]),
+        ]);
+        let mut runtime = IrRuntime::new(&program, accounting_limits(1_000_000, 8 << 20));
+        let rendered = runtime.render_show(&value, true).expect("small output");
+        assert_eq!(rendered, super::show(&value, &program.types, true));
+    }
+
+    #[test]
+    fn a_shared_aggregate_is_rescanned_after_a_pending_bytes_reset() {
+        let program = IrProgram::default();
+
+        let mut runtime = IrRuntime::new(&program, accounting_limits(1_000_000, 4096));
+        let epoch = runtime.scan_epoch;
+        runtime.note_alloc(1024);
+        runtime.refresh_memory(None).expect("the initial scan fits");
+        assert_eq!(runtime.pending_bytes, 0);
+
+        let inner = Value::list(vec![Value::str("abcd")]);
+        let value = Value::list(vec![inner.clone(), inner]);
+        let bytes = value.size_bytes(&mut HashSet::new());
+        runtime.note_alloc(16 + 16);
+        runtime
+            .finish_aggregate(&value, epoch)
+            .expect("the finished aggregate is rescanned");
+        assert_eq!(runtime.census_bytes, bytes);
+
+        let mut tight = IrRuntime::new(&program, accounting_limits(1_000_000, 50));
+        let epoch = tight.scan_epoch;
+        tight.note_alloc(16);
+        tight.refresh_memory(None).expect("the initial scan fits");
+        tight.note_alloc(32);
+        let error = tight
+            .finish_aggregate(&value, epoch)
+            .expect_err("the lost in-flight bytes are recovered");
+        assert!(
+            matches!(error, super::EvalError::Trap(Trap::OutOfMemory)),
+            "{error:?}"
         );
     }
 }
