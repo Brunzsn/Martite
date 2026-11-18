@@ -1081,6 +1081,118 @@ fn valid_match_verifies() {
     valid_match_program().verify().expect("match program");
 }
 
+#[test]
+fn accepts_exhaustive_bool_match_without_wildcard() {
+    let mut program = valid_match_program();
+    let bool_ty = program.types.intern_ty(Ty::Bool);
+    program.fns[0].params[0].ty = bool_ty;
+    program.fns[0].slot_info[0].ty = bool_ty;
+    program.fns[0].nodes[0].ty = bool_ty;
+    program.fns[0].patterns = vec![Pattern::Bool(true), Pattern::Bool(false)];
+    program
+        .verify()
+        .expect("an exhaustive bool match needs no wildcard");
+}
+
+#[test]
+fn accepts_exhaustive_enum_match_without_wildcard() {
+    let mut program = valid_match_program();
+    let choice_id = program.types.add_def(TypeDef {
+        name: "Choice".into(),
+        kind: TypeDefKind::Enum {
+            variants: vec![
+                martite_ir::VariantDef {
+                    name: "First".into(),
+                    payload: Vec::new(),
+                },
+                martite_ir::VariantDef {
+                    name: "Second".into(),
+                    payload: Vec::new(),
+                },
+            ],
+        },
+        params: 0,
+        is_interface: false,
+        is_builtin: false,
+    });
+    let choice = program.types.intern_ty(Ty::Named(choice_id, Vec::new()));
+    program.fns[0].params[0].ty = choice;
+    program.fns[0].slot_info[0].ty = choice;
+    program.fns[0].nodes[0].ty = choice;
+    for index in [0, 3, 4, 5] {
+        program.fns[0].nodes[index].effects |= Effects::SHARES;
+    }
+    program.fns[0].patterns = vec![
+        Pattern::Variant {
+            type_id: choice_id,
+            variant: 0,
+            args: Vec::new(),
+        },
+        Pattern::Variant {
+            type_id: choice_id,
+            variant: 1,
+            args: Vec::new(),
+        },
+    ];
+    program
+        .verify()
+        .expect("every enum variant is covered without a wildcard");
+}
+
+#[test]
+fn accepts_exhaustive_match_over_variant_payloads() {
+    let mut program = valid_match_program();
+    let bool_ty = program.types.intern_ty(Ty::Bool);
+    let choice_id = program.types.add_def(TypeDef {
+        name: "Choice".into(),
+        kind: TypeDefKind::Enum {
+            variants: vec![martite_ir::VariantDef {
+                name: "Only".into(),
+                payload: vec![bool_ty],
+            }],
+        },
+        params: 0,
+        is_interface: false,
+        is_builtin: false,
+    });
+    let choice = program.types.intern_ty(Ty::Named(choice_id, Vec::new()));
+    program.fns[0].params[0].ty = choice;
+    program.fns[0].slot_info[0].ty = choice;
+    program.fns[0].nodes[0].ty = choice;
+    for index in [0, 3, 4, 5] {
+        program.fns[0].nodes[index].effects |= Effects::SHARES;
+    }
+    program.fns[0].patterns = vec![
+        Pattern::Variant {
+            type_id: choice_id,
+            variant: 0,
+            args: vec![Pattern::Bool(true)],
+        },
+        Pattern::Variant {
+            type_id: choice_id,
+            variant: 0,
+            args: vec![Pattern::Bool(false)],
+        },
+    ];
+    program
+        .verify()
+        .expect("the singleton variant's bool payload is fully covered");
+}
+
+#[test]
+fn rejects_non_exhaustive_match() {
+    let mut program = valid_match_program();
+    program.fns[0].patterns[1] = Pattern::Int(2);
+    let error = program.verify().expect_err("match falls through");
+    assert!(
+        matches!(
+            error.kind,
+            VerifyErrorKind::ControlFlow { context } if context.contains("exhaustive")
+        ),
+        "{error:?}"
+    );
+}
+
 fn host_program(grants: Vec<Box<str>>) -> IrProgram {
     let mut types = TypeTable::default();
     let unit = types.intern_ty(Ty::Unit);
@@ -2262,5 +2374,91 @@ fn rejects_match_arm_binding_shared_with_another_arm() {
             context: "match arm binding slot is shared with another arm",
             ..
         }
+    ));
+}
+
+#[test]
+fn rejects_value_call_argc_overflow() {
+    let mut program = duplicate_mut_program();
+    program.fns[1].nodes[4].kind = NodeKind::CallValue {
+        first_child: 0,
+        argc: u32::MAX,
+    };
+    assert!(matches!(
+        error_kind(program),
+        VerifyErrorKind::ChildRange { .. }
+    ));
+}
+
+#[test]
+fn rejects_value_call_with_a_short_child_arena() {
+    let mut program = duplicate_mut_program();
+    let int = type_id(&program, Ty::Int);
+    let unit = type_id(&program, Ty::Unit);
+    let fn_ty = program.types.intern_ty(Ty::Fn(vec![int, int], unit));
+    let fn_ref = IrId::new(program.fns[1].nodes.len() as u32);
+    program.fns[1].nodes.push(node(
+        NodeKind::FnRef(FnId::new(0)),
+        fn_ty,
+        Charge::expression(),
+        Effects::NONE,
+    ));
+    program.fns[1].spans.push(Span::empty(0));
+    program.fns[1].synthetic.push(None);
+    program.fns[1].safepoints.push(false);
+    program.fns[1].nodes[4].kind = NodeKind::CallValue {
+        first_child: 0,
+        argc: 2,
+    };
+    program.fns[1].children = vec![fn_ref];
+    assert!(matches!(
+        error_kind(program),
+        VerifyErrorKind::ChildRange { .. }
+    ));
+}
+
+#[test]
+fn rejects_over_deep_type_nesting() {
+    let mut program = valid_program();
+    let depth = martite_ir::MAX_NODE_DEPTH as usize + 100;
+    let start = program.types.tys.len() as u32;
+    for index in 0..depth {
+        let next = TyId::new(start + index as u32 + 1);
+        program.types.add_ty(Ty::List(next));
+    }
+    program.types.add_ty(Ty::Int);
+    assert!(matches!(
+        error_kind(program),
+        VerifyErrorKind::TypeTable { context, .. } if context.contains("depth")
+    ));
+}
+
+#[test]
+fn rejects_over_deep_const_nesting() {
+    let mut program = valid_program();
+    let depth = martite_ir::MAX_NODE_DEPTH as usize + 100;
+    let mut value = ConstValue::Int(0);
+    for _ in 0..depth {
+        value = ConstValue::List(std::rc::Rc::from(vec![value]));
+    }
+    program.consts.push(value);
+    assert!(matches!(
+        error_kind(program),
+        VerifyErrorKind::Const { context, .. } if context.contains("depth")
+    ));
+}
+
+#[test]
+fn rejects_over_deep_pattern_nesting() {
+    let mut program = valid_program();
+    let depth = martite_ir::MAX_NODE_DEPTH as usize + 100;
+    let mut pattern = Pattern::Wild;
+    for _ in 0..depth {
+        pattern = Pattern::Tuple(vec![pattern]);
+    }
+    program.fns[0].patterns.push(pattern);
+    assert!(matches!(
+        error_kind(program),
+        VerifyErrorKind::PatternShape { context, .. } if context.contains("depth")
     ));
 }
