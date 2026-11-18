@@ -471,7 +471,8 @@ impl<'a> Checker<'a> {
         infer: &mut Infer,
     ) -> HashMap<String, (BindingId, Ty)> {
         let mut bindings = HashMap::new();
-        self.check_pattern_with(pat, ty, mode, mutable, &mut bindings, infer);
+        let mut seen = HashSet::new();
+        self.check_pattern_with(pat, ty, mode, mutable, &mut bindings, &mut seen, infer);
         if mode != PatMode::Match && !self.is_irrefutable(pat, ty) {
             let module = self.current_module();
             self.err_at(
@@ -491,12 +492,25 @@ impl<'a> Checker<'a> {
         mode: PatMode,
         mutable: bool,
         bindings: &mut HashMap<String, (BindingId, Ty)>,
+        seen: &mut HashSet<String>,
         infer: &mut Infer,
     ) {
         let module = self.current_module();
         match &pat.kind {
             PatKind::Wild => {}
             PatKind::Bind(name) => {
+                if !seen.insert(name.clone()) {
+                    self.err_at(
+                        module,
+                        pat.span,
+                        Code::E303,
+                        format!("`{name}` is bound more than once in this pattern"),
+                    );
+                    if let Some((id, _)) = bindings.get(name) {
+                        self.pattern_bindings.insert(pat.id, *id);
+                    }
+                    return;
+                }
                 if let Some((id, existing_ty)) = bindings.get(name) {
                     if !infer.matches(existing_ty, ty) {
                         self.err_at(
@@ -576,6 +590,7 @@ impl<'a> Checker<'a> {
                         mode,
                         mutable,
                         bindings,
+                        seen,
                         infer,
                     );
                 }
@@ -700,7 +715,7 @@ impl<'a> Checker<'a> {
                 }
                 self.pattern_resolutions.insert(pat.id, resolution);
                 for (arg, arg_ty) in args.iter().zip(payload.iter()) {
-                    self.check_pattern_with(arg, arg_ty, mode, mutable, bindings, infer);
+                    self.check_pattern_with(arg, arg_ty, mode, mutable, bindings, seen, infer);
                 }
             }
             PatKind::Struct { name, fields, rest } => {
@@ -781,6 +796,7 @@ impl<'a> Checker<'a> {
                             mode,
                             mutable,
                             bindings,
+                            seen,
                             infer,
                         );
                     } else {
@@ -820,14 +836,17 @@ impl<'a> Checker<'a> {
                     }
                 }
                 let base_names: HashSet<String> = bindings.keys().cloned().collect();
+                let outer_seen = seen.clone();
                 for alternative in alternatives {
                     let mut alternative_bindings = bindings.clone();
+                    let mut alternative_seen = outer_seen.clone();
                     self.check_pattern_with(
                         alternative,
                         ty,
                         mode,
                         mutable,
                         &mut alternative_bindings,
+                        &mut alternative_seen,
                         infer,
                     );
                     let names: HashSet<String> = alternative_bindings.keys().cloned().collect();
@@ -851,6 +870,9 @@ impl<'a> Checker<'a> {
                             }
                         }
                     }
+                }
+                for (name, _) in &first_bindings {
+                    seen.insert(name.clone());
                 }
             }
         }

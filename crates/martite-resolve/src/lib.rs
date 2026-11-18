@@ -366,8 +366,12 @@ impl<'a> Loader<'a> {
             return true;
         }
         let has_interface = self.interfaces.contains_key(path);
+        // Module path segments are snake_case identifiers. A Pascal or
+        // SCREAMING final segment names an item, not a module, so probing
+        // `<it>.mt` would let a case-insensitive filesystem match an
+        // unrelated module file (for example `a/point.mt` for `use a.Point`).
         let file = Self::module_file(path);
-        let has_file = self.read_file(&file).is_some();
+        let has_file = path.split('.').all(is_snake_case) && self.read_file(&file).is_some();
         if has_interface && has_file && !self.conflicts.contains(path) {
             self.conflicts.insert(path.to_string());
             self.diag(
@@ -1601,5 +1605,91 @@ mod tests {
             "main.mt",
         );
         assert!(out.diagnostics.iter().any(|d| d.code == Code::E102));
+    }
+
+    /// Mimics a case-insensitive filesystem such as NTFS, where probing
+    /// `a/Point.mt` can open `a/point.mt`.
+    struct CaseInsensitiveProvider {
+        files: HashMap<String, String>,
+    }
+
+    impl SourceProvider for CaseInsensitiveProvider {
+        fn read(&self, path: &str) -> Result<String, String> {
+            self.files
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(path))
+                .map(|(_, text)| text.clone())
+                .ok_or_else(|| format!("file not found: {path}"))
+        }
+    }
+
+    #[test]
+    fn item_shaped_import_is_not_probed_as_a_module_file() {
+        let mut files = HashMap::new();
+        files.insert("main.mt".into(), "use a.Point\nfn main() { }\n".into());
+        files.insert("a.mt".into(), "pub struct Point { x: int }\n".into());
+        files.insert("a/point.mt".into(), "pub struct Broken {\n".into());
+        let provider = CaseInsensitiveProvider { files };
+
+        let mut sources = SourceMap::new();
+        let out = resolve(
+            &provider,
+            &ResolveOptions {
+                entry: "main.mt".into(),
+                interfaces: Vec::new(),
+                grants: Vec::new(),
+                limits: LoadLimits::default(),
+            },
+            &mut sources,
+        );
+        if !out.diagnostics.is_empty() {
+            for d in &out.diagnostics {
+                eprintln!("{}", d.render(&sources));
+            }
+        }
+        assert!(!out.has_errors(), "unexpected errors");
+        let program = out.program.expect("program");
+        assert!(
+            program.entry_module().symbols.types.contains_key("Point"),
+            "`use a.Point` must bind the type item"
+        );
+        assert!(
+            program.modules.iter().all(|m| m.path != "a.point"),
+            "the case-insensitive `a/point.mt` file must not be loaded as a module"
+        );
+    }
+
+    #[test]
+    fn snake_module_and_item_import_can_coexist() {
+        let mut files = HashMap::new();
+        files.insert(
+            "main.mt".into(),
+            "use a.point\nuse a.Point\nfn main() { let n = point.value() }\n".into(),
+        );
+        files.insert("a.mt".into(), "pub struct Point { x: int }\n".into());
+        files.insert("a/point.mt".into(), "pub fn value() -> int { 1 }\n".into());
+        let provider = CaseInsensitiveProvider { files };
+
+        let mut sources = SourceMap::new();
+        let out = resolve(
+            &provider,
+            &ResolveOptions {
+                entry: "main.mt".into(),
+                interfaces: Vec::new(),
+                grants: Vec::new(),
+                limits: LoadLimits::default(),
+            },
+            &mut sources,
+        );
+        if !out.diagnostics.is_empty() {
+            for d in &out.diagnostics {
+                eprintln!("{}", d.render(&sources));
+            }
+        }
+        assert!(!out.has_errors(), "unexpected errors");
+        let program = out.program.expect("program");
+        let symbols = &program.entry_module().symbols;
+        assert!(symbols.modules.contains_key("point"));
+        assert!(symbols.types.contains_key("Point"));
     }
 }
