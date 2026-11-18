@@ -17,7 +17,8 @@ use std::fmt;
 use martite_base::{SourceId, Span};
 
 use crate::analysis::{
-    DefiniteAssignment, check_slot_initialization, pattern_binding_set, pattern_binds_irrefutably,
+    DefiniteAssignment, check_slot_initialization, pattern_always_matches, pattern_binding_set,
+    pattern_binds_irrefutably,
 };
 use crate::builtin::{
     BuiltinEffects, BuiltinGenerics, BuiltinMethodDef, BuiltinReceiver, BuiltinTy,
@@ -581,6 +582,33 @@ impl<'a> Verifier<'a> {
     }
 
     fn check_ty_id(&self, id: TyId, states: &mut [TypeState]) -> Result<(), VerifyError> {
+        self.check_ty_id_depth(id, states, 0)
+    }
+
+    fn check_ty_id_depth(
+        &self,
+        id: TyId,
+        states: &mut [TypeState],
+        depth: u32,
+    ) -> Result<(), VerifyError> {
+        if depth > crate::MAX_NODE_DEPTH {
+            return Err(self.error(VerifyErrorKind::TypeTable {
+                context: "type nesting exceeds the verifier depth limit",
+                ty: Some(id),
+                def: None,
+            }));
+        }
+        stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
+            self.check_ty_id_inner(id, states, depth)
+        })
+    }
+
+    fn check_ty_id_inner(
+        &self,
+        id: TyId,
+        states: &mut [TypeState],
+        depth: u32,
+    ) -> Result<(), VerifyError> {
         let Some(state) = states.get_mut(id.index()) else {
             return Err(self.error(VerifyErrorKind::OutOfRange {
                 arena: Arena::Type,
@@ -611,19 +639,21 @@ impl<'a> Verifier<'a> {
             | Ty::Param(_) => {}
             Ty::Tuple(items) => {
                 for item in items {
-                    self.check_ty_id(item, states)?;
+                    self.check_ty_id_depth(item, states, depth + 1)?;
                 }
             }
-            Ty::List(item) | Ty::Option(item) => self.check_ty_id(item, states)?,
+            Ty::List(item) | Ty::Option(item) => {
+                self.check_ty_id_depth(item, states, depth + 1)?;
+            }
             Ty::Map(key, value) | Ty::Result(key, value) => {
-                self.check_ty_id(key, states)?;
-                self.check_ty_id(value, states)?;
+                self.check_ty_id_depth(key, states, depth + 1)?;
+                self.check_ty_id_depth(value, states, depth + 1)?;
             }
             Ty::Fn(params, ret) => {
                 for param in params {
-                    self.check_ty_id(param, states)?;
+                    self.check_ty_id_depth(param, states, depth + 1)?;
                 }
-                self.check_ty_id(ret, states)?;
+                self.check_ty_id_depth(ret, states, depth + 1)?;
             }
             Ty::Named(type_id, args) => {
                 let Some(def) = self.program.types.get(type_id) else {
@@ -641,7 +671,7 @@ impl<'a> Verifier<'a> {
                     }));
                 }
                 for arg in args {
-                    self.check_ty_id(arg, states)?;
+                    self.check_ty_id_depth(arg, states, depth + 1)?;
                 }
             }
         }
@@ -658,13 +688,42 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
-    #[allow(clippy::only_used_in_recursion)]
     fn check_const_value(
         &self,
         id: ConstId,
         value: &ConstValue,
         context: &'static str,
         seen: &mut HashSet<usize>,
+    ) -> Result<(), VerifyError> {
+        self.check_const_value_depth(id, value, context, seen, 0)
+    }
+
+    fn check_const_value_depth(
+        &self,
+        id: ConstId,
+        value: &ConstValue,
+        context: &'static str,
+        seen: &mut HashSet<usize>,
+        depth: u32,
+    ) -> Result<(), VerifyError> {
+        if depth > crate::MAX_NODE_DEPTH {
+            return Err(self.error(VerifyErrorKind::Const {
+                id,
+                context: "const nesting exceeds the verifier depth limit",
+            }));
+        }
+        stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
+            self.check_const_value_inner(id, value, context, seen, depth)
+        })
+    }
+
+    fn check_const_value_inner(
+        &self,
+        id: ConstId,
+        value: &ConstValue,
+        context: &'static str,
+        seen: &mut HashSet<usize>,
+        depth: u32,
     ) -> Result<(), VerifyError> {
         if let Some(addr) = const_payload_addr(value)
             && !seen.insert(addr)
@@ -678,14 +737,14 @@ impl<'a> Verifier<'a> {
             ConstValue::Str(str) => self.check_str(*str),
             ConstValue::Tuple(items) | ConstValue::List(items) => {
                 for item in items.iter() {
-                    self.check_const_value(id, item, context, seen)?;
+                    self.check_const_value_depth(id, item, context, seen, depth + 1)?;
                 }
                 Ok(())
             }
             ConstValue::Map(entries) => {
                 for (key, value) in entries.iter() {
-                    self.check_const_value(id, key, context, seen)?;
-                    self.check_const_value(id, value, context, seen)?;
+                    self.check_const_value_depth(id, key, context, seen, depth + 1)?;
+                    self.check_const_value_depth(id, value, context, seen, depth + 1)?;
                 }
                 Ok(())
             }
@@ -709,7 +768,7 @@ impl<'a> Verifier<'a> {
                     }));
                 }
                 for value in fields.iter() {
-                    self.check_const_value(id, value, context, seen)?;
+                    self.check_const_value_depth(id, value, context, seen, depth + 1)?;
                 }
                 Ok(())
             }
@@ -739,7 +798,7 @@ impl<'a> Verifier<'a> {
                     }));
                 }
                 for value in payload.iter() {
-                    self.check_const_value(id, value, context, seen)?;
+                    self.check_const_value_depth(id, value, context, seen, depth + 1)?;
                 }
                 Ok(())
             }
@@ -755,7 +814,7 @@ impl<'a> Verifier<'a> {
                     }));
                 }
                 for value in payload.iter() {
-                    self.check_const_value(id, value, context, seen)?;
+                    self.check_const_value_depth(id, value, context, seen, depth + 1)?;
                 }
                 Ok(())
             }
@@ -1170,6 +1229,37 @@ impl<'a> Verifier<'a> {
         id: PatternId,
         pattern: &Pattern,
     ) -> Result<(), VerifyError> {
+        self.check_pattern_structure_depth(function, id, pattern, 0)
+    }
+
+    fn check_pattern_structure_depth(
+        &self,
+        function: &IrFn,
+        id: PatternId,
+        pattern: &Pattern,
+        depth: u32,
+    ) -> Result<(), VerifyError> {
+        if depth > crate::MAX_NODE_DEPTH {
+            return Err(verify_error(
+                function,
+                VerifyErrorKind::PatternShape {
+                    pattern: id,
+                    context: "pattern nesting exceeds the verifier depth limit",
+                },
+            ));
+        }
+        stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
+            self.check_pattern_structure_inner(function, id, pattern, depth)
+        })
+    }
+
+    fn check_pattern_structure_inner(
+        &self,
+        function: &IrFn,
+        id: PatternId,
+        pattern: &Pattern,
+        depth: u32,
+    ) -> Result<(), VerifyError> {
         let error = |kind| verify_error(function, kind);
         match pattern {
             Pattern::Wild | Pattern::Int(_) | Pattern::Bool(_) => Ok(()),
@@ -1195,7 +1285,7 @@ impl<'a> Verifier<'a> {
             }
             Pattern::Tuple(items) => {
                 for item in items {
-                    self.check_pattern_structure(function, id, item)?;
+                    self.check_pattern_structure_depth(function, id, item, depth + 1)?;
                 }
                 Ok(())
             }
@@ -1230,7 +1320,7 @@ impl<'a> Verifier<'a> {
                     }));
                 }
                 for item in args {
-                    self.check_pattern_structure(function, id, item)?;
+                    self.check_pattern_structure_depth(function, id, item, depth + 1)?;
                 }
                 Ok(())
             }
@@ -1246,7 +1336,7 @@ impl<'a> Verifier<'a> {
                     }));
                 }
                 for item in args {
-                    self.check_pattern_structure(function, id, item)?;
+                    self.check_pattern_structure_depth(function, id, item, depth + 1)?;
                 }
                 Ok(())
             }
@@ -1273,7 +1363,7 @@ impl<'a> Verifier<'a> {
                         }));
                     }
                     seen.push(*offset);
-                    self.check_pattern_structure(function, id, item)?;
+                    self.check_pattern_structure_depth(function, id, item, depth + 1)?;
                 }
                 Ok(())
             }
@@ -1291,7 +1381,7 @@ impl<'a> Verifier<'a> {
                         }
                         Some(_) => {}
                     }
-                    self.check_pattern_structure(function, id, item)?;
+                    self.check_pattern_structure_depth(function, id, item, depth + 1)?;
                 }
                 Ok(())
             }
@@ -1337,6 +1427,601 @@ fn type_accepts_owned(
         return Ok(true);
     }
     type_equal(program, actual, expected)
+}
+
+/// Upper bound on the number of alternative rows one arm may expand to.
+const MAX_COVERAGE_ROWS: usize = 1024;
+/// Upper bound on the recursive usefulness steps for one match.
+const MAX_COVERAGE_STEPS: u32 = 20_000;
+/// Upper bound on the number of pattern columns in one query.
+const MAX_COVERAGE_WIDTH: usize = 1024;
+/// Upper bound on memo entries for one match.
+const MAX_COVERAGE_MEMO: usize = 4096;
+
+/// A constructor of a finite value space, mirroring the checker's
+/// exhaustiveness algorithm.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum CoverCtor {
+    Unit,
+    Bool(bool),
+    Int(i64),
+    Str(StrId),
+    Tuple(usize),
+    Struct(TypeId),
+    Variant(TypeId, u32),
+    Prelude(PreludeVariant),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Cover {
+    Wild,
+    Ctor(CoverCtor, Vec<Cover>),
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CoverageKey {
+    matrix: Vec<Vec<Cover>>,
+    vector: Vec<Cover>,
+    types: Vec<Ty>,
+}
+
+/// Match exhaustiveness over the IR pattern table.
+///
+/// Guards never contribute coverage, and an arm is one alternative row. The
+/// search is the checker's pattern-matrix algorithm: finite constructors
+/// (bool, unit, tuples, structs, enums and the prelude variants) are expanded
+/// until only wildcards remain. A step or expansion budget makes a query
+/// conservatively report "not exhaustive", which can only reject IR that the
+/// checker already refused.
+fn match_is_exhaustive(
+    program: &IrProgram,
+    function: &IrFn,
+    set: &MatchSet,
+    scrutinee: &Ty,
+) -> bool {
+    if matches!(scrutinee, Ty::Never) {
+        return true;
+    }
+    stacker::maybe_grow(64 * 1024, 16 * 1024 * 1024, || {
+        let mut unguarded = Vec::new();
+        for arm in &set.arms {
+            if arm.guard.is_some() {
+                continue;
+            }
+            let Some(pattern) = function.pattern(arm.pattern) else {
+                return false;
+            };
+            if pattern_always_matches(program, pattern) {
+                return true;
+            }
+            unguarded.push(pattern);
+        }
+        let mut coverage = Coverage::new(program);
+        let mut matrix = Vec::new();
+        for pattern in unguarded {
+            let mut alternatives = Vec::new();
+            coverage.expand(pattern, scrutinee, &mut alternatives);
+            if coverage.overflow {
+                return false;
+            }
+            for alternative in alternatives {
+                matrix.push(vec![alternative]);
+            }
+        }
+        coverage.exhaustive(&matrix, scrutinee)
+    })
+}
+
+struct Coverage<'a> {
+    program: &'a IrProgram,
+    steps: u32,
+    overflow: bool,
+    memo: HashMap<CoverageKey, bool>,
+}
+
+impl<'a> Coverage<'a> {
+    fn new(program: &'a IrProgram) -> Self {
+        Self {
+            program,
+            steps: 0,
+            overflow: false,
+            memo: HashMap::new(),
+        }
+    }
+
+    fn ty(&self, id: TyId) -> Option<Ty> {
+        self.program.types.get_ty(id).cloned()
+    }
+
+    fn exhaustive(&mut self, matrix: &[Vec<Cover>], scrutinee: &Ty) -> bool {
+        let vector = [Cover::Wild];
+        !self.query(matrix, &vector, std::slice::from_ref(scrutinee))
+    }
+
+    fn push(&mut self, out: &mut Vec<Cover>, value: Cover) {
+        if out.len() >= MAX_COVERAGE_ROWS {
+            self.overflow = true;
+        } else {
+            out.push(value);
+        }
+    }
+
+    fn column(&mut self, pattern: Option<&Pattern>, ty: &Ty) -> Vec<Cover> {
+        let mut out = Vec::new();
+        match pattern {
+            Some(pattern) => self.expand(pattern, ty, &mut out),
+            None => self.push(&mut out, Cover::Wild),
+        }
+        out
+    }
+
+    fn columns(&mut self, patterns: &[Pattern], tys: &[Ty]) -> Vec<Vec<Cover>> {
+        let mut columns = Vec::with_capacity(tys.len());
+        for (index, ty) in tys.iter().enumerate() {
+            columns.push(self.column(patterns.get(index), ty));
+        }
+        columns
+    }
+
+    /// Cartesian product of the per-column alternatives, bounded by
+    /// [`MAX_COVERAGE_ROWS`].
+    fn product(&mut self, columns: Vec<Vec<Cover>>) -> Vec<Vec<Cover>> {
+        let mut rows: Vec<Vec<Cover>> = vec![Vec::new()];
+        for alternatives in columns {
+            if self.overflow || alternatives.is_empty() {
+                return Vec::new();
+            }
+            if rows.len().saturating_mul(alternatives.len()) > MAX_COVERAGE_ROWS {
+                self.overflow = true;
+                return Vec::new();
+            }
+            let mut next = Vec::with_capacity(rows.len() * alternatives.len());
+            for prefix in &rows {
+                for alternative in &alternatives {
+                    let mut row = prefix.clone();
+                    row.push(alternative.clone());
+                    next.push(row);
+                }
+            }
+            rows = next;
+        }
+        rows
+    }
+
+    fn expand(&mut self, pattern: &Pattern, ty: &Ty, out: &mut Vec<Cover>) {
+        if self.overflow {
+            return;
+        }
+        match pattern {
+            Pattern::Wild | Pattern::Bind { .. } => self.push(out, Cover::Wild),
+            Pattern::Int(value) => {
+                self.push(out, Cover::Ctor(CoverCtor::Int(*value), Vec::new()));
+            }
+            Pattern::Bool(value) => {
+                self.push(out, Cover::Ctor(CoverCtor::Bool(*value), Vec::new()));
+            }
+            Pattern::Str(value) => {
+                self.push(out, Cover::Ctor(CoverCtor::Str(*value), Vec::new()));
+            }
+            Pattern::Tuple(items) => {
+                let Ty::Tuple(field_ids) = ty else {
+                    if items.is_empty() && matches!(ty, Ty::Unit) {
+                        self.push(out, Cover::Ctor(CoverCtor::Unit, Vec::new()));
+                    } else {
+                        self.overflow = true;
+                    }
+                    return;
+                };
+                if field_ids.len() != items.len() {
+                    self.overflow = true;
+                    return;
+                }
+                let field_tys: Vec<Ty> = field_ids
+                    .iter()
+                    .map(|id| self.ty(*id).unwrap_or(Ty::Never))
+                    .collect();
+                let columns = self.columns(items, &field_tys);
+                for args in self.product(columns) {
+                    self.push(out, Cover::Ctor(CoverCtor::Tuple(items.len()), args));
+                }
+            }
+            Pattern::Variant {
+                type_id,
+                variant,
+                args,
+            } => {
+                let Ty::Named(expected_id, type_args) = ty else {
+                    self.overflow = true;
+                    return;
+                };
+                if type_id != expected_id {
+                    self.overflow = true;
+                    return;
+                }
+                let Some(def) = self.program.types.get(*type_id) else {
+                    self.overflow = true;
+                    return;
+                };
+                let TypeDefKind::Enum { variants } = &def.kind else {
+                    self.overflow = true;
+                    return;
+                };
+                let Some(def_variant) = variants.get(*variant as usize) else {
+                    self.overflow = true;
+                    return;
+                };
+                let payload: Vec<Ty> = def_variant
+                    .payload
+                    .iter()
+                    .map(|id| substitute_ty(self.program, *id, type_args))
+                    .collect();
+                let columns = self.columns(args, &payload);
+                for row in self.product(columns) {
+                    self.push(
+                        out,
+                        Cover::Ctor(CoverCtor::Variant(*type_id, *variant), row),
+                    );
+                }
+            }
+            Pattern::Prelude { variant, args } => {
+                let payload: Vec<Ty> = match (variant, ty) {
+                    (PreludeVariant::None, Ty::Option(_)) => Vec::new(),
+                    (PreludeVariant::Some, Ty::Option(item)) => {
+                        vec![self.ty(*item).unwrap_or(Ty::Never)]
+                    }
+                    (PreludeVariant::Ok, Ty::Result(ok, _)) => {
+                        vec![self.ty(*ok).unwrap_or(Ty::Never)]
+                    }
+                    (PreludeVariant::Err, Ty::Result(_, err)) => {
+                        vec![self.ty(*err).unwrap_or(Ty::Never)]
+                    }
+                    _ => {
+                        self.overflow = true;
+                        return;
+                    }
+                };
+                let columns = self.columns(args, &payload);
+                for row in self.product(columns) {
+                    self.push(out, Cover::Ctor(CoverCtor::Prelude(*variant), row));
+                }
+            }
+            Pattern::Struct { type_id, fields } => {
+                let Ty::Named(expected_id, type_args) = ty else {
+                    self.overflow = true;
+                    return;
+                };
+                if type_id != expected_id {
+                    self.overflow = true;
+                    return;
+                }
+                let Some(def) = self.program.types.get(*type_id) else {
+                    self.overflow = true;
+                    return;
+                };
+                let TypeDefKind::Struct { fields: def_fields } = &def.kind else {
+                    self.overflow = true;
+                    return;
+                };
+                let field_tys: Vec<Ty> = def_fields
+                    .iter()
+                    .map(|field| substitute_ty(self.program, field.ty, type_args))
+                    .collect();
+                let mut seen = Vec::new();
+                for (offset, _) in fields {
+                    if *offset as usize >= field_tys.len() || seen.contains(offset) {
+                        self.overflow = true;
+                        return;
+                    }
+                    seen.push(*offset);
+                }
+                let mut columns = Vec::with_capacity(field_tys.len());
+                for (index, field_ty) in field_tys.iter().enumerate() {
+                    let pattern = fields
+                        .iter()
+                        .find(|(offset, _)| *offset as usize == index)
+                        .map(|(_, pattern)| pattern);
+                    columns.push(self.column(pattern, field_ty));
+                }
+                for row in self.product(columns) {
+                    self.push(out, Cover::Ctor(CoverCtor::Struct(*type_id), row));
+                }
+            }
+            Pattern::Or(items) => {
+                for item in items {
+                    self.expand(item, ty, out);
+                }
+            }
+        }
+    }
+
+    fn query(&mut self, matrix: &[Vec<Cover>], vector: &[Cover], types: &[Ty]) -> bool {
+        if matrix
+            .iter()
+            .any(|row| row.len() == vector.len() && row.iter().all(is_wild))
+        {
+            return false;
+        }
+        if vector.is_empty() {
+            return matrix.is_empty();
+        }
+        if vector.len() > MAX_COVERAGE_WIDTH
+            || types.len() != vector.len()
+            || self.steps >= MAX_COVERAGE_STEPS
+        {
+            return true;
+        }
+        self.steps += 1;
+
+        let cacheable =
+            matrix.len() <= 128 && vector.len() <= 16 && self.memo.len() < MAX_COVERAGE_MEMO;
+        let key = cacheable.then(|| CoverageKey {
+            matrix: matrix.to_vec(),
+            vector: vector.to_vec(),
+            types: types.to_vec(),
+        });
+        if let Some(key) = &key
+            && let Some(result) = self.memo.get(key)
+        {
+            return *result;
+        }
+
+        let result = self.useful(matrix, vector, types);
+        if let Some(key) = key {
+            self.memo.insert(key, result);
+        }
+        result
+    }
+
+    fn useful(&mut self, matrix: &[Vec<Cover>], vector: &[Cover], types: &[Ty]) -> bool {
+        let ty = &types[0];
+        match &vector[0] {
+            Cover::Ctor(ctor, args) => {
+                let ctor = ctor.clone();
+                let arity = args.len();
+                let specialized = specialize(matrix, &ctor, arity);
+                let mut new_vector = args.clone();
+                new_vector.extend_from_slice(&vector[1..]);
+                let mut new_types = self.argument_types(&ctor, ty);
+                new_types.resize(arity, Ty::Never);
+                new_types.extend_from_slice(&types[1..]);
+                self.query(&specialized, &new_vector, &new_types)
+            }
+            Cover::Wild => {
+                if let Some(all) = self.constructors(ty) {
+                    let present = head_constructors(matrix);
+                    let complete = all.iter().all(|ctor| present.contains(ctor))
+                        && present.iter().all(|ctor| all.contains(ctor));
+                    if complete {
+                        for ctor in all {
+                            let arity = self.arity(&ctor, ty);
+                            let specialized = specialize(matrix, &ctor, arity);
+                            let mut new_vector = vec![Cover::Wild; arity];
+                            new_vector.extend_from_slice(&vector[1..]);
+                            let mut new_types = self.argument_types(&ctor, ty);
+                            new_types.resize(arity, Ty::Never);
+                            new_types.extend_from_slice(&types[1..]);
+                            if self.query(&specialized, &new_vector, &new_types) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                }
+                let specialized = default_matrix(matrix);
+                self.query(&specialized, &vector[1..], &types[1..])
+            }
+        }
+    }
+
+    fn constructors(&self, ty: &Ty) -> Option<Vec<CoverCtor>> {
+        match ty {
+            Ty::Never => Some(Vec::new()),
+            Ty::Bool => Some(vec![CoverCtor::Bool(false), CoverCtor::Bool(true)]),
+            Ty::Unit => Some(vec![CoverCtor::Unit]),
+            Ty::Tuple(items) => Some(vec![CoverCtor::Tuple(items.len())]),
+            Ty::Option(_) => Some(vec![
+                CoverCtor::Prelude(PreludeVariant::None),
+                CoverCtor::Prelude(PreludeVariant::Some),
+            ]),
+            Ty::Result(_, _) => Some(vec![
+                CoverCtor::Prelude(PreludeVariant::Ok),
+                CoverCtor::Prelude(PreludeVariant::Err),
+            ]),
+            Ty::Named(id, _) => match &self.program.types.get(*id)?.kind {
+                TypeDefKind::Enum { variants } => Some(
+                    variants
+                        .iter()
+                        .enumerate()
+                        .map(|(index, _)| CoverCtor::Variant(*id, index as u32))
+                        .collect(),
+                ),
+                TypeDefKind::Struct { .. } => Some(vec![CoverCtor::Struct(*id)]),
+                TypeDefKind::Opaque => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn arity(&self, ctor: &CoverCtor, _ty: &Ty) -> usize {
+        match ctor {
+            CoverCtor::Unit | CoverCtor::Bool(_) | CoverCtor::Int(_) | CoverCtor::Str(_) => 0,
+            CoverCtor::Tuple(len) => *len,
+            CoverCtor::Struct(id) => match self.program.types.get(*id).map(|def| &def.kind) {
+                Some(TypeDefKind::Struct { fields }) => fields.len(),
+                _ => 0,
+            },
+            CoverCtor::Variant(id, index) => self
+                .program
+                .types
+                .get(*id)
+                .and_then(|def| match &def.kind {
+                    TypeDefKind::Enum { variants } => variants.get(*index as usize),
+                    _ => None,
+                })
+                .map(|variant| variant.payload.len())
+                .unwrap_or(0),
+            CoverCtor::Prelude(variant) => match variant {
+                PreludeVariant::None => 0,
+                PreludeVariant::Some | PreludeVariant::Ok | PreludeVariant::Err => 1,
+            },
+        }
+    }
+
+    fn argument_types(&self, ctor: &CoverCtor, ty: &Ty) -> Vec<Ty> {
+        match ctor {
+            CoverCtor::Tuple(len) => match ty {
+                Ty::Tuple(items) if items.len() == *len => items
+                    .iter()
+                    .map(|id| self.ty(*id).unwrap_or(Ty::Never))
+                    .collect(),
+                _ => vec![Ty::Never; *len],
+            },
+            CoverCtor::Struct(id) => {
+                if let Ty::Named(_, type_args) = ty
+                    && let Some(def) = self.program.types.get(*id)
+                    && let TypeDefKind::Struct { fields } = &def.kind
+                {
+                    return fields
+                        .iter()
+                        .map(|field| substitute_ty(self.program, field.ty, type_args))
+                        .collect();
+                }
+                vec![Ty::Never; self.arity(ctor, ty)]
+            }
+            CoverCtor::Variant(id, index) => {
+                if let Ty::Named(_, type_args) = ty
+                    && let Some(def) = self.program.types.get(*id)
+                    && let TypeDefKind::Enum { variants } = &def.kind
+                    && let Some(variant) = variants.get(*index as usize)
+                {
+                    return variant
+                        .payload
+                        .iter()
+                        .map(|payload| substitute_ty(self.program, *payload, type_args))
+                        .collect();
+                }
+                vec![Ty::Never; self.arity(ctor, ty)]
+            }
+            CoverCtor::Prelude(variant) => match (variant, ty) {
+                (PreludeVariant::None, _) => Vec::new(),
+                (PreludeVariant::Some, Ty::Option(item)) => {
+                    vec![self.ty(*item).unwrap_or(Ty::Never)]
+                }
+                (PreludeVariant::Ok, Ty::Result(ok, _)) => {
+                    vec![self.ty(*ok).unwrap_or(Ty::Never)]
+                }
+                (PreludeVariant::Err, Ty::Result(_, err)) => {
+                    vec![self.ty(*err).unwrap_or(Ty::Never)]
+                }
+                _ => vec![Ty::Never],
+            },
+            CoverCtor::Unit | CoverCtor::Bool(_) | CoverCtor::Int(_) | CoverCtor::Str(_) => {
+                Vec::new()
+            }
+        }
+    }
+}
+
+fn is_wild(cover: &Cover) -> bool {
+    matches!(cover, Cover::Wild)
+}
+
+fn specialize(matrix: &[Vec<Cover>], ctor: &CoverCtor, arity: usize) -> Vec<Vec<Cover>> {
+    let mut out = Vec::new();
+    for row in matrix {
+        let Some(head) = row.first() else {
+            continue;
+        };
+        match head {
+            Cover::Wild => {
+                let mut new_row = vec![Cover::Wild; arity];
+                new_row.extend_from_slice(&row[1..]);
+                out.push(new_row);
+            }
+            Cover::Ctor(row_ctor, args) if row_ctor == ctor => {
+                let mut new_row = args.clone();
+                new_row.extend_from_slice(&row[1..]);
+                out.push(new_row);
+            }
+            Cover::Ctor(..) => {}
+        }
+    }
+    out
+}
+
+fn default_matrix(matrix: &[Vec<Cover>]) -> Vec<Vec<Cover>> {
+    matrix
+        .iter()
+        .filter_map(|row| match row.first() {
+            Some(Cover::Wild) => Some(row[1..].to_vec()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn head_constructors(matrix: &[Vec<Cover>]) -> Vec<CoverCtor> {
+    let mut out = Vec::new();
+    for row in matrix {
+        if let Some(Cover::Ctor(ctor, _)) = row.first()
+            && !out.contains(ctor)
+        {
+            out.push(ctor.clone());
+        }
+    }
+    out
+}
+
+/// Substitute a named type's generic parameters with the scrutinee's type
+/// arguments, one structural level at a time.
+fn substitute_ty(program: &IrProgram, ty: TyId, args: &[TyId]) -> Ty {
+    let Some(value) = program.types.get_ty(ty) else {
+        return Ty::Never;
+    };
+    match value {
+        Ty::Param(index) => args
+            .get(*index as usize)
+            .and_then(|id| program.types.get_ty(*id))
+            .cloned()
+            .unwrap_or(Ty::Never),
+        Ty::Tuple(items) => Ty::Tuple(
+            items
+                .iter()
+                .map(|item| substitute_ty_id(program, *item, args))
+                .collect(),
+        ),
+        Ty::List(item) => Ty::List(substitute_ty_id(program, *item, args)),
+        Ty::Map(key, value) => Ty::Map(
+            substitute_ty_id(program, *key, args),
+            substitute_ty_id(program, *value, args),
+        ),
+        Ty::Option(item) => Ty::Option(substitute_ty_id(program, *item, args)),
+        Ty::Result(ok, err) => Ty::Result(
+            substitute_ty_id(program, *ok, args),
+            substitute_ty_id(program, *err, args),
+        ),
+        Ty::Fn(params, ret) => Ty::Fn(
+            params
+                .iter()
+                .map(|param| substitute_ty_id(program, *param, args))
+                .collect(),
+            substitute_ty_id(program, *ret, args),
+        ),
+        Ty::Named(type_id, type_args) => Ty::Named(
+            *type_id,
+            type_args
+                .iter()
+                .map(|arg| substitute_ty_id(program, *arg, args))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn substitute_ty_id(program: &IrProgram, ty: TyId, args: &[TyId]) -> TyId {
+    match program.types.get_ty(ty) {
+        Some(Ty::Param(index)) => args.get(*index as usize).copied().unwrap_or(ty),
+        _ => ty,
+    }
 }
 
 fn type_equal(program: &IrProgram, actual: &Ty, expected: &Ty) -> Result<bool, VerifyError> {
@@ -2145,54 +2830,7 @@ impl<'p> FnCheck<'p> {
     }
 
     fn substitute(&self, ty: TyId, args: &[TyId]) -> Ty {
-        let Some(value) = self.program.types.get_ty(ty) else {
-            return Ty::Never;
-        };
-        match value {
-            Ty::Param(index) => args
-                .get(*index as usize)
-                .and_then(|id| self.program.types.get_ty(*id))
-                .cloned()
-                .unwrap_or(Ty::Never),
-            Ty::Tuple(items) => Ty::Tuple(
-                items
-                    .iter()
-                    .map(|item| self.substitute_id(*item, args))
-                    .collect(),
-            ),
-            Ty::List(item) => Ty::List(self.substitute_id(*item, args)),
-            Ty::Map(key, value) => Ty::Map(
-                self.substitute_id(*key, args),
-                self.substitute_id(*value, args),
-            ),
-            Ty::Option(item) => Ty::Option(self.substitute_id(*item, args)),
-            Ty::Result(ok, err) => Ty::Result(
-                self.substitute_id(*ok, args),
-                self.substitute_id(*err, args),
-            ),
-            Ty::Fn(params, ret) => Ty::Fn(
-                params
-                    .iter()
-                    .map(|param| self.substitute_id(*param, args))
-                    .collect(),
-                self.substitute_id(*ret, args),
-            ),
-            Ty::Named(type_id, type_args) => Ty::Named(
-                *type_id,
-                type_args
-                    .iter()
-                    .map(|arg| self.substitute_id(*arg, args))
-                    .collect(),
-            ),
-            other => other.clone(),
-        }
-    }
-
-    fn substitute_id(&self, ty: TyId, args: &[TyId]) -> TyId {
-        match self.program.types.get_ty(ty) {
-            Some(Ty::Param(index)) => args.get(*index as usize).copied().unwrap_or(ty),
-            _ => ty,
-        }
+        substitute_ty(self.program, ty, args)
     }
 
     fn check_value_node(&mut self, id: IrId, node: Node) -> Result<Ty, VerifyError> {
@@ -3345,7 +3983,17 @@ impl<'p> FnCheck<'p> {
     }
 
     fn check_child_count(&self, first: u32, count: u32) -> Result<(), VerifyError> {
-        let end = first as usize + count as usize;
+        let end = (first as usize)
+            .checked_add(count as usize)
+            .ok_or_else(|| {
+                self.error(
+                    None,
+                    VerifyErrorKind::ChildRange {
+                        range: ChildRange::new(first, count),
+                        len: self.function.children.len() as u32,
+                    },
+                )
+            })?;
         if end > self.function.children.len() {
             return Err(self.error(
                 None,
@@ -3455,6 +4103,14 @@ impl<'p> FnCheck<'p> {
                 None => body_ty,
                 Some(previous) => self.join_types(&previous, &body_ty, "match arms")?,
             });
+        }
+        if !match_is_exhaustive(self.program, self.function, set, &scrutinee_ty) {
+            return Err(self.error(
+                Some(id),
+                VerifyErrorKind::ControlFlow {
+                    context: "match is not exhaustive",
+                },
+            ));
         }
         Ok(result.unwrap_or(Ty::Unit))
     }
@@ -4168,8 +4824,30 @@ impl<'p> FnCheck<'p> {
         argc: u32,
         node_ty: TyId,
     ) -> Result<Ty, VerifyError> {
-        self.check_child_count(first_child, argc + 1)?;
-        let callee = self.function.children[first_child as usize];
+        let count = argc.checked_add(1).ok_or_else(|| {
+            self.error(
+                None,
+                VerifyErrorKind::ChildRange {
+                    range: ChildRange::new(first_child, argc),
+                    len: self.function.children.len() as u32,
+                },
+            )
+        })?;
+        self.check_child_count(first_child, count)?;
+        let callee = self
+            .function
+            .children
+            .get(first_child as usize)
+            .copied()
+            .ok_or_else(|| {
+                self.error(
+                    None,
+                    VerifyErrorKind::OutOfRange {
+                        arena: Arena::Node,
+                        id: first_child,
+                    },
+                )
+            })?;
         let callee_ty = self.check_node(callee, NodeRole::Value)?;
         let callee_ty = self.ty(callee_ty)?;
         let (params, ret) = match callee_ty {
@@ -4198,7 +4876,20 @@ impl<'p> FnCheck<'p> {
         }
         let mut subst = Vec::new();
         for (index, param) in params.iter().enumerate() {
-            let child = self.function.children[first_child as usize + 1 + index];
+            let Some(child) = self
+                .function
+                .children
+                .get(first_child as usize + 1 + index)
+                .copied()
+            else {
+                return Err(self.error(
+                    None,
+                    VerifyErrorKind::ChildRange {
+                        range: ChildRange::new(first_child, argc),
+                        len: self.function.children.len() as u32,
+                    },
+                ));
+            };
             let node = self.node(child)?;
             if matches!(node.kind, NodeKind::MutArg(_)) {
                 return Err(self.error(
