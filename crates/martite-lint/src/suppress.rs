@@ -58,7 +58,7 @@ pub fn apply(
             let Some(target) = suppression.target else {
                 continue;
             };
-            if !elements[target].head.contains(span) {
+            if !head_covers(elements[target].head, span) {
                 continue;
             }
             if suppression
@@ -90,7 +90,7 @@ pub fn apply(
             let Some(target) = suppression.target else {
                 return false;
             };
-            elements[target].head.contains(span)
+            head_covers(elements[target].head, span)
                 && suppression
                     .ids
                     .iter()
@@ -523,6 +523,13 @@ fn collect_expr(expr: &Expr, text: &str, out: &mut Vec<Element>) {
 
 fn push(out: &mut Vec<Element>, span: Span, head: Span) {
     out.push(Element { span, head });
+}
+
+/// A suppression covers a diagnostic when the diagnostic's primary span starts
+/// inside the element head. It does not need to end inside it: compound `if`
+/// and `match` heads stop at the opening brace.
+fn head_covers(head: Span, span: Span) -> bool {
+    head.start <= span.start && span.start < head.end
 }
 
 fn block_head(span: Span, block: &Block) -> Span {

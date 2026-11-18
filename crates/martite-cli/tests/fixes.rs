@@ -391,3 +391,173 @@ fn lint_fix_followed_by_fmt_is_stable() {
     let check = martite(&[s("fmt"), s("--check"), script.as_os_str()]);
     assert!(check.status.success(), "{}", stderr(&check));
 }
+
+/// Run `lint --fix --rule <rule>` twice and return the file text after the
+/// first pass, checking that the second pass changes nothing.
+fn fix_twice(script: &Path, rule: &str, suggested: bool) -> String {
+    let mut args = vec![s("lint"), s("--fix")];
+    if suggested {
+        args.push(s("--suggested"));
+    }
+    args.extend([s("--rule"), s(rule), script.as_os_str()]);
+    let first = martite(&args);
+    assert!(
+        first.status.success(),
+        "{rule} fix failed: {}",
+        stderr(&first)
+    );
+    let text = std::fs::read_to_string(script).expect("fixed file");
+    let second = martite(&args);
+    assert!(
+        second.status.success(),
+        "{rule} second fix failed: {}",
+        stderr(&second)
+    );
+    assert_eq!(
+        std::fs::read_to_string(script).expect("fixed file"),
+        text,
+        "{rule} fix is not idempotent"
+    );
+    text
+}
+
+#[test]
+fn l011_not_comparison_fixes_are_idempotent_and_preserve_stdout() {
+    let cases = [
+        (
+            "bare",
+            "fn main() {\n    let a = true\n    let b = false\n    if not a == b {\n        print(\"branch\")\n    }\n}\n",
+            "if a != b {",
+            "branch\n",
+        ),
+        (
+            "paren",
+            "fn main() {\n    let a = true\n    let b = false\n    if not (a == b) {\n        print(\"paren\")\n    }\n}\n",
+            "if (a != b) {",
+            "paren\n",
+        ),
+        (
+            "nested",
+            "fn main() {\n    let a = false\n    let b = false\n    let c = true\n    if not ((a or b) == c) {\n        print(\"nested\")\n    }\n}\n",
+            "if ((a or b) != c) {",
+            "nested\n",
+        ),
+    ];
+    for (name, source, expected, output) in cases {
+        let dir = TempDir::new(&format!("l011-{name}"));
+        let script = dir.file("main.mt", source);
+        let before = martite(&[s("run"), script.as_os_str()]);
+        assert!(before.status.success(), "{name}: {}", stderr(&before));
+        assert_eq!(stdout(&before), output, "{name}");
+        let text = fix_twice(&script, "L011", false);
+        assert!(text.contains(expected), "{name}: {text}");
+        assert!(!text.contains("not "), "{name}: {text}");
+        let after = martite(&[s("run"), script.as_os_str()]);
+        assert!(after.status.success(), "{name}: {}", stderr(&after));
+        assert_eq!(stdout(&after), output, "{name}: behavior changed");
+    }
+}
+
+#[test]
+fn l002_keeps_a_mutated_destructuring_var_and_fixes_an_unmutated_one_once() {
+    let dir = TempDir::new("l002-destructuring");
+    let mutated = dir.file(
+        "mutated.mt",
+        "fn main() {\n    var (a, b) = (0, 0)\n    a += 1\n    print(\"{b}\")\n}\n",
+    );
+    let before = martite(&[s("run"), mutated.as_os_str()]);
+    assert!(before.status.success(), "{}", stderr(&before));
+    let original = std::fs::read_to_string(&mutated).unwrap();
+    let fix = martite(&[
+        s("lint"),
+        s("--fix"),
+        s("--rule"),
+        s("L002"),
+        mutated.as_os_str(),
+    ]);
+    assert!(fix.status.success(), "{}", stderr(&fix));
+    assert_eq!(std::fs::read_to_string(&mutated).unwrap(), original);
+    let after = martite(&[s("run"), mutated.as_os_str()]);
+    assert_eq!(stdout(&before), stdout(&after));
+
+    let immutable = dir.file(
+        "immutable.mt",
+        "fn main() {\n    var (a, b) = (0, 0)\n    print(\"{a}{b}\")\n}\n",
+    );
+    let text = fix_twice(&immutable, "L002", false);
+    assert_eq!(text.matches("let").count(), 1, "{text}");
+    assert!(!text.contains("var"), "{text}");
+    let check = martite(&[s("check"), immutable.as_os_str()]);
+    assert!(check.status.success(), "{}", stderr(&check));
+}
+
+#[test]
+fn l004_removal_keeps_a_closing_brace_on_the_same_line() {
+    let dir = TempDir::new("l004-brace");
+    let script = dir.file(
+        "main.mt",
+        "fn f() {\n    panic(\"x\")\n    let x = 1 }\nfn main() { f() }\n",
+    );
+    let text = fix_twice(&script, "L004", true);
+    assert!(text.contains("fn main() { f() }"), "{text}");
+    assert!(
+        text.lines().any(|line| line.trim() == "}"),
+        "closing brace was eaten: {text}"
+    );
+    let check = martite(&[s("check"), script.as_os_str()]);
+    assert!(check.status.success(), "{}", stderr(&check));
+}
+
+#[test]
+fn l012_parenthesized_rhs_fix_is_idempotent_and_keeps_output() {
+    let dir = TempDir::new("l012-paren");
+    let script = dir.file(
+        "main.mt",
+        "fn main() {\n    var x = 0\n    x = x + (1)\n    print(\"{x}\")\n}\n",
+    );
+    let before = martite(&[s("run"), script.as_os_str()]);
+    assert!(before.status.success(), "{}", stderr(&before));
+    let text = fix_twice(&script, "L012", false);
+    assert!(text.contains("x += (1)"), "{text}");
+    let after = martite(&[s("run"), script.as_os_str()]);
+    assert_eq!(stdout(&before), stdout(&after));
+}
+
+#[test]
+fn l013_parenthesized_final_return_fix_is_idempotent_and_keeps_output() {
+    let dir = TempDir::new("l013-paren");
+    let script = dir.file(
+        "main.mt",
+        "fn f(a: ()) {\n    return (a)\n}\n\nfn main() {\n    f(())\n}\n",
+    );
+    let before = martite(&[s("run"), script.as_os_str()]);
+    assert!(before.status.success(), "{}", stderr(&before));
+    let text = fix_twice(&script, "L013", false);
+    assert!(text.contains("    (a)\n"), "{text}");
+    let after = martite(&[s("run"), script.as_os_str()]);
+    assert_eq!(stdout(&before), stdout(&after));
+}
+
+#[test]
+fn an_aliased_variant_import_is_not_removed() {
+    let dir = TempDir::new("l001-alias");
+    dir.file("m.mt", "pub enum Shape { Circle(float) }\n");
+    let script = dir.file(
+        "main.mt",
+        "use m.Shape as S\n\nfn main() {\n    print(\"{S.Circle(1.0)}\")\n}\n",
+    );
+    let before = martite(&[s("run"), script.as_os_str()]);
+    assert!(before.status.success(), "{}", stderr(&before));
+    let original = std::fs::read_to_string(&script).unwrap();
+    let fix = martite(&[
+        s("lint"),
+        s("--fix"),
+        s("--rule"),
+        s("L001"),
+        script.as_os_str(),
+    ]);
+    assert!(fix.status.success(), "{}", stderr(&fix));
+    assert_eq!(std::fs::read_to_string(&script).unwrap(), original);
+    let after = martite(&[s("run"), script.as_os_str()]);
+    assert_eq!(stdout(&before), stdout(&after));
+}

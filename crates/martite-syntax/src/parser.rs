@@ -140,6 +140,113 @@ impl Program {
     pub fn is_parenthesized(&self, id: NodeId) -> bool {
         !self.parentheses.expression_parens(id).is_empty()
     }
+
+    /// The full source range of an expression, including parentheses that wrap
+    /// the expression itself or any subexpression. AST spans deliberately
+    /// exclude parentheses, so tools that copy source text start here.
+    pub fn expression_span(&self, expr: &Expr) -> Span {
+        expression_source_span(&self.parentheses, expr)
+    }
+}
+
+fn expression_source_span(parentheses: &ParenthesisTables, expr: &Expr) -> Span {
+    let mut span = expr.span;
+    for pair in parentheses.expression_parens(expr.id) {
+        span = span.merge(pair.open).merge(pair.close);
+    }
+    match &expr.kind {
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Unit
+        | ExprKind::Var(_) => {}
+        ExprKind::Str(parts) => {
+            for part in parts {
+                if let StrExprPart::Expr(expr) = part {
+                    span = span.merge(expression_source_span(parentheses, expr));
+                }
+            }
+        }
+        ExprKind::Tuple(items) | ExprKind::List(items) => {
+            for item in items {
+                span = span.merge(expression_source_span(parentheses, item));
+            }
+        }
+        ExprKind::Map(entries) => {
+            for (key, value) in entries {
+                span = span
+                    .merge(expression_source_span(parentheses, key))
+                    .merge(expression_source_span(parentheses, value));
+            }
+        }
+        ExprKind::StructLit { fields, base, .. } => {
+            for field in fields {
+                if let Some(value) = &field.value {
+                    span = span.merge(expression_source_span(parentheses, value));
+                }
+            }
+            if let Some(base) = base {
+                span = span.merge(expression_source_span(parentheses, base));
+            }
+        }
+        ExprKind::Unary { expr, .. } | ExprKind::Try(expr) | ExprKind::Convert { expr, .. } => {
+            span = span.merge(expression_source_span(parentheses, expr));
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            span = span
+                .merge(expression_source_span(parentheses, lhs))
+                .merge(expression_source_span(parentheses, rhs));
+        }
+        ExprKind::Range { start, end, .. } => {
+            span = span
+                .merge(expression_source_span(parentheses, start))
+                .merge(expression_source_span(parentheses, end));
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            span = span
+                .merge(expression_source_span(parentheses, cond))
+                .merge(then_branch.span);
+            if let Some(else_branch) = else_branch {
+                span = span.merge(expression_source_span(parentheses, else_branch));
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            span = span.merge(expression_source_span(parentheses, scrutinee));
+            for arm in arms {
+                match &arm.body {
+                    MatchBody::Block(block) => span = span.merge(block.span),
+                    MatchBody::Expr(expr) => {
+                        span = span.merge(expression_source_span(parentheses, expr));
+                    }
+                }
+            }
+        }
+        ExprKind::Lambda { body, .. } => {
+            if let LambdaBody::Expr(expr) = body {
+                span = span.merge(expression_source_span(parentheses, expr));
+            }
+        }
+        ExprKind::Block(block) => span = span.merge(block.span),
+        ExprKind::Field { base, .. } => {
+            span = span.merge(expression_source_span(parentheses, base));
+        }
+        ExprKind::Call { callee, args } => {
+            span = span.merge(expression_source_span(parentheses, callee));
+            for arg in args {
+                span = span.merge(expression_source_span(parentheses, &arg.expr));
+            }
+        }
+        ExprKind::Index { base, index } => {
+            span = span
+                .merge(expression_source_span(parentheses, base))
+                .merge(expression_source_span(parentheses, index));
+        }
+    }
+    span
 }
 
 #[derive(Debug, Clone)]
@@ -1556,12 +1663,15 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_not(&mut self) -> PResult<Expr> {
-        if self.eat(&TokenKind::Not) {
+        if self.at(&TokenKind::Not) {
+            let keyword = self.advance();
             self.skip_continuation_newlines();
             let expr = self.parse_not()?;
-            let span = self.span_before().merge(expr.span);
+            let span = keyword.merge(expression_source_span(&self.parentheses, &expr));
+            let id = self.id();
+            self.record_keyword(id, keyword);
             return Ok(Expr {
-                id: self.id(),
+                id,
                 span,
                 kind: ExprKind::Unary {
                     op: UnaryOp::Not,
@@ -2762,6 +2872,37 @@ mod tests {
         assert_eq!(ids.allocate(), NodeId(1));
         assert_eq!(ids.allocate(), NodeId(2));
         assert_eq!(ids.next_id(), 3);
+    }
+
+    #[test]
+    fn not_spans_start_at_the_keyword_and_include_operand_parens() {
+        let source = "fn f(a: bool, b: bool) -> bool {\n    let first = not a == b\n    let second = not (a == b)\n    let third = not ((a or b) == b)\n    third\n}\n";
+        let parsed = parse_source(source, LoadLimits::default());
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let program = &parsed.program;
+        let slice = |span: Span| &source[span.start as usize..span.end as usize];
+
+        let Item::Fn(function) = &program.items[0] else {
+            panic!("expected a function");
+        };
+        let body = function.body.as_ref().expect("function body");
+        let values: Vec<&Expr> = body
+            .stmts
+            .iter()
+            .filter_map(|stmt| match &stmt.kind {
+                StmtKind::Let { value, .. } => Some(value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(slice(values[0].span), "not a == b");
+        assert_eq!(slice(program.keyword_span(values[0].id).unwrap()), "not");
+        assert_eq!(slice(values[1].span), "not (a == b)");
+        assert_eq!(slice(values[2].span), "not ((a or b) == b)");
+
+        let ExprKind::Unary { expr, .. } = &values[1].kind else {
+            panic!("expected a negation");
+        };
+        assert_eq!(slice(program.operator_span(expr.id).unwrap()), "==");
     }
 
     #[test]

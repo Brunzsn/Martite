@@ -32,6 +32,45 @@ pub fn item_start(text: &str, start: u32) -> u32 {
     start as u32
 }
 
+/// The span of a keyword plus following horizontal whitespace, so deleting it
+/// does not leave `fn f( x)` or `f( x)` behind.
+pub fn keyword_removal_span(text: &str, span: Span) -> Span {
+    let mut end = (span.end as usize).min(text.len());
+    while end < text.len() && matches!(text.as_bytes()[end], b' ' | b'\t') {
+        end += 1;
+    }
+    Span::new(span.start, end as u32)
+}
+
+/// The span to remove for an unreachable statement. Prefer the statement's own
+/// line, but never absorb text after the statement, which can be an enclosing
+/// `}` on a shared line.
+pub fn statement_removal_span(text: &str, span: Span) -> Span {
+    let start = span.start.min(text.len() as u32) as usize;
+    let end = span.end.min(text.len() as u32) as usize;
+    let line_start = text[..start]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let line_end = text[end..]
+        .find('\n')
+        .map(|offset| end + offset + 1)
+        .unwrap_or(text.len());
+    let prefix_is_space = text[line_start..start].chars().all(char::is_whitespace);
+    let suffix_end = if line_end > end && text.as_bytes()[line_end - 1] == b'\n' {
+        line_end - 1
+    } else {
+        line_end
+    };
+    let suffix = &text[end..suffix_end];
+    let suffix_is_space = suffix.trim().is_empty() || suffix.trim_start().starts_with("//");
+    if prefix_is_space && suffix_is_space {
+        Span::new(line_start as u32, line_end as u32)
+    } else {
+        Span::new(start as u32, end as u32)
+    }
+}
+
 /// Comments directly before `start`, with only whitespace between them and the
 /// element. Blank lines do not detach a comment. Returned in source order.
 pub fn preceding_comments<'a>(program: &'a Program, text: &str, start: u32) -> Vec<&'a Comment> {

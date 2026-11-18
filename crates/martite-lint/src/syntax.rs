@@ -9,7 +9,7 @@ use martite_syntax::{
 
 use crate::registry;
 use crate::settings::ResolvedSettings;
-use crate::trivia::{self, doc_comments};
+use crate::trivia::{self, doc_comments, keyword_removal_span};
 
 pub struct SyntaxCtx<'a> {
     source: SourceId,
@@ -477,11 +477,13 @@ impl<'a> SyntaxCtx<'a> {
                                     );
                                     self.slice(inner).trim().to_string()
                                 }
-                                _ => self.slice(else_branch.span).to_string(),
+                                _ => self
+                                    .slice(self.program.expression_span(else_branch))
+                                    .to_string(),
                             };
                             let replacement = format!(
                                 "if {} {}\n{}",
-                                self.slice(cond.span),
+                                self.slice(self.program.expression_span(cond)),
                                 self.slice(then_branch.span),
                                 else_text
                             );
@@ -714,7 +716,7 @@ impl<'a> SyntaxCtx<'a> {
                             self.block_value(block)
                         }
                     }
-                    _ => Some(self.slice(expr.span).to_string()),
+                    _ => Some(self.slice(self.program.expression_span(expr)).to_string()),
                 },
                 None => Some("()".to_string()),
             }
@@ -728,7 +730,7 @@ impl<'a> SyntaxCtx<'a> {
         let StmtKind::Expr { expr, assign: None } = &stmt.kind else {
             return None;
         };
-        Some(self.slice(expr.span).to_string())
+        Some(self.slice(self.program.expression_span(expr)).to_string())
     }
 
     fn block_inner(&self, block: &Block) -> String {
@@ -767,9 +769,11 @@ impl<'a> SyntaxCtx<'a> {
             return;
         };
         let replacement = match (op, literal) {
-            (BinaryOp::Eq, true) | (BinaryOp::Ne, false) => self.slice(other.span).to_string(),
+            (BinaryOp::Eq, true) | (BinaryOp::Ne, false) => {
+                self.slice(self.program.expression_span(other)).to_string()
+            }
             (BinaryOp::Eq, false) | (BinaryOp::Ne, true) => {
-                format!("not ({})", self.slice(other.span))
+                format!("not ({})", self.slice(self.program.expression_span(other)))
             }
             _ => return,
         };
@@ -785,7 +789,7 @@ impl<'a> SyntaxCtx<'a> {
     }
 
     fn check_not_comparison(&mut self, expr: &Expr, inner: &Expr) {
-        let ExprKind::Binary { op, lhs, rhs } = &inner.kind else {
+        let ExprKind::Binary { op, .. } = &inner.kind else {
             return;
         };
         let inverse = match op {
@@ -793,13 +797,15 @@ impl<'a> SyntaxCtx<'a> {
             BinaryOp::Ne => "==",
             _ => return,
         };
-        let replacement = format!(
-            "{} {} {}",
-            self.slice(lhs.span),
-            inverse,
-            self.slice(rhs.span)
-        );
-        let fix = Fix::machine(vec![FixEdit::new(expr.span, replacement)]);
+        let keyword = self.program.keyword_span(expr.id);
+        let operator = self.program.operator_span(inner.id);
+        let fix = match (keyword, operator) {
+            (Some(keyword), Some(operator)) => Some(Fix::machine(vec![
+                FixEdit::new(keyword_removal_span(self.text, keyword), ""),
+                FixEdit::new(operator, inverse.to_string()),
+            ])),
+            _ => None,
+        };
         self.emit(
             Code::L011,
             expr.span,
@@ -808,7 +814,7 @@ impl<'a> SyntaxCtx<'a> {
                 op.as_str()
             ),
             Some(format!("replace the negation with `{inverse}`")),
-            Some(fix),
+            fix,
         );
     }
 
@@ -829,8 +835,8 @@ impl<'a> SyntaxCtx<'a> {
             return;
         };
         let replacement = match (then_value, else_value) {
-            (true, false) => self.slice(cond.span).to_string(),
-            (false, true) => format!("not ({})", self.slice(cond.span)),
+            (true, false) => self.slice(self.program.expression_span(cond)).to_string(),
+            (false, true) => format!("not ({})", self.slice(self.program.expression_span(cond))),
             _ => return,
         };
         let fix = Fix::machine(vec![FixEdit::new(expr.span, replacement)]);
@@ -857,9 +863,13 @@ impl<'a> SyntaxCtx<'a> {
             .keyword_span(last.id)
             .unwrap_or_else(|| Span::empty(last.span.start));
         match value {
-            Some(value) => {
-                let replacement = self.slice(value.span).to_string();
-                let fix = Fix::machine(vec![FixEdit::new(last.span, replacement)]);
+            Some(_) => {
+                // Remove only `return`, never rebuild the value from its span:
+                // expression spans exclude parentheses around subexpressions.
+                let fix = Fix::machine(vec![FixEdit::new(
+                    keyword_removal_span(self.text, keyword),
+                    "",
+                )]);
                 self.emit(
                     Code::L013,
                     keyword,

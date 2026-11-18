@@ -1,4 +1,4 @@
-use martite_base::{Code, MemoryProvider, SourceId};
+use martite_base::{Code, Fix, MemoryProvider, SourceId};
 use martite_config::ToolConfig;
 use martite_driver::{LoadOptions, load};
 use martite_lint::{LintInputs, ManifestInput, SettingsResolver, lint, lint_syntax_only};
@@ -26,6 +26,31 @@ fn lint_script(source: &str, preset: &str) -> Vec<Code> {
 
 fn lint_script_with(source: &str, settings: &SettingsResolver) -> Vec<Code> {
     codes(&lint_script_diagnostics_with(source, settings))
+}
+
+fn apply_fix(source: &str, fix: &Fix) -> String {
+    apply_fixes(source, std::iter::once(fix))
+}
+
+fn apply_fixes<'a>(source: &str, fixes: impl IntoIterator<Item = &'a Fix>) -> String {
+    let mut edits: Vec<_> = fixes.into_iter().flat_map(|fix| fix.edits.iter()).collect();
+    edits.sort_by_key(|edit| std::cmp::Reverse((edit.span.start, edit.span.end)));
+    let mut text = source.to_string();
+    for edit in edits {
+        text.replace_range(
+            edit.span.start as usize..edit.span.end as usize,
+            &edit.replacement,
+        );
+    }
+    text
+}
+
+fn fix_for(diagnostics: &[martite_base::Diagnostic], code: Code) -> &Fix {
+    diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == code)
+        .and_then(|diagnostic| diagnostic.fix.as_ref())
+        .unwrap_or_else(|| panic!("expected a {code} fix in {:?}", codes(diagnostics)))
 }
 
 fn lint_script_diagnostics_with(
@@ -457,4 +482,133 @@ fn main() {
 "#;
     let found = lint_script(source, "recommended");
     assert!(!found.contains(&Code::L003), "{found:?}");
+}
+
+#[test]
+fn l011_not_spans_cover_the_negation_and_fixes_are_idempotent() {
+    let source = "fn first(a: bool, b: bool) -> bool {\n    not a == b\n}\n\nfn second(a: bool, b: bool) -> bool {\n    not (a == b)\n}\n\nfn third(a: bool, b: bool, c: bool) -> bool {\n    not ((a or b) == c)\n}\n\nfn main() {\n    print(\"{first(true, false)}{second(true, false)}{third(false, false, false)}\")\n}\n";
+    let diagnostics = lint_script_diagnostics_with(source, &resolver("recommended"));
+    let spans: Vec<&str> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == Code::L011)
+        .map(|diagnostic| {
+            let span = diagnostic.span.expect("L011 span");
+            &source[span.start as usize..span.end as usize]
+        })
+        .collect();
+    assert_eq!(
+        spans,
+        ["not a == b", "not (a == b)", "not ((a or b) == c)"],
+        "{:?}",
+        codes(&diagnostics)
+    );
+
+    let l011_fixes: Vec<&Fix> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == Code::L011)
+        .filter_map(|diagnostic| diagnostic.fix.as_ref())
+        .collect();
+    let fixed = apply_fixes(source, l011_fixes);
+    assert!(!fixed.contains("not "), "{fixed}");
+    let found = lint_script(&fixed, "recommended");
+    assert!(!found.contains(&Code::L011), "{found:?}");
+}
+
+#[test]
+fn l002_reports_a_destructuring_var_once_per_declaration() {
+    let source = "fn main() {\n    var (a, b) = (0, 0)\n    print(\"{a}{b}\")\n}\n";
+    let diagnostics = lint_script_diagnostics_with(source, &resolver("recommended"));
+    let l002: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == Code::L002)
+        .collect();
+    assert_eq!(l002.len(), 1, "{:?}", codes(&diagnostics));
+    let fixed = apply_fix(source, l002[0].fix.as_ref().expect("L002 fix"));
+    assert_eq!(fixed.matches("let").count(), 1, "{fixed}");
+    assert!(!fixed.contains("var"), "{fixed}");
+    let found = lint_script(&fixed, "recommended");
+    assert!(!found.contains(&Code::L002), "{found:?}");
+}
+
+#[test]
+fn l002_skips_a_destructuring_var_when_one_binding_is_mutated() {
+    let source = "fn main() {\n    var (a, b) = (0, 0)\n    a += 1\n    print(\"{b}\")\n}\n";
+    let found = lint_script(source, "recommended");
+    assert!(!found.contains(&Code::L002), "{found:?}");
+}
+
+#[test]
+fn l004_removal_never_eats_a_closing_brace() {
+    let source = "fn f() {\n    panic(\"x\")\n    let x = 1 }\nfn main() { f() }\n";
+    let diagnostics = lint_script_diagnostics_with(source, &resolver("recommended"));
+    let fixed = apply_fix(source, fix_for(&diagnostics, Code::L004));
+    assert!(fixed.contains("    }\n"), "{fixed}");
+    assert!(fixed.contains("fn main() { f() }"), "{fixed}");
+    let found = lint_script(&fixed, "recommended");
+    assert!(!found.contains(&Code::L004), "{found:?}");
+}
+
+#[test]
+fn l012_fix_keeps_a_parenthesized_rhs_balanced() {
+    let source = "fn main() {\n    var x = 0\n    x = x + (1)\n    print(\"{x}\")\n}\n";
+    let diagnostics = lint_script_diagnostics_with(source, &resolver("recommended"));
+    let fixed = apply_fix(source, fix_for(&diagnostics, Code::L012));
+    assert!(fixed.contains("x += (1)"), "{fixed}");
+    let found = lint_script(&fixed, "recommended");
+    assert!(!found.contains(&Code::L012), "{found:?}");
+}
+
+#[test]
+fn l013_final_return_keeps_parenthesized_value_source() {
+    let source = "fn f(a: int, b: int, c: int) -> int {\n    return (a + b) * c\n}\n\nfn main() {\n    print(\"{f(1, 2, 3)}\")\n}\n";
+    let parsed = parse_source(source, Default::default());
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let settings = resolver("recommended").resolve("main.mt");
+    let diagnostics = lint_syntax_only(SourceId(0), source, &parsed.program, &settings);
+    let fixed = apply_fix(source, fix_for(&diagnostics, Code::L013));
+    assert!(fixed.contains("    (a + b) * c\n"), "{fixed}");
+    let found = lint_script(&fixed, "recommended");
+    assert!(!found.contains(&Code::L013), "{found:?}");
+}
+
+#[test]
+fn suppression_covers_the_head_of_a_compound_if() {
+    let source =
+        "fn main() {\n    return\n    // allow(L004)\n    if true { print(\"dead\") }\n}\n";
+    let found = lint_script(source, "recommended");
+    assert!(!found.contains(&Code::L004), "{found:?}");
+    assert!(!found.contains(&Code::L022), "{found:?}");
+}
+
+#[test]
+fn aliased_enum_variant_construction_counts_as_a_use() {
+    let mut provider = MemoryProvider::new();
+    provider.insert("m.mt", "pub enum Shape { Circle(float) }\n");
+    provider.insert(
+        "main.mt",
+        "use m.Shape as S\n\nfn main() {\n    print(\"{S.Circle(1.0)}\")\n}\n",
+    );
+    let loaded = load(
+        &provider,
+        &LoadOptions {
+            entry: "main.mt".into(),
+            interfaces: Vec::new(),
+            grants: Vec::new(),
+            limits: Default::default(),
+            edition: "1".into(),
+        },
+    );
+    assert!(!loaded.has_errors(), "{:?}", codes(&loaded.diagnostics));
+    let output = lint(
+        loaded.program.as_ref().expect("checked program"),
+        &loaded.sources,
+        &resolver("recommended"),
+        "",
+        &LintInputs::default(),
+    );
+    assert!(
+        !codes(&output.diagnostics).contains(&Code::L001),
+        "{:?}",
+        output.diagnostics
+    );
 }
