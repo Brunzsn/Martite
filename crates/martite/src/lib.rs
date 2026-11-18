@@ -44,6 +44,12 @@ pub struct LoadError {
 
 pub type HostFn = dyn Fn(&mut HostContext, &[Value]) -> Result<Value, HostFault>;
 
+/// Validates an opaque handle found in a restored snapshot.
+///
+/// The arguments are the opaque type name and the host-defined token. Returning
+/// `false` rejects the snapshot before its state is installed.
+pub type SnapshotHandleValidator = dyn Fn(&str, &str) -> bool;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum HostType {
     Unit,
@@ -126,6 +132,7 @@ pub struct Engine {
     optimize: bool,
     require_host_impls: bool,
     verification: VerifyMode,
+    snapshot_handle_validator: Option<Rc<SnapshotHandleValidator>>,
 }
 
 impl Default for Engine {
@@ -145,7 +152,23 @@ impl Engine {
             optimize: true,
             require_host_impls: true,
             verification: VerifyMode::Always,
+            snapshot_handle_validator: None,
         }
+    }
+
+    /// Install the validator for opaque handles found in restored snapshots.
+    ///
+    /// The validator receives the opaque type name and the host-defined token.
+    /// Snapshot restore rejects every handle when no validator is installed:
+    /// a token is only valid for the host session that issued it, and the codec
+    /// cannot tell a current token from a replayed one. Plugins without handles
+    /// in their state do not need a validator.
+    pub fn set_snapshot_handle_validator(
+        &mut self,
+        validator: impl Fn(&str, &str) -> bool + 'static,
+    ) -> &mut Self {
+        self.snapshot_handle_validator = Some(Rc::new(validator));
+        self
     }
 
     pub fn set_limits(&mut self, max: ExecLimits, default: ExecLimits) {
@@ -278,8 +301,9 @@ impl Engine {
 
     /// Re-check a plugin and decide whether its previous snapshot can be kept.
     ///
-    /// The returned [`Reload`] calls `init` when the state fingerprint changed,
-    /// and restores the snapshot without calling `init` when it did not.
+    /// The returned [`Reload`] calls `init` when the snapshot format version or
+    /// state fingerprint changed, and restores the snapshot without calling
+    /// `init` when neither did.
     ///
     /// This is the diagnostics-only variant of [`Engine::try_reload`].
     pub fn reload(
@@ -303,7 +327,8 @@ impl Engine {
     ) -> Result<Reload, LoadError> {
         let plugin = self.try_load(manifest_text, provider)?;
         let fingerprint = plugin.type_fingerprint();
-        let keep_snapshot = fingerprint != [0u8; 32]
+        let keep_snapshot = snapshot.format_version == SNAPSHOT_FORMAT_VERSION
+            && fingerprint != [0u8; 32]
             && fingerprint == previous.type_fingerprint()
             && fingerprint == snapshot.type_fingerprint;
         Ok(Reload {
@@ -519,6 +544,7 @@ impl Engine {
             caller,
             manifest,
             verification: self.verification,
+            snapshot_handle_validator: self.snapshot_handle_validator.clone(),
         }))
     }
 
@@ -670,6 +696,7 @@ impl Engine {
             caller,
             manifest,
             verification: self.verification,
+            snapshot_handle_validator: self.snapshot_handle_validator.clone(),
         }))
     }
 }
@@ -707,6 +734,7 @@ struct PluginInner {
     caller: HostCaller,
     manifest: Manifest,
     verification: VerifyMode,
+    snapshot_handle_validator: Option<Rc<SnapshotHandleValidator>>,
 }
 
 impl PluginInner {
@@ -732,8 +760,9 @@ pub struct Plugin {
 /// The result of [`Engine::reload`].
 pub struct Reload {
     pub plugin: Plugin,
-    /// True when the state type fingerprint is unchanged and the snapshot was
-    /// kept; `instantiate` then restores it instead of calling `init`.
+    /// True when the snapshot format version and state type fingerprint are
+    /// unchanged and the snapshot was kept; `instantiate` then restores it
+    /// instead of calling `init`.
     pub snapshot_kept: bool,
     snapshot: Option<Snapshot>,
 }
@@ -866,6 +895,25 @@ impl Plugin {
             .unwrap_or([0u8; 32])
     }
 
+    /// The IR state type used to validate snapshots.
+    fn state_type(&self) -> Result<Option<martite_ir::Ty>, String> {
+        match self.inner.ir.entries.state_type {
+            None => Ok(None),
+            Some(id) => self
+                .inner
+                .ir
+                .types
+                .get_ty(id)
+                .cloned()
+                .map(Some)
+                .ok_or_else(|| "plugin state type is missing from the type table".into()),
+        }
+    }
+
+    fn snapshot_handle_validator(&self) -> Option<&SnapshotHandleValidator> {
+        self.inner.snapshot_handle_validator.as_deref()
+    }
+
     /// Run `fn main` in a script, using the registered host functions.
     pub fn run_main(&self) -> Result<martite_runtime::MainResult, Trap> {
         let mut dispatcher = IrDispatch {
@@ -877,17 +925,33 @@ impl Plugin {
     }
 
     /// Instantiate by restoring a snapshot instead of running `init`.
+    ///
+    /// The snapshot is decoded with a budget derived from [`Self::limits`].
     pub fn instantiate_restored(&self, snapshot: &Snapshot) -> Result<Instance, Trap> {
+        self.instantiate_restored_with_limit(snapshot, self.limits().memory)
+    }
+
+    /// Instantiate by restoring a snapshot with a host-supplied byte budget.
+    ///
+    /// The budget caps both [`Snapshot::bytes`] and the decoded allocation, the
+    /// same way [`Instance::restore_with_limit`] does.
+    pub fn instantiate_restored_with_limit(
+        &self,
+        snapshot: &Snapshot,
+        max_bytes: u64,
+    ) -> Result<Instance, Trap> {
         let mut instance = Instance {
             plugin: self.clone(),
             state: None,
         };
-        instance.restore(snapshot).map_err(|message| Trap::Panic {
-            message,
-            source: None,
-            span: None,
-            trace: Vec::new(),
-        })?;
+        instance
+            .restore_with_limit(snapshot, max_bytes)
+            .map_err(|message| Trap::Panic {
+                message,
+                source: None,
+                span: None,
+                trace: Vec::new(),
+            })?;
         Ok(instance)
     }
 
@@ -1042,34 +1106,86 @@ impl Instance {
         Ok(())
     }
 
-    /// A deterministic snapshot of the state and a fingerprint of its type.
-    pub fn snapshot(&self) -> Snapshot {
+    /// A deterministic, budgeted snapshot of the state and a fingerprint of
+    /// its type.
+    ///
+    /// The state is validated against the plugin's declared state type before
+    /// it is written. Encoding fails when the state does not match that type or
+    /// when its expanded form would exceed [`Plugin::limits`]'s memory budget;
+    /// the wire format itself is unchanged. Shared `Rc` values are expanded by
+    /// the format, so a deeply shared state can exceed the budget even though it
+    /// is small in memory.
+    pub fn snapshot(&self) -> Result<Snapshot, String> {
+        self.snapshot_with_limit(self.plugin.limits().memory)
+    }
+
+    /// Take a snapshot with a host-supplied byte budget.
+    ///
+    /// `max_bytes` caps the encoded output. A host that persists snapshots can
+    /// choose a value independent of the plugin's execution memory.
+    pub fn snapshot_with_limit(&self, max_bytes: u64) -> Result<Snapshot, String> {
         let type_fingerprint = self.plugin.type_fingerprint();
-        let bytes = self
-            .state
-            .as_ref()
-            .map(|state| ValueCodec::new(self.plugin.types()).encode(state))
-            .unwrap_or_default();
-        Snapshot {
+        let bytes = match &self.state {
+            None => Vec::new(),
+            Some(state) => {
+                let Some(expected) = self.plugin.state_type()? else {
+                    return Err("plugin has state but no declared state type".into());
+                };
+                ValueCodec::new(self.plugin.types()).encode(state, &expected, max_bytes)?
+            }
+        };
+        Ok(Snapshot {
             format_version: SNAPSHOT_FORMAT_VERSION,
             type_fingerprint,
             bytes,
-        }
+        })
     }
 
-    /// Restore a snapshot if its type fingerprint matches this plugin.
+    /// Restore a snapshot if its format version and type fingerprint match.
+    ///
+    /// Every decoded tag is validated against the plugin's checked state type.
+    /// An empty payload is only valid for a stateless plugin. Opaque handles are
+    /// passed to the engine's [`SnapshotHandleValidator`] and rejected when no
+    /// validator is installed. The decode budget is derived from
+    /// [`Plugin::limits`]'s memory.
     pub fn restore(&mut self, snapshot: &Snapshot) -> Result<(), String> {
+        self.restore_with_limit(snapshot, self.plugin.limits().memory)
+    }
+
+    /// Restore a snapshot with a host-supplied byte budget.
+    ///
+    /// The budget caps both [`Snapshot::bytes`] and the decoded allocation.
+    pub fn restore_with_limit(
+        &mut self,
+        snapshot: &Snapshot,
+        max_bytes: u64,
+    ) -> Result<(), String> {
         if snapshot.format_version != SNAPSHOT_FORMAT_VERSION {
             return Err("unsupported snapshot format version".into());
         }
         if snapshot.type_fingerprint != self.plugin.type_fingerprint() {
             return Err("snapshot type fingerprint mismatch".into());
         }
-        if snapshot.bytes.is_empty() {
-            self.state = None;
-            return Ok(());
+        if snapshot.bytes.len() as u64 > max_bytes {
+            return Err(format!(
+                "snapshot is {} bytes but the restore budget is {max_bytes} bytes",
+                snapshot.bytes.len()
+            ));
         }
-        let value = ValueCodec::new(self.plugin.types()).decode(&snapshot.bytes)?;
+        let expected = self.plugin.state_type()?;
+        if snapshot.bytes.is_empty() {
+            if expected.is_none() {
+                self.state = None;
+                return Ok(());
+            }
+            return Err("snapshot is empty but the plugin has state".into());
+        }
+        let Some(expected) = expected else {
+            return Err("snapshot contains state but the plugin is stateless".into());
+        };
+        let codec = ValueCodec::new(self.plugin.types())
+            .with_handle_validator(self.plugin.snapshot_handle_validator());
+        let value = codec.decode(&snapshot.bytes, &expected, max_bytes)?;
         self.state = Some(value);
         Ok(())
     }

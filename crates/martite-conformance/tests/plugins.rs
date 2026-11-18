@@ -149,6 +149,8 @@ fn editor_engine() -> Engine {
             _ => Err(HostFault::new("expected a Doc handle")),
         },
     );
+    // These fixtures deliberately restore snapshots that contain handles.
+    engine.set_snapshot_handle_validator(|_, _| true);
     engine
 }
 
@@ -301,7 +303,7 @@ fn snapshots_round_trip_and_validate_their_type_fingerprint() {
     let doc = plugin.make_handle("Doc", "ok").unwrap();
     let mut instance = plugin.instantiate().expect("init");
     instance.call("saved", vec![doc]).expect("call");
-    let snapshot = instance.snapshot();
+    let snapshot = instance.snapshot().expect("snapshot");
     assert_eq!(snapshot.format_version, 1);
     assert_ne!(snapshot.type_fingerprint, [0u8; 32]);
     assert!(!snapshot.bytes.is_empty());
@@ -328,7 +330,11 @@ fn snapshots_round_trip_and_validate_their_type_fingerprint() {
 #[test]
 fn stateless_snapshots_are_empty_and_restore_to_no_state() {
     let plugin = load("on check() {}\n", MANIFEST).expect("stateless plugin");
-    let snapshot = plugin.instantiate().expect("instantiate").snapshot();
+    let snapshot = plugin
+        .instantiate()
+        .expect("instantiate")
+        .snapshot()
+        .expect("snapshot");
     assert_eq!(snapshot.format_version, 1);
     assert!(snapshot.bytes.is_empty());
 
@@ -343,7 +349,7 @@ fn snapshots_preserve_handles_and_report_stale_tokens_after_restore() {
     let doc = plugin.make_handle("Doc", "stale-token").expect("handle");
     let mut instance = plugin.instantiate().expect("init");
     instance.call("remember", vec![doc]).expect("remember");
-    let snapshot = instance.snapshot();
+    let snapshot = instance.snapshot().expect("snapshot");
 
     let mut restored = plugin.instantiate().expect("init");
     restored.restore(&snapshot).expect("restore");
@@ -453,7 +459,7 @@ fn reload_keeps_or_reinitializes_the_snapshot_by_fingerprint() {
     let doc = plugin.make_handle("Doc", "ok").unwrap();
     let mut instance = plugin.instantiate().expect("init");
     instance.call("saved", vec![doc]).expect("call");
-    let snapshot = instance.snapshot();
+    let snapshot = instance.snapshot().expect("snapshot");
     assert_eq!(state_int(&instance, 0), 1);
 
     let reloaded = engine

@@ -66,7 +66,7 @@ fn plugin_allocs(table: &mut String) {
         let _ = black_box(instance.snapshot());
     });
 
-    let snapshot = instance.snapshot();
+    let snapshot = instance.snapshot().expect("snapshot");
     let mut restored = plugin.instantiate().expect("init");
     measure(table, "runtime/plugin_restore", 20, || {
         let _ = black_box(restored.restore(&snapshot));
