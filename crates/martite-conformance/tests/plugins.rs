@@ -84,7 +84,7 @@ on mutate(mut x: int) -> int {
     x
 }
 
-on shutdown(self) {}
+on shutdown(mut self) { self.saves += 1 }
 "#;
 
 const DOC_STATE_PLUGIN: &str = r#"
@@ -250,6 +250,11 @@ fn shutdown_and_stateless_plugins_work() {
     instance.call("tick", vec![]).expect("call");
     assert_eq!(state_int(&instance, 0), 1);
     instance.shutdown().expect("shutdown runs");
+    assert_eq!(
+        state_int(&instance, 0),
+        2,
+        "shutdown must run its body and commit its state writeback"
+    );
 
     let stateless = load("on check() {}\n", MANIFEST).expect("stateless plugin");
     let mut instance = stateless.instantiate().expect("instantiate");

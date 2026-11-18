@@ -45,6 +45,11 @@ impl CorpusReport {
             "IR differential: covered {}, skipped {}",
             self.covered, self.skipped
         );
+        assert_eq!(
+            self.skipped, 0,
+            "IR differential silently skipped {} fixture(s); a fixture with a golden must load, check and run",
+            self.skipped
+        );
         if self.failures.is_empty() {
             return;
         }
@@ -84,7 +89,7 @@ impl CorpusReport {
 pub fn run_all(expected: &BTreeMap<String, SnapshotRecord>) -> CorpusReport {
     let cases = snapshot_cases::all_cases();
     let mut covered = 0;
-    let mut skipped = 0;
+    let skipped = 0;
     let mut failures = Vec::new();
 
     for case in cases {
@@ -95,7 +100,7 @@ pub fn run_all(expected: &BTreeMap<String, SnapshotRecord>) -> CorpusReport {
             );
         };
         if case.checked_program().is_none() {
-            skipped += 1;
+            failures.push(load_failure(&case));
             continue;
         }
         covered += 1;
@@ -138,7 +143,7 @@ pub fn run_all(expected: &BTreeMap<String, SnapshotRecord>) -> CorpusReport {
 pub fn run_optimized(expected: &BTreeMap<String, SnapshotRecord>) -> CorpusReport {
     let cases = snapshot_cases::all_cases();
     let mut covered = 0;
-    let mut skipped = 0;
+    let skipped = 0;
     let mut failures = Vec::new();
 
     for case in cases {
@@ -149,7 +154,7 @@ pub fn run_optimized(expected: &BTreeMap<String, SnapshotRecord>) -> CorpusRepor
             );
         };
         if case.checked_program().is_none() {
-            skipped += 1;
+            failures.push(load_failure(&case));
             continue;
         }
         covered += 1;
@@ -185,6 +190,19 @@ pub fn run_optimized(expected: &BTreeMap<String, SnapshotRecord>) -> CorpusRepor
     }
 }
 
+fn load_failure(case: &SnapshotCase) -> CaseFailure {
+    CaseFailure {
+        id: case.id().to_owned(),
+        note: Some("fixture has a golden but does not load or check".into()),
+        differences: vec![FieldDifference {
+            field: "fixture".into(),
+            expected: "loads and checks".into(),
+            actual: "load or check failed".into(),
+        }],
+        ir_dump: None,
+    }
+}
+
 fn ir_dump(case: &SnapshotCase, stage: ProgramStage) -> String {
     let Some((program, sources)) = case.checked_program() else {
         return "<not executable>".into();
@@ -205,8 +223,12 @@ fn ir_dump(case: &SnapshotCase, stage: ProgramStage) -> String {
     }
 }
 
-/// Compare the full observable record, ignoring the threshold fields because
-/// they are checked behaviorally by [`SnapshotCase::verify_ir_thresholds`].
+/// Compare the full observable record.
+///
+/// The numeric threshold levels are checked behaviorally by
+/// [`SnapshotCase::verify_ir_thresholds`], but the note is part of the record and
+/// stays in the comparison. Dropping the whole `thresholds` field would let a
+/// forged note or a limit-trap opt-out pass unnoticed.
 pub fn observable_differences(
     expected: &SnapshotRecord,
     actual: &SnapshotRecord,
@@ -214,14 +236,22 @@ pub fn observable_differences(
     let mut expected = serde_json::to_value(expected).expect("serialize expected snapshot");
     let mut actual = serde_json::to_value(actual).expect("serialize actual snapshot");
     if let Some(object) = expected.as_object_mut() {
-        object.remove("thresholds");
+        remove_threshold_levels(object);
     }
     if let Some(object) = actual.as_object_mut() {
-        object.remove("thresholds");
+        remove_threshold_levels(object);
     }
     let mut differences = Vec::new();
     compare_values("", &expected, &actual, &mut differences);
     differences
+}
+
+fn remove_threshold_levels(object: &mut serde_json::Map<String, serde_json::Value>) {
+    if let Some(serde_json::Value::Object(thresholds)) = object.get_mut("thresholds") {
+        thresholds.remove("fuel");
+        thresholds.remove("memory");
+        thresholds.remove("depth");
+    }
 }
 
 fn compare_values(

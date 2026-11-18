@@ -1,3 +1,6 @@
+use std::time::Duration;
+
+use crate::ProbeCaps;
 use crate::snapshot::SnapshotCase;
 use crate::snapshot_cases::{default_caps, main_case};
 
@@ -163,6 +166,40 @@ pub fn cases() -> Vec<SnapshotCase> {
         "fn down(n: int) -> int {\n    if n == 0 { 0 } else { down(n - 1) }\n}\nfn main() { print(down(10)) }",
         None,
         caps,
+    ));
+
+    // One golden per limit trap. These record `thresholds.note` because a
+    // threshold search would be circular, so the verification instead pins the
+    // exact trap kind at the recorded limits.
+    cases.push(main_case(
+        "limits/traps/out-of-fuel",
+        "fn main() { var i = 0\nwhile i < 10 { i += 1 } }",
+        None,
+        ProbeCaps { fuel: 5, ..caps },
+    ));
+    cases.push(main_case(
+        "limits/traps/out-of-memory",
+        "fn main() { let xs = [1, 2, 3, 4, 5, 6, 7, 8] }",
+        None,
+        ProbeCaps { memory: 4, ..caps },
+    ));
+    cases.push(main_case(
+        "limits/traps/depth-exceeded",
+        "fn down(n: int) -> int {\n    if n == 0 { 0 } else { down(n - 1) }\n}\nfn main() { print(down(5)) }",
+        None,
+        ProbeCaps { depth: 2, ..caps },
+    ));
+    // A zero deadline is deterministic: it is already due at the first
+    // deadline check (every 1024 fuel ticks), so this pins `Deadline` without
+    // depending on wall-clock time.
+    cases.push(main_case(
+        "limits/traps/deadline",
+        "fn main() { var i = 0\nwhile i < 2000 { i += 1 } }",
+        None,
+        ProbeCaps {
+            deadline: Some(Duration::ZERO),
+            ..caps
+        },
     ));
     cases
 }

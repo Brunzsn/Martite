@@ -6,6 +6,7 @@ pub mod snapshot;
 pub mod snapshot_cases;
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use martite_base::{
     Code, Diagnostic, LoadLimits, MemoryProvider, Severity, SourceId, SourceMap, Span,
@@ -357,6 +358,10 @@ pub struct ProbeCaps {
     pub fuel: u64,
     pub memory: u64,
     pub depth: u32,
+    /// A deadline for the probe. Only a zero deadline is deterministic; the
+    /// deadline trap fixture uses it to exercise `Deadline` without depending
+    /// on wall-clock timing.
+    pub deadline: Option<Duration>,
 }
 
 impl Default for ProbeCaps {
@@ -365,6 +370,7 @@ impl Default for ProbeCaps {
             fuel: 1_000_000,
             memory: 8 << 20,
             depth: 200,
+            deadline: None,
         }
     }
 }

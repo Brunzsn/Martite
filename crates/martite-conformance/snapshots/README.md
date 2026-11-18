@@ -70,9 +70,11 @@ as its snapshot record exists.
   the sum across steps.
 - Limit-driven outcomes (`out_of_fuel`, `out_of_memory`, `depth_exceeded`,
   `deadline`) record the input limits and `thresholds.note =
-  "limit-driven outcome"`; a threshold search would be circular.
-- Deadline cases are not part of the snapshot corpus because they depend on
-  wall-clock timing.
+  "limit-driven outcome"`; a threshold search would be circular. The note is
+  accepted only for those outcomes and may not carry numeric levels.
+- The deadline case uses a zero deadline, which is already due at the first
+  deadline check (every 1024 fuel ticks). That pins `Deadline` deterministically
+  instead of depending on wall-clock timing.
 
 ## Coverage notes
 

@@ -17,6 +17,8 @@ on fail() -> Result[(), str]
 on boom()
 on mutate(x: int) -> int
 on check()
+on remember(doc: Doc)
+on recall() -> Result[(), str]
 "#;
 
 const MANIFEST: &str = r#"
@@ -84,7 +86,30 @@ on mutate(mut x: int) -> int {
     x
 }
 
-on shutdown(self) {}
+on shutdown(mut self) { self.saves += 1 }
+"#;
+
+const DOC_STATE_PLUGIN: &str = r#"
+use app.editor
+use app.editor.Doc
+
+struct State { doc: Doc? }
+
+on init() -> State { State { doc: None } }
+
+on remember(mut self, doc: Doc) {
+    self.doc = Some(doc)
+}
+
+on recall(self) -> Result[(), str] {
+    match self.doc {
+        Some(doc) => match editor.stale_text(doc) {
+            Some(_) => Ok(()),
+            None => Err("stale handle"),
+        },
+        None => Err("no doc"),
+    }
+}
 "#;
 
 fn editor_hosts() -> HostSet {
@@ -263,6 +288,22 @@ pub fn cases() -> Vec<SnapshotCase> {
                 PluginStep::Call {
                     hook: "lookup",
                     args: vec![ArgSpec::handle("Doc", "stale")],
+                },
+            ],
+        ),
+        scenario(
+            "handle_inside_plugin_state",
+            DOC_STATE_PLUGIN,
+            Some(editor_hosts()),
+            vec![
+                PluginStep::Init,
+                PluginStep::Call {
+                    hook: "remember",
+                    args: vec![ArgSpec::handle("Doc", "ok")],
+                },
+                PluginStep::Call {
+                    hook: "recall",
+                    args: Vec::new(),
                 },
             ],
         ),

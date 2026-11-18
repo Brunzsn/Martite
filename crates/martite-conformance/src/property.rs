@@ -7,8 +7,10 @@
 //!
 //! For each source, the harness checks the program, lowers it twice, verifies
 //! the result, proves that a deliberately corrupted clone is rejected, and
-//! executes the IR at a limit sweep. Two-run determinism, exact fuel
-//! boundaries and the low memory/depth sweep are the permanent invariants.
+//! executes the IR at a limit sweep. Two-run determinism, binary-searched exact
+//! fuel/memory/depth boundaries, the exact trap kind below each boundary and a
+//! full value/log/fuel match at every completing limit are the permanent
+//! invariants. `Skipped` is not a pass; the property test fails on it.
 
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -33,13 +35,13 @@ pub const BASELINE_FUEL: u64 = 50_000;
 pub const BASELINE_MEMORY: u64 = 1 << 20;
 pub const BASELINE_DEPTH: u32 = 128;
 
-/// Per-execution deadline. A generated program that hits this is skipped
-/// rather than treated as a failure, so a slow runner cannot make the suite
-/// flaky.
+/// Per-execution deadline. A generated program that hits this is reported as
+/// `Skipped`; the property test treats that as a hang regression, not a pass.
 const EXECUTION_DEADLINE: Duration = Duration::from_millis(500);
 
 /// Whole-program wall-clock cap. The limit sweep re-runs the program many
-/// times; a program that cannot finish the sweep is skipped.
+/// times; a program that cannot finish the sweep is reported as `Skipped` and
+/// therefore fails the property test.
 const WALL_CLOCK_CAP: Duration = Duration::from_secs(2);
 
 /// Outcome of one checked source.
@@ -163,7 +165,12 @@ pub fn check_source(source: &str) -> Result<PropertyOutcome, PropertyFailure> {
     let first_ir = observe_ir(&ir, &sources, baseline);
     let optimized_baseline = observe_ir(&optimized, &sources, baseline);
     if deadline(&first_ir) || deadline(&optimized_baseline) {
-        return Ok(skipped("deadline at baseline limits"));
+        return Err(PropertyFailure::new(
+            "deadline",
+            source,
+            "generated program hit the wall-clock deadline at baseline limits",
+        )
+        .with_dump(dump));
     }
     if optimized_baseline != first_ir {
         return Err(PropertyFailure::new(
@@ -184,11 +191,14 @@ pub fn check_source(source: &str) -> Result<PropertyOutcome, PropertyFailure> {
         )
         .with_dump(dump));
     }
+    let baseline_log = first_ir.log.clone();
     let fuel_used = first_ir.fuel_used;
 
-    let sweep = limit_sweep(fuel_used);
+    let sweep = limit_sweep(&ir, &sources);
     let mut checks = 0usize;
-    for (name, limits) in sweep {
+    for probe in sweep {
+        let name = probe.name;
+        let limits = probe.limits;
         if timed_out(start) {
             return Ok(skipped(format!(
                 "wall-clock cap during limit sweep at `{name}`"
@@ -203,7 +213,12 @@ pub fn check_source(source: &str) -> Result<PropertyOutcome, PropertyFailure> {
             || deadline(&optimized_run)
             || deadline(&optimized_second)
         {
-            return Ok(skipped(format!("deadline during limit sweep at `{name}`")));
+            return Err(PropertyFailure::new(
+                "deadline",
+                source,
+                format!("`{name}` hit the wall-clock deadline at {limits:?}"),
+            )
+            .with_dump(dump));
         }
         if optimized_run != optimized_second {
             return Err(PropertyFailure::new(
@@ -245,32 +260,42 @@ pub fn check_source(source: &str) -> Result<PropertyOutcome, PropertyFailure> {
             )
             .with_dump(dump));
         }
-        if name == "fuel below minimum" {
-            match &ir_first.outcome {
-                OutcomeRecord::Trap { trap } if trap.kind == "out_of_fuel" => {}
-                other => {
+        match probe.expect {
+            Expected::Complete => {
+                if ir_first.outcome != baseline_outcome
+                    || ir_first.log != baseline_log
+                    || ir_first.fuel_used != fuel_used
+                {
                     return Err(PropertyFailure::new(
-                        "fuel boundary",
+                        "limit observation",
                         source,
                         format!(
-                            "`{name}` must trap OutOfFuel at fuel={} (baseline used {fuel_used}), got {other:?}",
-                            limits.fuel
+                            "`{name}` completes but its observation differs from the baseline\nlimits:   {limits:?}\nbaseline: outcome {:?}, log {:?}, fuel {}\nactual:   outcome {:?}, log {:?}, fuel {}",
+                            baseline_outcome,
+                            baseline_log,
+                            fuel_used,
+                            ir_first.outcome,
+                            ir_first.log,
+                            ir_first.fuel_used
                         ),
                     )
                     .with_dump(dump));
                 }
             }
-        }
-        if name == "fuel at minimum" && !matches!(ir_first.outcome, OutcomeRecord::Value { .. }) {
-            return Err(PropertyFailure::new(
-                "fuel boundary",
-                source,
-                format!(
-                    "`{name}` must complete at fuel={} (baseline used {fuel_used}), got {:?}",
-                    limits.fuel, ir_first.outcome
-                ),
-            )
-            .with_dump(dump));
+            Expected::Trap(kind) => {
+                let actual = ir_first.trap_kind();
+                if actual != Some(kind) {
+                    return Err(PropertyFailure::new(
+                        "limit trap kind",
+                        source,
+                        format!(
+                            "`{name}` must trap `{kind}` at {limits:?}, got {:?}",
+                            ir_first.outcome
+                        ),
+                    )
+                    .with_dump(dump));
+                }
+            }
         }
         checks += 1;
     }
@@ -519,73 +544,138 @@ fn non_limit_trap(observation: &RunObservation) -> Option<&str> {
     }
 }
 
-/// A small sweep around the exact fuel threshold, plus low memory and depth.
-fn limit_sweep(fuel_used: u64) -> Vec<(&'static str, ExecLimits)> {
+/// What a limit probe must observe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expected {
+    /// Complete, with exactly the baseline value, log and fuel.
+    Complete,
+    /// Trap with this exact kind.
+    Trap(&'static str),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LimitProbe {
+    name: &'static str,
+    limits: ExecLimits,
+    expect: Expected,
+}
+
+/// Binary-search the exact fuel, memory and depth boundaries, then probe the
+/// minimum, one unit below it and zero for each dimension.
+///
+/// Every completing probe must reproduce the baseline value, log and fuel; every
+/// boundary probe must trap with the exact limit trap for that dimension.
+fn limit_sweep(ir: &IrProgram, sources: &SourceMap) -> Vec<LimitProbe> {
     let baseline = baseline_limits();
+    let at_fuel = |fuel| ExecLimits { fuel, ..baseline };
+    let at_memory = |memory| ExecLimits { memory, ..baseline };
+    let at_depth = |depth| ExecLimits { depth, ..baseline };
+
+    let fuel_min = binary_minimum(1, baseline.fuel, |fuel| {
+        observe_ir(ir, sources, at_fuel(fuel)).completed()
+    });
+    let memory_min = binary_minimum(0, baseline.memory, |memory| {
+        observe_ir(ir, sources, at_memory(memory)).completed()
+    });
+    let depth_min = binary_minimum(0, baseline.depth as u64, |depth| {
+        observe_ir(ir, sources, at_depth(depth as u32)).completed()
+    }) as u32;
+
+    let zero_memory = if memory_min == 0 {
+        Expected::Complete
+    } else {
+        Expected::Trap("out_of_memory")
+    };
+    let zero_depth = if depth_min == 0 {
+        Expected::Complete
+    } else {
+        Expected::Trap("depth_exceeded")
+    };
+
     let mut sweep = vec![
-        (
-            "fuel at minimum",
-            ExecLimits {
-                fuel: fuel_used.saturating_add(1),
-                ..baseline
-            },
-        ),
-        (
-            "fuel half",
-            ExecLimits {
-                fuel: (fuel_used / 2).max(1),
-                ..baseline
-            },
-        ),
-        (
-            "fuel one",
-            ExecLimits {
-                fuel: 1,
-                ..baseline
-            },
-        ),
-        (
-            "memory low",
-            ExecLimits {
-                memory: baseline.memory / 8,
-                ..baseline
-            },
-        ),
-        (
-            "memory zero",
-            ExecLimits {
-                memory: 0,
-                ..baseline
-            },
-        ),
-        (
-            "depth one",
-            ExecLimits {
-                depth: 1,
-                ..baseline
-            },
-        ),
-        (
-            "depth zero",
-            ExecLimits {
-                depth: 0,
-                ..baseline
-            },
-        ),
+        LimitProbe {
+            name: "fuel minimum",
+            limits: at_fuel(fuel_min),
+            expect: Expected::Complete,
+        },
+        LimitProbe {
+            name: "fuel one above minimum",
+            limits: at_fuel(fuel_min.saturating_add(1)),
+            expect: Expected::Complete,
+        },
+        LimitProbe {
+            name: "fuel below minimum",
+            limits: at_fuel(fuel_min.saturating_sub(1)),
+            expect: Expected::Trap("out_of_fuel"),
+        },
+        LimitProbe {
+            name: "memory minimum",
+            limits: at_memory(memory_min),
+            expect: Expected::Complete,
+        },
+        LimitProbe {
+            name: "memory zero",
+            limits: at_memory(0),
+            expect: zero_memory,
+        },
+        LimitProbe {
+            name: "depth minimum",
+            limits: at_depth(depth_min),
+            expect: Expected::Complete,
+        },
+        LimitProbe {
+            name: "depth zero",
+            limits: at_depth(0),
+            expect: zero_depth,
+        },
     ];
-    if fuel_used > 0 {
-        sweep.insert(
-            1,
-            (
-                "fuel below minimum",
-                ExecLimits {
-                    fuel: fuel_used,
-                    ..baseline
-                },
-            ),
-        );
+    if memory_min > 1 {
+        sweep.push(LimitProbe {
+            name: "memory below minimum",
+            limits: at_memory(memory_min - 1),
+            expect: Expected::Trap("out_of_memory"),
+        });
+    }
+    if depth_min > 1 {
+        sweep.push(LimitProbe {
+            name: "depth below minimum",
+            limits: at_depth(depth_min - 1),
+            expect: Expected::Trap("depth_exceeded"),
+        });
+    }
+    if memory_min < baseline.memory {
+        sweep.push(LimitProbe {
+            name: "memory one above minimum",
+            limits: at_memory(memory_min + 1),
+            expect: Expected::Complete,
+        });
+    }
+    if depth_min < baseline.depth {
+        sweep.push(LimitProbe {
+            name: "depth one above minimum",
+            limits: at_depth(depth_min + 1),
+            expect: Expected::Complete,
+        });
     }
     sweep
+}
+
+/// The smallest limit that still completes. `high` must complete; this is the
+/// same boundary search the snapshot oracle uses for its recorded thresholds.
+fn binary_minimum(mut low: u64, mut high: u64, mut completes: impl FnMut(u64) -> bool) -> u64 {
+    assert!(
+        completes(high),
+        "generated program must complete at the baseline cap"
+    );
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if completes(mid) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    low
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -593,6 +683,19 @@ struct RunObservation {
     outcome: OutcomeRecord,
     log: Vec<String>,
     fuel_used: u64,
+}
+
+impl RunObservation {
+    fn completed(&self) -> bool {
+        matches!(self.outcome, OutcomeRecord::Value { .. })
+    }
+
+    fn trap_kind(&self) -> Option<&str> {
+        match &self.outcome {
+            OutcomeRecord::Trap { trap } => Some(trap.kind.as_str()),
+            _ => None,
+        }
+    }
 }
 
 fn observe_ir(ir: &IrProgram, sources: &SourceMap, limits: ExecLimits) -> RunObservation {
