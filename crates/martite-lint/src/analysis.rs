@@ -720,6 +720,17 @@ impl<'a> Analysis<'a> {
                             .entry(walk.module.id)
                             .or_default()
                             .insert(def.name.clone());
+                        if let Some(def) = def.def {
+                            self.def_uses.entry(walk.module.id).or_default().insert(def);
+                        }
+                    }
+                    // `S.Circle(…)` names the local import (`S` may be an
+                    // alias), so record the qualifier as a type-name use too.
+                    if let ExprKind::Var(base_name) = &base.kind {
+                        self.type_names
+                            .entry(walk.module.id)
+                            .or_default()
+                            .insert(base_name.clone());
                     }
                 }
                 self.walk_expr(base, walk)

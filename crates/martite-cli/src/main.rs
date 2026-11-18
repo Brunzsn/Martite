@@ -1227,7 +1227,11 @@ struct PendingEdit {
     path: String,
     span: martite_base::Span,
     replacement: String,
+}
+
+struct PendingFix {
     code: Code,
+    edits: Vec<PendingEdit>,
 }
 
 struct FixOutcome {
@@ -1367,7 +1371,7 @@ fn collect_edits(
     sources: &SourceMap,
     suggested: bool,
 ) -> Vec<PendingEdit> {
-    let mut edits = Vec::new();
+    let mut fixes: Vec<PendingFix> = Vec::new();
     for diagnostic in diagnostics {
         let Some(fix) = &diagnostic.fix else {
             continue;
@@ -1375,29 +1379,56 @@ fn collect_edits(
         if fix.applicability == Applicability::Maybe && !suggested {
             continue;
         }
+        let mut fix_edits = Vec::new();
+        let mut complete = true;
         for edit in &fix.edits {
             let source = edit.source.or(diagnostic.source);
             let Some(source) = source else {
-                continue;
+                complete = false;
+                break;
             };
             let Some(file) = sources.get(source) else {
-                continue;
+                complete = false;
+                break;
             };
-            edits.push(PendingEdit {
+            if edit.span.start > edit.span.end || edit.span.end as usize > file.text().len() {
+                complete = false;
+                break;
+            }
+            fix_edits.push(PendingEdit {
                 path: file.name().to_string(),
                 span: edit.span,
                 replacement: edit.replacement.clone(),
+            });
+        }
+        if complete && !fix_edits.is_empty() {
+            fixes.push(PendingFix {
                 code: diagnostic.code,
+                edits: fix_edits,
             });
         }
     }
-    edits.sort_by_key(|edit| (edit.span.start, edit.code, edit.span.end));
+    fixes.sort_by_key(|fix| {
+        (
+            fix.edits
+                .iter()
+                .map(|edit| edit.span.start)
+                .min()
+                .unwrap_or(u32::MAX),
+            fix.code,
+        )
+    });
     let mut accepted: Vec<PendingEdit> = Vec::new();
-    for edit in edits {
-        if accepted.iter().any(|previous| interferes(previous, &edit)) {
+    for fix in fixes {
+        // A fix is atomic: all of its edits are accepted, or none are.
+        if fix
+            .edits
+            .iter()
+            .any(|edit| accepted.iter().any(|previous| interferes(previous, edit)))
+        {
             continue;
         }
-        accepted.push(edit);
+        accepted.extend(fix.edits);
     }
     accepted
 }

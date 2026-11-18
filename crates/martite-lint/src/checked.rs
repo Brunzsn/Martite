@@ -15,6 +15,7 @@ use martite_syntax::{
 use crate::analysis::{self, Analysis, ModuleRef, same_expr, same_place, stable};
 use crate::registry;
 use crate::settings::ResolvedSettings;
+use crate::trivia::{keyword_removal_span, statement_removal_span};
 
 pub fn run(
     program: &CheckedProgram,
@@ -160,7 +161,7 @@ impl<'a> Checked<'a> {
                 let fix = Fix {
                     applicability: Applicability::Maybe,
                     edits: vec![FixEdit::new(
-                        line_removal_span(self.module.text, stmt.span),
+                        statement_removal_span(self.module.text, stmt.span),
                         "",
                     )],
                 };
@@ -357,26 +358,30 @@ impl<'a> Checked<'a> {
                     && analysis::side_effect_free(self.program, lhs)
                     && !mutates_root(self.program, binary_rhs, lhs)
                 {
-                    let mut edits =
-                        vec![FixEdit::new(operator, format!("{}=", binary_op.as_str()))];
-                    edits.push(FixEdit::new(
-                        Span::new(rhs.span.start, binary_rhs.span.start),
-                        "",
-                    ));
-                    let _ = stmt;
+                    let binary_operator = self.module.ast.operator_span(rhs.id);
+                    let fix = binary_operator.map(|binary_operator| Fix {
+                        applicability: Applicability::Machine,
+                        edits: vec![
+                            FixEdit::new(operator, format!("{}=", binary_op.as_str())),
+                            FixEdit::new(
+                                Span::new(
+                                    self.module.ast.expression_span(binary_lhs).start,
+                                    keyword_removal_span(self.module.text, binary_operator).end,
+                                ),
+                                "",
+                            ),
+                        ],
+                    });
                     self.emit(
                         Code::L012,
                         operator,
                         "compound assignment is shorter",
                         Some(format!(
                             "replace with `{} {}= ...`",
-                            self.slice(lhs.span),
+                            self.slice(self.module.ast.expression_span(binary_lhs)),
                             binary_op.as_str()
                         )),
-                        Some(Fix {
-                            applicability: Applicability::Machine,
-                            edits,
-                        }),
+                        fix,
                     );
                 }
             }
@@ -685,7 +690,7 @@ impl<'a> Checked<'a> {
                     (Some(true_index), Some(other_index)) if true_index < other_index => {
                         let replacement = format!(
                             "if ({}) {} else {}",
-                            self.slice(scrutinee.span),
+                            self.slice(self.module.ast.expression_span(scrutinee)),
                             arm_body_text(self, &arms[true_index].body),
                             arm_body_text(self, &arms[other_index].body)
                         );
@@ -851,7 +856,9 @@ impl<'a> Checked<'a> {
         {
             return;
         }
-        let replacement = self.slice(callee.span).to_string();
+        let replacement = self
+            .slice(self.module.ast.expression_span(callee))
+            .to_string();
         self.emit(
             Code::L029,
             expr.span,
@@ -1301,20 +1308,40 @@ impl<'a> Checked<'a> {
             );
         }
 
+        let mut var_groups: Vec<(Span, Vec<(BindingId, analysis::Decl)>)> = Vec::new();
         for (binding, decl) in &self.analysis.decls {
-            if decl.source != self.module.source {
-                continue;
-            }
-            if decl.kind != analysis::DeclKind::Var || self.analysis.is_mutated(*binding) {
+            if decl.source != self.module.source || decl.kind != analysis::DeclKind::Var {
                 continue;
             }
             let Some(span) = decl.keyword_span else {
                 continue;
             };
+            if let Some((_, members)) = var_groups
+                .iter_mut()
+                .find(|(keyword, _)| keyword.start == span.start)
+            {
+                members.push((*binding, decl.clone()));
+            } else {
+                var_groups.push((span, vec![(*binding, decl.clone())]));
+            }
+        }
+        var_groups.sort_by_key(|(span, _)| span.start);
+        for (span, members) in var_groups {
+            if members
+                .iter()
+                .any(|(binding, _)| self.analysis.is_mutated(*binding))
+            {
+                continue;
+            }
+            let message = if let [(_, decl)] = members.as_slice() {
+                format!("variable `{}` is never mutated", decl.name)
+            } else {
+                "destructured variables are never mutated".to_string()
+            };
             self.emit(
                 Code::L002,
                 span,
-                format!("variable `{}` is never mutated", decl.name),
+                message,
                 Some("replace `var` with `let`".into()),
                 Some(Fix::machine(vec![FixEdit::new(span, "let")])),
             );
@@ -1826,16 +1853,6 @@ fn option_arg(tyexpr: &TyExpr) -> Option<&TyExpr> {
 
 // ----- helpers ----------------------------------------------------------
 
-fn keyword_removal_span(text: &str, span: Span) -> Span {
-    let mut end = (span.end as usize).min(text.len());
-    // Remove the separator too, so the fix does not leave `fn f( x)` or
-    // `f( x)` behind.
-    while end < text.len() && matches!(text.as_bytes()[end], b' ' | b'\t') {
-        end += 1;
-    }
-    Span::new(span.start, end as u32)
-}
-
 fn line_removal_span(text: &str, span: Span) -> Span {
     let start = span.start.min(text.len() as u32) as usize;
     let end = span.end.min(text.len() as u32) as usize;
@@ -2307,7 +2324,10 @@ fn merge_branch(target: &mut Flow, left: &Flow, right: &Flow) {
 fn arm_body_text(checked: &Checked<'_>, body: &MatchBody) -> String {
     match body {
         MatchBody::Block(block) => checked.slice(block.span).to_string(),
-        MatchBody::Expr(expr) => format!("{{ {} }}", checked.slice(expr.span)),
+        MatchBody::Expr(expr) => format!(
+            "{{ {} }}",
+            checked.slice(checked.module.ast.expression_span(expr))
+        ),
     }
 }
 
