@@ -66,6 +66,11 @@ pub struct SourceFile {
     name: String,
     text: String,
     line_starts: Vec<u32>,
+    /// One flag per line: true when every byte on the line is ASCII, so a
+    /// column can be computed without scanning from the line start.
+    line_ascii: Vec<bool>,
+    /// Scalar count of each line without its terminator.
+    line_chars: Vec<u32>,
 }
 
 impl SourceFile {
@@ -76,15 +81,38 @@ impl SourceFile {
             text
         };
         let mut line_starts = vec![0];
+        let mut line_ascii = Vec::new();
+        let mut ascii = true;
         for (i, b) in text.bytes().enumerate() {
             if b == b'\n' {
+                line_ascii.push(ascii);
                 line_starts.push((i + 1) as u32);
+                ascii = true;
+            } else if !b.is_ascii() {
+                ascii = false;
             }
         }
+        line_ascii.push(ascii);
+        let line_chars = line_starts
+            .iter()
+            .enumerate()
+            .map(|(index, &start)| {
+                let end = line_starts
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or(text.len() as u32);
+                text[start as usize..end as usize]
+                    .trim_end_matches(['\r', '\n'])
+                    .chars()
+                    .count() as u32
+            })
+            .collect();
         Self {
             name,
             text,
             line_starts,
+            line_ascii,
+            line_chars,
         }
     }
 
@@ -107,7 +135,11 @@ impl SourceFile {
             Err(i) => i.saturating_sub(1),
         };
         let line_start = self.line_starts[line] as usize;
-        let col = self.text[line_start..offset].chars().count() + 1;
+        let col = if self.line_ascii[line] {
+            offset - line_start + 1
+        } else {
+            self.text[line_start..offset].chars().count() + 1
+        };
         ((line + 1) as u32, col as u32)
     }
 
@@ -122,6 +154,14 @@ impl SourceFile {
             .copied()
             .unwrap_or(self.text.len() as u32);
         self.text[start as usize..end as usize].trim_end_matches(['\r', '\n'])
+    }
+
+    /// Scalar count of a 1-based line, excluding its terminator.
+    pub fn line_char_count(&self, line: u32) -> u32 {
+        self.line_chars
+            .get(line.saturating_sub(1) as usize)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn slice(&self, span: Span) -> &str {
@@ -411,6 +451,27 @@ mod tests {
         let file = SourceFile::new("x.mt".into(), "aé\n".into());
         assert_eq!(file.line_col(2), (1, 2));
         assert_eq!(file.slice(Span::new(0, 2)), "a");
+    }
+
+    #[test]
+    fn columns_are_relative_to_each_line() {
+        let file = SourceFile::new(
+            "x.mt".into(),
+            "fn main() {\n    let x = 1\n    let y = 2\n}\n".into(),
+        );
+        assert_eq!(file.line_col(12), (2, 1));
+        assert_eq!(file.line_col(20), (2, 9));
+        assert_eq!(file.line_col(26), (3, 1));
+        assert_eq!(file.line_col(34), (3, 9));
+        assert_eq!(file.line_text(2), "    let x = 1");
+    }
+
+    #[test]
+    fn unicode_columns_still_count_scalars() {
+        let file = SourceFile::new("x.mt".into(), "éa\nbé\n".into());
+        assert_eq!(file.line_col(2), (1, 2));
+        assert_eq!(file.line_col(5), (2, 2));
+        assert_eq!(file.line_col(7), (2, 3));
     }
 
     #[test]

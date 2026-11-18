@@ -1,5 +1,7 @@
 //! AST-driven formatter implementation.
 
+use std::collections::HashMap;
+
 use martite_base::Span;
 use martite_config::{EndOfLine, FmtConfig};
 use martite_syntax::{
@@ -83,11 +85,49 @@ fn op_class(op: BinaryOp) -> OpClass {
     }
 }
 
+/// Position index over the token stream, so punctuation lookups do not scan
+/// every token for every const type, generic list, return arrow, or range.
+struct TokenIndex {
+    /// Start offset of every token, in source order.
+    starts: Vec<u32>,
+    /// Token indices grouped by their normalized text, in source order.
+    by_text: HashMap<&'static str, Vec<usize>>,
+}
+
+impl TokenIndex {
+    fn new(tokens: &[Token]) -> Self {
+        let starts = tokens.iter().map(|token| token.span.start).collect();
+        let mut by_text: HashMap<&'static str, Vec<usize>> = HashMap::new();
+        for (index, token) in tokens.iter().enumerate() {
+            if matches!(token.kind, TokenKind::Newline | TokenKind::Eof) {
+                continue;
+            }
+            if let Some(text) = normalize::token_text(&token.kind) {
+                by_text.entry(text).or_default().push(index);
+            }
+        }
+        Self { starts, by_text }
+    }
+
+    /// Last token whose text is `text` and which ends at or before `pos`.
+    fn find_before(&self, tokens: &[Token], pos: u32, text: &str) -> Option<Span> {
+        let high = self.starts.partition_point(|&start| start < pos);
+        let indices = self.by_text.get(text)?;
+        let count = indices.partition_point(|&index| index < high);
+        indices[..count]
+            .iter()
+            .rev()
+            .find(|&&index| tokens[index].span.end <= pos)
+            .map(|&index| tokens[index].span)
+    }
+}
+
 struct Formatter<'a> {
     source: &'a str,
     program: &'a Program,
     parentheses: &'a ParenthesisTables,
     tokens: Vec<Token>,
+    token_index: TokenIndex,
     config: &'a FmtConfig,
     used: Vec<bool>,
     cursor: usize,
@@ -100,11 +140,13 @@ impl<'a> Formatter<'a> {
         tokens: Vec<Token>,
         config: &'a FmtConfig,
     ) -> Self {
+        let token_index = TokenIndex::new(&tokens);
         Self {
             source,
             program,
             parentheses: program.parentheses(),
             tokens,
+            token_index,
             config,
             used: vec![false; program.comments.len()],
             cursor: 0,
@@ -871,13 +913,7 @@ impl<'a> Formatter<'a> {
     }
 
     fn find_before(&self, pos: u32, text: &str) -> Option<Span> {
-        self.tokens
-            .iter()
-            .filter(|token| !matches!(token.kind, TokenKind::Newline | TokenKind::Eof))
-            .filter(|token| token.span.end <= pos)
-            .filter(|token| normalize::token_text(&token.kind) == Some(text))
-            .next_back()
-            .map(|token| token.span)
+        self.token_index.find_before(&self.tokens, pos, text)
     }
 
     // ----- parameters and types ------------------------------------------
@@ -2570,5 +2606,38 @@ fn expr_contains_nested(expr: &Expr) -> bool {
             expr_contains_nested(base) || expr_contains_nested(index)
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_index_finds_the_last_match_before_a_position() {
+        let mut tokens = Vec::new();
+        for i in 0..10_000u32 {
+            tokens.push(Token {
+                kind: TokenKind::Comma,
+                span: Span::new(i * 3, i * 3 + 1),
+            });
+        }
+        let arrow = Span::new(30_000, 30_002);
+        tokens.push(Token {
+            kind: TokenKind::Arrow,
+            span: arrow,
+        });
+        let colon = Span::new(30_003, 30_004);
+        tokens.push(Token {
+            kind: TokenKind::Colon,
+            span: colon,
+        });
+
+        let index = TokenIndex::new(&tokens);
+        assert_eq!(index.find_before(&tokens, 30_003, "->"), Some(arrow));
+        assert_eq!(index.find_before(&tokens, arrow.start, "->"), None);
+        assert_eq!(index.find_before(&tokens, 30_004, ":"), Some(colon));
+        assert_eq!(index.find_before(&tokens, colon.start, ":"), None);
+        assert_eq!(index.find_before(&tokens, 30_004, "+"), None);
     }
 }

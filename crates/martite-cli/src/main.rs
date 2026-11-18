@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use martite::{Engine, HostSignature, HostType, LANG_EDITION, LoadError, Plugin, VerifyMode};
 use martite_base::{
     Applicability, Code, Diagnostic, FileSystemProvider, LoadLimits, Severity, SourceMap,
-    SourceProvider, normalize_source,
+    SourceProvider, cap_diagnostics, normalize_source,
 };
 use martite_check::CheckedProgram;
 use martite_config::{Manifest, ToolConfig, parse_manifest, parse_tool_config};
@@ -386,8 +387,9 @@ fn render_all(diagnostics: &[Diagnostic], sources: &SourceMap, out: &mut Vec<Ren
 
 fn print_rendered(diagnostics: &mut [RenderedDiagnostic], json: bool) {
     diagnostics.sort_by(|left, right| {
-        left.file
-            .cmp(&right.file)
+        (left.severity == Severity::Note)
+            .cmp(&(right.severity == Severity::Note))
+            .then_with(|| left.file.cmp(&right.file))
             .then_with(|| left.start.cmp(&right.start))
             .then_with(|| left.code.cmp(&right.code))
             .then_with(|| left.message.cmp(&right.message))
@@ -697,8 +699,7 @@ fn format_stdin(
 }
 
 fn format_file(path: &Path, args: &FmtArgs) -> Result<ExitCode, String> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let source = read_tool_source(path, LoadLimits::default().file_size)?;
     let interface = path.extension().and_then(|ext| ext.to_str()) == Some("mti");
     let config = fmt_config_for(path)?;
     let output = if interface {
@@ -734,6 +735,38 @@ fn format_file(path: &Path, args: &FmtArgs) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Read a tool input while enforcing the loader's source-size limit.
+///
+/// `format_file` and `lint --syntax-only` are not routed through the loader, so
+/// they need the same bound; check metadata first so an oversized file is
+/// rejected before it is read into memory.
+fn read_tool_source(path: &Path, max_bytes: usize) -> Result<String, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let length = file
+        .metadata()
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?
+        .len();
+    if length > max_bytes as u64 {
+        return Err(format!(
+            "cannot read {}: source file exceeds the {max_bytes} byte limit",
+            path.display()
+        ));
+    }
+    let mut source = String::new();
+    let mut limited = file.take(max_bytes.saturating_add(1) as u64);
+    limited
+        .read_to_string(&mut source)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if source.len() > max_bytes {
+        return Err(format!(
+            "cannot read {}: source file exceeds the {max_bytes} byte limit",
+            path.display()
+        ));
+    }
+    Ok(source)
+}
+
 fn verify_format(before: &str, after: &str, interface: bool) -> Result<(), String> {
     let left = if interface {
         parse_interface(before, LoadLimits::default())
@@ -760,11 +793,13 @@ fn verify_format(before: &str, after: &str, interface: bool) -> Result<(), Strin
 fn print_fmt_diagnostics(diagnostics: &[martite_base::Diagnostic], name: &str, source: &str) {
     let mut sources = SourceMap::new();
     let source_id = sources.add(name.to_string(), source.to_string());
-    for diagnostic in diagnostics {
-        if !matches!(diagnostic.code, Code::E001 | Code::E002 | Code::E003) {
-            continue;
-        }
-        let mut diagnostic = diagnostic.clone();
+    let mut visible: Vec<Diagnostic> = diagnostics
+        .iter()
+        .filter(|diagnostic| matches!(diagnostic.code, Code::E001 | Code::E002 | Code::E003))
+        .cloned()
+        .collect();
+    cap_diagnostics(&mut visible);
+    for mut diagnostic in visible {
         diagnostic.source = Some(source_id);
         eprintln!("{}", diagnostic.render(&sources));
     }
@@ -1677,11 +1712,12 @@ fn lint_syntax_only_mode(args: &LintArgs) -> ExitCode {
     let mut sources = SourceMap::new();
     let mut diagnostics = Vec::new();
     let mut had_parse_error = false;
+    let limits = LoadLimits::default();
     for path in files {
-        let text = match std::fs::read_to_string(&path) {
+        let text = match read_tool_source(&path, limits.file_size) {
             Ok(text) => normalize_source(&text).into_owned(),
             Err(error) => {
-                eprintln!("error: cannot read {}: {error}", path.display());
+                eprintln!("error: {error}");
                 return ExitCode::from(2);
             }
         };
@@ -1691,13 +1727,14 @@ fn lint_syntax_only_mode(args: &LintArgs) -> ExitCode {
             .display()
             .to_string();
         let source = sources.add(display, text.clone());
-        let parsed = parse_source(&text, LoadLimits::default());
+        let parsed = parse_source(&text, limits);
         if !parsed.diagnostics.is_empty() {
             had_parse_error = true;
             let mut parse_diagnostics = parsed.diagnostics;
             for diagnostic in &mut parse_diagnostics {
                 diagnostic.source = Some(source);
             }
+            cap_diagnostics(&mut parse_diagnostics);
             diagnostics.extend(parse_diagnostics);
             continue;
         }

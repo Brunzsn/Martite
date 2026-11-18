@@ -505,10 +505,9 @@ impl Diagnostic {
                 let line_text = file.line_text(line);
                 out.push_str(&format!("\n{:>width$} |", ""));
                 out.push_str(&format!("\n{:>width$} | {}", line, line_text));
-                let remaining = line_text
-                    .chars()
-                    .skip((col.saturating_sub(1)) as usize)
-                    .count();
+                let remaining = file
+                    .line_char_count(line)
+                    .saturating_sub(col.saturating_sub(1)) as usize;
                 let label = file.slice(span);
                 let mut length = label
                     .split('\n')
@@ -626,6 +625,34 @@ fn json_str(s: &str) -> String {
     out
 }
 
+/// Upper bound on retained diagnostics per file or tool run.
+///
+/// A single invalid byte can produce a diagnostic, so unbounded output turns a
+/// small file into minutes of rendering. Rustc uses the same default.
+pub const MAX_DIAGNOSTICS: usize = 100;
+
+/// Truncate `diagnostics` to [`MAX_DIAGNOSTICS`] and append a note for the
+/// remainder. Returns the number of diagnostics that were suppressed.
+pub fn cap_diagnostics(diagnostics: &mut Vec<Diagnostic>) -> usize {
+    cap_diagnostics_at(diagnostics, MAX_DIAGNOSTICS)
+}
+
+/// [`cap_diagnostics`] with an explicit bound.
+pub fn cap_diagnostics_at(diagnostics: &mut Vec<Diagnostic>, max: usize) -> usize {
+    if diagnostics.len() <= max {
+        return 0;
+    }
+    let suppressed = diagnostics.len() - max;
+    diagnostics.truncate(max);
+    let mut note = Diagnostic::error(
+        Code::E002,
+        format!("{suppressed} more diagnostics suppressed"),
+    );
+    note.severity = Severity::Note;
+    diagnostics.push(note);
+    suppressed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,5 +671,36 @@ mod tests {
         let d = Diagnostic::at(Code::E201, id, Span::new(0, 1), "bad \"thing\"\n");
         let json = d.render_json(&sources);
         assert!(json.contains("bad \\\"thing\\\"\\n"));
+    }
+
+    #[test]
+    fn lint_rendering_uses_the_span_line_and_column() {
+        let mut sources = SourceMap::new();
+        let id = sources.add("a.mt", "fn main() {\n    let x = 1\n}\n");
+        let diagnostic = Diagnostic::lint(Code::L001, id, Span::new(20, 21), "unused `x`");
+        let text = diagnostic.render_lint(&sources);
+        assert!(text.contains("--> a.mt:2:9"), "{text}");
+        assert!(text.contains("\n2 |     let x = 1"), "{text}");
+        assert!(text.contains("\n  |         ^"), "{text}");
+    }
+
+    #[test]
+    fn capping_diagnostics_reports_the_suppressed_count() {
+        let mut diagnostics = vec![Diagnostic::error(Code::E001, "bad")];
+        let mut many = Vec::new();
+        for _ in 0..150 {
+            many.push(Diagnostic::error(Code::E001, "bad"));
+        }
+        diagnostics.append(&mut many);
+        let suppressed = cap_diagnostics(&mut diagnostics);
+        assert_eq!(suppressed, 51);
+        assert_eq!(diagnostics.len(), MAX_DIAGNOSTICS + 1);
+        let note = diagnostics.last().expect("note");
+        assert_eq!(note.code, Code::E002);
+        assert_eq!(note.severity, Severity::Note);
+        assert_eq!(note.message, "51 more diagnostics suppressed");
+        assert!(note.span.is_none());
+
+        assert_eq!(cap_diagnostics_at(&mut diagnostics, 1_000), 0);
     }
 }

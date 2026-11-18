@@ -555,6 +555,46 @@ fn lint_syntax_only_reports_constant_conditions() {
 }
 
 #[test]
+fn check_caps_diagnostic_floods() {
+    let dir = TempDir::new("diag-cap");
+    let script = dir.file("main.mt", &"@".repeat(40_000));
+    let output = martite(&[s("check"), script.as_os_str()]);
+    assert_eq!(output.status.code(), Some(1));
+    let error = stderr(&output);
+    assert!(
+        error.contains("more diagnostics suppressed"),
+        "stderr: {error}"
+    );
+    assert!(
+        error.matches("E001").count() <= martite_base::MAX_DIAGNOSTICS,
+        "too many diagnostics rendered: {error}"
+    );
+}
+
+#[test]
+fn fmt_and_syntax_only_lint_reject_oversized_sources() {
+    let dir = TempDir::new("oversized-tool");
+    let limit = martite_base::LoadLimits::default().file_size;
+    let script = dir.file("main.mt", &"x".repeat(limit + 1));
+
+    let formatted = martite(&[s("fmt"), s("--check"), script.as_os_str()]);
+    assert_eq!(formatted.status.code(), Some(2));
+    assert!(
+        stderr(&formatted).contains("exceeds"),
+        "stderr: {}",
+        stderr(&formatted)
+    );
+
+    let linted = martite(&[s("lint"), s("--syntax-only"), script.as_os_str()]);
+    assert_eq!(linted.status.code(), Some(2));
+    assert!(
+        stderr(&linted).contains("exceeds"),
+        "stderr: {}",
+        stderr(&linted)
+    );
+}
+
+#[test]
 fn lint_fix_applies_machine_fixes() {
     let dir = TempDir::new("lint-fix");
     let script = dir.file(
