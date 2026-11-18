@@ -103,7 +103,7 @@ fn plugin_init_hook_and_state() {
         Outcome::NoHandler => panic!("handler missing"),
     }
     assert!(matches!(instance.state(), Some(Value::Struct(_))));
-    let snapshot = instance.snapshot();
+    let snapshot = instance.snapshot().expect("snapshot");
     assert_ne!(snapshot.type_fingerprint, [0u8; 32]);
     assert!(!snapshot.bytes.is_empty());
 
@@ -122,7 +122,7 @@ fn reload_keeps_snapshot_when_the_state_type_is_unchanged() {
     let mut instance = plugin.instantiate().unwrap();
     instance.call("saved", vec![doc]).unwrap();
     assert_eq!(state_saves(&instance), 1);
-    let snapshot = instance.snapshot();
+    let snapshot = instance.snapshot().expect("snapshot");
 
     let mut provider = MemoryProvider::new();
     provider.insert("main.mt", PLUGIN);
@@ -143,7 +143,7 @@ fn reload_reinitializes_when_the_state_type_changes() {
     let mut instance = plugin.instantiate().unwrap();
     instance.call("saved", vec![doc]).unwrap();
     assert_eq!(state_saves(&instance), 1);
-    let snapshot = instance.snapshot();
+    let snapshot = instance.snapshot().expect("snapshot");
 
     let changed = PLUGIN
         .replace(
@@ -963,7 +963,8 @@ fn reload_can_use_a_different_init_budget() {
     let snapshot = plugin
         .instantiate_with_limits(roomy_limits())
         .expect("init")
-        .snapshot();
+        .snapshot()
+        .expect("snapshot");
 
     provider.insert("main.mt", SPIN_INIT_STATE_PLUGIN);
     let reloaded = engine

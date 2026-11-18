@@ -39,7 +39,7 @@ fn runtime_benches(c: &mut Criterion) {
         b.iter(|| black_box(instance.snapshot()))
     });
 
-    let snapshot = instance.snapshot();
+    let snapshot = instance.snapshot().expect("snapshot");
     let mut restored = plugin.instantiate().expect("init");
     group.bench_function("plugin_restore", |b| {
         b.iter(|| black_box(restored.restore(&snapshot)))
