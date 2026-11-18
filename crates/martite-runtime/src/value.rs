@@ -549,6 +549,10 @@ impl OrderedMap {
         self.entries.insert(key, value)
     }
 
+    pub(crate) fn try_reserve(&mut self, additional: usize) -> Result<(), ()> {
+        self.entries.try_reserve(additional).map_err(|_| ())
+    }
+
     /// Remove a key in O(n), preserving the order of the remaining keys.
     pub fn remove(&mut self, key: &Key) -> Option<Value> {
         self.entries.shift_remove(key)
@@ -844,6 +848,16 @@ impl Value {
             }
         }
     }
+}
+
+/// Fuel for hashing and copying `value` as a map key.
+///
+/// `string_slots` already sums every string component, including strings nested
+/// in tuple, struct, enum, `Option` and `Result` keys. The first eight-byte
+/// unit is covered by the lookup's own expression charge, so small keys keep
+/// their existing fuel values while large keys are charged for every scan.
+pub(crate) fn map_key_cost(value: &Value) -> u64 {
+    value.meta().string_slots.saturating_sub(1)
 }
 
 pub(crate) fn key_value_size(key: &KeyValue) -> u64 {

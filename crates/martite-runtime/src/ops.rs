@@ -161,17 +161,123 @@ fn type_rank(value: &Value) -> u8 {
     }
 }
 
+/// A `Show` output buffer with a hard byte cap.
+///
+/// The buffer is used to render interpolation, `print` and `str(x)`. Callers
+/// set the cap from the remaining memory budget so a shared `Rc` DAG cannot
+/// expand into an allocation larger than the configured memory limit. The
+/// buffer fails closed: once a write would pass the cap, `is_overflowed`
+/// reports it and no further bytes are appended.
+#[derive(Debug)]
+pub(crate) struct ShowOutput {
+    text: String,
+    limit: usize,
+    overflowed: bool,
+}
+
+impl ShowOutput {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            text: String::new(),
+            limit,
+            overflowed: false,
+        }
+    }
+
+    pub(crate) fn unbounded() -> Self {
+        Self::new(usize::MAX)
+    }
+
+    /// Lower (or raise) the cap for subsequent writes.
+    ///
+    /// Callers recompute it after evaluating an interpolated expression so a
+    /// value that grew the live heap also tightens the output buffer.
+    pub(crate) fn set_limit(&mut self, limit: usize) {
+        self.limit = limit;
+        if self.text.len() > limit {
+            self.overflowed = true;
+        }
+    }
+
+    pub(crate) fn is_overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        self.text
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.text.capacity()
+    }
+
+    pub(crate) fn push_str(&mut self, text: &str) {
+        if self.reserve(text.len()) {
+            self.text.push_str(text);
+        }
+    }
+
+    pub(crate) fn push(&mut self, ch: char) {
+        if self.reserve(ch.len_utf8()) {
+            self.text.push(ch);
+        }
+    }
+
+    fn reserve(&mut self, extra: usize) -> bool {
+        if self.overflowed {
+            return false;
+        }
+        let needed = self.text.len().saturating_add(extra);
+        if needed > self.limit {
+            self.overflowed = true;
+            return false;
+        }
+        if needed <= self.text.capacity() {
+            return true;
+        }
+        // Grow geometrically but never reserve past the cap, so the buffer's
+        // peak capacity stays near the configured memory limit.
+        let target = needed.max(self.text.capacity() + self.text.capacity() / 2);
+        let target = target.min(self.limit);
+        if target < needed
+            || self
+                .text
+                .try_reserve_exact(target - self.text.len())
+                .is_err()
+        {
+            self.overflowed = true;
+            return false;
+        }
+        true
+    }
+}
+
+impl std::fmt::Write for ShowOutput {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        if self.reserve(text.len()) {
+            self.text.push_str(text);
+            Ok(())
+        } else {
+            Err(std::fmt::Error)
+        }
+    }
+}
+
 /// The normative `Show` format. `top` is true for `{x}`, `str(x)`, and
 /// `print(x)`; strings are raw at the top and quoted inside containers.
 pub fn show(value: &Value, types: &TypeTable, top: bool) -> String {
-    let mut out = String::new();
+    let mut out = ShowOutput::unbounded();
     write_show(&mut out, value, types, top);
-    out
+    out.into_string()
 }
 
 /// Appends the normative `Show` format to `out`.
-pub(crate) fn write_show(out: &mut String, value: &Value, types: &TypeTable, top: bool) {
+pub(crate) fn write_show(out: &mut ShowOutput, value: &Value, types: &TypeTable, top: bool) {
     use std::fmt::Write;
+    if out.is_overflowed() {
+        return;
+    }
     match value {
         Value::Unit => out.push_str("()"),
         Value::Int(v) => {
@@ -197,6 +303,9 @@ pub(crate) fn write_show(out: &mut String, value: &Value, types: &TypeTable, top
                         '\r' => out.push_str("\\r"),
                         c => out.push(c),
                     }
+                    if out.is_overflowed() {
+                        return;
+                    }
                 }
                 out.push('"');
             }
@@ -208,6 +317,9 @@ pub(crate) fn write_show(out: &mut String, value: &Value, types: &TypeTable, top
                     out.push_str(", ");
                 }
                 write_show(out, item, types, false);
+                if out.is_overflowed() {
+                    return;
+                }
             }
             out.push(']');
         }
@@ -218,6 +330,9 @@ pub(crate) fn write_show(out: &mut String, value: &Value, types: &TypeTable, top
                     out.push_str(", ");
                 }
                 write_show(out, item, types, false);
+                if out.is_overflowed() {
+                    return;
+                }
             }
             if items.len() == 1 {
                 out.push(',');
@@ -233,6 +348,9 @@ pub(crate) fn write_show(out: &mut String, value: &Value, types: &TypeTable, top
                 write_show(out, &crate::value::key_to_value(key), types, false);
                 out.push_str(": ");
                 write_show(out, value, types, false);
+                if out.is_overflowed() {
+                    return;
+                }
             }
             out.push('}');
         }
@@ -255,6 +373,9 @@ pub(crate) fn write_show(out: &mut String, value: &Value, types: &TypeTable, top
                     }
                     let _ = write!(out, "{}: ", field.name);
                     write_show(out, field_value, types, false);
+                    if out.is_overflowed() {
+                        return;
+                    }
                 }
             }
             out.push_str(" }");
@@ -277,6 +398,9 @@ pub(crate) fn write_show(out: &mut String, value: &Value, types: &TypeTable, top
                         out.push_str(", ");
                     }
                     write_show(out, item, types, false);
+                    if out.is_overflowed() {
+                        return;
+                    }
                 }
                 out.push(')');
             }

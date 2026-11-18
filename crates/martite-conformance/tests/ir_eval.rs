@@ -100,12 +100,13 @@ fn zero_payload_variant_value_keeps_the_tick_cadence() {
 
 #[test]
 fn identical_static_literals_at_distinct_nodes_account_separately() {
-    let case = Case::single(
-        "fn main() {\n    let a = \"abcd\"\n    let b = \"abcd\"\n    let _ = (a, b)\n}",
+    let one = Case::single("fn main() {\n    let a = \"abcd\"\n    let _ = a.len()\n}");
+    let two = Case::single(
+        "fn main() {\n    let a = \"abcd\"\n    let b = \"abcd\"\n    let _ = a.len() + b.len()\n}",
     );
     assert_eq!(
-        min_memory(&case),
-        40,
+        min_memory(&two),
+        min_memory(&one) + 20,
         "each literal site must have its own first-use cache"
     );
 }
@@ -241,8 +242,24 @@ fn failed_guards_restore_the_previous_binding_for_copy_on_write() {
     let observation = observe(&case, ExecLimits::default());
     assert_eq!(observation.outcome, Ok("()".into()));
     assert_eq!(observation.log, ["1", "9"]);
+    // Measure the restore without print-log bytes so the threshold still
+    // isolates the copy-on-write cost of a retained reference.
+    let memory_case = Case::single(
+        r#"
+        fn main() {
+            var items = [1, 2, 3]
+            for i in 0..2 {
+                match Some(items) {
+                    Some(bound) if i == 0 => {},
+                    _ => {}
+                }
+            }
+            items[0] = 9
+        }
+        "#,
+    );
     assert_eq!(
-        min_memory(&case),
+        min_memory(&memory_case),
         80,
         "a failed guard must restore the previous binding, not clear the slot"
     );
@@ -250,18 +267,17 @@ fn failed_guards_restore_the_previous_binding_for_copy_on_write() {
 
 #[test]
 fn failed_guard_bindings_do_not_leak_a_reference_in_ir() {
-    let baseline = Case::single(
-        "fn main() {\n    var items = [1, 2, 3]\n    items.push(4)\n    print(\"{items.len()}\")\n}",
-    );
+    let baseline = Case::single("fn main() {\n    var items = [1, 2, 3]\n    items.push(4)\n}");
     let with_failed_guard = Case::single(
-        "fn main() {\n    var items = [1, 2, 3]\n    match Some(items) {\n        Some(bound) if false => print(\"{bound.len()}\"),\n        _ => {}\n    }\n    items.push(4)\n    print(\"{items.len()}\")\n}",
+        "fn main() {\n    var items = [1, 2, 3]\n    match Some(items) {\n        Some(bound) if false => {},\n        _ => {}\n    }\n    items.push(4)\n}",
     );
     let observation = observe(&with_failed_guard, ExecLimits::default());
     assert_eq!(observation.outcome, Ok("()".into()));
-    assert_eq!(observation.log, ["4"]);
-    assert_eq!(
-        min_memory(&with_failed_guard),
-        min_memory(&baseline),
+    // The `Some` scrutinee is live during the match, so one 16-byte wrapper is
+    // expected. A retained list reference would force a copy-on-write and add a
+    // whole list payload.
+    assert!(
+        min_memory(&with_failed_guard) <= min_memory(&baseline) + 16,
         "a failed guard must not keep its binding slot live into later copy-on-write"
     );
 }
