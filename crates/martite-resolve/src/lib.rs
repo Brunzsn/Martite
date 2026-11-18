@@ -296,7 +296,9 @@ impl<'a> Loader<'a> {
         }
 
         let entry_path = module_path_from_file(&self.options.entry);
-        let Some(entry) = self.ensure_module(&entry_path, false) else {
+        let entry_file = self.options.entry.replace('\\', "/");
+        let Some(entry) = self.ensure_module_with_file(&entry_path, false, Some(&entry_file))
+        else {
             self.diag(
                 Code::E508,
                 None,
@@ -381,6 +383,20 @@ impl<'a> Loader<'a> {
     }
 
     fn ensure_module(&mut self, path: &str, want_interface: bool) -> Option<ModuleId> {
+        self.ensure_module_with_file(path, want_interface, None)
+    }
+
+    /// Load a module by dotted path, optionally from an exact provider path.
+    ///
+    /// The entry file is loaded with its literal path so a file name such as
+    /// `main.v1.mt` never round-trips through the dotted module name
+    /// `main.v1` into `main/v1.mt`.
+    fn ensure_module_with_file(
+        &mut self,
+        path: &str,
+        want_interface: bool,
+        source_file: Option<&str>,
+    ) -> Option<ModuleId> {
         if self.loading.contains(path) {
             self.diag(
                 Code::E106,
@@ -395,7 +411,9 @@ impl<'a> Loader<'a> {
         }
 
         let interface = self.interfaces.get(path).cloned();
-        let source_file = Self::module_file(path);
+        let source_file = source_file
+            .map(str::to_string)
+            .unwrap_or_else(|| Self::module_file(path));
         let source_text = if want_interface {
             if interface.is_none() {
                 return None;
@@ -1516,6 +1534,25 @@ mod tests {
         assert!(main.symbols.modules.contains_key("shapes"));
         assert!(main.symbols.types.contains_key("Circle"));
         assert!(main.symbols.consts.contains_key("MAX_SIZE"));
+    }
+
+    #[test]
+    fn entry_is_loaded_as_an_exact_path() {
+        let (sources, out) = resolve_text(
+            &[
+                ("main.v1.mt", "fn main() {}\n"),
+                ("main/v1.mt", "fn main( {\n"),
+            ],
+            "main.v1.mt",
+        );
+        assert!(
+            !out.has_errors(),
+            "unexpected errors: {:?}",
+            out.diagnostics
+        );
+        let program = out.program.expect("program");
+        let source = program.entry_module().source;
+        assert_eq!(sources.get(source).expect("source").name(), "main.v1.mt");
     }
 
     #[test]

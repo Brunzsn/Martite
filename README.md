@@ -167,12 +167,19 @@ engine.interface_package(&package);
 ```
 
 The host should load the package from a trusted embedded or installed location;
-runtime plugin manifests never choose interface file paths.
+runtime plugin manifests never choose interface file paths. A `[workspace]` in
+the plugin project itself is not trusted: it cannot supply the interfaces the
+plugin is validated against. Workspaces above the plugin, including the
+invocation root, still apply.
 
 ## Host policy
 
 `martite run` is the standalone host and is intentionally unrestricted: it has
 ambient filesystem access plus `std.io` and `std.env`. Limit flags still apply.
+
+`martite test` also uses a sandboxed provider, but it does not register the
+standalone host by default: `use std.io` or `use std.env` is an unknown module
+unless the test passes `--ambient-host`.
 
 Embeddings and plugin hosts use a sandboxed `FileSystemProvider` by default.
 An embedding that deliberately wants ambient access must opt in with

@@ -9,6 +9,7 @@
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
+use martite_base::{FileSystemProvider, SourceProvider};
 use martite_config::{is_valid_module_segment, parse_interface_manifest};
 use martite_resolve::InterfaceSource;
 
@@ -43,9 +44,11 @@ impl InterfacePackage {
             )));
         }
 
+        let provider = FileSystemProvider::new(root);
         let manifest_path = root.join("interface.toml");
         let (name, version) = if manifest_path.is_file() {
-            let text = std::fs::read_to_string(&manifest_path)
+            let text = provider
+                .read("interface.toml")
                 .map_err(|e| fail(format!("cannot read {}: {e}", manifest_path.display())))?;
             let manifest = parse_interface_manifest(&text)
                 .map_err(|e| fail(format!("{}: {}", manifest_path.display(), e.message)))?;
@@ -88,7 +91,16 @@ impl InterfacePackage {
                     "interface package `{name}` defines module `{module}` more than once"
                 )));
             }
-            let text = std::fs::read_to_string(&path)
+            let relative = path.strip_prefix(root).map_err(|_| {
+                fail(format!(
+                    "interface file {} is outside package {}",
+                    path.display(),
+                    root.display()
+                ))
+            })?;
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let text = provider
+                .read(&relative)
                 .map_err(|e| fail(format!("cannot read {}: {e}", path.display())))?;
             modules.push(InterfaceSource { path: module, text });
         }
