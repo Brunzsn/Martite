@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use martite_base::{FileSystemProvider, SourceProvider};
 use martite_config::{WorkspaceConfig, parse_tool_config};
 use martite_resolve::InterfaceSource;
 
@@ -60,13 +61,31 @@ fn find_workspace_config(
     } else {
         start
     };
+    let plugin_root = find_plugin_root(start);
 
     for directory in start.ancestors() {
+        // A plugin project may not supply the interfaces it is validated
+        // against. Configs at or below the project root are untrusted; a
+        // workspace above it (the invocation root or an ancestor) still works.
+        if plugin_root
+            .as_deref()
+            .is_some_and(|root| directory.starts_with(root))
+        {
+            continue;
+        }
         let path = directory.join("martite.toml");
         if !path.is_file() {
             continue;
         }
-        let text = std::fs::read_to_string(&path)
+        // Configuration is read through the sandboxed provider so a symlink or
+        // junction cannot steer discovery outside the directory.
+        let provider_root = if directory.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            directory
+        };
+        let text = FileSystemProvider::new(provider_root)
+            .read("martite.toml")
             .map_err(|error| workspace_error(format!("cannot read {}: {error}", path.display())))?;
         let config = parse_tool_config(&text)
             .map_err(|error| workspace_error(format!("{}: {}", path.display(), error.message)))?;
@@ -76,6 +95,13 @@ fn find_workspace_config(
         return Ok(Some((directory.to_path_buf(), workspace)));
     }
     Ok(None)
+}
+
+fn find_plugin_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|directory| directory.join("plugin.toml").is_file())
+        .map(Path::to_path_buf)
 }
 
 fn build_workspace(root: PathBuf, config: WorkspaceConfig) -> Result<Workspace, WorkspaceError> {
@@ -350,6 +376,60 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(workspace.root, root);
+    }
+
+    #[test]
+    fn plugin_owned_workspace_is_not_trusted() {
+        let root = temp("plugin-owned-workspace");
+        plugin(&root, "calculator");
+        interface(&root);
+        config(
+            &root,
+            "[workspace]\nmembers = [\"plugins/*\"]\ninterface-packages = [\"interfaces/nvlaunch\"]\n",
+        );
+
+        let plugin_root = root.join("plugins/calculator");
+        let local = plugin_root.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(
+            local.join("interface.toml"),
+            "[interface]\nname = \"attacker\"\n",
+        )
+        .unwrap();
+        std::fs::write(local.join("editor.mti"), "fn text() -> int\n").unwrap();
+        config(
+            &plugin_root,
+            "[workspace]\ninterface-packages = [\"local\"]\n",
+        );
+
+        let workspace = discover_workspace(&plugin_root).unwrap().unwrap();
+        assert_eq!(workspace.root, root);
+        assert_eq!(
+            workspace
+                .interfaces
+                .iter()
+                .map(|interface| interface.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nvlaunch.launcher"]
+        );
+        assert!(
+            !workspace
+                .interfaces
+                .iter()
+                .any(|interface| interface.path.starts_with("attacker."))
+        );
+
+        let standalone = temp("plugin-owned-workspace-standalone");
+        plugin(&standalone, "calculator");
+        config(
+            &standalone.join("plugins/calculator"),
+            "[workspace]\ninterface-packages = [\"local\"]\n",
+        );
+        assert!(
+            discover_workspace(&standalone.join("plugins/calculator"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

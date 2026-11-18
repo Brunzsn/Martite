@@ -11,7 +11,7 @@ use martite_check::CheckedProgram;
 use martite_config::{Manifest, ToolConfig, parse_manifest, parse_tool_config};
 use martite_driver::{
     LoadOptions, LoadedProgram, LowerOptions, Workspace, discover_workspace,
-    discover_workspace_root, load, lower_with,
+    discover_workspace_root, load, lower_with, validate_project_entry,
 };
 use martite_ir::{IrProgram, Printer};
 use martite_lint::{LintInputs, ManifestInput, SettingsResolver, normalize_path, sort_diagnostics};
@@ -43,6 +43,7 @@ Options:
     --depth <n>           Call-depth limit for `run` and `test`
     --no-optimize         Skip optimizer passes for `run` and `test`
     --dump-ir[=stage]     Dump IR for `run`/`test`: before, after, both
+    --ambient-host        Register std.io/std.env for `test`
 
 Lower options:
     --optimize            Print the optimized IR instead of the lowered IR
@@ -133,6 +134,8 @@ struct CliArgs {
     dump_ir: Option<DumpStage>,
     no_optimize: bool,
     optimize: bool,
+    /// Register the standalone `std.io`/`std.env` host for `test`.
+    ambient_host: bool,
     path: Option<String>,
     /// Arguments after the script path, passed through to `std.env.args()`.
     script_args: Vec<String>,
@@ -190,6 +193,7 @@ fn parse_args(args: &[String], command: Command) -> Result<CliArgs, String> {
             }
             Long("no-optimize") => out.no_optimize = true,
             Long("optimize") => out.optimize = true,
+            Long("ambient-host") => out.ambient_host = true,
             Long("dump-ir") => {
                 out.dump_ir = Some(match parser.optional_value() {
                     None => DumpStage::Both,
@@ -245,10 +249,16 @@ fn parse_args(args: &[String], command: Command) -> Result<CliArgs, String> {
             if out.optimize {
                 return Err("unexpected option '--optimize'".into());
             }
+            if out.ambient_host {
+                return Err("--ambient-host is only supported by `martite test`".into());
+            }
         }
         Command::Run | Command::Test => {
             if out.optimize {
                 return Err("unexpected option '--optimize'".into());
+            }
+            if out.ambient_host && command == Command::Run {
+                return Err("`martite run` always registers the standalone host".into());
             }
         }
         Command::Lower => {
@@ -260,6 +270,9 @@ fn parse_args(args: &[String], command: Command) -> Result<CliArgs, String> {
             }
             if out.no_optimize {
                 return Err("`lower` does not accept --no-optimize".into());
+            }
+            if out.ambient_host {
+                return Err("--ambient-host is only supported by `martite test`".into());
             }
         }
     }
@@ -433,14 +446,15 @@ fn load_tool_config(start: &Path) -> Result<Option<(ToolConfig, PathBuf)>, Strin
     let Some(path) = find_nearest(start, "martite.toml") else {
         return Ok(None);
     };
-    let text = std::fs::read_to_string(&path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-    let config = parse_tool_config(&text).map_err(|error| error.message)?;
     let dir = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .to_path_buf();
+    let text = FileSystemProvider::new(&dir)
+        .read("martite.toml")
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let config = parse_tool_config(&text).map_err(|error| error.message)?;
     Ok(Some((config, dir)))
 }
 
@@ -954,13 +968,21 @@ fn load_plugin_spec(
     workspace: Option<&Workspace>,
 ) -> Result<ProjectSpec, ProjectError> {
     let manifest_path = root.join("plugin.toml");
-    let text = std::fs::read_to_string(&manifest_path).map_err(|error| {
-        ProjectError::Usage(format!("cannot read {}: {error}", manifest_path.display()))
-    })?;
+    let text = FileSystemProvider::new(root)
+        .read("plugin.toml")
+        .map_err(|error| {
+            ProjectError::Usage(format!("cannot read {}: {error}", manifest_path.display()))
+        })?;
     let manifest = parse_manifest(&text).map_err(|error| {
         ProjectError::Diagnostic(Diagnostic::error(
             Code::E508,
             format!("{}: {}", manifest_path.display(), error.message),
+        ))
+    })?;
+    validate_project_entry(root, &manifest.entry).map_err(|message| {
+        ProjectError::Diagnostic(Diagnostic::error(
+            Code::E508,
+            format!("{}: {message}", manifest_path.display()),
         ))
     })?;
     let interfaces = merge_interfaces(
@@ -997,10 +1019,16 @@ fn exec_limits(args: &CliArgs) -> ExecLimits {
 
 /// Build the execution host for one project.
 ///
-/// `run` and `test` share this: the same interfaces, standalone std modules
-/// (scripts only), optimizer switch and limits. `check` and `lint` stay on the
-/// static driver loader so they never require Rust host implementations.
-fn build_engine(spec: &ProjectSpec, args: &CliArgs, script_args: Vec<String>) -> Engine {
+/// `run` and `test` share this: the same interfaces, optimizer switch and
+/// limits. The standalone `std.io`/`std.env` host is opt-in; `run` always
+/// enables it and `test` must pass `--ambient-host`. `check` and `lint` stay on
+/// the static driver loader so they never require Rust host implementations.
+fn build_engine(
+    spec: &ProjectSpec,
+    args: &CliArgs,
+    script_args: Vec<String>,
+    ambient_host: bool,
+) -> Engine {
     let mut engine = Engine::new();
     engine.set_optimize(!args.no_optimize);
     engine.set_verification(CLI_VERIFICATION);
@@ -1009,7 +1037,7 @@ fn build_engine(spec: &ProjectSpec, args: &CliArgs, script_args: Vec<String>) ->
     for interface in &spec.interfaces {
         engine.interface(interface.path.clone(), interface.text.clone());
     }
-    if spec.is_script() {
+    if ambient_host && spec.is_script() {
         StandaloneHost { script_args }.register(&mut engine, &spec.interfaces);
     }
     engine
@@ -1733,7 +1761,7 @@ fn cmd_run(raw: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let engine = build_engine(&spec, &args, args.script_args.clone());
+    let engine = build_engine(&spec, &args, args.script_args.clone(), true);
     // `martite run` is the standalone host: it is intentionally unrestricted.
     let provider = FileSystemProvider::unrestricted(root);
     let plugin = match load_executable(&spec, &engine, &provider) {
@@ -1934,7 +1962,7 @@ fn cmd_test(raw: &[String]) -> ExitCode {
             .as_ref()
             .map(|manifest| manifest.name.clone())
             .unwrap_or_else(|| spec.entry.clone());
-        let mut engine = build_engine(&spec, &args, Vec::new());
+        let mut engine = build_engine(&spec, &args, Vec::new(), args.ambient_host);
         // Tests run without a double for every host function: an unregistered
         // call traps with `no test double` instead of failing the load.
         engine.set_allow_missing_host_impls(true);

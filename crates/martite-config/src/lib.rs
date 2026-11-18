@@ -76,6 +76,30 @@ pub fn is_valid_module_segment(segment: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// Whether a manifest `entry` is a safe project-relative path.
+///
+/// The entry is loaded as a path, not as a dotted module name, so every
+/// component is checked literally. Components may not be empty, `.`, `..`, or
+/// start with `.` (a leading dot would otherwise round-trip through a module
+/// name as an absolute path). Windows strips trailing spaces and dots from path
+/// components, so those are rejected on every platform to keep the rule
+/// deterministic.
+pub fn is_valid_entry_path(entry: &str) -> bool {
+    if entry.is_empty() || entry.starts_with('/') || entry.starts_with('\\') || entry.contains(':')
+    {
+        return false;
+    }
+    entry.split(['/', '\\']).all(|part| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && !part.starts_with('.')
+            && !part.ends_with(' ')
+            && !part.ends_with('.')
+            && !part.contains('\0')
+    })
+}
+
 pub fn parse_interface_manifest(text: &str) -> Result<InterfaceManifest, ManifestError> {
     let file: InterfaceFile = toml::from_str(text).map_err(|e| ManifestError {
         message: format!("malformed interface.toml: {e}"),
@@ -173,14 +197,7 @@ pub fn parse_manifest(text: &str) -> Result<Manifest, ManifestError> {
     let entry = plugin.entry.ok_or_else(|| ManifestError {
         message: "plugin.entry is required".into(),
     })?;
-    if entry.is_empty()
-        || entry.starts_with('/')
-        || entry.starts_with('\\')
-        || entry
-            .split(['/', '\\'])
-            .any(|part| part.is_empty() || part == ".." || part == ".")
-        || entry.contains(':')
-    {
+    if !is_valid_entry_path(&entry) {
         return Err(ManifestError {
             message: "plugin.entry must be a relative path inside the project".into(),
         });
@@ -526,6 +543,34 @@ mod tests {
     fn unknown_workspace_keys_are_rejected() {
         let err = parse_tool_config("[workspace]\nplugin = [\"x\"]\n").unwrap_err();
         assert!(err.message.contains("unknown field"));
+    }
+
+    #[test]
+    fn entry_paths_are_validated() {
+        for entry in [
+            "",
+            "/main.mt",
+            "\\main.mt",
+            "C:/main.mt",
+            "a//main.mt",
+            "a/./main.mt",
+            "a/../main.mt",
+            ".hidden/main.mt",
+            ".main.mt",
+            "dir /main.mt",
+            "main.mt ",
+            "main.mt.",
+            "dir\\..\\main.mt",
+        ] {
+            assert!(!is_valid_entry_path(entry), "{entry:?}");
+            let text = format!(
+                "[plugin]\nname = \"x\"\nversion = \"1\"\nlang = \"1\"\napi = \"1.0\"\nentry = {entry:?}\n"
+            );
+            assert!(parse_manifest(&text).is_err(), "{entry:?}");
+        }
+        for entry in ["main.mt", "main.v1.mt", "src/main.mt", "dir\\main.mt"] {
+            assert!(is_valid_entry_path(entry), "{entry:?}");
+        }
     }
 
     #[test]

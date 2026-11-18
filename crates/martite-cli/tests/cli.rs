@@ -295,13 +295,29 @@ fn test_runs_passing_and_failing_blocks() {
 }
 
 #[test]
-fn test_runs_std_host_calls_in_scripts() {
+fn test_without_ambient_host_rejects_std_modules() {
+    let dir = TempDir::new("test-no-std");
+    let script = dir.file(
+        "main.mt",
+        "use std.io\n\ntest \"reads a file\" {\n    let missing = io.read_file(\"definitely-not-a-real-file.txt\")\n    assert(missing.is_err(), \"expected a read error\")\n}\n",
+    );
+    let output = martite(&[s("test"), script.as_os_str()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("E106"),
+        "stderr: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn test_runs_std_host_calls_in_scripts_with_ambient_host() {
     let dir = TempDir::new("test-std");
     let script = dir.file(
         "main.mt",
         "use std.env\nuse std.io\n\ntest \"standalone host is registered\" {\n    assert(env.args().len() == 0, \"no script arguments\")\n    let missing = io.read_file(\"definitely-not-a-real-file.txt\")\n    assert(missing.is_err(), \"expected a read error\")\n}\n",
     );
-    let output = martite(&[s("test"), script.as_os_str()]);
+    let output = martite(&[s("test"), s("--ambient-host"), script.as_os_str()]);
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(
         stdout(&output).contains("1/1 tests passed"),
@@ -449,6 +465,60 @@ grant = ["app.editor"]
         dir.path().as_os_str(),
     ]);
     assert!(output.status.success(), "stderr: {}", stderr(&output));
+}
+
+#[test]
+fn plugin_entry_with_dots_loads_that_file() {
+    let dir = TempDir::new("entry-dots");
+    dir.file(
+        "plugin.toml",
+        "[plugin]\nname = \"entry-dots\"\nversion = \"0.1.0\"\nlang = \"1\"\napi = \"1.0\"\nentry = \"main.v1.mt\"\n\n[permissions]\ngrant = [\"app.editor\"]\n",
+    );
+    dir.file(
+        "main.v1.mt",
+        "use app.editor\n\non query(_text: str) -> () { }\n",
+    );
+    dir.file("main/v1.mt", "on query(\n");
+    let interface = dir.file("app/editor.mti", "on query(text: str) -> ()\n");
+
+    let output = martite(&[
+        s("check"),
+        s("--interface"),
+        interface.as_os_str(),
+        dir.path().as_os_str(),
+    ]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+}
+
+#[test]
+fn plugin_owned_workspace_cannot_supply_interfaces() {
+    let dir = TempDir::new("plugin-workspace");
+    let plugin = dir.path().join("plugin");
+    dir.file(
+        "plugin/martite.toml",
+        "[workspace]\ninterface-packages = [\"ifaces\"]\n",
+    );
+    dir.file(
+        "plugin/plugin.toml",
+        "[plugin]\nname = \"plugin-workspace\"\nversion = \"0.1.0\"\nlang = \"1\"\napi = \"1.0\"\nentry = \"main.mt\"\n\n[permissions]\ngrant = [\"app.editor\"]\n",
+    );
+    dir.file(
+        "plugin/main.mt",
+        "use app.editor\n\non query(_text: str) -> int { editor.text(1) }\n",
+    );
+    dir.file(
+        "plugin/ifaces/interface.toml",
+        "[interface]\nname = \"app\"\n",
+    );
+    dir.file("plugin/ifaces/editor.mti", "fn text(doc: int) -> int\n");
+
+    let output = martite(&[s("check"), plugin.as_os_str()]);
+    assert_eq!(output.status.code(), Some(1));
+    let error = stderr(&output);
+    assert!(
+        error.contains("E508") || error.contains("E106"),
+        "stderr: {error}"
+    );
 }
 
 #[test]

@@ -5,6 +5,7 @@ mod workspace;
 
 use martite_base::{Code, Diagnostic, LoadLimits, Severity, SourceMap, SourceProvider};
 use martite_check::{CheckedProgram, check};
+use martite_config::is_valid_entry_path;
 use martite_ir::IrProgram;
 use martite_resolve::{InterfaceSource, ResolveOptions, resolve};
 
@@ -53,6 +54,20 @@ pub fn load(provider: &dyn SourceProvider, options: &LoadOptions) -> LoadedProgr
             diagnostics: vec![d],
         };
     }
+    if !is_valid_entry_path(&options.entry) {
+        let d = Diagnostic::error(
+            Code::E508,
+            format!(
+                "entry `{}` must be a relative path inside the project",
+                options.entry
+            ),
+        );
+        return LoadedProgram {
+            program: None,
+            sources,
+            diagnostics: vec![d],
+        };
+    }
     let resolved = resolve(
         provider,
         &ResolveOptions {
@@ -87,6 +102,32 @@ pub fn load(provider: &dyn SourceProvider, options: &LoadOptions) -> LoadedProgr
         program,
         sources,
         diagnostics,
+    }
+}
+
+/// Validate a project entry before a caller hands it to a provider.
+///
+/// Checks the literal path components with [`is_valid_entry_path`], then
+/// canonicalizes `root.join(entry)` and requires the result to stay under the
+/// canonical project root. A missing entry is left for the loader to report, so
+/// this still works for a provider that synthesizes files.
+pub fn validate_project_entry(root: &std::path::Path, entry: &str) -> Result<(), String> {
+    if !is_valid_entry_path(entry) {
+        return Err(format!(
+            "entry `{entry}` must be a relative path inside the project"
+        ));
+    }
+    let root = std::fs::canonicalize(root)
+        .map_err(|error| format!("cannot resolve {}: {error}", root.display()))?;
+    let relative = entry.replace('\\', "/");
+    let candidate = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
+    match std::fs::canonicalize(&candidate) {
+        Ok(path) if !path.starts_with(&root) => Err(format!(
+            "entry `{entry}` resolves outside the project root {}",
+            root.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(_) => Ok(()),
     }
 }
 
