@@ -122,6 +122,10 @@ struct Checker<'a> {
     /// through the alias check the item's declared bounds exactly as a direct
     /// call would.
     generic_fn_aliases: FxHashMap<BindingId, DefId>,
+    /// Immutable locals that directly alias a handler. Calls through the alias
+    /// are checked as handler calls so E505 cannot be bypassed by assigning a
+    /// handler to a local first.
+    handler_aliases: FxHashMap<BindingId, DefId>,
     /// Declared bounds for inference variables that stand in for a generic
     /// function's type parameters while one call is being checked. Keyed by
     /// `Ty::Var`; cleared for each body so ids cannot collide across bodies.
@@ -163,6 +167,7 @@ impl<'a> Checker<'a> {
             bindings: FxHashMap::default(),
             builtin_fn_aliases: FxHashMap::default(),
             generic_fn_aliases: FxHashMap::default(),
+            handler_aliases: FxHashMap::default(),
             var_bounds: FxHashMap::default(),
             pattern_bindings: NodeTable::with_capacity(node_capacity),
             lambdas: FxHashMap::default(),
