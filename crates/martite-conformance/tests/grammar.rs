@@ -1,5 +1,5 @@
 use martite_base::{Code, LoadLimits};
-use martite_syntax::{parse_interface, parse_source};
+use martite_syntax::{Item, StmtKind, parse_interface, parse_source};
 
 fn parse_ok(source: &str) -> bool {
     let parsed = parse_source(source, LoadLimits::default());
@@ -200,4 +200,77 @@ fn struct_pattern_rest_allows_a_trailing_comma() {
     parse_ok(
         "struct P { x: int, y: int }\nfn main(p: P) {\n    match p {\n        P { x, .., } => print(\"{x}\"),\n        P { .., } => print(\"p\"),\n    }\n}\n",
     );
+}
+
+#[test]
+fn statement_errors_recover_at_statement_boundaries() {
+    let source = "fn main() {\n    let = 1\n    let = 2\n    let ok = 3\n    print(\"after\")\n    return ok\n}\nfn after() {}\n";
+    let parsed = parse_source(source, LoadLimits::default());
+    let e003 = parsed
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == Code::E003)
+        .count();
+    assert_eq!(e003, 2, "{:?}", parsed.diagnostics);
+    assert_eq!(parsed.program.items.len(), 2, "{:?}", parsed.program.items);
+
+    let Item::Fn(main) = &parsed.program.items[0] else {
+        panic!("expected main");
+    };
+    let body = main.body.as_ref().expect("function body");
+    assert_eq!(body.stmts.len(), 3, "{:?}", body.stmts);
+    assert!(matches!(body.stmts[0].kind, StmtKind::Let { .. }));
+    assert!(matches!(
+        body.stmts[1].kind,
+        StmtKind::Expr { assign: None, .. }
+    ));
+    assert!(matches!(body.stmts[2].kind, StmtKind::Return(Some(_))));
+    assert!(matches!(
+        &parsed.program.items[1],
+        Item::Fn(function) if function.name == "after"
+    ));
+}
+
+#[test]
+fn malformed_items_and_unmatched_openers_still_terminate() {
+    let parsed = parse_source(
+        "fn broken( {\n    let x = 1\n}\nfn after() {}\n",
+        LoadLimits::default(),
+    );
+    assert!(parsed.diagnostics.iter().any(|d| d.code == Code::E003));
+    assert_eq!(parsed.program.items.len(), 1, "{:?}", parsed.program.items);
+    assert!(matches!(
+        &parsed.program.items[0],
+        Item::Fn(function) if function.name == "after"
+    ));
+
+    for source in [
+        "fn main() {",
+        "fn main() {\n    let x = [1, 2\n",
+        "fn main() {\n    let x = (1 + 2\n",
+        "fn main() {\n    let x = {1: 2\n",
+    ] {
+        let parsed = parse_source(source, LoadLimits::default());
+        assert!(
+            parsed.diagnostics.iter().any(|d| d.code == Code::E003),
+            "{source:?}: {:?}",
+            parsed.diagnostics
+        );
+    }
+}
+
+#[test]
+fn malformed_interface_lines_keep_later_signatures() {
+    let source = "struct Doc\nfn text(doc: Doc) -> str\nlet broken =\nfn other() -> int\n";
+    let parsed = parse_interface(source, LoadLimits::default());
+    assert!(parsed.diagnostics.iter().any(|d| d.code == Code::E003));
+    assert_eq!(parsed.program.items.len(), 3, "{:?}", parsed.program.items);
+    assert!(matches!(
+        &parsed.program.items[1],
+        Item::Fn(function) if function.name == "text"
+    ));
+    assert!(matches!(
+        &parsed.program.items[2],
+        Item::Fn(function) if function.name == "other"
+    ));
 }

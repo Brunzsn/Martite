@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::mem::discriminant;
 use std::rc::Rc;
 
-use martite_base::{Code, Diagnostic, LoadLimits, Span, normalize_source};
+use martite_base::{Code, Diagnostic, LoadLimits, Span, cap_diagnostics, normalize_source};
 
 use crate::ast::*;
 use crate::lexer::{Lexed, lex, lex_fragment};
@@ -424,7 +424,7 @@ impl<'a> Parser<'a> {
             match self.parse_item() {
                 Ok(item) => {
                     items.push(item);
-                    self.statement_end();
+                    self.statement_end(None);
                 }
                 Err(()) => self.recover_item(),
             }
@@ -434,6 +434,8 @@ impl<'a> Parser<'a> {
         }
         let end = self.span();
         let tokens = self.tokens;
+        let mut diagnostics = self.diagnostics;
+        cap_diagnostics(&mut diagnostics);
         let program = Program {
             items,
             is_interface: self.interface,
@@ -445,7 +447,7 @@ impl<'a> Parser<'a> {
         (
             ParseOutput {
                 program,
-                diagnostics: self.diagnostics,
+                diagnostics,
             },
             tokens,
         )
@@ -724,7 +726,13 @@ impl<'a> Parser<'a> {
             .is_some_and(|t| discriminant(&t.kind) == discriminant(kind))
     }
 
-    fn statement_end(&mut self) {
+    /// Consume the boundary after a statement or item.
+    ///
+    /// `statement_start` is the token index where the statement began, if any.
+    /// Item-level callers pass `None` and keep [`Self::recover_item`]; block
+    /// callers pass the index so recovery stops at the enclosing `}` instead of
+    /// skipping following items.
+    fn statement_end(&mut self, statement_start: Option<usize>) {
         if self.at(&TokenKind::RBrace) || self.at(&TokenKind::Eof) {
             return;
         }
@@ -741,7 +749,61 @@ impl<'a> Parser<'a> {
             span,
             "expected a newline or end of block after this statement",
         );
-        self.recover_item();
+        match statement_start {
+            Some(start) => {
+                let open = self.open_braces_since(start);
+                self.recover_stmt(open);
+            }
+            None => self.recover_item(),
+        }
+    }
+
+    /// Number of `{` tokens consumed since `start` that have not been closed.
+    ///
+    /// A failed statement can leave the parser inside a map or struct literal
+    /// whose opening brace was already consumed. Recovery must consume the
+    /// matching `}` instead of mistaking it for the enclosing block's `}`.
+    fn open_braces_since(&self, start: usize) -> usize {
+        let mut depth = 0isize;
+        for token in &self.tokens[start..self.idx] {
+            match token.kind {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => depth -= 1,
+                _ => {}
+            }
+        }
+        depth.max(0) as usize
+    }
+
+    /// Skip the rest of a malformed statement without leaving its block.
+    ///
+    /// Recovery stops at the next newline at bracket depth zero, or before the
+    /// `}` that closes the current block, and never consumes that `}`. Nested
+    /// `()`, `[]`, and `{}` are tracked so newlines inside them do not end
+    /// recovery. `open_braces` counts braces already consumed by the failed
+    /// statement, which have no matching tokens left to scan.
+    fn recover_stmt(&mut self, mut open_braces: usize) {
+        let mut parens = 0usize;
+        let mut brackets = 0usize;
+        loop {
+            match self.raw_kind() {
+                TokenKind::Eof => return,
+                TokenKind::RBrace if open_braces == 0 => return,
+                TokenKind::Newline if parens == 0 && brackets == 0 && open_braces == 0 => {
+                    self.idx += 1;
+                    self.skip_all_newlines();
+                    return;
+                }
+                TokenKind::LParen => parens += 1,
+                TokenKind::RParen => parens = parens.saturating_sub(1),
+                TokenKind::LBracket => brackets += 1,
+                TokenKind::RBracket => brackets = brackets.saturating_sub(1),
+                TokenKind::LBrace => open_braces += 1,
+                TokenKind::RBrace => open_braces -= 1,
+                _ => {}
+            }
+            self.idx += 1;
+        }
     }
 
     fn recover_item(&mut self) {
@@ -1392,10 +1454,33 @@ impl<'a> Parser<'a> {
                 if p.limit_hit {
                     return Err(());
                 }
-                let stmt = p.parse_stmt()?;
-                stmts.push(stmt);
-                p.statement_end();
-                p.skip_all_newlines();
+                let stmt_start = p.idx;
+                match p.parse_stmt() {
+                    Ok(stmt) => {
+                        stmts.push(stmt);
+                        p.statement_end(Some(stmt_start));
+                        p.skip_all_newlines();
+                    }
+                    Err(()) => {
+                        if p.limit_hit {
+                            return Err(());
+                        }
+                        let before = p.idx;
+                        let open = p.open_braces_since(stmt_start);
+                        p.recover_stmt(open);
+                        if p.idx == before {
+                            // `recover_stmt` only stalls at the enclosing `}` or
+                            // at EOF, where the loop below terminates. Guard
+                            // against any other non-advancing recovery so a
+                            // single bad statement cannot loop forever.
+                            if p.at(&TokenKind::RBrace) || p.at(&TokenKind::Eof) {
+                                break;
+                            }
+                            p.advance();
+                        }
+                        p.skip_all_newlines();
+                    }
+                }
             }
             Ok(())
         })?;
@@ -3129,5 +3214,193 @@ mod tests {
         let source = "struct P { x: int }\nfn main(p: P) {\n    match p {\n        P { .., x } => print(\"{x}\"),\n    }\n}\n";
         let parsed = parse_source(source, LoadLimits::default());
         assert!(parsed.diagnostics.iter().any(|d| d.code == Code::E003));
+    }
+
+    fn e003_count(parsed: &ParseOutput) -> usize {
+        parsed
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == Code::E003)
+            .count()
+    }
+
+    fn function_body(parsed: &ParseOutput, index: usize) -> &Block {
+        let Item::Fn(function) = &parsed.program.items[index] else {
+            panic!("expected a function at item {index}");
+        };
+        function.body.as_ref().expect("function body")
+    }
+
+    #[test]
+    fn statement_recovery_keeps_later_statements_and_items() {
+        let source = "fn main() {\n    let = 1\n    let = 2\n    let ok = 3\n    print(\"after\")\n    return ok\n}\nfn after() {}\n";
+        let parsed = parse_source(source, LoadLimits::default());
+        assert_eq!(e003_count(&parsed), 2, "{:?}", parsed.diagnostics);
+        assert_eq!(parsed.program.items.len(), 2, "{:?}", parsed.program.items);
+
+        let body = function_body(&parsed, 0);
+        assert_eq!(body.stmts.len(), 3, "{:?}", body.stmts);
+        assert!(matches!(body.stmts[0].kind, StmtKind::Let { .. }));
+        assert!(matches!(
+            body.stmts[1].kind,
+            StmtKind::Expr { assign: None, .. }
+        ));
+        assert!(matches!(body.stmts[2].kind, StmtKind::Return(Some(_))));
+        assert!(matches!(
+            &parsed.program.items[1],
+            Item::Fn(function) if function.name == "after"
+        ));
+    }
+
+    #[test]
+    fn statement_recovery_keeps_a_following_return() {
+        let source = "fn main() -> int {\n    let broken + 1\n    return 41 + 1\n}\n";
+        let parsed = parse_source(source, LoadLimits::default());
+        assert_eq!(e003_count(&parsed), 1, "{:?}", parsed.diagnostics);
+
+        let body = function_body(&parsed, 0);
+        assert_eq!(body.stmts.len(), 1, "{:?}", body.stmts);
+        let StmtKind::Return(Some(value)) = &body.stmts[0].kind else {
+            panic!("expected a return statement");
+        };
+        assert!(matches!(
+            value.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn missing_statement_newlines_recover_inside_the_block() {
+        let source = "fn main() {\n    let x = 1 let y = 2\n    let z = 3\n}\nfn after() {}\n";
+        let parsed = parse_source(source, LoadLimits::default());
+        assert_eq!(e003_count(&parsed), 1, "{:?}", parsed.diagnostics);
+        assert_eq!(parsed.program.items.len(), 2, "{:?}", parsed.program.items);
+
+        let body = function_body(&parsed, 0);
+        assert_eq!(body.stmts.len(), 2, "{:?}", body.stmts);
+        assert!(matches!(
+            &parsed.program.items[1],
+            Item::Fn(function) if function.name == "after"
+        ));
+    }
+
+    #[test]
+    fn recovery_consumes_an_open_literal_brace_before_the_block_brace() {
+        let source = "fn main() {\n    let table = {\"a\": }\n    let after = 1\n}\nfn next() {}\n";
+        let parsed = parse_source(source, LoadLimits::default());
+        assert_eq!(e003_count(&parsed), 1, "{:?}", parsed.diagnostics);
+        assert_eq!(parsed.program.items.len(), 2, "{:?}", parsed.program.items);
+
+        let body = function_body(&parsed, 0);
+        assert_eq!(body.stmts.len(), 1, "{:?}", body.stmts);
+        let StmtKind::Let {
+            pattern:
+                Pattern {
+                    kind: PatKind::Bind(name),
+                    ..
+                },
+            ..
+        } = &body.stmts[0].kind
+        else {
+            panic!("expected the valid `let after` statement");
+        };
+        assert_eq!(name, "after");
+    }
+
+    #[test]
+    fn malformed_items_still_recover_at_item_boundaries() {
+        let source = "fn broken( {\n    let x = 1\n}\nfn after() {}\n";
+        let parsed = parse_source(source, LoadLimits::default());
+        assert_eq!(e003_count(&parsed), 1, "{:?}", parsed.diagnostics);
+        assert_eq!(parsed.program.items.len(), 1, "{:?}", parsed.program.items);
+        assert!(matches!(
+            &parsed.program.items[0],
+            Item::Fn(function) if function.name == "after"
+        ));
+    }
+
+    #[test]
+    fn statement_recovery_works_at_each_nested_block_level() {
+        let source = "fn main() {\n    while true {\n        let = 1\n        let a = 2\n        while true {\n            let = 3\n            let b = 4\n        }\n        let c = 5\n    }\n    let d = 6\n}\nfn next() {}\n";
+        let parsed = parse_source(source, LoadLimits::default());
+        assert_eq!(e003_count(&parsed), 2, "{:?}", parsed.diagnostics);
+        assert_eq!(parsed.program.items.len(), 2, "{:?}", parsed.program.items);
+
+        let body = function_body(&parsed, 0);
+        assert_eq!(body.stmts.len(), 2, "{:?}", body.stmts);
+        let StmtKind::While { body: outer, .. } = &body.stmts[0].kind else {
+            panic!("expected an outer while");
+        };
+        assert_eq!(outer.stmts.len(), 3, "{:?}", outer.stmts);
+        let StmtKind::While { body: inner, .. } = &outer.stmts[1].kind else {
+            panic!("expected an inner while");
+        };
+        assert_eq!(inner.stmts.len(), 1, "{:?}", inner.stmts);
+        assert!(matches!(body.stmts[1].kind, StmtKind::Let { .. }));
+        assert!(matches!(outer.stmts[2].kind, StmtKind::Let { .. }));
+    }
+
+    #[test]
+    fn unmatched_openers_at_eof_still_terminate() {
+        let cases = [
+            "fn main() {",
+            "fn main() {\n    let x = [1, 2\n",
+            "fn main() {\n    let x = (1 + 2\n",
+            "fn main() {\n    let x = {1: 2\n",
+        ];
+        for source in cases {
+            let parsed = parse_source(source, LoadLimits::default());
+            assert!(
+                parsed.diagnostics.iter().any(|d| d.code == Code::E003),
+                "{source:?}: {:?}",
+                parsed.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn every_truncation_of_a_valid_program_terminates() {
+        let source = "fn main() {\n    let values = [1, 2, 3]\n    if true {\n        return values\n    }\n}\n";
+        for end in 0..=source.len() {
+            let _ = parse_source(&source[..end], LoadLimits::default());
+        }
+    }
+
+    #[test]
+    fn malformed_interface_statements_keep_later_signatures() {
+        let source = "struct Doc\nfn text(doc: Doc) -> str\nlet broken =\nfn other() -> int\n";
+        let parsed = parse_interface(source, LoadLimits::default());
+        assert_eq!(e003_count(&parsed), 1, "{:?}", parsed.diagnostics);
+        assert_eq!(parsed.program.items.len(), 3, "{:?}", parsed.program.items);
+        assert!(matches!(
+            &parsed.program.items[1],
+            Item::Fn(function) if function.name == "text"
+        ));
+        assert!(matches!(
+            &parsed.program.items[2],
+            Item::Fn(function) if function.name == "other"
+        ));
+    }
+
+    #[test]
+    fn pathological_statement_errors_are_capped() {
+        let source = format!("fn main() {{\n{}}}\n", "let = 1\n".repeat(200));
+        let parsed = parse_source(&source, LoadLimits::default());
+        assert!(
+            parsed.diagnostics.len() <= martite_base::MAX_DIAGNOSTICS + 1,
+            "{} diagnostics",
+            parsed.diagnostics.len()
+        );
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("suppressed")),
+            "{:?}",
+            parsed.diagnostics
+        );
     }
 }
