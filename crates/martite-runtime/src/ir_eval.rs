@@ -3649,6 +3649,87 @@ mod tests {
         );
     }
 
+    fn run_interpolation(
+        function: IrFn,
+        nodes: Vec<Node>,
+        children: Vec<IrId>,
+        consts: Vec<ConstValue>,
+        str_parts: Vec<martite_ir::StrPart>,
+        body: IrId,
+    ) -> String {
+        let mut function = finish(function, nodes, children);
+        function.str_parts = str_parts;
+        function.body = Some(body);
+        let program = IrProgram {
+            fns: vec![function],
+            consts,
+            entries: Entries {
+                main: Some(FnId::new(0)),
+                ..Entries::default()
+            },
+            ..IrProgram::default()
+        };
+        let mut runtime = IrRuntime::new(&program, accounting_limits(1_000_000, 8 << 20));
+        let result = runtime.run_main().expect("interpolation runs");
+        result
+            .value
+            .as_str()
+            .expect("interpolation returns a string")
+            .to_string()
+    }
+
+    #[test]
+    fn integer_interpolation_is_byte_exact() {
+        let cases = [
+            (i64::MIN, "-9223372036854775808"),
+            (i64::MAX, "9223372036854775807"),
+            (-1, "-1"),
+            (0, "0"),
+            (9, "9"),
+            (10, "10"),
+            (-9, "-9"),
+            (-10, "-10"),
+        ];
+        for (value, expected) in cases {
+            let output = run_interpolation(
+                empty_function(0),
+                vec![
+                    expression(NodeKind::Int(ConstId::new(0))),
+                    zero(NodeKind::StrInterp(ChildRange::new(0, 1))),
+                ],
+                Vec::new(),
+                vec![ConstValue::Int(value)],
+                vec![martite_ir::StrPart::Expr(IrId::new(0))],
+                IrId::new(1),
+            );
+            assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn nested_container_interpolation_shows_integers_exactly() {
+        let output = run_interpolation(
+            empty_function(0),
+            vec![
+                expression(NodeKind::Int(ConstId::new(0))),
+                expression(NodeKind::Int(ConstId::new(1))),
+                expression(NodeKind::Int(ConstId::new(2))),
+                zero(NodeKind::List(ChildRange::new(0, 2))),
+                zero(NodeKind::Tuple(ChildRange::new(2, 2))),
+                zero(NodeKind::StrInterp(ChildRange::new(0, 1))),
+            ],
+            vec![IrId::new(0), IrId::new(1), IrId::new(3), IrId::new(2)],
+            vec![
+                ConstValue::Int(i64::MIN),
+                ConstValue::Int(0),
+                ConstValue::Int(10),
+            ],
+            vec![martite_ir::StrPart::Expr(IrId::new(4))],
+            IrId::new(5),
+        );
+        assert_eq!(output, "([-9223372036854775808, 0], 10)");
+    }
+
     #[test]
     fn shared_dag_show_stays_inside_the_memory_limit() {
         let program = IrProgram::default();
