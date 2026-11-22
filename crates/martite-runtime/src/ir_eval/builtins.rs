@@ -66,23 +66,19 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         values: &[Value],
         span: Span,
     ) -> EvalResult<Value> {
-        let Some(def) = item.item() else {
-            return self.trap(self.internal_panic("unknown builtin module item"));
-        };
-        match (def.module, def.name) {
-            ("std.math", "min") | ("std.math", "max") => {
+        match item {
+            BuiltinItemId::MATH_MIN | BuiltinItemId::MATH_MAX => {
                 let a = values.first().cloned().unwrap_or(Value::Unit);
                 let b = values.get(1).cloned().unwrap_or(Value::Unit);
                 let ord = value_ord(&a, &b);
-                Ok(
-                    if (def.name == "min" && ord.is_le()) || (def.name == "max" && ord.is_ge()) {
-                        a
-                    } else {
-                        b
-                    },
-                )
+                let take_a = if item == BuiltinItemId::MATH_MIN {
+                    ord.is_le()
+                } else {
+                    ord.is_ge()
+                };
+                Ok(if take_a { a } else { b })
             }
-            ("std.math", "clamp") => {
+            BuiltinItemId::MATH_CLAMP => {
                 let x = values.first().cloned().unwrap_or(Value::Unit);
                 let lo = values.get(1).cloned().unwrap_or(Value::Unit);
                 let hi = values.get(2).cloned().unwrap_or(Value::Unit);
@@ -94,20 +90,25 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     Ok(x)
                 }
             }
-            ("std.math", name @ ("sin" | "cos" | "tan" | "exp" | "ln" | "log10")) => {
+            BuiltinItemId::MATH_SIN
+            | BuiltinItemId::MATH_COS
+            | BuiltinItemId::MATH_TAN
+            | BuiltinItemId::MATH_EXP
+            | BuiltinItemId::MATH_LN
+            | BuiltinItemId::MATH_LOG10 => {
                 let Value::Float(x) = values.first().cloned().unwrap_or(Value::Float(0.0)) else {
                     return self.trap(self.internal_panic("expected float"));
                 };
-                Ok(Value::Float(match name {
-                    "sin" => libm::sin(x),
-                    "cos" => libm::cos(x),
-                    "tan" => libm::tan(x),
-                    "exp" => libm::exp(x),
-                    "ln" => libm::log(x),
+                Ok(Value::Float(match item {
+                    BuiltinItemId::MATH_SIN => libm::sin(x),
+                    BuiltinItemId::MATH_COS => libm::cos(x),
+                    BuiltinItemId::MATH_TAN => libm::tan(x),
+                    BuiltinItemId::MATH_EXP => libm::exp(x),
+                    BuiltinItemId::MATH_LN => libm::log(x),
                     _ => libm::log10(x),
                 }))
             }
-            ("std.math", "atan2") => {
+            BuiltinItemId::MATH_ATAN2 => {
                 let Value::Float(y) = values.first().cloned().unwrap_or(Value::Float(0.0)) else {
                     return self.trap(self.internal_panic("expected float"));
                 };
@@ -116,7 +117,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 };
                 Ok(Value::Float(libm::atan2(y, x)))
             }
-            ("std.json", "parse") => {
+            BuiltinItemId::JSON_PARSE => {
                 let Some(text) = values.first().and_then(|value| value.as_str()) else {
                     return self.trap(self.internal_panic("expected str"));
                 };
@@ -139,7 +140,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     Err(crate::json::ParseError::TooLarge) => self.trap(Trap::OutOfMemory),
                 }
             }
-            ("std.json", "stringify") => {
+            BuiltinItemId::JSON_STRINGIFY => {
                 let Some(value) = values.first() else {
                     return self.trap(self.internal_panic("expected Json"));
                 };
@@ -165,11 +166,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let Some(def) = method.def() else {
             return self.trap(self.internal_panic("unknown builtin method"));
         };
-        let Some(arity) = method.arity() else {
-            return self.trap(self.internal_panic("unknown builtin method"));
-        };
-        let receiver_kind = def.receiver;
-        let name = def.name;
+        let arity = def.arity;
         let mut_self = def.mut_self;
         let function = self.current_function();
         let Some(receiver_id) = function.children.get(first_child as usize).copied() else {
@@ -179,8 +176,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         if !mut_self {
             let mut receiver = self.eval(receiver_id)?;
             let args = self.builtin_method_args(first_child, arity)?;
-            let result =
-                self.apply_builtin_method(receiver_kind, name, &mut receiver, args, span)?;
+            let result = self.apply_builtin_method(method, &mut receiver, args, span)?;
             self.check_value_depth(&result, span)?;
             self.note_value(&result);
             return Ok(result);
@@ -195,19 +191,17 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let place = self.eval_place(place)?;
         let mut receiver = self.read_place(&place)?;
         let args = self.builtin_method_args(first_child, arity)?;
-        self.check_builtin_mutation_depth(name, &args, place.accessors.len())?;
+        self.check_builtin_mutation_depth(method, &args, place.accessors.len())?;
 
         let mut root = self.take_place_root(&place)?;
         let (result, root) = if place.accessors.is_empty() {
             drop(root);
-            let result =
-                self.apply_builtin_method(receiver_kind, name, &mut receiver, args, span)?;
+            let result = self.apply_builtin_method(method, &mut receiver, args, span)?;
             (result, receiver)
         } else {
             let replaced = self.take_path_value(&mut root, &place.accessors)?;
             drop(replaced);
-            let result =
-                self.apply_builtin_method(receiver_kind, name, &mut receiver, args, span)?;
+            let result = self.apply_builtin_method(method, &mut receiver, args, span)?;
             self.set_path(&mut root, &place.accessors, receiver, MAX_VALUE_DEPTH)?;
             (result, root)
         };
@@ -242,27 +236,29 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 
     fn apply_builtin_method(
         &mut self,
-        receiver: BuiltinReceiver,
-        name: &str,
+        method: BuiltinMethodId,
         receiver_value: &mut Value,
         args: CallArgs,
         span: Span,
     ) -> EvalResult<Value> {
-        match receiver {
-            BuiltinReceiver::List => self.list_method(name, receiver_value, args, span),
-            BuiltinReceiver::Map => self.map_method(name, receiver_value, args, span),
-            BuiltinReceiver::Str => self.str_method(name, receiver_value, args, span),
-            BuiltinReceiver::Int => self.int_method(name, receiver_value, args, span),
-            BuiltinReceiver::Float => self.float_method(name, receiver_value, args, span),
-            BuiltinReceiver::Range => self.range_method(name, receiver_value, args, span),
-            BuiltinReceiver::Option => self.option_method(name, receiver_value, args, span),
-            BuiltinReceiver::Result => self.result_method(name, receiver_value, args, span),
+        let Some(def) = method.def() else {
+            return self.trap(self.internal_panic("unknown builtin method"));
+        };
+        match def.receiver {
+            BuiltinReceiver::List => self.list_method(method, receiver_value, args, span),
+            BuiltinReceiver::Map => self.map_method(method, receiver_value, args, span),
+            BuiltinReceiver::Str => self.str_method(method, receiver_value, args, span),
+            BuiltinReceiver::Int => self.int_method(method, receiver_value, args, span),
+            BuiltinReceiver::Float => self.float_method(method, receiver_value, args, span),
+            BuiltinReceiver::Range => self.range_method(method, receiver_value, args, span),
+            BuiltinReceiver::Option => self.option_method(method, receiver_value, args, span),
+            BuiltinReceiver::Result => self.result_method(method, receiver_value, args, span),
         }
     }
 
     fn list_method(
         &mut self,
-        name: &str,
+        method: BuiltinMethodId,
         receiver: &mut Value,
         args: CallArgs,
         span: Span,
@@ -270,9 +266,9 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let Value::List(items) = receiver else {
             return self.trap(self.internal_panic("receiver is not a list"));
         };
-        match name {
-            "len" => Ok(Value::Int(items.len() as i64)),
-            "get" => {
+        match method {
+            BuiltinMethodId::LIST_LEN => Ok(Value::Int(items.len() as i64)),
+            BuiltinMethodId::LIST_GET => {
                 let index = int_arg(&args, 0);
                 Ok(match index {
                     Some(i) if i >= 0 => items
@@ -283,17 +279,17 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     _ => Value::Option(None),
                 })
             }
-            "first" => Ok(items
+            BuiltinMethodId::LIST_FIRST => Ok(items
                 .first()
                 .cloned()
                 .map(|value| Value::Option(Some(Box::new(value))))
                 .unwrap_or(Value::Option(None))),
-            "last" => Ok(items
+            BuiltinMethodId::LIST_LAST => Ok(items
                 .last()
                 .cloned()
                 .map(|value| Value::Option(Some(Box::new(value))))
                 .unwrap_or(Value::Option(None))),
-            "contains" => {
+            BuiltinMethodId::LIST_CONTAINS => {
                 let needle = args.into_iter().next().unwrap_or(Value::Unit);
                 let needle_meta = needle.meta();
                 self.charge(fuel::slot_cost(items.len() as u64))?;
@@ -309,7 +305,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 }
                 Ok(Value::Bool(false))
             }
-            "map" => {
+            BuiltinMethodId::LIST_MAP => {
                 let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
                 self.charge(fuel::slot_cost(snapshot.len() as u64))?;
@@ -343,7 +339,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 }
                 Ok(Value::list(out))
             }
-            "filter" => {
+            BuiltinMethodId::LIST_FILTER => {
                 let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
                 self.charge(fuel::slot_cost(snapshot.len() as u64))?;
@@ -381,7 +377,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 }
                 Ok(Value::list(out))
             }
-            "fold" => {
+            BuiltinMethodId::LIST_FOLD => {
                 let mut args = args;
                 let mut init = if args.is_empty() {
                     Value::Unit
@@ -419,7 +415,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 }
                 Ok(init)
             }
-            "any" => {
+            BuiltinMethodId::LIST_ANY => {
                 let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
                 for item in snapshot.iter() {
@@ -434,7 +430,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 }
                 Ok(Value::Bool(false))
             }
-            "all" => {
+            BuiltinMethodId::LIST_ALL => {
                 let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
                 for item in snapshot.iter() {
@@ -449,7 +445,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 }
                 Ok(Value::Bool(true))
             }
-            "enumerate" => {
+            BuiltinMethodId::LIST_ENUMERATE => {
                 let out: Vec<Value> = items
                     .iter()
                     .enumerate()
@@ -460,20 +456,20 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 self.charge(fuel::slot_cost(out.len() as u64))?;
                 Ok(Value::list(out))
             }
-            "reversed" => {
+            BuiltinMethodId::LIST_REVERSED => {
                 let mut out: Vec<Value> = items.iter().cloned().collect();
                 out.reverse();
                 self.charge(fuel::slot_cost(out.len() as u64))?;
                 Ok(Value::list(out))
             }
-            "sorted" => {
+            BuiltinMethodId::LIST_SORTED => {
                 let mut out: Vec<Value> = items.iter().cloned().collect();
                 self.charge(fuel::sort_cost(out.len() as u64))?;
                 out.sort_by(value_ord);
                 self.ensure_deadline()?;
                 Ok(Value::list(out))
             }
-            "sorted_by" => {
+            BuiltinMethodId::LIST_SORTED_BY => {
                 let closure = self.closure_arg(&args, 0)?;
                 let snapshot = items.clone();
                 self.charge(fuel::sort_cost(snapshot.len() as u64))?;
@@ -490,7 +486,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     keyed.into_iter().map(|(_, value)| value).collect(),
                 ))
             }
-            "join" => {
+            BuiltinMethodId::LIST_JOIN => {
                 let separator = args
                     .first()
                     .and_then(|value| value.as_str())
@@ -521,7 +517,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 }
                 Ok(Value::str(out))
             }
-            "push" => {
+            BuiltinMethodId::LIST_PUSH => {
                 let value = args.into_iter().next().unwrap_or(Value::Unit);
                 let len = items.len();
                 self.charge(fuel::SLOT_COST)?;
@@ -530,7 +526,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 list.push(value);
                 Ok(Value::Unit)
             }
-            "pop" => {
+            BuiltinMethodId::LIST_POP => {
                 let len = items.len();
                 self.charge(fuel::SLOT_COST)?;
                 let list = self.cow_vec_mut(items, len)?;
@@ -539,7 +535,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     .map(|value| Value::Option(Some(Box::new(value))))
                     .unwrap_or(Value::Option(None)))
             }
-            "sort" => {
+            BuiltinMethodId::LIST_SORT => {
                 let len = items.len();
                 self.charge(fuel::sort_cost(len as u64))?;
                 let list = self.cow_vec_mut(items, len)?;
@@ -547,7 +543,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 self.ensure_deadline()?;
                 Ok(Value::Unit)
             }
-            "insert" => {
+            BuiltinMethodId::LIST_INSERT => {
                 let index = int_arg(&args, 0).unwrap_or(0);
                 let value = args.into_iter().nth(1).unwrap_or(Value::Unit);
                 let len = items.len();
@@ -561,7 +557,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 list.insert(index, value);
                 Ok(Value::Unit)
             }
-            "remove_at" => {
+            BuiltinMethodId::LIST_REMOVE_AT => {
                 let index = int_arg(&args, 0).unwrap_or(0);
                 let len = items.len();
                 if index < 0 || index as usize >= len {
@@ -572,7 +568,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 let list = self.cow_vec_mut(items, len)?;
                 Ok(list.remove(index))
             }
-            "extend" => {
+            BuiltinMethodId::LIST_EXTEND => {
                 let other = args.into_iter().next().unwrap_or(Value::Unit);
                 if let Value::List(other) = other {
                     let len = items.len();
@@ -583,7 +579,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 }
                 Ok(Value::Unit)
             }
-            "clear" => {
+            BuiltinMethodId::LIST_CLEAR => {
                 self.charge(fuel::slot_cost(items.len() as u64))?;
                 if Rc::strong_count(items) == 1 {
                     Rc::make_mut(items).clear();
@@ -593,13 +589,16 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 }
                 Ok(Value::Unit)
             }
-            _ => self.trap(self.internal_panic(format!("unknown list method `{name}`"))),
+            _ => self.trap(self.internal_panic(format!(
+                "unknown list method `{}`",
+                method.def().map_or("<invalid>", |def| def.name)
+            ))),
         }
     }
 
     fn map_method(
         &mut self,
-        name: &str,
+        method: BuiltinMethodId,
         receiver: &mut Value,
         args: CallArgs,
         span: Span,
@@ -607,9 +606,9 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let Value::Map(map) = receiver else {
             return self.trap(self.internal_panic("receiver is not a map"));
         };
-        match name {
-            "len" => Ok(Value::Int(map.len() as i64)),
-            "get" => {
+        match method {
+            BuiltinMethodId::MAP_LEN => Ok(Value::Int(map.len() as i64)),
+            BuiltinMethodId::MAP_GET => {
                 let key = args.first().cloned().unwrap_or(Value::Unit);
                 self.charge(map_key_cost(&key))?;
                 let key = key_from_value(&key)
@@ -620,22 +619,22 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     .map(|value| Value::Option(Some(Box::new(value))))
                     .unwrap_or(Value::Option(None)))
             }
-            "has" => {
+            BuiltinMethodId::MAP_HAS => {
                 let key = args.first().cloned().unwrap_or(Value::Unit);
                 self.charge(map_key_cost(&key))?;
                 let key = key_from_value(&key)
                     .map_err(|message| EvalError::Trap(self.panic(message, span)))?;
                 Ok(Value::Bool(map.get(&key).is_some()))
             }
-            "keys" => {
+            BuiltinMethodId::MAP_KEYS => {
                 self.charge(fuel::slot_cost(map.len() as u64))?;
                 Ok(Value::list(map.keys().iter().map(key_to_value).collect()))
             }
-            "values" => {
+            BuiltinMethodId::MAP_VALUES => {
                 self.charge(fuel::slot_cost(map.len() as u64))?;
                 Ok(Value::list(map.values()))
             }
-            "entries" => {
+            BuiltinMethodId::MAP_ENTRIES => {
                 self.charge(fuel::map_cost(map.len() as u64))?;
                 Ok(Value::list(
                     map.entries()
@@ -644,7 +643,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                         .collect(),
                 ))
             }
-            "remove" => {
+            BuiltinMethodId::MAP_REMOVE => {
                 let key = args.first().cloned().unwrap_or(Value::Unit);
                 self.charge(map_key_cost(&key))?;
                 let key = key_from_value(&key)
@@ -661,7 +660,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 self.charge(fuel::map_remove_cost(len as u64, index as u64))?;
                 Ok(Value::Option(Some(Box::new(removed))))
             }
-            "clear" => {
+            BuiltinMethodId::MAP_CLEAR => {
                 let len = map.len();
                 self.charge(fuel::map_cost(len as u64))?;
                 if Rc::strong_count(map) == 1 {
@@ -672,13 +671,16 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 }
                 Ok(Value::Unit)
             }
-            _ => self.trap(self.internal_panic(format!("unknown map method `{name}`"))),
+            _ => self.trap(self.internal_panic(format!(
+                "unknown map method `{}`",
+                method.def().map_or("<invalid>", |def| def.name)
+            ))),
         }
     }
 
     fn str_method(
         &mut self,
-        name: &str,
+        method: BuiltinMethodId,
         receiver: &mut Value,
         args: CallArgs,
         span: Span,
@@ -686,12 +688,12 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let Value::Str(text) = receiver else {
             return self.trap(self.internal_panic("receiver is not a str"));
         };
-        match name {
-            "len" => {
+        match method {
+            BuiltinMethodId::STR_LEN => {
                 self.charge(fuel::string_cost(text.len() as u64))?;
                 Ok(Value::Int(text.chars().count() as i64))
             }
-            "chars" => {
+            BuiltinMethodId::STR_CHARS => {
                 self.charge(fuel::string_cost(text.len() as u64))?;
                 let count = text.chars().count();
                 let projected = 16u64
@@ -709,7 +711,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 );
                 Ok(Value::list(out))
             }
-            "split" => {
+            BuiltinMethodId::STR_SPLIT => {
                 let separator = args
                     .first()
                     .and_then(|value| value.as_str())
@@ -739,13 +741,13 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 }
                 Ok(Value::list(parts))
             }
-            "trim" => {
+            BuiltinMethodId::STR_TRIM => {
                 self.charge(fuel::string_cost(text.len() as u64))?;
                 let out = text.trim();
                 self.ensure_output_capacity(16u64.saturating_add(out.len() as u64))?;
                 Ok(Value::Str(Rc::from(out)))
             }
-            "contains" => {
+            BuiltinMethodId::STR_CONTAINS => {
                 let needle = args
                     .first()
                     .and_then(|value| value.as_str())
@@ -753,7 +755,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 self.charge(fuel::string_cost(text.len() as u64))?;
                 Ok(Value::Bool(text.contains(needle)))
             }
-            "find" => {
+            BuiltinMethodId::STR_FIND => {
                 let needle = args
                     .first()
                     .and_then(|value| value.as_str())
@@ -765,7 +767,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     .map(|value| Value::Option(Some(Box::new(value))))
                     .unwrap_or(Value::Option(None)))
             }
-            "starts_with" => {
+            BuiltinMethodId::STR_STARTS_WITH => {
                 let needle = args
                     .first()
                     .and_then(|value| value.as_str())
@@ -773,7 +775,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 self.charge(fuel::string_cost(text.len() as u64))?;
                 Ok(Value::Bool(text.starts_with(needle)))
             }
-            "ends_with" => {
+            BuiltinMethodId::STR_ENDS_WITH => {
                 let needle = args
                     .first()
                     .and_then(|value| value.as_str())
@@ -781,7 +783,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 self.charge(fuel::string_cost(text.len() as u64))?;
                 Ok(Value::Bool(text.ends_with(needle)))
             }
-            "replace" => {
+            BuiltinMethodId::STR_REPLACE => {
                 let from = args
                     .first()
                     .and_then(|value| value.as_str())
@@ -828,37 +830,40 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 out.push_str(rest);
                 Ok(Value::str(out))
             }
-            "to_upper" => {
+            BuiltinMethodId::STR_TO_UPPER => {
                 let out = text.to_uppercase();
                 self.charge(fuel::string_cost(out.len() as u64))?;
                 Ok(Value::str(out))
             }
-            "to_lower" => {
+            BuiltinMethodId::STR_TO_LOWER => {
                 let out = text.to_lowercase();
                 self.charge(fuel::string_cost(out.len() as u64))?;
                 Ok(Value::str(out))
             }
-            "parse_int" => {
+            BuiltinMethodId::STR_PARSE_INT => {
                 self.charge(fuel::string_cost(text.len() as u64))?;
                 Ok(match parse_int(text) {
                     Some(value) => Value::Option(Some(Box::new(Value::Int(value)))),
                     None => Value::Option(None),
                 })
             }
-            "parse_float" => {
+            BuiltinMethodId::STR_PARSE_FLOAT => {
                 self.charge(fuel::string_cost(text.len() as u64))?;
                 Ok(match parse_float(text) {
                     Some(value) => Value::Option(Some(Box::new(Value::Float(value)))),
                     None => Value::Option(None),
                 })
             }
-            _ => self.trap(self.internal_panic(format!("unknown str method `{name}`"))),
+            _ => self.trap(self.internal_panic(format!(
+                "unknown str method `{}`",
+                method.def().map_or("<invalid>", |def| def.name)
+            ))),
         }
     }
 
     fn int_method(
         &mut self,
-        name: &str,
+        method: BuiltinMethodId,
         receiver: &mut Value,
         args: CallArgs,
         span: Span,
@@ -866,12 +871,12 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let Value::Int(value) = receiver else {
             return self.trap(self.internal_panic("receiver is not an int"));
         };
-        match name {
-            "abs" => value
+        match method {
+            BuiltinMethodId::INT_ABS => value
                 .checked_abs()
                 .map(Value::Int)
                 .ok_or_else(|| EvalError::Trap(self.panic("integer overflow", span))),
-            "pow" => {
+            BuiltinMethodId::INT_POW => {
                 let exponent = int_arg(&args, 0).unwrap_or(0);
                 if exponent < 0 {
                     return self.trap(self.panic("negative exponent", span));
@@ -894,13 +899,16 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     }
                 }
             }
-            _ => self.trap(self.internal_panic(format!("unknown int method `{name}`"))),
+            _ => self.trap(self.internal_panic(format!(
+                "unknown int method `{}`",
+                method.def().map_or("<invalid>", |def| def.name)
+            ))),
         }
     }
 
     fn float_method(
         &mut self,
-        name: &str,
+        method: BuiltinMethodId,
         receiver: &mut Value,
         args: CallArgs,
         span: Span,
@@ -908,13 +916,13 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let Value::Float(value) = receiver else {
             return self.trap(self.internal_panic("receiver is not a float"));
         };
-        match name {
-            "abs" => Ok(Value::Float(libm::fabs(*value))),
-            "floor" => Ok(Value::Float(libm::floor(*value))),
-            "ceil" => Ok(Value::Float(libm::ceil(*value))),
-            "trunc" => Ok(Value::Float(libm::trunc(*value))),
-            "sqrt" => Ok(Value::Float(libm::sqrt(*value))),
-            "pow" => {
+        match method {
+            BuiltinMethodId::FLOAT_ABS => Ok(Value::Float(libm::fabs(*value))),
+            BuiltinMethodId::FLOAT_FLOOR => Ok(Value::Float(libm::floor(*value))),
+            BuiltinMethodId::FLOAT_CEIL => Ok(Value::Float(libm::ceil(*value))),
+            BuiltinMethodId::FLOAT_TRUNC => Ok(Value::Float(libm::trunc(*value))),
+            BuiltinMethodId::FLOAT_SQRT => Ok(Value::Float(libm::sqrt(*value))),
+            BuiltinMethodId::FLOAT_POW => {
                 let exponent = args
                     .first()
                     .and_then(|value| match value {
@@ -924,7 +932,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     .unwrap_or(0.0);
                 Ok(Value::Float(libm::pow(*value, exponent)))
             }
-            "round" => {
+            BuiltinMethodId::FLOAT_ROUND => {
                 let digits = int_arg(&args, 0).unwrap_or(0);
                 if digits < 0 {
                     return self.trap(self.panic("round digits must be non-negative", span));
@@ -935,15 +943,18 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 let factor = 10f64.powi(digits as i32);
                 Ok(Value::Float(libm::round(*value * factor) / factor))
             }
-            "is_nan" => Ok(Value::Bool(value.is_nan())),
-            "is_finite" => Ok(Value::Bool(value.is_finite())),
-            _ => self.trap(self.internal_panic(format!("unknown float method `{name}`"))),
+            BuiltinMethodId::FLOAT_IS_NAN => Ok(Value::Bool(value.is_nan())),
+            BuiltinMethodId::FLOAT_IS_FINITE => Ok(Value::Bool(value.is_finite())),
+            _ => self.trap(self.internal_panic(format!(
+                "unknown float method `{}`",
+                method.def().map_or("<invalid>", |def| def.name)
+            ))),
         }
     }
 
     fn range_method(
         &mut self,
-        name: &str,
+        method: BuiltinMethodId,
         receiver: &mut Value,
         args: CallArgs,
         _span: Span,
@@ -957,9 +968,9 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             return self.trap(self.internal_panic("receiver is not a range"));
         };
         let len = range_len(*start, *end, *inclusive);
-        match name {
-            "len" => Ok(Value::Int(len)),
-            "contains" => {
+        match method {
+            BuiltinMethodId::RANGE_LEN => Ok(Value::Int(len)),
+            BuiltinMethodId::RANGE_CONTAINS => {
                 let value = int_arg(&args, 0).unwrap_or(0);
                 let inside = value >= *start
                     && if *inclusive {
@@ -969,7 +980,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     };
                 Ok(Value::Bool(inside))
             }
-            "to_list" => {
+            BuiltinMethodId::RANGE_TO_LIST => {
                 let count = len.max(0) as u64;
                 self.charge(fuel::slot_cost(count))?;
                 let projected = 16u64.saturating_add(8u64.saturating_mul(count));
@@ -998,13 +1009,16 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 }
                 Ok(Value::list(out))
             }
-            _ => self.trap(self.internal_panic(format!("unknown range method `{name}`"))),
+            _ => self.trap(self.internal_panic(format!(
+                "unknown range method `{}`",
+                method.def().map_or("<invalid>", |def| def.name)
+            ))),
         }
     }
 
     fn option_method(
         &mut self,
-        name: &str,
+        method: BuiltinMethodId,
         receiver: &mut Value,
         args: CallArgs,
         span: Span,
@@ -1012,10 +1026,10 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let Value::Option(option) = std::mem::replace(receiver, Value::Unit) else {
             return self.trap(self.internal_panic("receiver is not an Option"));
         };
-        match name {
-            "is_some" => Ok(Value::Bool(option.is_some())),
-            "is_none" => Ok(Value::Bool(option.is_none())),
-            "map" => {
+        match method {
+            BuiltinMethodId::OPTION_IS_SOME => Ok(Value::Bool(option.is_some())),
+            BuiltinMethodId::OPTION_IS_NONE => Ok(Value::Bool(option.is_none())),
+            BuiltinMethodId::OPTION_MAP => {
                 let closure = self.closure_arg(&args, 0)?;
                 match option {
                     Some(value) => Ok(Value::Option(Some(Box::new(
@@ -1025,7 +1039,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     None => Ok(Value::Option(None)),
                 }
             }
-            "and_then" => {
+            BuiltinMethodId::OPTION_AND_THEN => {
                 let closure = self.closure_arg(&args, 0)?;
                 match option {
                     Some(value) => self
@@ -1034,17 +1048,17 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     None => Ok(Value::Option(None)),
                 }
             }
-            "unwrap_or" => Ok(match option {
+            BuiltinMethodId::OPTION_UNWRAP_OR => Ok(match option {
                 Some(value) => *value,
                 None => args.into_iter().next().unwrap_or(Value::Unit),
             }),
-            "ok_or" => Ok(match option {
+            BuiltinMethodId::OPTION_OK_OR => Ok(match option {
                 Some(value) => Value::Result(Ok(value)),
                 None => Value::Result(Err(Box::new(
                     args.into_iter().next().unwrap_or(Value::Unit),
                 ))),
             }),
-            "expect" => match option {
+            BuiltinMethodId::OPTION_EXPECT => match option {
                 Some(value) => Ok(*value),
                 None => {
                     let message = args
@@ -1054,13 +1068,16 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     self.trap(self.panic(message, span))
                 }
             },
-            _ => self.trap(self.internal_panic(format!("unknown Option method `{name}`"))),
+            _ => self.trap(self.internal_panic(format!(
+                "unknown Option method `{}`",
+                method.def().map_or("<invalid>", |def| def.name)
+            ))),
         }
     }
 
     fn result_method(
         &mut self,
-        name: &str,
+        method: BuiltinMethodId,
         receiver: &mut Value,
         args: CallArgs,
         span: Span,
@@ -1068,10 +1085,10 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let Value::Result(result) = std::mem::replace(receiver, Value::Unit) else {
             return self.trap(self.internal_panic("receiver is not a Result"));
         };
-        match name {
-            "is_ok" => Ok(Value::Bool(result.is_ok())),
-            "is_err" => Ok(Value::Bool(result.is_err())),
-            "map" => {
+        match method {
+            BuiltinMethodId::RESULT_IS_OK => Ok(Value::Bool(result.is_ok())),
+            BuiltinMethodId::RESULT_IS_ERR => Ok(Value::Bool(result.is_err())),
+            BuiltinMethodId::RESULT_MAP => {
                 let closure = self.closure_arg(&args, 0)?;
                 match result {
                     Ok(value) => Ok(Value::Result(Ok(Box::new(
@@ -1081,7 +1098,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     Err(error) => Ok(Value::Result(Err(error))),
                 }
             }
-            "map_err" => {
+            BuiltinMethodId::RESULT_MAP_ERR => {
                 let closure = self.closure_arg(&args, 0)?;
                 match result {
                     Ok(value) => Ok(Value::Result(Ok(value))),
@@ -1091,7 +1108,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     )))),
                 }
             }
-            "and_then" => {
+            BuiltinMethodId::RESULT_AND_THEN => {
                 let closure = self.closure_arg(&args, 0)?;
                 match result {
                     Ok(value) => self
@@ -1100,15 +1117,15 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     Err(error) => Ok(Value::Result(Err(error))),
                 }
             }
-            "unwrap_or" => Ok(match result {
+            BuiltinMethodId::RESULT_UNWRAP_OR => Ok(match result {
                 Ok(value) => *value,
                 Err(_) => args.into_iter().next().unwrap_or(Value::Unit),
             }),
-            "ok" => Ok(match result {
+            BuiltinMethodId::RESULT_OK => Ok(match result {
                 Ok(value) => Value::Option(Some(value)),
                 Err(_) => Value::Option(None),
             }),
-            "expect" => match result {
+            BuiltinMethodId::RESULT_EXPECT => match result {
                 Ok(value) => Ok(*value),
                 Err(_) => {
                     let message = args
@@ -1118,7 +1135,10 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     self.trap(self.panic(message, span))
                 }
             },
-            _ => self.trap(self.internal_panic(format!("unknown Result method `{name}`"))),
+            _ => self.trap(self.internal_panic(format!(
+                "unknown Result method `{}`",
+                method.def().map_or("<invalid>", |def| def.name)
+            ))),
         }
     }
 
@@ -1200,8 +1220,7 @@ mod tests {
             inclusive: false,
         };
         let result = runtime.apply_builtin_method(
-            BuiltinReceiver::Range,
-            "to_list",
+            BuiltinMethodId::RANGE_TO_LIST,
             &mut range,
             CallArgs::new(),
             span(),
@@ -1220,8 +1239,7 @@ mod tests {
         };
         let value = runtime
             .apply_builtin_method(
-                BuiltinReceiver::Range,
-                "to_list",
+                BuiltinMethodId::RANGE_TO_LIST,
                 &mut range,
                 CallArgs::new(),
                 span(),
@@ -1282,8 +1300,7 @@ mod tests {
         let mut runtime = IrRuntime::new(&program, limits(1000, 8 << 20));
         let mut text = Value::str(big.clone());
         let result = runtime.apply_builtin_method(
-            BuiltinReceiver::Str,
-            "trim",
+            BuiltinMethodId::STR_TRIM,
             &mut text,
             CallArgs::new(),
             span(),
@@ -1294,7 +1311,7 @@ mod tests {
         let mut text = Value::str(big.clone());
         let args: CallArgs = smallvec![Value::str(big.clone()), Value::str("")];
         let result =
-            runtime.apply_builtin_method(BuiltinReceiver::Str, "replace", &mut text, args, span());
+            runtime.apply_builtin_method(BuiltinMethodId::STR_REPLACE, &mut text, args, span());
         assert!(matches!(trap_of(result), Trap::OutOfFuel), "replace");
 
         let mut runtime = IrRuntime::new(&program, limits(1000, 8 << 20));
@@ -1315,7 +1332,7 @@ mod tests {
         let mut receiver = Value::map(map);
         let args: CallArgs = smallvec![Value::str(big.clone())];
         let result =
-            runtime.apply_builtin_method(BuiltinReceiver::Map, "has", &mut receiver, args, span());
+            runtime.apply_builtin_method(BuiltinMethodId::MAP_HAS, &mut receiver, args, span());
         assert!(matches!(trap_of(result), Trap::OutOfFuel), "map key");
 
         let mut map = OrderedMap::new();
@@ -1329,8 +1346,7 @@ mod tests {
         let mut receiver = Value::list(items);
         let args: CallArgs = smallvec![Value::str("y".repeat(100))];
         let result = runtime.apply_builtin_method(
-            BuiltinReceiver::List,
-            "contains",
+            BuiltinMethodId::LIST_CONTAINS,
             &mut receiver,
             args,
             span(),
@@ -1345,13 +1361,8 @@ mod tests {
         let items = (0..10).map(|_| Value::str("x".repeat(1000))).collect();
         let mut receiver = Value::list(items);
         let args: CallArgs = smallvec![Value::str(",")];
-        let result = runtime.apply_builtin_method(
-            BuiltinReceiver::List,
-            "join",
-            &mut receiver,
-            args,
-            span(),
-        );
+        let result =
+            runtime.apply_builtin_method(BuiltinMethodId::LIST_JOIN, &mut receiver, args, span());
         assert!(matches!(trap_of(result), Trap::OutOfMemory));
     }
 
@@ -1362,7 +1373,7 @@ mod tests {
         let mut text = Value::str("a".repeat(1000));
         let args: CallArgs = smallvec![Value::str("a"), Value::str("b".repeat(100))];
         let result =
-            runtime.apply_builtin_method(BuiltinReceiver::Str, "replace", &mut text, args, span());
+            runtime.apply_builtin_method(BuiltinMethodId::STR_REPLACE, &mut text, args, span());
         assert!(matches!(trap_of(result), Trap::OutOfMemory));
     }
 
@@ -1374,8 +1385,7 @@ mod tests {
         let mut text = Value::str(" ".repeat(8000));
         runtime
             .apply_builtin_method(
-                BuiltinReceiver::Str,
-                "trim",
+                BuiltinMethodId::STR_TRIM,
                 &mut text,
                 CallArgs::new(),
                 span(),
@@ -1401,7 +1411,7 @@ mod tests {
         let mut text = Value::str("x".repeat(8000));
         let args: CallArgs = smallvec![Value::str("x".repeat(8000)), Value::str("")];
         runtime
-            .apply_builtin_method(BuiltinReceiver::Str, "replace", &mut text, args, span())
+            .apply_builtin_method(BuiltinMethodId::STR_REPLACE, &mut text, args, span())
             .expect("replace");
         assert_eq!(runtime.fuel_used(), 1000, "replace scans the input");
 
@@ -1411,7 +1421,7 @@ mod tests {
         let mut receiver = Value::map(map);
         let args: CallArgs = smallvec![Value::str("x".repeat(8000))];
         runtime
-            .apply_builtin_method(BuiltinReceiver::Map, "has", &mut receiver, args, span())
+            .apply_builtin_method(BuiltinMethodId::MAP_HAS, &mut receiver, args, span())
             .expect("map has");
         assert_eq!(runtime.fuel_used(), 999, "map keys charge their bytes");
 
@@ -1420,13 +1430,7 @@ mod tests {
         let mut receiver = Value::list(items);
         let args: CallArgs = smallvec![Value::str("y".repeat(80))];
         runtime
-            .apply_builtin_method(
-                BuiltinReceiver::List,
-                "contains",
-                &mut receiver,
-                args,
-                span(),
-            )
+            .apply_builtin_method(BuiltinMethodId::LIST_CONTAINS, &mut receiver, args, span())
             .expect("contains");
         assert_eq!(
             runtime.fuel_used(),
@@ -1443,8 +1447,7 @@ mod tests {
         let mut text = Value::str("  hi  ");
         runtime
             .apply_builtin_method(
-                BuiltinReceiver::Str,
-                "trim",
+                BuiltinMethodId::STR_TRIM,
                 &mut text,
                 CallArgs::new(),
                 span(),
@@ -1470,7 +1473,7 @@ mod tests {
         let mut text = Value::str("Hello");
         let args: CallArgs = smallvec![Value::str("Hello"), Value::str("Bye")];
         runtime
-            .apply_builtin_method(BuiltinReceiver::Str, "replace", &mut text, args, span())
+            .apply_builtin_method(BuiltinMethodId::STR_REPLACE, &mut text, args, span())
             .expect("small replace");
         assert_eq!(runtime.fuel_used(), 1, "replace scan unit");
 
@@ -1480,7 +1483,7 @@ mod tests {
         let mut receiver = Value::map(map);
         let args: CallArgs = smallvec![Value::str("a")];
         runtime
-            .apply_builtin_method(BuiltinReceiver::Map, "has", &mut receiver, args, span())
+            .apply_builtin_method(BuiltinMethodId::MAP_HAS, &mut receiver, args, span())
             .expect("small map lookup");
         assert_eq!(runtime.fuel_used(), 0, "small keys keep their old fuel");
 
@@ -1488,14 +1491,204 @@ mod tests {
         let mut receiver = Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
         let args: CallArgs = smallvec![Value::Int(3)];
         runtime
-            .apply_builtin_method(
-                BuiltinReceiver::List,
-                "contains",
-                &mut receiver,
-                args,
-                span(),
-            )
+            .apply_builtin_method(BuiltinMethodId::LIST_CONTAINS, &mut receiver, args, span())
             .expect("small contains");
         assert_eq!(runtime.fuel_used(), 3, "one unit per element");
+    }
+
+    fn receiver_for(receiver: BuiltinReceiver) -> Value {
+        match receiver {
+            BuiltinReceiver::List => Value::list(Vec::new()),
+            BuiltinReceiver::Map => Value::map(OrderedMap::new()),
+            BuiltinReceiver::Str => Value::str(""),
+            BuiltinReceiver::Int => Value::Int(1),
+            BuiltinReceiver::Float => Value::Float(1.0),
+            BuiltinReceiver::Range => Value::Range {
+                start: 0,
+                end: 0,
+                inclusive: false,
+            },
+            BuiltinReceiver::Option => Value::Option(None),
+            BuiltinReceiver::Result => Value::Result(Ok(Box::new(Value::Int(1)))),
+        }
+    }
+
+    #[test]
+    fn every_canonical_builtin_method_reaches_a_dispatch_arm() {
+        for (index, def) in martite_ir::BUILTIN_METHODS.iter().enumerate() {
+            let program = IrProgram::default();
+            let mut runtime = IrRuntime::new(&program, limits(1_000_000, 8 << 20));
+            let mut receiver = receiver_for(def.receiver);
+            let result = runtime.apply_builtin_method(
+                BuiltinMethodId::new(index as u32),
+                &mut receiver,
+                CallArgs::new(),
+                span(),
+            );
+            if let Err(EvalError::Trap(Trap::Panic { message, .. })) = result {
+                assert!(
+                    !message.contains("unknown"),
+                    "{} {} fell through to the dispatch fallback: {message}",
+                    def.receiver.as_str(),
+                    def.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_method_dispatch_by_id_keeps_results() {
+        let program = IrProgram::default();
+        let mut runtime = IrRuntime::new(&program, limits(1_000_000, 8 << 20));
+
+        let mut list = Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        let result = runtime
+            .apply_builtin_method(
+                BuiltinMethodId::LIST_LEN,
+                &mut list,
+                CallArgs::new(),
+                span(),
+            )
+            .expect("list len");
+        assert!(matches!(result, Value::Int(3)));
+
+        let mut list = Value::list(Vec::new());
+        runtime
+            .apply_builtin_method(
+                BuiltinMethodId::LIST_PUSH,
+                &mut list,
+                smallvec![Value::Int(7)],
+                span(),
+            )
+            .expect("list push");
+        let result = runtime
+            .apply_builtin_method(
+                BuiltinMethodId::LIST_LEN,
+                &mut list,
+                CallArgs::new(),
+                span(),
+            )
+            .expect("list len after push");
+        assert!(matches!(result, Value::Int(1)));
+
+        let mut float = Value::Float(9.0);
+        let result = runtime
+            .apply_builtin_method(
+                BuiltinMethodId::FLOAT_SQRT,
+                &mut float,
+                CallArgs::new(),
+                span(),
+            )
+            .expect("float sqrt");
+        let Value::Float(value) = result else {
+            panic!("expected a float");
+        };
+        assert_eq!(value, 3.0);
+
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Str("k".into()), Value::Int(7));
+        let mut receiver = Value::map(map);
+        let result = runtime
+            .apply_builtin_method(
+                BuiltinMethodId::MAP_GET,
+                &mut receiver,
+                smallvec![Value::str("k")],
+                span(),
+            )
+            .expect("map get");
+        let Value::Option(Some(value)) = result else {
+            panic!("expected Some");
+        };
+        assert!(matches!(*value, Value::Int(7)));
+    }
+
+    #[test]
+    fn builtin_module_items_dispatch_by_id() {
+        let program = IrProgram::default();
+        let mut runtime = IrRuntime::new(&program, limits(1_000_000, 8 << 20));
+
+        let result = runtime
+            .call_builtin_item_values(
+                BuiltinItemId::MATH_MIN,
+                &[Value::Int(3), Value::Int(5)],
+                span(),
+            )
+            .expect("math min");
+        assert!(matches!(result, Value::Int(3)));
+
+        let result = runtime
+            .call_builtin_item_values(
+                BuiltinItemId::MATH_MAX,
+                &[Value::Int(3), Value::Int(5)],
+                span(),
+            )
+            .expect("math max");
+        assert!(matches!(result, Value::Int(5)));
+
+        let result = runtime
+            .call_builtin_item_values(
+                BuiltinItemId::MATH_CLAMP,
+                &[Value::Int(9), Value::Int(0), Value::Int(7)],
+                span(),
+            )
+            .expect("math clamp");
+        assert!(matches!(result, Value::Int(7)));
+
+        for item in [
+            BuiltinItemId::MATH_SIN,
+            BuiltinItemId::MATH_COS,
+            BuiltinItemId::MATH_TAN,
+            BuiltinItemId::MATH_EXP,
+            BuiltinItemId::MATH_LN,
+            BuiltinItemId::MATH_LOG10,
+        ] {
+            let result = runtime
+                .call_builtin_item_values(item, &[Value::Float(0.0)], span())
+                .unwrap_or_else(|error| panic!("{item:?}: {error:?}"));
+            assert!(matches!(result, Value::Float(_)));
+        }
+
+        let result = runtime
+            .call_builtin_item_values(
+                BuiltinItemId::MATH_ATAN2,
+                &[Value::Float(0.0), Value::Float(1.0)],
+                span(),
+            )
+            .expect("math atan2");
+        assert!(matches!(result, Value::Float(_)));
+
+        let parsed = runtime
+            .call_builtin_item_values(BuiltinItemId::JSON_PARSE, &[Value::str("null")], span())
+            .expect("json parse");
+        let Value::Result(Ok(value)) = parsed else {
+            panic!("expected a successful parse");
+        };
+        let stringified = runtime
+            .call_builtin_item_values(BuiltinItemId::JSON_STRINGIFY, &[*value], span())
+            .expect("json stringify");
+        assert_eq!(stringified.as_str(), Some("null"));
+    }
+
+    #[test]
+    fn malformed_builtin_ids_trap_defensively() {
+        let program = IrProgram::default();
+        let mut runtime = IrRuntime::new(&program, limits(1_000_000, 8 << 20));
+
+        let result = runtime.apply_builtin_method(
+            BuiltinMethodId::new(999),
+            &mut Value::Unit,
+            CallArgs::new(),
+            span(),
+        );
+        let Trap::Panic { message, .. } = trap_of(result) else {
+            panic!("expected a panic");
+        };
+        assert!(message.contains("unknown builtin method"), "{message}");
+
+        let result = runtime.call_builtin_item_values(BuiltinItemId::new(999), &[], span());
+        let Trap::Panic { message, .. } = trap_of(result) else {
+            panic!("expected a panic");
+        };
+        assert!(message.contains("unknown builtin module item"), "{message}");
     }
 }
