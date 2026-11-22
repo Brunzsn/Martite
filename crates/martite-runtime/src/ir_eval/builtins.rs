@@ -612,8 +612,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             "get" => {
                 let key = args.first().cloned().unwrap_or(Value::Unit);
                 self.charge(map_key_cost(&key))?;
-                let key = key_from_value(&key)
-                    .map_err(|message| EvalError::Trap(self.panic(message, span)))?;
+                let key = self.map_key_ref_at(&key, span)?;
                 Ok(map
                     .get(&key)
                     .cloned()
@@ -623,8 +622,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             "has" => {
                 let key = args.first().cloned().unwrap_or(Value::Unit);
                 self.charge(map_key_cost(&key))?;
-                let key = key_from_value(&key)
-                    .map_err(|message| EvalError::Trap(self.panic(message, span)))?;
+                let key = self.map_key_ref_at(&key, span)?;
                 Ok(Value::Bool(map.get(&key).is_some()))
             }
             "keys" => {
@@ -647,8 +645,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             "remove" => {
                 let key = args.first().cloned().unwrap_or(Value::Unit);
                 self.charge(map_key_cost(&key))?;
-                let key = key_from_value(&key)
-                    .map_err(|message| EvalError::Trap(self.panic(message, span)))?;
+                let key = self.map_key_ref_at(&key, span)?;
                 if map.get(&key).is_none() {
                     return Ok(Value::Option(None));
                 }
@@ -1497,5 +1494,134 @@ mod tests {
             )
             .expect("small contains");
         assert_eq!(runtime.fuel_used(), 3, "one unit per element");
+    }
+
+    fn option_int(value: &Value) -> Option<Option<i64>> {
+        match value {
+            Value::Option(Some(inner)) => Some(inner.as_int()),
+            Value::Option(None) => Some(None),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn map_lookup_methods_accept_borrowed_keys() {
+        let program = IrProgram::default();
+        let mut runtime = IrRuntime::new(&program, limits(1_000_000, 8 << 20));
+
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Str("b".into()), Value::Int(2));
+        map.insert(KeyValue::Str("a".into()), Value::Int(1));
+        map.insert(KeyValue::Int(7), Value::Int(3));
+        map.insert(KeyValue::Bool(false), Value::Int(4));
+        map.insert(
+            KeyValue::Tuple(vec![KeyValue::Str("pair".into()), KeyValue::Int(2)]),
+            Value::Int(5),
+        );
+        let mut receiver = Value::map(map);
+
+        let args: CallArgs = smallvec![Value::str("a")];
+        let result = runtime
+            .apply_builtin_method(BuiltinReceiver::Map, "get", &mut receiver, args, span())
+            .expect("str get");
+        assert_eq!(option_int(&result), Some(Some(1)));
+
+        let args: CallArgs = smallvec![Value::Int(7)];
+        let result = runtime
+            .apply_builtin_method(BuiltinReceiver::Map, "has", &mut receiver, args, span())
+            .expect("int has");
+        assert!(matches!(result, Value::Bool(true)));
+
+        let args: CallArgs = smallvec![Value::Bool(false)];
+        let result = runtime
+            .apply_builtin_method(BuiltinReceiver::Map, "get", &mut receiver, args, span())
+            .expect("bool get");
+        assert_eq!(option_int(&result), Some(Some(4)));
+
+        let pair = Value::tuple(vec![Value::str("pair"), Value::Int(2)]);
+        let result = runtime
+            .index_value(receiver.clone(), pair.clone(), span())
+            .expect("tuple index");
+        assert_eq!(result.as_int(), Some(5));
+
+        let args: CallArgs = smallvec![pair];
+        let result = runtime
+            .apply_builtin_method(BuiltinReceiver::Map, "remove", &mut receiver, args, span())
+            .expect("tuple remove");
+        assert_eq!(option_int(&result), Some(Some(5)));
+
+        let Value::Map(map) = &receiver else {
+            panic!("receiver is a map");
+        };
+        let order: Vec<KeyValue> = map.entries().iter().map(|(key, _)| key.clone()).collect();
+        assert_eq!(
+            order,
+            vec![
+                KeyValue::Str("b".into()),
+                KeyValue::Str("a".into()),
+                KeyValue::Int(7),
+                KeyValue::Bool(false),
+            ],
+            "borrowed lookup and removal preserve insertion order"
+        );
+
+        let args: CallArgs = smallvec![Value::str("b")];
+        let result = runtime
+            .apply_builtin_method(BuiltinReceiver::Map, "remove", &mut receiver, args, span())
+            .expect("str remove");
+        assert_eq!(option_int(&result), Some(Some(2)));
+
+        let args: CallArgs = smallvec![Value::str("missing")];
+        let result = runtime
+            .apply_builtin_method(BuiltinReceiver::Map, "remove", &mut receiver, args, span())
+            .expect("missing remove");
+        assert_eq!(option_int(&result), Some(None));
+
+        let Value::Map(map) = &receiver else {
+            panic!("receiver is a map");
+        };
+        let order: Vec<KeyValue> = map.entries().iter().map(|(key, _)| key.clone()).collect();
+        assert_eq!(
+            order,
+            vec![
+                KeyValue::Str("a".into()),
+                KeyValue::Int(7),
+                KeyValue::Bool(false),
+            ]
+        );
+    }
+
+    #[test]
+    fn map_lookup_methods_still_reject_non_key_values() {
+        let program = IrProgram::default();
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Int(1), Value::Int(1));
+        let mut receiver = Value::map(map);
+
+        for method in ["get", "has", "remove"] {
+            let mut runtime = IrRuntime::new(&program, limits(1_000_000, 8 << 20));
+            let args: CallArgs = smallvec![Value::list(vec![Value::Int(1)])];
+            let trap = trap_of(runtime.apply_builtin_method(
+                BuiltinReceiver::Map,
+                method,
+                &mut receiver,
+                args,
+                span(),
+            ));
+            assert!(
+                trap.panic_message()
+                    .contains("value cannot be used as a map key"),
+                "{method} must reject a list key"
+            );
+        }
+
+        let mut runtime = IrRuntime::new(&program, limits(1_000_000, 8 << 20));
+        let trap =
+            trap_of(runtime.index_value(receiver.clone(), Value::tuple(vec![Value::Unit]), span()));
+        assert!(
+            trap.panic_message()
+                .contains("value cannot be used as a map key"),
+            "indexing must reject a tuple containing a non-key value"
+        );
     }
 }
