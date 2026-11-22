@@ -37,7 +37,7 @@ pub enum Value {
 /// `slots` and `string_slots` mirror the fuel table. `bytes` is nominal and
 /// counts shared payloads at each occurrence; the authoritative memory census
 /// still uses `Value::size_bytes` with its de-duplicating set.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValueMeta {
     pub depth: u16,
     pub slots: u64,
@@ -279,6 +279,9 @@ impl SeqValue {
     }
 
     pub(crate) fn note_child_replaced(&mut self, old: ValueMeta, new: ValueMeta) {
+        if old == new {
+            return;
+        }
         let items = &self.items;
         self.meta
             .replace(EntryMeta::item(old), EntryMeta::item(new), |meta| {
@@ -370,6 +373,9 @@ impl MapValue {
     }
 
     pub(crate) fn note_value_replaced(&mut self, key: &Key, old: ValueMeta, new: ValueMeta) {
+        if old == new {
+            return;
+        }
         let stats = KeyStats::new(key);
         let entries = self.map.iter();
         self.meta.replace(
@@ -444,6 +450,9 @@ impl StructValue {
     }
 
     pub(crate) fn note_field_replaced(&mut self, old: ValueMeta, new: ValueMeta) {
+        if old == new {
+            return;
+        }
         let fields = &self.fields;
         self.meta
             .replace(EntryMeta::item(old), EntryMeta::item(new), |meta| {
@@ -2042,6 +2051,65 @@ mod tests {
         let old = value.fields[1].meta();
         *value.field_mut(1).expect("field") = Value::Int(9);
         let new = value.fields[1].meta();
+        value.note_field_replaced(old, new);
+        assert_struct(&value);
+    }
+
+    #[test]
+    fn replacement_notes_skip_identical_metadata_and_update_changed_metadata() {
+        let mut seq = SeqValue::new(vec![Value::Int(1), Value::list(vec![Value::Int(2)])]);
+        let old = seq[0].meta();
+        *seq.slot_mut(0).expect("slot") = Value::Int(7);
+        let new = seq[0].meta();
+        assert_eq!(old, new, "scalar replacements share metadata");
+        let before = seq.meta;
+        seq.note_child_replaced(old, new);
+        assert_eq!(seq.meta.value, before.value);
+        assert_eq!(seq.meta.deep_count, before.deep_count);
+        assert_seq(&seq);
+        let old = seq[0].meta();
+        *seq.slot_mut(0).expect("slot") = Value::list(vec![Value::list(vec![Value::Int(3)])]);
+        let new = seq[0].meta();
+        assert_ne!(old, new);
+        seq.note_child_replaced(old, new);
+        assert_seq(&seq);
+
+        let key = KeyValue::Str("key".into());
+        let mut map = MapValue::new(OrderedMap::new());
+        map.insert(key.clone(), Value::Int(1));
+        let old = map.get(&key).expect("entry").meta();
+        *map.value_mut(&key).expect("entry") = Value::Int(2);
+        let new = map.get(&key).expect("entry").meta();
+        assert_eq!(old, new, "scalar replacements share metadata");
+        let before = map.meta;
+        map.note_value_replaced(&key, old, new);
+        assert_eq!(map.meta.value, before.value);
+        assert_eq!(map.meta.deep_count, before.deep_count);
+        assert_map(&map);
+        let old = map.get(&key).expect("entry").meta();
+        *map.value_mut(&key).expect("entry") = Value::list(vec![Value::list(vec![Value::Int(3)])]);
+        let new = map.get(&key).expect("entry").meta();
+        assert_ne!(old, new);
+        map.note_value_replaced(&key, old, new);
+        assert_map(&map);
+
+        let mut value = StructValue::new(
+            TypeId(1),
+            vec![Value::Int(1), Value::list(vec![Value::Int(2)])],
+        );
+        let old = value.fields[0].meta();
+        *value.field_mut(0).expect("field") = Value::Int(9);
+        let new = value.fields[0].meta();
+        assert_eq!(old, new, "scalar replacements share metadata");
+        let before = value.meta;
+        value.note_field_replaced(old, new);
+        assert_eq!(value.meta.value, before.value);
+        assert_eq!(value.meta.deep_count, before.deep_count);
+        assert_struct(&value);
+        let old = value.fields[0].meta();
+        *value.field_mut(0).expect("field") = Value::list(vec![Value::list(vec![Value::Int(3)])]);
+        let new = value.fields[0].meta();
+        assert_ne!(old, new);
         value.note_field_replaced(old, new);
         assert_struct(&value);
     }
