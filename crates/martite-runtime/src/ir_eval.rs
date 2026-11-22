@@ -1717,10 +1717,16 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     self.charge(per_iter)?;
                     match pair {
                         Some((key_pattern, value_pattern)) => match key_pattern {
-                            Pattern::Wild => self.bind_pattern(value_pattern, value)?,
+                            Pattern::Wild => {
+                                // The entry tuple is no longer materialised, but
+                                // keep its nominal accounting so tight memory
+                                // limits behave exactly as before.
+                                self.note_alloc(16 + 8 * 2);
+                                self.bind_pattern(value_pattern, value)?;
+                            }
                             Pattern::Bind { .. } => {
                                 let key = crate::value::key_to_value(key);
-                                self.note_value(&key);
+                                self.note_alloc(16 + 8 * 2);
                                 self.bind_pattern(key_pattern, &key)?;
                                 self.bind_pattern(value_pattern, value)?;
                             }
