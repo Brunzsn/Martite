@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use martite_base::{Code, LoadLimits};
-use martite_conformance::{Case, assert_clean, assert_diagnostic};
+use martite_conformance::{Case, assert_clean, assert_diagnostic, assert_diagnostic_at};
 
 struct ErrorRow {
     code: Code,
@@ -86,7 +86,14 @@ const ROWS: &[ErrorRow] = &[
         code: Code::E202,
         fail: "fn main() { let x = [] }",
         pass: "fn main() { let x: list[int] = []\nprint(x) }",
-        span: Some(""),
+        span: Some("[]"),
+        message: "infer",
+    },
+    ErrorRow {
+        code: Code::E202,
+        fail: "fn main() { let x = {} }",
+        pass: "fn main() { let x: map[str, int] = {}\nprint(x) }",
+        span: Some("{}"),
         message: "infer",
     },
     ErrorRow {
@@ -102,6 +109,13 @@ const ROWS: &[ErrorRow] = &[
         pass: "fn f(x: int) {}\nfn main() { f(1) }",
         span: Some("f()"),
         message: "argument",
+    },
+    ErrorRow {
+        code: Code::E204,
+        fail: "fn main() { let f: fn(int) -> int = fn() => 0\nprint(f(1)) }",
+        pass: "fn main() { let f: fn(int) -> int = fn(value) => value\nprint(f(1)) }",
+        span: Some("fn() => 0"),
+        message: "lambda takes",
     },
     ErrorRow {
         code: Code::E205,
@@ -216,6 +230,34 @@ const ROWS: &[ErrorRow] = &[
         message: "main",
     },
 ];
+
+#[test]
+fn placeholder_diagnostics_start_at_the_offending_expression() {
+    assert_diagnostic_at(
+        &Case::single("fn main() {\n    let values = []\n}"),
+        Code::E202,
+        2,
+        18,
+        Some("[]"),
+    );
+    assert_diagnostic_at(
+        &Case::single("fn main() {\n    let table = {}\n}"),
+        Code::E202,
+        2,
+        17,
+        Some("{}"),
+    );
+    assert_diagnostic_at(
+        &Case::single(
+            "fn apply(f: fn(int) -> int) -> int { f(1) }\n\
+             fn main() {\n    let g: fn(int) -> int = fn() => 0\n    print(\"{g(1)}\")\n}",
+        ),
+        Code::E204,
+        3,
+        29,
+        Some("fn() => 0"),
+    );
+}
 
 #[test]
 fn load_limit_variants_are_e002() {
