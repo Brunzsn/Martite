@@ -153,6 +153,101 @@ fn build_index_kinds(program: &IrProgram) -> Vec<Vec<IndexKind>> {
         .collect()
 }
 
+/// Specialized binary operation selected from the IR operand node types.
+///
+/// `General(op)` keeps the historical value-shape match for unresolved or
+/// non-scalar checker types (`Ty::Never`, `Ty::Param`, `Ty::Named`, a missing
+/// type-table entry, or an operand combination that does not fit one of the
+/// scalar rules). A specialized arm that sees unexpected value shapes falls
+/// back to `General` as well.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryDispatch {
+    IntAdd,
+    IntSub,
+    IntMul,
+    IntDiv,
+    IntRem,
+    FloatAdd,
+    FloatSub,
+    FloatMul,
+    FloatDiv,
+    FloatRem,
+    StrConcat,
+    IntCompare(BinaryKind),
+    FloatCompare(BinaryKind),
+    StrCompare(BinaryKind),
+    General(BinaryKind),
+}
+
+impl BinaryDispatch {
+    fn of(op: BinaryKind, lhs: Option<&Ty>, rhs: Option<&Ty>) -> Self {
+        use BinaryKind::*;
+        match (op, lhs, rhs) {
+            (Add, Some(Ty::Int), Some(Ty::Int)) => Self::IntAdd,
+            (Sub, Some(Ty::Int), Some(Ty::Int)) => Self::IntSub,
+            (Mul, Some(Ty::Int), Some(Ty::Int)) => Self::IntMul,
+            (Div, Some(Ty::Int), Some(Ty::Int)) => Self::IntDiv,
+            (Rem, Some(Ty::Int), Some(Ty::Int)) => Self::IntRem,
+            (Add, Some(Ty::Float), Some(Ty::Float)) => Self::FloatAdd,
+            (Sub, Some(Ty::Float), Some(Ty::Float)) => Self::FloatSub,
+            (Mul, Some(Ty::Float), Some(Ty::Float)) => Self::FloatMul,
+            (Div, Some(Ty::Float), Some(Ty::Float)) => Self::FloatDiv,
+            (Rem, Some(Ty::Float), Some(Ty::Float)) => Self::FloatRem,
+            (Add, Some(Ty::Str), Some(Ty::Str)) => Self::StrConcat,
+            (op @ (Eq | Ne | Lt | Le | Gt | Ge), Some(Ty::Int), Some(Ty::Int)) => {
+                Self::IntCompare(op)
+            }
+            (op @ (Eq | Ne | Lt | Le | Gt | Ge), Some(Ty::Float), Some(Ty::Float)) => {
+                Self::FloatCompare(op)
+            }
+            (op @ (Eq | Ne | Lt | Le | Gt | Ge), Some(Ty::Str), Some(Ty::Str)) => {
+                Self::StrCompare(op)
+            }
+            (op, _, _) => Self::General(op),
+        }
+    }
+}
+
+/// One table per function, parallel to `IrFn::nodes`.
+///
+/// Entries are only present for the eleven binary node kinds; every other node
+/// stays `None` and is never consulted by the evaluator.
+fn build_binary_dispatches(program: &IrProgram) -> Vec<Vec<Option<BinaryDispatch>>> {
+    program
+        .fns
+        .iter()
+        .map(|function| {
+            function
+                .nodes
+                .iter()
+                .map(|node| {
+                    let (op, lhs, rhs) = match node.kind {
+                        NodeKind::Add { lhs, rhs } => (BinaryKind::Add, lhs, rhs),
+                        NodeKind::Sub { lhs, rhs } => (BinaryKind::Sub, lhs, rhs),
+                        NodeKind::Mul { lhs, rhs } => (BinaryKind::Mul, lhs, rhs),
+                        NodeKind::Div { lhs, rhs } => (BinaryKind::Div, lhs, rhs),
+                        NodeKind::Rem { lhs, rhs } => (BinaryKind::Rem, lhs, rhs),
+                        NodeKind::Eq { lhs, rhs } => (BinaryKind::Eq, lhs, rhs),
+                        NodeKind::Ne { lhs, rhs } => (BinaryKind::Ne, lhs, rhs),
+                        NodeKind::Lt { lhs, rhs } => (BinaryKind::Lt, lhs, rhs),
+                        NodeKind::Le { lhs, rhs } => (BinaryKind::Le, lhs, rhs),
+                        NodeKind::Gt { lhs, rhs } => (BinaryKind::Gt, lhs, rhs),
+                        NodeKind::Ge { lhs, rhs } => (BinaryKind::Ge, lhs, rhs),
+                        _ => return None,
+                    };
+                    let lhs_ty = function
+                        .node(lhs)
+                        .and_then(|lhs| program.types.get_ty(lhs.ty));
+                    let rhs_ty = function
+                        .node(rhs)
+                        .and_then(|rhs| program.types.get_ty(rhs.ty));
+                    Some(BinaryDispatch::of(op, lhs_ty, rhs_ty))
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Executes one [`IrProgram`] with the limits and observable accounting rules
 /// pinned by the conformance snapshots.
 pub struct IrRuntime<'p, 'h> {
@@ -188,6 +283,9 @@ pub struct IrRuntime<'p, 'h> {
     literal_values: Vec<Option<Value>>,
     /// `IndexKind` per function and node, derived once from the IR node types.
     index_kinds: Vec<Vec<IndexKind>>,
+    /// `BinaryDispatch` per function and node, derived once from the IR node
+    /// types. `None` for non-binary nodes.
+    binary_dispatches: Vec<Vec<Option<BinaryDispatch>>>,
 }
 
 impl<'p, 'h> IrRuntime<'p, 'h> {
@@ -220,6 +318,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             const_values: vec![None; program.consts.len()],
             literal_values: vec![None; program.strs.len()],
             index_kinds: build_index_kinds(program),
+            binary_dispatches: build_binary_dispatches(program),
         }
     }
 
@@ -377,6 +476,17 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             .and_then(|kinds| kinds.get(id.index()))
             .copied()
             .unwrap_or(IndexKind::General)
+    }
+
+    #[inline]
+    fn binary_dispatch(&self, id: IrId, op: BinaryKind) -> BinaryDispatch {
+        let function = self.current_function();
+        self.binary_dispatches
+            .get(function.id.index())
+            .and_then(|kinds| kinds.get(id.index()))
+            .copied()
+            .flatten()
+            .unwrap_or(BinaryDispatch::General(op))
     }
 
     fn internal_panic(&self, message: impl Into<String>) -> Trap {
@@ -913,17 +1023,39 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     _ => self.trap(self.internal_panic("invalid unary operand")),
                 }
             }
-            NodeKind::Add { lhs, rhs } => self.eval_binary_values(BinaryKind::Add, lhs, rhs, span),
-            NodeKind::Sub { lhs, rhs } => self.eval_binary_values(BinaryKind::Sub, lhs, rhs, span),
-            NodeKind::Mul { lhs, rhs } => self.eval_binary_values(BinaryKind::Mul, lhs, rhs, span),
-            NodeKind::Div { lhs, rhs } => self.eval_binary_values(BinaryKind::Div, lhs, rhs, span),
-            NodeKind::Rem { lhs, rhs } => self.eval_binary_values(BinaryKind::Rem, lhs, rhs, span),
-            NodeKind::Eq { lhs, rhs } => self.eval_binary_values(BinaryKind::Eq, lhs, rhs, span),
-            NodeKind::Ne { lhs, rhs } => self.eval_binary_values(BinaryKind::Ne, lhs, rhs, span),
-            NodeKind::Lt { lhs, rhs } => self.eval_binary_values(BinaryKind::Lt, lhs, rhs, span),
-            NodeKind::Le { lhs, rhs } => self.eval_binary_values(BinaryKind::Le, lhs, rhs, span),
-            NodeKind::Gt { lhs, rhs } => self.eval_binary_values(BinaryKind::Gt, lhs, rhs, span),
-            NodeKind::Ge { lhs, rhs } => self.eval_binary_values(BinaryKind::Ge, lhs, rhs, span),
+            NodeKind::Add { lhs, rhs } => {
+                self.eval_binary_values(id, BinaryKind::Add, lhs, rhs, span)
+            }
+            NodeKind::Sub { lhs, rhs } => {
+                self.eval_binary_values(id, BinaryKind::Sub, lhs, rhs, span)
+            }
+            NodeKind::Mul { lhs, rhs } => {
+                self.eval_binary_values(id, BinaryKind::Mul, lhs, rhs, span)
+            }
+            NodeKind::Div { lhs, rhs } => {
+                self.eval_binary_values(id, BinaryKind::Div, lhs, rhs, span)
+            }
+            NodeKind::Rem { lhs, rhs } => {
+                self.eval_binary_values(id, BinaryKind::Rem, lhs, rhs, span)
+            }
+            NodeKind::Eq { lhs, rhs } => {
+                self.eval_binary_values(id, BinaryKind::Eq, lhs, rhs, span)
+            }
+            NodeKind::Ne { lhs, rhs } => {
+                self.eval_binary_values(id, BinaryKind::Ne, lhs, rhs, span)
+            }
+            NodeKind::Lt { lhs, rhs } => {
+                self.eval_binary_values(id, BinaryKind::Lt, lhs, rhs, span)
+            }
+            NodeKind::Le { lhs, rhs } => {
+                self.eval_binary_values(id, BinaryKind::Le, lhs, rhs, span)
+            }
+            NodeKind::Gt { lhs, rhs } => {
+                self.eval_binary_values(id, BinaryKind::Gt, lhs, rhs, span)
+            }
+            NodeKind::Ge { lhs, rhs } => {
+                self.eval_binary_values(id, BinaryKind::Ge, lhs, rhs, span)
+            }
             NodeKind::And { lhs, rhs } => {
                 let lhs = self.eval(lhs)?;
                 if !matches!(lhs, Value::Bool(true)) {
@@ -1270,6 +1402,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
     #[inline]
     fn eval_binary_values(
         &mut self,
+        id: IrId,
         op: BinaryKind,
         lhs: IrId,
         rhs: IrId,
@@ -1277,7 +1410,173 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
     ) -> EvalResult<Value> {
         let lhs = self.eval(lhs)?;
         let rhs = self.eval(rhs)?;
-        self.binary_values(op, lhs, rhs, span)
+        let dispatch = self.binary_dispatch(id, op);
+        self.binary_values_kind(dispatch, lhs, rhs, span)
+    }
+
+    /// Dispatch on the `BinaryDispatch` derived from the IR operand types.
+    ///
+    /// A specialized arm only handles its own value shape; anything else falls
+    /// back to `binary_values` so malformed or unresolved IR keeps the generic
+    /// rules (and the same traps and fuel).
+    fn binary_values_kind(
+        &mut self,
+        dispatch: BinaryDispatch,
+        lhs: Value,
+        rhs: Value,
+        span: Span,
+    ) -> EvalResult<Value> {
+        use BinaryKind::*;
+        match dispatch {
+            BinaryDispatch::IntAdd => self.int_arithmetic(Add, lhs, rhs, span),
+            BinaryDispatch::IntSub => self.int_arithmetic(Sub, lhs, rhs, span),
+            BinaryDispatch::IntMul => self.int_arithmetic(Mul, lhs, rhs, span),
+            BinaryDispatch::IntDiv => self.int_arithmetic(Div, lhs, rhs, span),
+            BinaryDispatch::IntRem => self.int_arithmetic(Rem, lhs, rhs, span),
+            BinaryDispatch::FloatAdd => self.float_arithmetic(Add, lhs, rhs, span),
+            BinaryDispatch::FloatSub => self.float_arithmetic(Sub, lhs, rhs, span),
+            BinaryDispatch::FloatMul => self.float_arithmetic(Mul, lhs, rhs, span),
+            BinaryDispatch::FloatDiv => self.float_arithmetic(Div, lhs, rhs, span),
+            BinaryDispatch::FloatRem => self.float_arithmetic(Rem, lhs, rhs, span),
+            BinaryDispatch::StrConcat => match (lhs, rhs) {
+                (Value::Str(lhs), Value::Str(rhs)) => self.concat_strings(lhs, rhs),
+                (lhs, rhs) => self.binary_values(Add, lhs, rhs, span),
+            },
+            BinaryDispatch::IntCompare(op) => self.int_compare(op, lhs, rhs, span),
+            BinaryDispatch::FloatCompare(op) => self.float_compare(op, lhs, rhs, span),
+            BinaryDispatch::StrCompare(op) => {
+                if let (Value::Str(_), Value::Str(_)) = (&lhs, &rhs) {
+                    self.charge(comparison_charge(&lhs, &rhs))?;
+                    let result = match op {
+                        Eq => value_eq(&lhs, &rhs),
+                        Ne => !value_eq(&lhs, &rhs),
+                        Lt => value_ord(&lhs, &rhs).is_lt(),
+                        Le => value_ord(&lhs, &rhs).is_le(),
+                        Gt => value_ord(&lhs, &rhs).is_gt(),
+                        Ge => value_ord(&lhs, &rhs).is_ge(),
+                        _ => unreachable!(),
+                    };
+                    Ok(Value::Bool(result))
+                } else {
+                    self.binary_values(op, lhs, rhs, span)
+                }
+            }
+            BinaryDispatch::General(op) => self.binary_values(op, lhs, rhs, span),
+        }
+    }
+
+    fn int_arithmetic(
+        &mut self,
+        op: BinaryKind,
+        lhs: Value,
+        rhs: Value,
+        span: Span,
+    ) -> EvalResult<Value> {
+        match (lhs, rhs) {
+            (Value::Int(a), Value::Int(b)) => {
+                let result = match op {
+                    BinaryKind::Add => a.checked_add(b),
+                    BinaryKind::Sub => a.checked_sub(b),
+                    BinaryKind::Mul => a.checked_mul(b),
+                    BinaryKind::Div => {
+                        if b == 0 {
+                            return self.trap(self.panic("division by zero", span));
+                        }
+                        a.checked_div(b)
+                    }
+                    BinaryKind::Rem => {
+                        if b == 0 {
+                            return self.trap(self.panic("division by zero", span));
+                        }
+                        a.checked_rem(b)
+                    }
+                    _ => unreachable!(),
+                };
+                result
+                    .map(Value::Int)
+                    .ok_or_else(|| EvalError::Trap(self.panic("integer overflow", span)))
+            }
+            (lhs, rhs) => self.binary_values(op, lhs, rhs, span),
+        }
+    }
+
+    fn float_arithmetic(
+        &mut self,
+        op: BinaryKind,
+        lhs: Value,
+        rhs: Value,
+        span: Span,
+    ) -> EvalResult<Value> {
+        match (lhs, rhs) {
+            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(match op {
+                BinaryKind::Add => a + b,
+                BinaryKind::Sub => a - b,
+                BinaryKind::Mul => a * b,
+                BinaryKind::Div => a / b,
+                BinaryKind::Rem => a % b,
+                _ => unreachable!(),
+            })),
+            (lhs, rhs) => self.binary_values(op, lhs, rhs, span),
+        }
+    }
+
+    fn int_compare(
+        &mut self,
+        op: BinaryKind,
+        lhs: Value,
+        rhs: Value,
+        span: Span,
+    ) -> EvalResult<Value> {
+        match (lhs, rhs) {
+            (Value::Int(a), Value::Int(b)) => {
+                self.charge(0)?;
+                Ok(Value::Bool(match op {
+                    BinaryKind::Eq => a == b,
+                    BinaryKind::Ne => a != b,
+                    BinaryKind::Lt => a < b,
+                    BinaryKind::Le => a <= b,
+                    BinaryKind::Gt => a > b,
+                    BinaryKind::Ge => a >= b,
+                    _ => unreachable!(),
+                }))
+            }
+            (lhs, rhs) => self.binary_values(op, lhs, rhs, span),
+        }
+    }
+
+    fn float_compare(
+        &mut self,
+        op: BinaryKind,
+        lhs: Value,
+        rhs: Value,
+        span: Span,
+    ) -> EvalResult<Value> {
+        match (lhs, rhs) {
+            (Value::Float(a), Value::Float(b)) => {
+                self.charge(0)?;
+                // IEEE comparisons make every ordered comparison false for
+                // NaN, matching the general `partial_cmp` fallback.
+                Ok(Value::Bool(match op {
+                    BinaryKind::Eq => a == b,
+                    BinaryKind::Ne => a != b,
+                    BinaryKind::Lt => a < b,
+                    BinaryKind::Le => a <= b,
+                    BinaryKind::Gt => a > b,
+                    BinaryKind::Ge => a >= b,
+                    _ => unreachable!(),
+                }))
+            }
+            (lhs, rhs) => self.binary_values(op, lhs, rhs, span),
+        }
+    }
+
+    fn concat_strings(&mut self, a: Rc<str>, b: Rc<str>) -> EvalResult<Value> {
+        let mut text = String::with_capacity(a.len() + b.len());
+        text.push_str(&a);
+        text.push_str(&b);
+        self.charge(fuel::string_cost(text.len() as u64))?;
+        self.note_alloc(16 + text.len() as u64);
+        Ok(Value::str(text))
     }
 
     #[inline]
@@ -1291,11 +1590,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         use BinaryKind::*;
         match op {
             Eq | Ne | Lt | Le | Gt | Ge => {
-                let lhs_meta = lhs.meta();
-                let rhs_meta = rhs.meta();
-                let cost = fuel::comparison_cost(lhs_meta.slots, lhs_meta.string_slots)
-                    .max(fuel::comparison_cost(rhs_meta.slots, rhs_meta.string_slots));
-                self.charge(cost)?;
+                self.charge(comparison_charge(&lhs, &rhs))?;
                 match op {
                     Eq => Ok(Value::Bool(value_eq(&lhs, &rhs))),
                     Ne => Ok(Value::Bool(!value_eq(&lhs, &rhs))),
@@ -3026,6 +3321,17 @@ enum BinaryKind {
     Ge,
 }
 
+/// Fuel a comparison of `lhs` and `rhs` touches.
+///
+/// Kept as one function so the specialized scalar comparisons and the general
+/// value-shape path charge exactly the same amount in the same order.
+fn comparison_charge(lhs: &Value, rhs: &Value) -> u64 {
+    let lhs_meta = lhs.meta();
+    let rhs_meta = rhs.meta();
+    fuel::comparison_cost(lhs_meta.slots, lhs_meta.string_slots)
+        .max(fuel::comparison_cost(rhs_meta.slots, rhs_meta.string_slots))
+}
+
 fn take_writeback(updated: &mut Writebacks, index: usize) -> Option<Value> {
     let position = updated.iter().position(|(slot, _)| *slot == index)?;
     Some(updated.swap_remove(position).1)
@@ -3110,7 +3416,9 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Accessor, CallArgs, Frame, IndexKind, IrRuntime, Place};
+    use super::{
+        Accessor, BinaryDispatch, BinaryKind, CallArgs, Frame, IndexKind, IrRuntime, Place,
+    };
     use crate::exec::{ExecLimits, Trap};
     use crate::value::{Closure, FnValue, KeyValue, OrderedMap, StructValue, Value, map_key_cost};
     use martite_ir::{
@@ -3926,6 +4234,7 @@ mod tests {
 
     struct TestTypes {
         int: TyId,
+        float: TyId,
         str_ty: TyId,
         range: TyId,
         list_int: TyId,
@@ -3939,6 +4248,7 @@ mod tests {
     fn test_types() -> (TypeTable, TestTypes) {
         let mut table = TypeTable::default();
         let int = table.add_ty(Ty::Int);
+        let float = table.add_ty(Ty::Float);
         let str_ty = table.add_ty(Ty::Str);
         let range = table.add_ty(Ty::Range);
         let struct_ty = table.add_ty(Ty::Named(TypeId::new(0), Vec::new()));
@@ -3951,6 +4261,7 @@ mod tests {
             table,
             TestTypes {
                 int,
+                float,
                 str_ty,
                 range,
                 list_int,
@@ -3984,6 +4295,7 @@ mod tests {
                 TypeTable::default(),
                 TestTypes {
                     int: zero,
+                    float: zero,
                     str_ty: zero,
                     range: zero,
                     list_int: zero,
@@ -4501,5 +4813,858 @@ mod tests {
             .index_value_kind(IndexKind::MapIndex, map, key, span)
             .expect("specialized map index");
         assert_eq!(general.fuel_used(), specialized.fuel_used());
+    }
+
+    // ------------------------------------------------------------------
+    // Binary operation specialization (#71)
+    // ------------------------------------------------------------------
+
+    /// A `main` that evaluates one binary node over two constants.
+    fn binary_program(
+        kind: NodeKind,
+        result_ty: TyId,
+        lhs: ConstValue,
+        rhs: ConstValue,
+        typed: bool,
+    ) -> IrProgram {
+        let (types, operand_ty) = if typed {
+            let (table, tys) = test_types();
+            (table, tys.int)
+        } else {
+            (TypeTable::default(), TyId::new(0))
+        };
+        let nodes = vec![
+            expression_with_ty(NodeKind::ConstRef(ConstId::new(0)), operand_ty),
+            expression_with_ty(NodeKind::ConstRef(ConstId::new(1)), operand_ty),
+            expression_with_ty(kind, result_ty),
+        ];
+        let mut function = finish(empty_function(0), nodes, Vec::new());
+        function.body = Some(IrId::new(2));
+        IrProgram {
+            fns: vec![function],
+            consts: vec![lhs, rhs],
+            types,
+            entries: Entries {
+                main: Some(FnId::new(0)),
+                ..Entries::default()
+            },
+            ..IrProgram::default()
+        }
+    }
+
+    #[test]
+    fn binary_dispatches_follow_the_ir_node_types() {
+        let (types, tys) = test_types();
+        let function = empty_function(0);
+        let unit = |ty: TyId| Node::new(NodeKind::Unit, ty, Charge::expression(), Effects::NONE);
+        let binary = |kind: NodeKind, ty: TyId| expression_with_ty(kind, ty);
+        let nodes = vec![
+            unit(tys.int),       // 0
+            unit(tys.float),     // 1
+            unit(tys.str_ty),    // 2
+            unit(tys.param),     // 3
+            unit(tys.never),     // 4
+            unit(tys.struct_ty), // 5
+            unit(TyId::new(99)), // 6 missing type entry
+            binary(
+                NodeKind::Add {
+                    lhs: IrId::new(0),
+                    rhs: IrId::new(0),
+                },
+                tys.int,
+            ), // 7 IntAdd
+            binary(
+                NodeKind::Sub {
+                    lhs: IrId::new(0),
+                    rhs: IrId::new(0),
+                },
+                tys.int,
+            ), // 8 IntSub
+            binary(
+                NodeKind::Mul {
+                    lhs: IrId::new(0),
+                    rhs: IrId::new(0),
+                },
+                tys.int,
+            ), // 9 IntMul
+            binary(
+                NodeKind::Div {
+                    lhs: IrId::new(0),
+                    rhs: IrId::new(0),
+                },
+                tys.int,
+            ), // 10 IntDiv
+            binary(
+                NodeKind::Rem {
+                    lhs: IrId::new(0),
+                    rhs: IrId::new(0),
+                },
+                tys.int,
+            ), // 11 IntRem
+            binary(
+                NodeKind::Add {
+                    lhs: IrId::new(1),
+                    rhs: IrId::new(1),
+                },
+                tys.float,
+            ), // 12 FloatAdd
+            binary(
+                NodeKind::Sub {
+                    lhs: IrId::new(1),
+                    rhs: IrId::new(1),
+                },
+                tys.float,
+            ), // 13 FloatSub
+            binary(
+                NodeKind::Mul {
+                    lhs: IrId::new(1),
+                    rhs: IrId::new(1),
+                },
+                tys.float,
+            ), // 14 FloatMul
+            binary(
+                NodeKind::Div {
+                    lhs: IrId::new(1),
+                    rhs: IrId::new(1),
+                },
+                tys.float,
+            ), // 15 FloatDiv
+            binary(
+                NodeKind::Rem {
+                    lhs: IrId::new(1),
+                    rhs: IrId::new(1),
+                },
+                tys.float,
+            ), // 16 FloatRem
+            binary(
+                NodeKind::Add {
+                    lhs: IrId::new(2),
+                    rhs: IrId::new(2),
+                },
+                tys.str_ty,
+            ), // 17 StrConcat
+            binary(
+                NodeKind::Eq {
+                    lhs: IrId::new(0),
+                    rhs: IrId::new(0),
+                },
+                tys.int,
+            ), // 18 IntCompare(Eq)
+            binary(
+                NodeKind::Lt {
+                    lhs: IrId::new(0),
+                    rhs: IrId::new(0),
+                },
+                tys.int,
+            ), // 19 IntCompare(Lt)
+            binary(
+                NodeKind::Ge {
+                    lhs: IrId::new(1),
+                    rhs: IrId::new(1),
+                },
+                tys.float,
+            ), // 20 FloatCompare(Ge)
+            binary(
+                NodeKind::Eq {
+                    lhs: IrId::new(2),
+                    rhs: IrId::new(2),
+                },
+                tys.int,
+            ), // 21 StrCompare(Eq)
+            binary(
+                NodeKind::Le {
+                    lhs: IrId::new(2),
+                    rhs: IrId::new(2),
+                },
+                tys.int,
+            ), // 22 StrCompare(Le)
+            binary(
+                NodeKind::Add {
+                    lhs: IrId::new(0),
+                    rhs: IrId::new(1),
+                },
+                tys.float,
+            ), // 23 General(Add), int/float mismatch
+            binary(
+                NodeKind::Add {
+                    lhs: IrId::new(3),
+                    rhs: IrId::new(0),
+                },
+                tys.int,
+            ), // 24 General(Add), param lhs
+            binary(
+                NodeKind::Add {
+                    lhs: IrId::new(4),
+                    rhs: IrId::new(0),
+                },
+                tys.int,
+            ), // 25 General(Add), never lhs
+            binary(
+                NodeKind::Add {
+                    lhs: IrId::new(5),
+                    rhs: IrId::new(0),
+                },
+                tys.int,
+            ), // 26 General(Add), named lhs
+            binary(
+                NodeKind::Add {
+                    lhs: IrId::new(6),
+                    rhs: IrId::new(0),
+                },
+                tys.int,
+            ), // 27 General(Add), missing lhs type
+            binary(
+                NodeKind::Add {
+                    lhs: IrId::new(0),
+                    rhs: IrId::new(99),
+                },
+                tys.int,
+            ), // 28 General(Add), missing rhs node
+            binary(
+                NodeKind::Lt {
+                    lhs: IrId::new(0),
+                    rhs: IrId::new(1),
+                },
+                tys.int,
+            ), // 29 General(Lt), int/float mismatch
+        ];
+        let mut function = finish(function, nodes, Vec::new());
+        function.body = Some(IrId::new(7));
+        let program = IrProgram {
+            fns: vec![function],
+            types,
+            ..IrProgram::default()
+        };
+        let mut runtime = IrRuntime::new(&program, ExecLimits::default());
+        runtime.current = program.function(FnId::new(0));
+        let dispatch = |id: u32, op: BinaryKind| runtime.binary_dispatch(IrId::new(id), op);
+        assert_eq!(dispatch(7, BinaryKind::Add), BinaryDispatch::IntAdd);
+        assert_eq!(dispatch(8, BinaryKind::Sub), BinaryDispatch::IntSub);
+        assert_eq!(dispatch(9, BinaryKind::Mul), BinaryDispatch::IntMul);
+        assert_eq!(dispatch(10, BinaryKind::Div), BinaryDispatch::IntDiv);
+        assert_eq!(dispatch(11, BinaryKind::Rem), BinaryDispatch::IntRem);
+        assert_eq!(dispatch(12, BinaryKind::Add), BinaryDispatch::FloatAdd);
+        assert_eq!(dispatch(13, BinaryKind::Sub), BinaryDispatch::FloatSub);
+        assert_eq!(dispatch(14, BinaryKind::Mul), BinaryDispatch::FloatMul);
+        assert_eq!(dispatch(15, BinaryKind::Div), BinaryDispatch::FloatDiv);
+        assert_eq!(dispatch(16, BinaryKind::Rem), BinaryDispatch::FloatRem);
+        assert_eq!(dispatch(17, BinaryKind::Add), BinaryDispatch::StrConcat);
+        assert_eq!(
+            dispatch(18, BinaryKind::Eq),
+            BinaryDispatch::IntCompare(BinaryKind::Eq)
+        );
+        assert_eq!(
+            dispatch(19, BinaryKind::Lt),
+            BinaryDispatch::IntCompare(BinaryKind::Lt)
+        );
+        assert_eq!(
+            dispatch(20, BinaryKind::Ge),
+            BinaryDispatch::FloatCompare(BinaryKind::Ge)
+        );
+        assert_eq!(
+            dispatch(21, BinaryKind::Eq),
+            BinaryDispatch::StrCompare(BinaryKind::Eq)
+        );
+        assert_eq!(
+            dispatch(22, BinaryKind::Le),
+            BinaryDispatch::StrCompare(BinaryKind::Le)
+        );
+        for id in 23..=28 {
+            assert_eq!(
+                dispatch(id, BinaryKind::Add),
+                BinaryDispatch::General(BinaryKind::Add),
+                "node {id} must stay general"
+            );
+        }
+        assert_eq!(
+            dispatch(29, BinaryKind::Lt),
+            BinaryDispatch::General(BinaryKind::Lt),
+            "an int/float comparison mismatch stays general"
+        );
+        assert_eq!(
+            dispatch(0, BinaryKind::Add),
+            BinaryDispatch::General(BinaryKind::Add),
+            "non-binary nodes have no table entry"
+        );
+    }
+
+    /// Run one specialized or general binary operation and report its result,
+    /// consumed fuel and charge count.
+    fn run_binary(
+        dispatch: Option<BinaryDispatch>,
+        op: BinaryKind,
+        lhs: &Value,
+        rhs: &Value,
+        span: martite_base::Span,
+        fuel: u64,
+    ) -> (Result<Value, String>, u64, u64) {
+        let program = IrProgram::default();
+        let mut runtime = IrRuntime::new(
+            &program,
+            ExecLimits {
+                fuel,
+                ..ExecLimits::default()
+            },
+        );
+        let result = match dispatch {
+            Some(dispatch) => runtime.binary_values_kind(dispatch, lhs.clone(), rhs.clone(), span),
+            None => runtime.binary_values(op, lhs.clone(), rhs.clone(), span),
+        };
+        let outcome = match result {
+            Ok(value) => Ok(value),
+            Err(super::EvalError::Trap(trap)) => Err(trap.panic_message()),
+            Err(_) => Err("unexpected control flow".into()),
+        };
+        (outcome, runtime.fuel_used(), runtime.ticks)
+    }
+
+    #[test]
+    fn specialized_binary_dispatch_keeps_values_and_traps() {
+        let program = IrProgram::default();
+        let span = test_span();
+        let mut runtime = IrRuntime::new(&program, ExecLimits::default());
+        let cases = [
+            (
+                BinaryDispatch::IntAdd,
+                Value::Int(40),
+                Value::Int(2),
+                Value::Int(42),
+            ),
+            (
+                BinaryDispatch::IntSub,
+                Value::Int(40),
+                Value::Int(2),
+                Value::Int(38),
+            ),
+            (
+                BinaryDispatch::IntMul,
+                Value::Int(6),
+                Value::Int(7),
+                Value::Int(42),
+            ),
+            (
+                BinaryDispatch::IntDiv,
+                Value::Int(7),
+                Value::Int(2),
+                Value::Int(3),
+            ),
+            (
+                BinaryDispatch::IntRem,
+                Value::Int(7),
+                Value::Int(2),
+                Value::Int(1),
+            ),
+            (
+                BinaryDispatch::FloatAdd,
+                Value::Float(1.5),
+                Value::Float(2.25),
+                Value::Float(3.75),
+            ),
+            (
+                BinaryDispatch::FloatSub,
+                Value::Float(1.5),
+                Value::Float(2.25),
+                Value::Float(-0.75),
+            ),
+            (
+                BinaryDispatch::FloatMul,
+                Value::Float(1.5),
+                Value::Float(2.0),
+                Value::Float(3.0),
+            ),
+            (
+                BinaryDispatch::FloatDiv,
+                Value::Float(1.0),
+                Value::Float(0.0),
+                Value::Float(f64::INFINITY),
+            ),
+            (
+                BinaryDispatch::FloatRem,
+                Value::Float(5.5),
+                Value::Float(2.0),
+                Value::Float(1.5),
+            ),
+            (
+                BinaryDispatch::StrConcat,
+                Value::str("ab"),
+                Value::str("cd"),
+                Value::str("abcd"),
+            ),
+            (
+                BinaryDispatch::IntCompare(BinaryKind::Eq),
+                Value::Int(3),
+                Value::Int(3),
+                Value::Bool(true),
+            ),
+            (
+                BinaryDispatch::IntCompare(BinaryKind::Lt),
+                Value::Int(3),
+                Value::Int(4),
+                Value::Bool(true),
+            ),
+            (
+                BinaryDispatch::FloatCompare(BinaryKind::Lt),
+                Value::Float(1.0),
+                Value::Float(2.0),
+                Value::Bool(true),
+            ),
+            (
+                BinaryDispatch::FloatCompare(BinaryKind::Ge),
+                Value::Float(2.0),
+                Value::Float(2.0),
+                Value::Bool(true),
+            ),
+            (
+                BinaryDispatch::StrCompare(BinaryKind::Lt),
+                Value::str("a"),
+                Value::str("b"),
+                Value::Bool(true),
+            ),
+            (
+                BinaryDispatch::StrCompare(BinaryKind::Ne),
+                Value::str("a"),
+                Value::str("a"),
+                Value::Bool(false),
+            ),
+        ];
+        for (dispatch, lhs, rhs, expected) in cases {
+            assert_eq!(
+                runtime
+                    .binary_values_kind(dispatch, lhs, rhs, span)
+                    .expect("specialized operation runs"),
+                expected,
+                "{dispatch:?}"
+            );
+        }
+
+        // NaN keeps the historical behavior: equality is false, inequality is
+        // true, and every ordered comparison is false.
+        let nan = Value::Float(f64::NAN);
+        for (op, expected) in [
+            (BinaryKind::Eq, false),
+            (BinaryKind::Ne, true),
+            (BinaryKind::Lt, false),
+            (BinaryKind::Le, false),
+            (BinaryKind::Gt, false),
+            (BinaryKind::Ge, false),
+        ] {
+            assert_eq!(
+                runtime
+                    .binary_values_kind(
+                        BinaryDispatch::FloatCompare(op),
+                        nan.clone(),
+                        Value::Float(1.0),
+                        span,
+                    )
+                    .expect("NaN comparison runs"),
+                Value::Bool(expected),
+                "{op:?}"
+            );
+        }
+
+        let division_by_zero = runtime
+            .binary_values_kind(BinaryDispatch::IntDiv, Value::Int(1), Value::Int(0), span)
+            .expect_err("division by zero traps");
+        let super::EvalError::Trap(Trap::Panic {
+            message,
+            span: Some(found),
+            ..
+        }) = division_by_zero
+        else {
+            panic!("expected a division-by-zero panic");
+        };
+        assert_eq!(message, "division by zero");
+        assert_eq!(found, span);
+
+        for (dispatch, lhs, rhs) in [
+            (BinaryDispatch::IntAdd, Value::Int(i64::MAX), Value::Int(1)),
+            (BinaryDispatch::IntSub, Value::Int(i64::MIN), Value::Int(1)),
+            (BinaryDispatch::IntMul, Value::Int(i64::MAX), Value::Int(2)),
+            (BinaryDispatch::IntDiv, Value::Int(i64::MIN), Value::Int(-1)),
+            (BinaryDispatch::IntRem, Value::Int(i64::MIN), Value::Int(-1)),
+        ] {
+            let error = runtime
+                .binary_values_kind(dispatch, lhs, rhs, span)
+                .expect_err("integer overflow traps");
+            let super::EvalError::Trap(Trap::Panic {
+                message,
+                span: Some(found),
+                ..
+            }) = error
+            else {
+                panic!("expected an integer-overflow panic");
+            };
+            assert_eq!(message, "integer overflow", "{dispatch:?}");
+            assert_eq!(found, span);
+        }
+
+        // Unexpected value shapes fall back to the general path instead of
+        // trapping differently from unspecialized IR.
+        assert_eq!(
+            runtime
+                .binary_values_kind(
+                    BinaryDispatch::IntAdd,
+                    Value::Float(1.5),
+                    Value::Float(2.25),
+                    span,
+                )
+                .expect("mismatched int arm falls back to general add"),
+            Value::Float(3.75)
+        );
+        assert_eq!(
+            runtime
+                .binary_values_kind(
+                    BinaryDispatch::StrConcat,
+                    Value::Int(2),
+                    Value::Int(3),
+                    span,
+                )
+                .expect("mismatched concat arm falls back to general add"),
+            Value::Int(5)
+        );
+        assert_eq!(
+            runtime
+                .binary_values_kind(
+                    BinaryDispatch::FloatCompare(BinaryKind::Lt),
+                    Value::Int(1),
+                    Value::Int(2),
+                    span,
+                )
+                .expect("mismatched float compare falls back to general compare"),
+            Value::Bool(true)
+        );
+        let invalid = runtime
+            .binary_values_kind(
+                BinaryDispatch::IntAdd,
+                Value::Bool(true),
+                Value::Bool(false),
+                span,
+            )
+            .expect_err("bools are not arithmetic operands");
+        let super::EvalError::Trap(Trap::Panic { message, .. }) = invalid else {
+            panic!("expected an invalid-operand panic");
+        };
+        assert_eq!(message, "invalid arithmetic operands");
+    }
+
+    #[test]
+    fn specialized_binary_fuel_and_ticks_match_the_general_path() {
+        let span = test_span();
+        let nan = Value::Float(f64::NAN);
+        let cases = vec![
+            (
+                BinaryDispatch::IntAdd,
+                BinaryKind::Add,
+                Value::Int(2),
+                Value::Int(3),
+            ),
+            (
+                BinaryDispatch::IntSub,
+                BinaryKind::Sub,
+                Value::Int(2),
+                Value::Int(3),
+            ),
+            (
+                BinaryDispatch::IntMul,
+                BinaryKind::Mul,
+                Value::Int(6),
+                Value::Int(7),
+            ),
+            (
+                BinaryDispatch::IntDiv,
+                BinaryKind::Div,
+                Value::Int(7),
+                Value::Int(2),
+            ),
+            (
+                BinaryDispatch::IntRem,
+                BinaryKind::Rem,
+                Value::Int(7),
+                Value::Int(2),
+            ),
+            (
+                BinaryDispatch::IntAdd,
+                BinaryKind::Add,
+                Value::Int(i64::MAX),
+                Value::Int(1),
+            ),
+            (
+                BinaryDispatch::IntSub,
+                BinaryKind::Sub,
+                Value::Int(i64::MIN),
+                Value::Int(1),
+            ),
+            (
+                BinaryDispatch::IntMul,
+                BinaryKind::Mul,
+                Value::Int(i64::MAX),
+                Value::Int(2),
+            ),
+            (
+                BinaryDispatch::IntDiv,
+                BinaryKind::Div,
+                Value::Int(1),
+                Value::Int(0),
+            ),
+            (
+                BinaryDispatch::IntRem,
+                BinaryKind::Rem,
+                Value::Int(1),
+                Value::Int(0),
+            ),
+            (
+                BinaryDispatch::IntDiv,
+                BinaryKind::Div,
+                Value::Int(i64::MIN),
+                Value::Int(-1),
+            ),
+            (
+                BinaryDispatch::IntRem,
+                BinaryKind::Rem,
+                Value::Int(i64::MIN),
+                Value::Int(-1),
+            ),
+            (
+                BinaryDispatch::FloatAdd,
+                BinaryKind::Add,
+                Value::Float(1.5),
+                Value::Float(2.25),
+            ),
+            (
+                BinaryDispatch::FloatSub,
+                BinaryKind::Sub,
+                Value::Float(1.5),
+                Value::Float(2.25),
+            ),
+            (
+                BinaryDispatch::FloatMul,
+                BinaryKind::Mul,
+                Value::Float(1.5),
+                Value::Float(2.0),
+            ),
+            (
+                BinaryDispatch::FloatDiv,
+                BinaryKind::Div,
+                Value::Float(1.0),
+                Value::Float(0.0),
+            ),
+            (
+                BinaryDispatch::FloatRem,
+                BinaryKind::Rem,
+                Value::Float(5.5),
+                Value::Float(2.0),
+            ),
+            (
+                BinaryDispatch::FloatCompare(BinaryKind::Eq),
+                BinaryKind::Eq,
+                nan.clone(),
+                nan.clone(),
+            ),
+            (
+                BinaryDispatch::FloatCompare(BinaryKind::Ne),
+                BinaryKind::Ne,
+                nan.clone(),
+                nan.clone(),
+            ),
+            (
+                BinaryDispatch::FloatCompare(BinaryKind::Lt),
+                BinaryKind::Lt,
+                nan.clone(),
+                Value::Float(1.0),
+            ),
+            (
+                BinaryDispatch::FloatCompare(BinaryKind::Le),
+                BinaryKind::Le,
+                Value::Float(1.0),
+                nan.clone(),
+            ),
+            (
+                BinaryDispatch::FloatCompare(BinaryKind::Gt),
+                BinaryKind::Gt,
+                Value::Float(2.0),
+                Value::Float(1.0),
+            ),
+            (
+                BinaryDispatch::FloatCompare(BinaryKind::Ge),
+                BinaryKind::Ge,
+                Value::Float(1.0),
+                Value::Float(1.0),
+            ),
+            (
+                BinaryDispatch::IntCompare(BinaryKind::Eq),
+                BinaryKind::Eq,
+                Value::Int(1),
+                Value::Int(1),
+            ),
+            (
+                BinaryDispatch::IntCompare(BinaryKind::Ne),
+                BinaryKind::Ne,
+                Value::Int(1),
+                Value::Int(1),
+            ),
+            (
+                BinaryDispatch::IntCompare(BinaryKind::Lt),
+                BinaryKind::Lt,
+                Value::Int(1),
+                Value::Int(2),
+            ),
+            (
+                BinaryDispatch::IntCompare(BinaryKind::Le),
+                BinaryKind::Le,
+                Value::Int(2),
+                Value::Int(2),
+            ),
+            (
+                BinaryDispatch::IntCompare(BinaryKind::Gt),
+                BinaryKind::Gt,
+                Value::Int(3),
+                Value::Int(2),
+            ),
+            (
+                BinaryDispatch::IntCompare(BinaryKind::Ge),
+                BinaryKind::Ge,
+                Value::Int(2),
+                Value::Int(3),
+            ),
+            (
+                BinaryDispatch::StrConcat,
+                BinaryKind::Add,
+                Value::str("ab"),
+                Value::str("cde"),
+            ),
+            (
+                BinaryDispatch::StrCompare(BinaryKind::Eq),
+                BinaryKind::Eq,
+                Value::str("a"),
+                Value::str("a"),
+            ),
+            (
+                BinaryDispatch::StrCompare(BinaryKind::Ne),
+                BinaryKind::Ne,
+                Value::str("a"),
+                Value::str("b"),
+            ),
+            (
+                BinaryDispatch::StrCompare(BinaryKind::Lt),
+                BinaryKind::Lt,
+                Value::str("a"),
+                Value::str("b"),
+            ),
+            (
+                BinaryDispatch::StrCompare(BinaryKind::Le),
+                BinaryKind::Le,
+                Value::str("b"),
+                Value::str("b"),
+            ),
+            (
+                BinaryDispatch::StrCompare(BinaryKind::Gt),
+                BinaryKind::Gt,
+                Value::str("c"),
+                Value::str("b"),
+            ),
+            (
+                BinaryDispatch::StrCompare(BinaryKind::Ge),
+                BinaryKind::Ge,
+                Value::str("a"),
+                Value::str("b"),
+            ),
+            // Shape mismatches take the general path from inside the arm.
+            (
+                BinaryDispatch::IntAdd,
+                BinaryKind::Add,
+                Value::Float(1.5),
+                Value::Float(2.25),
+            ),
+            (
+                BinaryDispatch::IntAdd,
+                BinaryKind::Add,
+                Value::str("a"),
+                Value::str("b"),
+            ),
+            (
+                BinaryDispatch::FloatCompare(BinaryKind::Eq),
+                BinaryKind::Eq,
+                Value::Int(1),
+                Value::Int(1),
+            ),
+            (
+                BinaryDispatch::StrCompare(BinaryKind::Lt),
+                BinaryKind::Lt,
+                Value::Int(1),
+                Value::Int(2),
+            ),
+        ];
+        for (dispatch, op, lhs, rhs) in cases {
+            assert_eq!(
+                run_binary(Some(dispatch), op, &lhs, &rhs, span, 1_000_000),
+                run_binary(None, op, &lhs, &rhs, span, 1_000_000),
+                "{dispatch:?} must match the general path"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_comparisons_keep_the_zero_charge() {
+        let program = IrProgram::default();
+        let span = test_span();
+        let limits = ExecLimits {
+            fuel: 0,
+            ..ExecLimits::default()
+        };
+        let mut specialized = IrRuntime::new(&program, limits);
+        let error = specialized
+            .binary_values_kind(
+                BinaryDispatch::IntCompare(BinaryKind::Lt),
+                Value::Int(1),
+                Value::Int(2),
+                span,
+            )
+            .expect_err("even a zero-unit comparison charges");
+        assert!(matches!(error, super::EvalError::Trap(Trap::OutOfFuel)));
+        let mut general = IrRuntime::new(&program, limits);
+        let error = general
+            .binary_values(BinaryKind::Lt, Value::Int(1), Value::Int(2), span)
+            .expect_err("the general comparison charges the same way");
+        assert!(matches!(error, super::EvalError::Trap(Trap::OutOfFuel)));
+    }
+
+    #[test]
+    fn typed_binary_nodes_match_the_general_path() {
+        let kind = NodeKind::Add {
+            lhs: IrId::new(0),
+            rhs: IrId::new(1),
+        };
+        let typed = binary_program(
+            kind.clone(),
+            TyId::new(0),
+            ConstValue::Int(20),
+            ConstValue::Int(22),
+            true,
+        );
+        let general = binary_program(
+            kind,
+            TyId::new(0),
+            ConstValue::Int(20),
+            ConstValue::Int(22),
+            false,
+        );
+        let (typed_value, typed_fuel) = run_program(&typed);
+        let (general_value, general_fuel) = run_program(&general);
+        assert_eq!(typed_value, Value::Int(42));
+        assert_eq!(general_value, typed_value);
+        assert_eq!(general_fuel, typed_fuel);
+
+        let mut runtime = IrRuntime::new(&typed, ExecLimits::default());
+        runtime.current = typed.function(FnId::new(0));
+        assert_eq!(
+            runtime.binary_dispatch(IrId::new(2), BinaryKind::Add),
+            BinaryDispatch::IntAdd
+        );
+        let mut runtime = IrRuntime::new(&general, ExecLimits::default());
+        runtime.current = general.function(FnId::new(0));
+        assert_eq!(
+            runtime.binary_dispatch(IrId::new(2), BinaryKind::Add),
+            BinaryDispatch::General(BinaryKind::Add)
+        );
     }
 }
