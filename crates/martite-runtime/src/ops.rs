@@ -272,6 +272,31 @@ pub fn show(value: &Value, types: &TypeTable, top: bool) -> String {
     out.into_string()
 }
 
+/// Appends an integer in decimal without going through `std::fmt`.
+fn push_int(out: &mut ShowOutput, value: i64) {
+    // A sign plus the 19 digits of `i64::MIN` is the widest possible output.
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    let negative = value < 0;
+    // `unsigned_abs` keeps `i64::MIN` representable.
+    let mut magnitude = value.unsigned_abs();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (magnitude % 10) as u8;
+        magnitude /= 10;
+        if magnitude == 0 {
+            break;
+        }
+    }
+    if negative {
+        start -= 1;
+        digits[start] = b'-';
+    }
+    // Every byte written above is an ASCII digit or `-`.
+    let text = std::str::from_utf8(&digits[start..]).expect("decimal digits are ASCII");
+    out.push_str(text);
+}
+
 /// Appends the normative `Show` format to `out`.
 pub(crate) fn write_show(out: &mut ShowOutput, value: &Value, types: &TypeTable, top: bool) {
     use std::fmt::Write;
@@ -280,9 +305,7 @@ pub(crate) fn write_show(out: &mut ShowOutput, value: &Value, types: &TypeTable,
     }
     match value {
         Value::Unit => out.push_str("()"),
-        Value::Int(v) => {
-            let _ = write!(out, "{v}");
-        }
+        Value::Int(v) => push_int(out, *v),
         Value::Float(v) => {
             let _ = write!(out, "{v:?}");
         }
@@ -525,4 +548,65 @@ pub(crate) fn parse_float(text: &str) -> Option<f64> {
     }
     let value = text.parse::<f64>().ok()?;
     value.is_finite().then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ShowOutput, show, write_show};
+    use crate::value::Value;
+    use martite_ir::TypeTable;
+
+    fn rendered(value: &Value) -> String {
+        show(value, &TypeTable::default(), true)
+    }
+
+    #[test]
+    fn integer_show_is_exact_across_the_range() {
+        let cases = [
+            (i64::MIN, "-9223372036854775808"),
+            (i64::MIN + 1, "-9223372036854775807"),
+            (-100, "-100"),
+            (-99, "-99"),
+            (-10, "-10"),
+            (-9, "-9"),
+            (-1, "-1"),
+            (0, "0"),
+            (1, "1"),
+            (9, "9"),
+            (10, "10"),
+            (99, "99"),
+            (100, "100"),
+            (i64::MAX, "9223372036854775807"),
+        ];
+        for (value, text) in cases {
+            assert_eq!(rendered(&Value::Int(value)), text);
+        }
+    }
+
+    #[test]
+    fn nested_containers_show_integers_exactly() {
+        let value = Value::list(vec![
+            Value::Int(i64::MIN),
+            Value::tuple(vec![Value::Int(0), Value::Int(10)]),
+            Value::list(vec![Value::Int(-1), Value::Int(i64::MAX)]),
+        ]);
+        assert_eq!(
+            rendered(&value),
+            "[-9223372036854775808, (0, 10), [-1, 9223372036854775807]]"
+        );
+    }
+
+    #[test]
+    fn integer_show_respects_the_output_limit() {
+        let types = TypeTable::default();
+
+        let mut out = ShowOutput::new(3);
+        write_show(&mut out, &Value::Int(1234), &types, true);
+        assert!(out.is_overflowed());
+
+        let mut out = ShowOutput::new(4);
+        write_show(&mut out, &Value::Int(1234), &types, true);
+        assert!(!out.is_overflowed());
+        assert_eq!(out.into_string(), "1234");
+    }
 }
