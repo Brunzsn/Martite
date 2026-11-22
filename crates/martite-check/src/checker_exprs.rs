@@ -147,8 +147,8 @@ impl<'a> Checker<'a> {
                 }
                 Ty::Tuple(tys)
             }
-            ExprKind::List(items) => self.check_list(items, expected, infer),
-            ExprKind::Map(entries) => self.check_map(entries, expected, infer),
+            ExprKind::List(items) => self.check_list(expr.span, items, expected, infer),
+            ExprKind::Map(entries) => self.check_map(expr.span, entries, expected, infer),
             ExprKind::StructLit { name, fields, base } => {
                 self.check_struct_lit(expr, name, fields, base.as_deref(), expected, infer)
             }
@@ -200,9 +200,15 @@ impl<'a> Checker<'a> {
             ExprKind::Match { scrutinee, arms } => {
                 self.check_match(expr, scrutinee, arms, expected, infer)
             }
-            ExprKind::Lambda { params, ret, body } => {
-                self.check_lambda(expr.id, params, ret.as_ref(), body, expected, infer)
-            }
+            ExprKind::Lambda { params, ret, body } => self.check_lambda(
+                expr.id,
+                expr.span,
+                params,
+                ret.as_ref(),
+                body,
+                expected,
+                infer,
+            ),
             ExprKind::Block(block) => self.check_block(block, expected, infer),
             ExprKind::Field { .. } => {
                 let result = self.resolve_field(expr, expected, infer);
@@ -215,7 +221,13 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_list(&mut self, items: &[Expr], expected: Option<&Ty>, infer: &mut Infer) -> Ty {
+    fn check_list(
+        &mut self,
+        span: Span,
+        items: &[Expr],
+        expected: Option<&Ty>,
+        infer: &mut Infer,
+    ) -> Ty {
         let expected_elem = match expected.map(|e| infer.resolve(e)) {
             Some(Ty::List(t)) => Some(*t),
             _ => None,
@@ -227,7 +239,7 @@ impl<'a> Checker<'a> {
             let module = self.current_module();
             self.err_at(
                 module,
-                self.current_span_placeholder(items),
+                span,
                 Code::E202,
                 "cannot infer the element type of `[]`; add an annotation",
             );
@@ -244,12 +256,9 @@ impl<'a> Checker<'a> {
         Ty::list(elem_ty.unwrap_or(Ty::Error))
     }
 
-    fn current_span_placeholder(&self, _items: &[Expr]) -> Span {
-        Span::empty(0)
-    }
-
     fn check_map(
         &mut self,
+        span: Span,
         entries: &[(Expr, Expr)],
         expected: Option<&Ty>,
         infer: &mut Infer,
@@ -265,7 +274,7 @@ impl<'a> Checker<'a> {
             let module = self.current_module();
             self.err_at(
                 module,
-                Span::empty(0),
+                span,
                 Code::E202,
                 "cannot infer the type of `{}`; add an annotation",
             );
@@ -289,7 +298,7 @@ impl<'a> Checker<'a> {
             let module = self.current_module();
             self.err_at(
                 module,
-                entries.first().map(|(k, _)| k.span).unwrap_or_else(|| Span::empty(0)),
+                entries.first().map(|(k, _)| k.span).unwrap_or(span),
                 Code::E205,
                 format!(
                     "{} cannot be used as a map key",
@@ -538,6 +547,7 @@ impl<'a> Checker<'a> {
     fn check_lambda(
         &mut self,
         node: NodeId,
+        span: Span,
         params: &[LambdaParam],
         ret: Option<&TyExpr>,
         body: &LambdaBody,
@@ -567,7 +577,7 @@ impl<'a> Checker<'a> {
                 let module = self.current_module();
                 self.err_at(
                     module,
-                    Span::empty(0),
+                    span,
                     Code::E204,
                     format!(
                         "lambda takes {} parameter(s), expected {}",

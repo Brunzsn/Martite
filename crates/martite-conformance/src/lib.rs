@@ -200,6 +200,60 @@ pub fn assert_diagnostic(
     panic!("{code} assertions failed:\n{}", failures.join("\n"));
 }
 
+/// Assert that the first diagnostic with `code` starts at the one-based
+/// `line`:`column` and optionally covers exactly `span_text`.
+pub fn assert_diagnostic_at(
+    case: &Case,
+    code: Code,
+    line: u32,
+    column: u32,
+    span_text: Option<&str>,
+) {
+    let loaded = case.load();
+    let diagnostic = loaded
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == code)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected {code}, got {:?}:\n{}",
+                loaded
+                    .diagnostics
+                    .iter()
+                    .map(|d| d.code)
+                    .collect::<Vec<_>>(),
+                loaded
+                    .diagnostics
+                    .iter()
+                    .map(|d| d.render(&loaded.sources))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        });
+    let span = diagnostic
+        .span
+        .unwrap_or_else(|| panic!("{code} has no primary span"));
+    let source = diagnostic
+        .source
+        .and_then(|source| loaded.sources.get(source))
+        .unwrap_or_else(|| panic!("{code} has no source"));
+    let actual = source.line_col(span.start);
+    assert_eq!(
+        actual,
+        (line, column),
+        "primary span start for {code}: {}",
+        diagnostic.render(&loaded.sources)
+    );
+    if let Some(expected) = span_text {
+        assert_eq!(
+            source.slice(span),
+            expected,
+            "primary span text for {code}: {}",
+            diagnostic.render(&loaded.sources)
+        );
+    }
+}
+
 pub struct LintRun {
     pub sources: SourceMap,
     pub diagnostics: Vec<Diagnostic>,
