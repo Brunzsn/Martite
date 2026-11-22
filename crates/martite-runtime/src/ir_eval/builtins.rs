@@ -324,7 +324,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                                     smallvec![item.clone()],
                                     closure.captures.clone(),
                                 )
-                                .map_err(EvalError::Trap)?;
+                                .map_err(EvalError::from)?;
                             out.push(value);
                         }
                     }
@@ -332,7 +332,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                         for item in snapshot.iter() {
                             out.push(
                                 self.call_function(*function, smallvec![item.clone()])
-                                    .map_err(EvalError::Trap)?,
+                                    .map_err(EvalError::from)?,
                             );
                         }
                     }
@@ -358,7 +358,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                                     smallvec![item.clone()],
                                     closure.captures.clone(),
                                 )
-                                .map_err(EvalError::Trap)?;
+                                .map_err(EvalError::from)?;
                             if matches!(keep, Value::Bool(true)) {
                                 out.push(item.clone());
                             }
@@ -368,7 +368,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                         for item in snapshot.iter() {
                             let keep = self
                                 .call_function(*function, smallvec![item.clone()])
-                                .map_err(EvalError::Trap)?;
+                                .map_err(EvalError::from)?;
                             if matches!(keep, Value::Bool(true)) {
                                 out.push(item.clone());
                             }
@@ -401,7 +401,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                                     smallvec![init, item.clone()],
                                     closure.captures.clone(),
                                 )
-                                .map_err(EvalError::Trap)?;
+                                .map_err(EvalError::from)?;
                             init = next;
                         }
                     }
@@ -409,7 +409,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                         for item in snapshot.iter() {
                             init = self
                                 .call_function(*function, smallvec![init, item.clone()])
-                                .map_err(EvalError::Trap)?;
+                                .map_err(EvalError::from)?;
                         }
                     }
                 }
@@ -422,7 +422,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     self.charge(fuel::ITERATION_COST)?;
                     if matches!(
                         self.call_closure_value(closure, smallvec![item.clone()])
-                            .map_err(EvalError::Trap)?,
+                            .map_err(EvalError::from)?,
                         Value::Bool(true)
                     ) {
                         return Ok(Value::Bool(true));
@@ -437,7 +437,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     self.charge(fuel::ITERATION_COST)?;
                     if !matches!(
                         self.call_closure_value(closure, smallvec![item.clone()])
-                            .map_err(EvalError::Trap)?,
+                            .map_err(EvalError::from)?,
                         Value::Bool(true)
                     ) {
                         return Ok(Value::Bool(false));
@@ -477,7 +477,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 for item in snapshot.iter() {
                     let key = self
                         .call_closure_value(closure, smallvec![item.clone()])
-                        .map_err(EvalError::Trap)?;
+                        .map_err(EvalError::from)?;
                     keyed.push((key, item.clone()));
                 }
                 keyed.sort_by(|a, b| value_ord(&a.0, &b.0));
@@ -872,7 +872,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             BuiltinMethodId::INT_ABS => value
                 .checked_abs()
                 .map(Value::Int)
-                .ok_or_else(|| EvalError::Trap(self.panic("integer overflow", span))),
+                .ok_or_else(|| EvalError::from(self.panic("integer overflow", span))),
             BuiltinMethodId::INT_POW => {
                 let exponent = int_arg(&args, 0).unwrap_or(0);
                 if exponent < 0 {
@@ -888,11 +888,11 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     -1 => Ok(Value::Int(-1)),
                     _ => {
                         let exponent = u32::try_from(exponent)
-                            .map_err(|_| EvalError::Trap(self.panic("integer overflow", span)))?;
+                            .map_err(|_| EvalError::from(self.panic("integer overflow", span)))?;
                         value
                             .checked_pow(exponent)
                             .map(Value::Int)
-                            .ok_or_else(|| EvalError::Trap(self.panic("integer overflow", span)))
+                            .ok_or_else(|| EvalError::from(self.panic("integer overflow", span)))
                     }
                 }
             }
@@ -1031,7 +1031,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 match option {
                     Some(value) => Ok(Value::Option(Some(Box::new(
                         self.call_closure_value(closure, smallvec![*value])
-                            .map_err(EvalError::Trap)?,
+                            .map_err(EvalError::from)?,
                     )))),
                     None => Ok(Value::Option(None)),
                 }
@@ -1041,7 +1041,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 match option {
                     Some(value) => self
                         .call_closure_value(closure, smallvec![*value])
-                        .map_err(EvalError::Trap),
+                        .map_err(EvalError::from),
                     None => Ok(Value::Option(None)),
                 }
             }
@@ -1090,7 +1090,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 match result {
                     Ok(value) => Ok(Value::Result(Ok(Box::new(
                         self.call_closure_value(closure, smallvec![*value])
-                            .map_err(EvalError::Trap)?,
+                            .map_err(EvalError::from)?,
                     )))),
                     Err(error) => Ok(Value::Result(Err(error))),
                 }
@@ -1101,7 +1101,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     Ok(value) => Ok(Value::Result(Ok(value))),
                     Err(error) => Ok(Value::Result(Err(Box::new(
                         self.call_closure_value(closure, smallvec![*error])
-                            .map_err(EvalError::Trap)?,
+                            .map_err(EvalError::from)?,
                     )))),
                 }
             }
@@ -1110,7 +1110,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 match result {
                     Ok(value) => self
                         .call_closure_value(closure, smallvec![*value])
-                        .map_err(EvalError::Trap),
+                        .map_err(EvalError::from),
                     Err(error) => Ok(Value::Result(Err(error))),
                 }
             }
@@ -1164,7 +1164,7 @@ mod tests {
 
     fn trap_of(result: EvalResult<Value>) -> Trap {
         match result {
-            Err(EvalError::Trap(trap)) => trap,
+            Err(EvalError::Trap(trap)) => *trap,
             Ok(value) => panic!("expected a trap, got {value:?}"),
             Err(other) => panic!("expected a trap, got {other:?}"),
         }
@@ -1191,7 +1191,7 @@ mod tests {
                 span(),
             ) {
                 Ok(_) => {}
-                Err(EvalError::Trap(Trap::OutOfMemory)) => {
+                Err(EvalError::Trap(trap)) if matches!(*trap, Trap::OutOfMemory) => {
                     trapped = true;
                     break;
                 }
@@ -1530,13 +1530,15 @@ mod tests {
                 CallArgs::new(),
                 span(),
             );
-            if let Err(EvalError::Trap(Trap::Panic { message, .. })) = result {
-                assert!(
-                    !message.contains("unknown"),
-                    "{} {} fell through to the dispatch fallback: {message}",
-                    def.receiver.as_str(),
-                    def.name
-                );
+            if let Err(EvalError::Trap(trap)) = result {
+                if let Trap::Panic { message, .. } = *trap {
+                    assert!(
+                        !message.contains("unknown"),
+                        "{} {} fell through to the dispatch fallback: {message}",
+                        def.receiver.as_str(),
+                        def.name
+                    );
+                }
             }
         }
     }

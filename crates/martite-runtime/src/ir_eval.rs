@@ -63,10 +63,17 @@ type BindingUndo = SmallVec<[(Slot, Option<Value>); 8]>;
 
 #[derive(Debug)]
 enum EvalError {
-    Trap(Trap),
+    Trap(Box<Trap>),
     Return(Value),
     Break,
     Continue,
+}
+
+impl From<Trap> for EvalError {
+    #[inline]
+    fn from(trap: Trap) -> Self {
+        Self::Trap(Box::new(trap))
+    }
 }
 
 struct Frame<'p> {
@@ -516,17 +523,17 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
     }
 
     fn trap<T>(&self, trap: Trap) -> EvalResult<T> {
-        Err(EvalError::Trap(trap))
+        Err(EvalError::from(trap))
     }
 
     /// Borrow a value for a map lookup without allocating an owned key.
     fn map_key_ref<'v>(&self, value: &'v Value) -> EvalResult<KeyRef<'v>> {
-        KeyRef::new(value).map_err(|message| EvalError::Trap(self.internal_panic(message)))
+        KeyRef::new(value).map_err(|message| EvalError::from(self.internal_panic(message)))
     }
 
     /// Borrow a value for a map lookup, reporting invalid keys at `span`.
     fn map_key_ref_at<'v>(&self, value: &'v Value, span: Span) -> EvalResult<KeyRef<'v>> {
-        KeyRef::new(value).map_err(|message| EvalError::Trap(self.panic(message, span)))
+        KeyRef::new(value).map_err(|message| EvalError::from(self.panic(message, span)))
     }
 
     fn function_info(&self, function: FnId) -> Result<&'p IrFn, Trap> {
@@ -678,7 +685,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         for (pattern, value) in pattern_params {
             if let Err(error) = self.bind_pattern(pattern, &value) {
                 let trap = match error {
-                    EvalError::Trap(trap) => trap,
+                    EvalError::Trap(trap) => *trap,
                     _ => self.internal_panic("lambda parameter binding failed"),
                 };
                 self.frames.pop();
@@ -688,7 +695,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         if let Err(trap) = self.maybe_check_memory() {
             self.frames.pop();
             return Err(match trap {
-                EvalError::Trap(trap) => trap,
+                EvalError::Trap(trap) => *trap,
                 _ => Trap::OutOfMemory,
             });
         }
@@ -709,7 +716,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         self.current = Some(function_info);
         let result = match self.eval_body(body) {
             Ok(value) | Err(EvalError::Return(value)) => Ok(value),
-            Err(EvalError::Trap(trap)) => Err(trap),
+            Err(EvalError::Trap(trap)) => Err(*trap),
             Err(EvalError::Break) | Err(EvalError::Continue) => {
                 Err(self.internal_panic(escaped_loop))
             }
@@ -750,7 +757,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let value = result?;
         self.maybe_check_returned_value(&value)
             .map_err(|error| match error {
-                EvalError::Trap(trap) => trap,
+                EvalError::Trap(trap) => *trap,
                 _ => Trap::OutOfMemory,
             })?;
         if value_depth_exceeds(&value, MAX_VALUE_DEPTH) {
@@ -923,7 +930,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         self.pending_bytes = 0;
         let live = total.saturating_add(self.log_bytes);
         if live > self.limits.memory {
-            Err(EvalError::Trap(Trap::OutOfMemory))
+            Err(EvalError::from(Trap::OutOfMemory))
         } else {
             Ok(())
         }
@@ -937,7 +944,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 
     fn ensure_deadline(&self) -> EvalResult<()> {
         if self.deadline_due() {
-            Err(EvalError::Trap(Trap::Deadline))
+            Err(EvalError::from(Trap::Deadline))
         } else {
             Ok(())
         }
@@ -1393,7 +1400,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             Value::Int(value) => value
                 .checked_neg()
                 .map(Value::Int)
-                .ok_or_else(|| EvalError::Trap(self.panic("integer overflow", span))),
+                .ok_or_else(|| EvalError::from(self.panic("integer overflow", span))),
             Value::Float(value) => Ok(Value::Float(-value)),
             _ => self.trap(self.internal_panic("invalid unary operand")),
         }
@@ -1494,7 +1501,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 };
                 result
                     .map(Value::Int)
-                    .ok_or_else(|| EvalError::Trap(self.panic("integer overflow", span)))
+                    .ok_or_else(|| EvalError::from(self.panic("integer overflow", span)))
             }
             (lhs, rhs) => self.binary_values(op, lhs, rhs, span),
         }
@@ -1635,7 +1642,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     };
                     result
                         .map(Value::Int)
-                        .ok_or_else(|| EvalError::Trap(self.panic("integer overflow", span)))
+                        .ok_or_else(|| EvalError::from(self.panic("integer overflow", span)))
                 }
                 (Value::Float(a), Value::Float(b)) => Ok(Value::Float(match op {
                     Add => a + b,
@@ -1727,7 +1734,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             let key_span = function.span(key_id).unwrap_or(span);
             self.charge(map_key_cost(&key))?;
             let key = key_from_value(&key)
-                .map_err(|message| EvalError::Trap(self.panic(message, key_span)))?;
+                .map_err(|message| EvalError::from(self.panic(message, key_span)))?;
             map.insert(key, value);
         }
         self.charge(fuel::map_cost(map.len() as u64))?;
@@ -2460,7 +2467,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 
     fn check_value_depth(&self, value: &Value, _span: Span) -> EvalResult<()> {
         if value_depth_exceeds(value, MAX_VALUE_DEPTH) {
-            Err(EvalError::Trap(Trap::DepthExceeded))
+            Err(EvalError::from(Trap::DepthExceeded))
         } else {
             Ok(())
         }
@@ -2497,7 +2504,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         }
         let (value, mut updated) = self
             .call_resolved(function_info, values, None)
-            .map_err(EvalError::Trap)?;
+            .map_err(EvalError::from)?;
         for (place, index) in writebacks {
             if let Some(value) = take_writeback(&mut updated, index) {
                 self.write_place(place, value)?;
@@ -2533,7 +2540,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         match callee {
             Value::Fn(function) => self
                 .call_closure_value(&function, values)
-                .map_err(EvalError::Trap),
+                .map_err(EvalError::from),
             Value::Builtin(function) => self.call_builtin_fn_values(function, &values, span),
             Value::BuiltinModuleFn(item) => self.call_builtin_item_values(item, &values, span),
             _ => self.trap(self.internal_panic("callee is not callable")),
@@ -2590,13 +2597,13 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             return self.trap(self.internal_panic("host function is out of range"));
         };
         let count = u32::try_from(info.params.len()).map_err(|_| {
-            EvalError::Trap(self.internal_panic("host parameter count exceeds u32"))
+            EvalError::from(self.internal_panic("host parameter count exceeds u32"))
         })?;
         let values = self.eval_plain_children(first_arg, count)?;
         if self.frames.len() >= self.limits.depth as usize {
             return self.trap(Trap::DepthExceeded);
         }
-        self.call_host(host, &values).map_err(EvalError::Trap)
+        self.call_host(host, &values).map_err(EvalError::from)
     }
 
     // ------------------------------------------------------------------
@@ -2717,23 +2724,23 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 .slots
                 .get(slot.index())
                 .and_then(Option::as_ref)
-                .ok_or_else(|| EvalError::Trap(self.internal_panic("unbound place root")))?,
+                .ok_or_else(|| EvalError::from(self.internal_panic("unbound place root")))?,
             PlaceRoot::Capture(index) => frame
                 .captures
                 .as_ref()
                 .and_then(|captures| captures.get(index.index()))
-                .ok_or_else(|| EvalError::Trap(self.internal_panic("capture is out of range")))?,
+                .ok_or_else(|| EvalError::from(self.internal_panic("capture is out of range")))?,
         };
         for accessor in accessors {
             value = match (value, accessor) {
                 (Value::Struct(struct_value), Accessor::Field(index)) => {
                     struct_value.fields.get(*index).ok_or_else(|| {
-                        EvalError::Trap(self.internal_panic("struct field out of range"))
+                        EvalError::from(self.internal_panic("struct field out of range"))
                     })?
                 }
                 (Value::Tuple(items), Accessor::Tuple(index)) => {
                     items.get(*index as usize).ok_or_else(|| {
-                        EvalError::Trap(self.internal_panic("tuple field out of range"))
+                        EvalError::from(self.internal_panic("tuple field out of range"))
                     })?
                 }
                 (Value::List(items), Accessor::Index(Value::Int(index))) => {
@@ -2817,17 +2824,17 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             .and_then(|frame| frame.slots.get(place.root.index()))
             .and_then(Option::as_ref)
             .cloned()
-            .ok_or_else(|| EvalError::Trap(self.internal_panic("unbound place root")))?;
+            .ok_or_else(|| EvalError::from(self.internal_panic("unbound place root")))?;
         for accessor in &place.accessors {
             value = match (value, accessor) {
                 (Value::Struct(value), Accessor::Field(index)) => {
                     value.fields.get(*index).cloned().ok_or_else(|| {
-                        EvalError::Trap(self.internal_panic("struct field out of range"))
+                        EvalError::from(self.internal_panic("struct field out of range"))
                     })?
                 }
                 (Value::Tuple(items), Accessor::Tuple(index)) => {
                     items.get(*index as usize).cloned().ok_or_else(|| {
-                        EvalError::Trap(self.internal_panic("tuple field out of range"))
+                        EvalError::from(self.internal_panic("tuple field out of range"))
                     })?
                 }
                 (Value::List(items), Accessor::Index(Value::Int(index))) => {
@@ -2841,7 +2848,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     let key = self.map_key_ref(key)?;
                     map.get(&key)
                         .cloned()
-                        .ok_or_else(|| EvalError::Trap(self.internal_panic("missing map key")))?
+                        .ok_or_else(|| EvalError::from(self.internal_panic("missing map key")))?
                 }
                 _ => return self.trap(self.internal_panic("invalid place access")),
             };
@@ -2857,10 +2864,10 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 .and_then(|frame| frame.slots.get(place.root.index()))
                 .is_some_and(Option::is_some);
             if !present {
-                return Err(EvalError::Trap(self.internal_panic("unbound place root")));
+                return Err(EvalError::from(self.internal_panic("unbound place root")));
             }
             if value_depth_exceeds(&value, MAX_VALUE_DEPTH) {
-                return Err(EvalError::Trap(Trap::DepthExceeded));
+                return Err(EvalError::from(Trap::DepthExceeded));
             }
             self.set_slot(place.root, value);
             return Ok(());
@@ -2879,7 +2886,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             .and_then(|frame| frame.slots.get(index))
             .is_some_and(Option::is_some);
         if !present {
-            return Err(EvalError::Trap(self.internal_panic("unbound place root")));
+            return Err(EvalError::from(self.internal_panic("unbound place root")));
         }
         let frame = self.frames.last_mut().expect("evaluation frame");
         Ok(frame.slots[index]
@@ -2932,13 +2939,13 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
     ) -> EvalResult<()> {
         let Some((first, rest)) = accessors.split_first() else {
             if value_depth_exceeds(&new_value, remaining) {
-                return Err(EvalError::Trap(Trap::DepthExceeded));
+                return Err(EvalError::from(Trap::DepthExceeded));
             }
             *value = new_value;
             return Ok(());
         };
         if remaining == 0 {
-            return Err(EvalError::Trap(Trap::DepthExceeded));
+            return Err(EvalError::from(Trap::DepthExceeded));
         }
         let child_remaining = remaining - 1;
         match first {
@@ -2952,7 +2959,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     .fields
                     .get(*index)
                     .ok_or_else(|| {
-                        EvalError::Trap(self.internal_panic("struct field out of range"))
+                        EvalError::from(self.internal_panic("struct field out of range"))
                     })?
                     .meta();
                 let slot = struct_value.field_mut(*index).expect("field was checked");
@@ -2971,7 +2978,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 let old = items
                     .get(index)
                     .ok_or_else(|| {
-                        EvalError::Trap(self.internal_panic("tuple field out of range"))
+                        EvalError::from(self.internal_panic("tuple field out of range"))
                     })?
                     .meta();
                 let slot = items.slot_mut(index).expect("field was checked");
@@ -3001,16 +3008,16 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 }
                 Value::Map(map) => {
                     if value_depth_exceeds(index_value, child_remaining) {
-                        return Err(EvalError::Trap(Trap::DepthExceeded));
+                        return Err(EvalError::from(Trap::DepthExceeded));
                     }
                     self.charge(map_key_cost(index_value))?;
                     let key = key_from_value(index_value)
-                        .map_err(|message| EvalError::Trap(self.internal_panic(message)))?;
+                        .map_err(|message| EvalError::from(self.internal_panic(message)))?;
                     let slots = map.len().saturating_mul(2);
                     let map = self.cow_map_mut(map, slots)?;
                     if rest.is_empty() {
                         if value_depth_exceeds(&new_value, child_remaining) {
-                            return Err(EvalError::Trap(Trap::DepthExceeded));
+                            return Err(EvalError::from(Trap::DepthExceeded));
                         }
                         if map.get(&key).is_none() {
                             self.note_alloc(16 + key_value_size(&key));
@@ -3020,7 +3027,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     } else {
                         let old = map
                             .get(&key)
-                            .ok_or_else(|| EvalError::Trap(self.internal_panic("missing map key")))?
+                            .ok_or_else(|| EvalError::from(self.internal_panic("missing map key")))?
                             .meta();
                         let slot = map.value_mut(&key).expect("key was checked");
                         let result = self.set_path(slot, rest, new_value, child_remaining);
@@ -3054,7 +3061,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     .fields
                     .get(*index)
                     .ok_or_else(|| {
-                        EvalError::Trap(self.internal_panic("struct field out of range"))
+                        EvalError::from(self.internal_panic("struct field out of range"))
                     })?
                     .meta();
                 let taken = {
@@ -3075,7 +3082,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 let old = items
                     .get(index)
                     .ok_or_else(|| {
-                        EvalError::Trap(self.internal_panic("tuple field out of range"))
+                        EvalError::from(self.internal_panic("tuple field out of range"))
                     })?
                     .meta();
                 let taken = {
@@ -3110,12 +3117,12 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 Value::Map(map) => {
                     self.charge(map_key_cost(index_value))?;
                     let key = key_from_value(index_value)
-                        .map_err(|message| EvalError::Trap(self.internal_panic(message)))?;
+                        .map_err(|message| EvalError::from(self.internal_panic(message)))?;
                     let slots = map.len().saturating_mul(2);
                     let map = self.cow_map_mut(map, slots)?;
                     let old = map
                         .get(&key)
-                        .ok_or_else(|| EvalError::Trap(self.internal_panic("missing map key")))?
+                        .ok_or_else(|| EvalError::from(self.internal_panic("missing map key")))?
                         .meta();
                     let taken = {
                         let slot = map.value_mut(&key).expect("key was checked");
@@ -3140,7 +3147,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let list_limit = MAX_VALUE_DEPTH.saturating_sub(path_depth);
         let check = |value: &Value, limit: usize| -> EvalResult<()> {
             if value_depth_exceeds(value, limit) {
-                Err(EvalError::Trap(Trap::DepthExceeded))
+                Err(EvalError::from(Trap::DepthExceeded))
             } else {
                 Ok(())
             }
@@ -3317,7 +3324,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         let key = self.map_key_ref_at(key, span)?;
         map.get(&key)
             .cloned()
-            .ok_or_else(|| EvalError::Trap(self.panic("missing map key", span)))
+            .ok_or_else(|| EvalError::from(self.panic("missing map key", span)))
     }
 }
 
@@ -3445,6 +3452,22 @@ mod tests {
     use smallvec::SmallVec;
     use std::collections::HashSet;
     use std::rc::Rc;
+
+    fn trap(error: super::EvalError) -> Trap {
+        match error {
+            super::EvalError::Trap(trap) => *trap,
+            other => panic!("expected a trap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_result_stays_within_its_size_budget() {
+        let size = std::mem::size_of::<super::EvalResult<Value>>();
+        assert!(
+            size <= 32,
+            "EvalResult<Value> is {size} bytes; boxed trap payloads should keep it within 32"
+        );
+    }
 
     fn expression(kind: NodeKind) -> Node {
         Node::new(kind, TyId::new(0), Charge::expression(), Effects::NONE)
@@ -4063,7 +4086,7 @@ mod tests {
             .render_show(&value, true)
             .expect_err("the expansion must be capped");
         assert!(
-            matches!(error, super::EvalError::Trap(Trap::OutOfMemory)),
+            matches!(&error, super::EvalError::Trap(trap) if matches!(&**trap, Trap::OutOfMemory)),
             "{error:?}"
         );
 
@@ -4118,7 +4141,7 @@ mod tests {
             .finish_aggregate(&value, epoch)
             .expect_err("the lost in-flight bytes are recovered");
         assert!(
-            matches!(error, super::EvalError::Trap(Trap::OutOfMemory)),
+            matches!(&error, super::EvalError::Trap(trap) if matches!(&**trap, Trap::OutOfMemory)),
             "{error:?}"
         );
     }
@@ -4794,7 +4817,7 @@ mod tests {
             accessors: SmallVec::from_vec(vec![Accessor::Index(Value::str("missing"))]),
         };
         let error = runtime.read_place(&missing).expect_err("missing key traps");
-        let super::EvalError::Trap(Trap::Panic { message, .. }) = error else {
+        let Trap::Panic { message, .. } = trap(error) else {
             panic!("expected a panic trap");
         };
         assert_eq!(message, "missing map key");
@@ -4831,11 +4854,11 @@ mod tests {
         let error = runtime
             .index_value_kind(IndexKind::ListIndex, list.clone(), Value::Int(3), span)
             .expect_err("out of bounds");
-        let super::EvalError::Trap(Trap::Panic {
+        let Trap::Panic {
             message,
             span: Some(found),
             ..
-        }) = error
+        } = trap(error)
         else {
             panic!("expected an index panic");
         };
@@ -4870,7 +4893,7 @@ mod tests {
         let error = runtime
             .index_value_kind(IndexKind::MapIndex, map, Value::str("missing"), span)
             .expect_err("missing key");
-        let super::EvalError::Trap(Trap::Panic { message, .. }) = error else {
+        let Trap::Panic { message, .. } = trap(error) else {
             panic!("expected a map panic");
         };
         assert_eq!(message, "missing map key");
@@ -5040,7 +5063,7 @@ mod tests {
         let error = runtime
             .write_place(place(), Value::Int(3))
             .expect_err("the missing root traps");
-        let super::EvalError::Trap(Trap::Panic { message, .. }) = error else {
+        let Trap::Panic { message, .. } = trap(error) else {
             panic!("expected a panic trap");
         };
         assert_eq!(message, "unbound place root");
@@ -5053,7 +5076,7 @@ mod tests {
         let error = runtime
             .write_place(place(), deep)
             .expect_err("the depth cap traps");
-        assert!(matches!(error, super::EvalError::Trap(Trap::DepthExceeded)));
+        assert!(matches!(trap(error), Trap::DepthExceeded));
         assert_eq!(
             runtime.frames.last().expect("frame").slots[0],
             Some(Value::Int(1)),
@@ -5475,11 +5498,11 @@ mod tests {
         let division_by_zero = runtime
             .binary_values_kind(BinaryDispatch::IntDiv, Value::Int(1), Value::Int(0), span)
             .expect_err("division by zero traps");
-        let super::EvalError::Trap(Trap::Panic {
+        let Trap::Panic {
             message,
             span: Some(found),
             ..
-        }) = division_by_zero
+        } = trap(division_by_zero)
         else {
             panic!("expected a division-by-zero panic");
         };
@@ -5496,11 +5519,11 @@ mod tests {
             let error = runtime
                 .binary_values_kind(dispatch, lhs, rhs, span)
                 .expect_err("integer overflow traps");
-            let super::EvalError::Trap(Trap::Panic {
+            let Trap::Panic {
                 message,
                 span: Some(found),
                 ..
-            }) = error
+            } = trap(error)
             else {
                 panic!("expected an integer-overflow panic");
             };
@@ -5551,7 +5574,7 @@ mod tests {
                 span,
             )
             .expect_err("bools are not arithmetic operands");
-        let super::EvalError::Trap(Trap::Panic { message, .. }) = invalid else {
+        let Trap::Panic { message, .. } = trap(invalid) else {
             panic!("expected an invalid-operand panic");
         };
         assert_eq!(message, "invalid arithmetic operands");
@@ -5830,12 +5853,12 @@ mod tests {
                 span,
             )
             .expect_err("even a zero-unit comparison charges");
-        assert!(matches!(error, super::EvalError::Trap(Trap::OutOfFuel)));
+        assert!(matches!(trap(error), Trap::OutOfFuel));
         let mut general = IrRuntime::new(&program, limits);
         let error = general
             .binary_values(BinaryKind::Lt, Value::Int(1), Value::Int(2), span)
             .expect_err("the general comparison charges the same way");
-        assert!(matches!(error, super::EvalError::Trap(Trap::OutOfFuel)));
+        assert!(matches!(trap(error), Trap::OutOfFuel));
     }
 
     #[test]
