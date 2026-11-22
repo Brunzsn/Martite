@@ -29,8 +29,9 @@ use martite_base::{SourceId, Span};
 use martite_fuel as fuel;
 use martite_ir::{
     AccessMode, BuiltinFnId, BuiltinItemId, BuiltinMethodId, CaptureIndex, CaptureSource,
-    ChildRange, ConstId, ConstValue, FnId, FnKind, HostId, IrFn, IrId, IrProgram, MatchSetId, Node,
-    NodeKind, Pattern, PreludeVariant, Slot, StrId, StructLayoutId, Ty, TypeDefKind, TypeId,
+    ChildRange, ConstId, ConstValue, Effects, FnId, FnKind, HostId, IrFn, IrId, IrProgram,
+    MatchSetId, Node, NodeKind, Pattern, PreludeVariant, Slot, StrId, StructLayoutId, Ty,
+    TypeDefKind, TypeId,
 };
 use smallvec::SmallVec;
 
@@ -82,10 +83,74 @@ struct Place {
     accessors: SmallVec<[Accessor; 4]>,
 }
 
+/// Root of a stable place read: a frame slot or a closure capture.
+#[derive(Clone, Copy)]
+enum PlaceRoot {
+    Slot(Slot),
+    Capture(CaptureIndex),
+}
+
 enum Accessor {
     Field(usize),
     Tuple(u32),
     Index(Value),
+}
+
+/// Specialized index operation selected from the IR base and index node types.
+///
+/// `General` keeps the historical sequential match for unresolved or
+/// non-container checker types (`Ty::Never`, `Ty::Param`, `Ty::Named`, a
+/// missing type-table entry, or an index kind that does not fit one of the
+/// four container rules).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexKind {
+    ListIndex,
+    ListSlice,
+    StrSlice,
+    MapIndex,
+    General,
+}
+
+impl IndexKind {
+    fn of(base: Option<&Ty>, index: Option<&Ty>) -> Self {
+        match (base, index) {
+            (Some(Ty::List(_)), Some(Ty::Int)) => Self::ListIndex,
+            (Some(Ty::List(_)), Some(Ty::Range)) => Self::ListSlice,
+            (Some(Ty::Str), Some(Ty::Range)) => Self::StrSlice,
+            (Some(Ty::Map(_, _)), Some(_)) => Self::MapIndex,
+            _ => Self::General,
+        }
+    }
+}
+
+/// One table per function, parallel to `IrFn::nodes`.
+///
+/// The classification is a runtime cache of the checker expression types that
+/// lowering already copied into `Node::ty`; the evaluator does not need the
+/// checker or the syntax tree to rebuild it.
+fn build_index_kinds(program: &IrProgram) -> Vec<Vec<IndexKind>> {
+    program
+        .fns
+        .iter()
+        .map(|function| {
+            function
+                .nodes
+                .iter()
+                .map(|node| match node.kind {
+                    NodeKind::Index { base, index } => {
+                        let base_ty = function
+                            .node(base)
+                            .and_then(|base| program.types.get_ty(base.ty));
+                        let index_ty = function
+                            .node(index)
+                            .and_then(|index| program.types.get_ty(index.ty));
+                        IndexKind::of(base_ty, index_ty)
+                    }
+                    _ => IndexKind::General,
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Executes one [`IrProgram`] with the limits and observable accounting rules
@@ -121,6 +186,8 @@ pub struct IrRuntime<'p, 'h> {
     /// Static string values, indexed by [`StrId`]. The payload is shared after
     /// the first use; every use still charges its bytes.
     literal_values: Vec<Option<Value>>,
+    /// `IndexKind` per function and node, derived once from the IR node types.
+    index_kinds: Vec<Vec<IndexKind>>,
 }
 
 impl<'p, 'h> IrRuntime<'p, 'h> {
@@ -152,6 +219,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             scan_epoch: 0,
             const_values: vec![None; program.consts.len()],
             literal_values: vec![None; program.strs.len()],
+            index_kinds: build_index_kinds(program),
         }
     }
 
@@ -299,6 +367,16 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
     #[inline]
     fn current_function(&self) -> &'p IrFn {
         self.current.expect("evaluation frame")
+    }
+
+    #[inline]
+    fn index_kind(&self, id: IrId) -> IndexKind {
+        let function = self.current_function();
+        self.index_kinds
+            .get(function.id.index())
+            .and_then(|kinds| kinds.get(id.index()))
+            .copied()
+            .unwrap_or(IndexKind::General)
     }
 
     fn internal_panic(&self, message: impl Into<String>) -> Trap {
@@ -809,12 +887,22 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 self.set_slot(slot, value);
                 Ok(Value::Unit)
             }
-            NodeKind::Field { base, index } => self.eval_field(base, index),
-            NodeKind::TupleField { base, index } => self.eval_tuple_field(base, index),
+            NodeKind::Field { base, index } => match self.eval_place_read(id)? {
+                Some(value) => Ok(value),
+                None => self.eval_field(base, index),
+            },
+            NodeKind::TupleField { base, index } => match self.eval_place_read(id)? {
+                Some(value) => Ok(value),
+                None => self.eval_tuple_field(base, index),
+            },
             NodeKind::Index { base, index } => {
+                if let Some(value) = self.eval_place_read(id)? {
+                    return Ok(value);
+                }
                 let base = self.eval(base)?;
                 let index = self.eval(index)?;
-                self.index_value(base, index, span)
+                let kind = self.index_kind(id);
+                self.index_value_kind(kind, base, index, span)
             }
 
             NodeKind::Neg(inner) => self.eval_neg(inner, span),
@@ -2214,6 +2302,151 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
     // Places
     // ------------------------------------------------------------------
 
+    /// Evaluate a value read of a stable access chain without cloning the
+    /// intermediate containers.
+    ///
+    /// A chain is stable when it is rooted at a shared slot or capture read
+    /// and consists only of struct/tuple fields and list indices. Index
+    /// expressions must be free of calls, host calls and writes: those could
+    /// observe or mutate the root while the old evaluator held its clone.
+    ///
+    /// Returns `None` before charging anything when the chain is not stable,
+    /// so the general evaluator takes over with unchanged fuel and traps.
+    fn eval_place_read(&mut self, id: IrId) -> EvalResult<Option<Value>> {
+        let Some((root, chain)) = self.stable_place_chain(id) else {
+            return Ok(None);
+        };
+        // The general path charges each chain node on entry, outermost first.
+        // Share that order so fuel, ticks and deadline checks stay identical.
+        // The outermost node was already charged by `eval` before this call.
+        let function = self.current_function();
+        for node_id in chain.iter().skip(1) {
+            let charge = function.nodes[node_id.index()].charge.pre;
+            if charge != 0 {
+                self.charge(u64::from(charge))?;
+            }
+        }
+        // Resolve accessors from the innermost one out. After each step, walk
+        // the resolved prefix so a list bound trap happens before any later
+        // index expression runs, exactly as the recursive evaluator did.
+        let mut accessors: SmallVec<[Accessor; 8]> = SmallVec::new();
+        for position in (0..chain.len().saturating_sub(1)).rev() {
+            let node_id = chain[position];
+            let node = self.current_function().nodes[node_id.index()];
+            let accessor = match node.kind {
+                NodeKind::Field { index, .. } => Accessor::Field(index as usize),
+                NodeKind::TupleField { index, .. } => Accessor::Tuple(index),
+                NodeKind::Index { index, .. } => Accessor::Index(self.eval(index)?),
+                _ => unreachable!("stable place chains contain only accessors"),
+            };
+            accessors.push(accessor);
+            let span = self.current_function().spans[node_id.index()];
+            let value = self.place_leaf(root, &accessors, span)?;
+            if position == 0 {
+                return Ok(Some(value.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Collect a stable access chain and validate its root before any charge.
+    ///
+    /// `chain` is ordered outermost to root: the order in which the general
+    /// evaluator charges the expression nodes.
+    fn stable_place_chain(&self, id: IrId) -> Option<(PlaceRoot, SmallVec<[IrId; 8]>)> {
+        let function = self.current_function();
+        let frame = self.frames.last()?;
+        let mut chain = SmallVec::new();
+        let mut current = id;
+        loop {
+            let node = function.node(current)?;
+            match node.kind {
+                NodeKind::Field { base, .. } | NodeKind::TupleField { base, .. } => {
+                    chain.push(current);
+                    current = base;
+                }
+                NodeKind::Index { base, index } => {
+                    if self.index_kind(current) != IndexKind::ListIndex {
+                        return None;
+                    }
+                    let index = function.node(index)?;
+                    if index.effects.intersects(
+                        Effects::CALLS
+                            | Effects::HOST
+                            | Effects::WRITES_LOCAL
+                            | Effects::WRITES_HEAP,
+                    ) {
+                        return None;
+                    }
+                    chain.push(current);
+                    current = base;
+                }
+                NodeKind::SlotRead {
+                    slot,
+                    mode: AccessMode::Share,
+                } => {
+                    frame.slots.get(slot.index())?.as_ref()?;
+                    chain.push(current);
+                    return Some((PlaceRoot::Slot(slot), chain));
+                }
+                NodeKind::CaptureRead(index) => {
+                    frame.captures.as_ref()?.get(index.index())?;
+                    chain.push(current);
+                    return Some((PlaceRoot::Capture(index), chain));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Borrow the value at `accessors` below `root`.
+    ///
+    /// The caller only adds one accessor at a time, so an already-traversed
+    /// prefix cannot fail: the only trap left is the newest accessor's list
+    /// bound or an invalid shape.
+    fn place_leaf<'a>(
+        &'a self,
+        root: PlaceRoot,
+        accessors: &[Accessor],
+        span: Span,
+    ) -> EvalResult<&'a Value> {
+        let frame = self.frames.last().expect("evaluation frame");
+        let mut value = match root {
+            PlaceRoot::Slot(slot) => frame
+                .slots
+                .get(slot.index())
+                .and_then(Option::as_ref)
+                .ok_or_else(|| EvalError::Trap(self.internal_panic("unbound place root")))?,
+            PlaceRoot::Capture(index) => frame
+                .captures
+                .as_ref()
+                .and_then(|captures| captures.get(index.index()))
+                .ok_or_else(|| EvalError::Trap(self.internal_panic("capture is out of range")))?,
+        };
+        for accessor in accessors {
+            value = match (value, accessor) {
+                (Value::Struct(struct_value), Accessor::Field(index)) => {
+                    struct_value.fields.get(*index).ok_or_else(|| {
+                        EvalError::Trap(self.internal_panic("struct field out of range"))
+                    })?
+                }
+                (Value::Tuple(items), Accessor::Tuple(index)) => {
+                    items.get(*index as usize).ok_or_else(|| {
+                        EvalError::Trap(self.internal_panic("tuple field out of range"))
+                    })?
+                }
+                (Value::List(items), Accessor::Index(Value::Int(index))) => {
+                    if *index < 0 || *index as usize >= items.len() {
+                        return self.trap(self.panic("index out of bounds", span));
+                    }
+                    &items[*index as usize]
+                }
+                _ => return self.trap(self.internal_panic("invalid place access")),
+            };
+        }
+        Ok(value)
+    }
+
     fn eval_place(&mut self, id: IrId) -> EvalResult<Place> {
         let function = self.current_function();
         let Some(node) = function.node(id).copied() else {
@@ -2245,6 +2478,38 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
     }
 
     fn read_place(&mut self, place: &Place) -> EvalResult<Value> {
+        if let Some(value) = self.read_place_borrowed(place) {
+            return Ok(value);
+        }
+        self.read_place_cloned(place)
+    }
+
+    /// Borrowed walk for struct/tuple fields and list indices.
+    ///
+    /// Returns `None` when the chain reaches a map or a shape the old path
+    /// must diagnose; map keys still go through `map_key_ref` there.
+    fn read_place_borrowed(&self, place: &Place) -> Option<Value> {
+        let frame = self.frames.last()?;
+        let mut value = frame.slots.get(place.root.index())?.as_ref()?;
+        for accessor in &place.accessors {
+            value = match (value, accessor) {
+                (Value::Struct(struct_value), Accessor::Field(index)) => {
+                    struct_value.fields.get(*index)?
+                }
+                (Value::Tuple(items), Accessor::Tuple(index)) => items.get(*index as usize)?,
+                (Value::List(items), Accessor::Index(Value::Int(index))) => {
+                    if *index < 0 {
+                        return None;
+                    }
+                    items.get(*index as usize)?
+                }
+                _ => return None,
+            };
+        }
+        Some(value.clone())
+    }
+
+    fn read_place_cloned(&mut self, place: &Place) -> EvalResult<Value> {
         let mut value = self
             .frames
             .last()
@@ -2585,14 +2850,10 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
         Ok(())
     }
 
+    /// General entry point, also used by builtins that index a value directly.
     fn index_value(&mut self, base: Value, index: Value, span: Span) -> EvalResult<Value> {
         match (base, index) {
-            (Value::List(items), Value::Int(index)) => {
-                if index < 0 || index as usize >= items.len() {
-                    return self.trap(self.panic("index out of bounds", span));
-                }
-                Ok(items[index as usize].clone())
-            }
+            (Value::List(items), Value::Int(index)) => self.index_list_element(items, index, span),
             (
                 Value::List(items),
                 Value::Range {
@@ -2600,20 +2861,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     end,
                     inclusive,
                 },
-            ) => {
-                let len = items.len() as i64;
-                let Some((start, end)) = slice_bounds(start, end, inclusive, len) else {
-                    return self.trap(self.panic("invalid list slice", span));
-                };
-                let slice_len = end - start;
-                self.charge(fuel::slot_cost(slice_len as u64))?;
-                self.ensure_output_capacity(16 + 8 * slice_len as u64)?;
-                let slice = items[start..end].to_vec();
-                self.note_alloc(16 + 8 * slice.len() as u64);
-                let value = Value::list(slice);
-                self.check_value_depth(&value, span)?;
-                Ok(value)
-            }
+            ) => self.index_list_slice(items, start, end, inclusive, span),
             (
                 Value::Str(text),
                 Value::Range {
@@ -2621,43 +2869,139 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                     end,
                     inclusive,
                 },
-            ) => {
-                // Slicing scans to find character boundaries. Validate first so
-                // an invalid slice keeps its panic (and its fuel) unchanged,
-                // then charge the input bytes the scan touched.
-                let char_count = text.chars().count() as i64;
-                let Some((start, end)) = slice_bounds(start, end, inclusive, char_count) else {
-                    return self.trap(self.panic("invalid string slice", span));
-                };
-                self.charge(fuel::string_cost(text.len() as u64))?;
-                let start_byte = text
-                    .char_indices()
-                    .nth(start)
-                    .map(|(byte, _)| byte)
-                    .unwrap_or(text.len());
-                let end_byte = if end as i64 == char_count {
-                    text.len()
-                } else {
-                    text.char_indices()
-                        .nth(end)
-                        .map(|(byte, _)| byte)
-                        .unwrap_or(text.len())
-                };
-                let out = &text[start_byte..end_byte];
-                self.ensure_output_capacity(16 + out.len() as u64)?;
-                let out = out.to_string();
-                self.note_alloc(16 + out.len() as u64);
-                Ok(Value::str(out))
-            }
-            (Value::Map(map), key) => {
-                self.charge(map_key_cost(&key))?;
-                let key = self.map_key_ref_at(&key, span)?;
-                map.get(&key)
-                    .cloned()
-                    .ok_or_else(|| EvalError::Trap(self.panic("missing map key", span)))
-            }
+            ) => self.index_str_slice(text, start, end, inclusive, span),
+            (Value::Map(map), key) => self.index_map_lookup(map, &key, span),
             _ => self.trap(self.panic("invalid index operation", span)),
         }
+    }
+
+    /// Dispatch on the `IndexKind` derived from the IR base and index types.
+    ///
+    /// A specialized arm only handles its own shape; anything else falls back
+    /// to the sequential match so malformed or unresolved IR keeps the generic
+    /// rules (and the same traps and fuel).
+    fn index_value_kind(
+        &mut self,
+        kind: IndexKind,
+        base: Value,
+        index: Value,
+        span: Span,
+    ) -> EvalResult<Value> {
+        match kind {
+            IndexKind::ListIndex => match (base, index) {
+                (Value::List(items), Value::Int(index)) => {
+                    self.index_list_element(items, index, span)
+                }
+                (base, index) => self.index_value(base, index, span),
+            },
+            IndexKind::ListSlice => match (base, index) {
+                (
+                    Value::List(items),
+                    Value::Range {
+                        start,
+                        end,
+                        inclusive,
+                    },
+                ) => self.index_list_slice(items, start, end, inclusive, span),
+                (base, index) => self.index_value(base, index, span),
+            },
+            IndexKind::StrSlice => match (base, index) {
+                (
+                    Value::Str(text),
+                    Value::Range {
+                        start,
+                        end,
+                        inclusive,
+                    },
+                ) => self.index_str_slice(text, start, end, inclusive, span),
+                (base, index) => self.index_value(base, index, span),
+            },
+            IndexKind::MapIndex => match base {
+                Value::Map(map) => self.index_map_lookup(map, &index, span),
+                base => self.index_value(base, index, span),
+            },
+            IndexKind::General => self.index_value(base, index, span),
+        }
+    }
+
+    fn index_list_element(&self, items: Rc<SeqValue>, index: i64, span: Span) -> EvalResult<Value> {
+        if index < 0 || index as usize >= items.len() {
+            return self.trap(self.panic("index out of bounds", span));
+        }
+        Ok(items[index as usize].clone())
+    }
+
+    fn index_list_slice(
+        &mut self,
+        items: Rc<SeqValue>,
+        start: i64,
+        end: i64,
+        inclusive: bool,
+        span: Span,
+    ) -> EvalResult<Value> {
+        let len = items.len() as i64;
+        let Some((start, end)) = slice_bounds(start, end, inclusive, len) else {
+            return self.trap(self.panic("invalid list slice", span));
+        };
+        let slice_len = end - start;
+        self.charge(fuel::slot_cost(slice_len as u64))?;
+        self.ensure_output_capacity(16 + 8 * slice_len as u64)?;
+        let slice = items[start..end].to_vec();
+        self.note_alloc(16 + 8 * slice.len() as u64);
+        let value = Value::list(slice);
+        self.check_value_depth(&value, span)?;
+        Ok(value)
+    }
+
+    fn index_str_slice(
+        &mut self,
+        text: Rc<str>,
+        start: i64,
+        end: i64,
+        inclusive: bool,
+        span: Span,
+    ) -> EvalResult<Value> {
+        // Slicing scans to find character boundaries. Validate first so an
+        // invalid slice keeps its panic (and its fuel) unchanged, then charge
+        // the input bytes the scan touched.
+        let char_count = text.chars().count() as i64;
+        let Some((start, end)) = slice_bounds(start, end, inclusive, char_count) else {
+            return self.trap(self.panic("invalid string slice", span));
+        };
+        self.charge(fuel::string_cost(text.len() as u64))?;
+        let start_byte = text
+            .char_indices()
+            .nth(start)
+            .map(|(byte, _)| byte)
+            .unwrap_or(text.len());
+        let end_byte = if end as i64 == char_count {
+            text.len()
+        } else {
+            text.char_indices()
+                .nth(end)
+                .map(|(byte, _)| byte)
+                .unwrap_or(text.len())
+        };
+        let out = &text[start_byte..end_byte];
+        self.ensure_output_capacity(16 + out.len() as u64)?;
+        let out = out.to_string();
+        self.note_alloc(16 + out.len() as u64);
+        Ok(Value::str(out))
+    }
+
+    /// Map-key conversion and lookup stay in one place so key changes are
+    /// isolated from the index dispatch.
+    fn index_map_lookup(
+        &mut self,
+        map: Rc<MapValue>,
+        key: &Value,
+        span: Span,
+    ) -> EvalResult<Value> {
+        self.charge(map_key_cost(key))?;
+        let key = self.map_key_ref_at(key, span)?;
+        map.get(&key)
+            .cloned()
+            .ok_or_else(|| EvalError::Trap(self.panic("missing map key", span)))
     }
 }
 
@@ -2760,13 +3104,13 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CallArgs, Frame, IrRuntime};
+    use super::{Accessor, CallArgs, Frame, IndexKind, IrRuntime, Place};
     use crate::exec::{ExecLimits, Trap};
-    use crate::value::{Closure, FnValue, KeyValue, OrderedMap, Value};
+    use crate::value::{Closure, FnValue, KeyValue, OrderedMap, StructValue, Value, map_key_cost};
     use martite_ir::{
         AccessMode, CaptureIndex, CaptureInfo, CaptureSource, Charge, ChildRange, ConstId,
         ConstValue, Effects, Entries, FnId, FnKind, IrFn, IrId, IrProgram, Node, NodeKind,
-        ParamInfo, Pattern, PatternId, Slot, SlotInfo, StrId, TyId,
+        ParamInfo, Pattern, PatternId, Slot, SlotInfo, StrId, Ty, TyId, TypeId, TypeTable,
     };
     use smallvec::SmallVec;
     use std::collections::HashSet;
@@ -3568,5 +3912,588 @@ mod tests {
         };
         assert_eq!(entry[0].as_str(), Some("key"));
         assert_eq!(entry[1].as_int(), Some(9));
+    }
+
+    // ------------------------------------------------------------------
+    // Borrowed place reads and index specialization (#70, #84)
+    // ------------------------------------------------------------------
+
+    struct TestTypes {
+        int: TyId,
+        str_ty: TyId,
+        range: TyId,
+        list_int: TyId,
+        list_struct: TyId,
+        map_str_int: TyId,
+        struct_ty: TyId,
+        param: TyId,
+        never: TyId,
+    }
+
+    fn test_types() -> (TypeTable, TestTypes) {
+        let mut table = TypeTable::default();
+        let int = table.add_ty(Ty::Int);
+        let str_ty = table.add_ty(Ty::Str);
+        let range = table.add_ty(Ty::Range);
+        let struct_ty = table.add_ty(Ty::Named(TypeId::new(0), Vec::new()));
+        let list_int = table.add_ty(Ty::List(int));
+        let list_struct = table.add_ty(Ty::List(struct_ty));
+        let map_str_int = table.add_ty(Ty::Map(str_ty, int));
+        let param = table.add_ty(Ty::Param(0));
+        let never = table.add_ty(Ty::Never);
+        (
+            table,
+            TestTypes {
+                int,
+                str_ty,
+                range,
+                list_int,
+                list_struct,
+                map_str_int,
+                struct_ty,
+                param,
+                never,
+            },
+        )
+    }
+
+    fn test_span() -> martite_base::Span {
+        martite_base::Span::empty(0)
+    }
+
+    /// A `main` that initializes slot 0 from a constant, reads
+    /// `slot[index]` and optionally `.field`, and returns the leaf.
+    fn chain_read_program(
+        constant: ConstValue,
+        index: i64,
+        field: Option<u32>,
+        typed: bool,
+    ) -> IrProgram {
+        let (types, tys) = if typed {
+            let (table, tys) = test_types();
+            (table, tys)
+        } else {
+            let zero = TyId::new(0);
+            (
+                TypeTable::default(),
+                TestTypes {
+                    int: zero,
+                    str_ty: zero,
+                    range: zero,
+                    list_int: zero,
+                    list_struct: zero,
+                    map_str_int: zero,
+                    struct_ty: zero,
+                    param: zero,
+                    never: zero,
+                },
+            )
+        };
+        let list_ty = if field.is_some() {
+            tys.list_struct
+        } else {
+            tys.list_int
+        };
+        let mut nodes = Vec::new();
+        let base = IrId::new(nodes.len() as u32);
+        nodes.push(expression_with_ty(
+            NodeKind::ConstRef(ConstId::new(0)),
+            list_ty,
+        ));
+        let init = IrId::new(nodes.len() as u32);
+        nodes.push(zero_with_ty(
+            NodeKind::SlotInit {
+                slot: Slot::new(0),
+                value: base,
+            },
+            tys.int,
+        ));
+        let index_id = IrId::new(nodes.len() as u32);
+        nodes.push(expression_with_ty(NodeKind::Int(ConstId::new(1)), tys.int));
+        let root = IrId::new(nodes.len() as u32);
+        nodes.push(expression_with_ty(
+            NodeKind::SlotRead {
+                slot: Slot::new(0),
+                mode: AccessMode::Share,
+            },
+            list_ty,
+        ));
+        let mut current = IrId::new(nodes.len() as u32);
+        let index_ty = if field.is_some() {
+            tys.struct_ty
+        } else {
+            tys.int
+        };
+        nodes.push(expression_with_ty(
+            NodeKind::Index {
+                base: root,
+                index: index_id,
+            },
+            index_ty,
+        ));
+        if let Some(field) = field {
+            let field_id = IrId::new(nodes.len() as u32);
+            nodes.push(expression_with_ty(
+                NodeKind::Field {
+                    base: current,
+                    index: field,
+                },
+                tys.int,
+            ));
+            current = field_id;
+        }
+        let init_stmt = IrId::new(nodes.len() as u32);
+        nodes.push(zero_with_ty(NodeKind::ExprStmt(init), tys.int));
+        let value_stmt = IrId::new(nodes.len() as u32);
+        nodes.push(zero_with_ty(NodeKind::ExprStmt(current), tys.int));
+        let block = IrId::new(nodes.len() as u32);
+        nodes.push(zero_with_ty(
+            NodeKind::Block(ChildRange::new(0, 2)),
+            tys.int,
+        ));
+        let mut function = finish(empty_function(1), nodes, vec![init_stmt, value_stmt]);
+        function.body = Some(block);
+        IrProgram {
+            fns: vec![function],
+            consts: vec![constant, ConstValue::Int(index)],
+            types,
+            entries: Entries {
+                main: Some(FnId::new(0)),
+                ..Entries::default()
+            },
+            ..IrProgram::default()
+        }
+    }
+
+    fn expression_with_ty(kind: NodeKind, ty: TyId) -> Node {
+        Node::new(kind, ty, Charge::expression(), Effects::NONE)
+    }
+
+    fn zero_with_ty(kind: NodeKind, ty: TyId) -> Node {
+        Node::new(kind, ty, Charge::ZERO, Effects::NONE)
+    }
+
+    fn run_program(program: &IrProgram) -> (Value, u64) {
+        let mut runtime = IrRuntime::new(program, ExecLimits::default());
+        let result = runtime.run_main().expect("program runs");
+        (result.value, runtime.fuel_used())
+    }
+
+    #[test]
+    fn index_kinds_follow_the_ir_node_types() {
+        let (types, tys) = test_types();
+        let function = empty_function(0);
+        let unit = |ty: TyId| Node::new(NodeKind::Unit, ty, Charge::expression(), Effects::NONE);
+        let index = |base: IrId, index: IrId, ty: TyId| {
+            expression_with_ty(NodeKind::Index { base, index }, ty)
+        };
+        let nodes = vec![
+            unit(tys.list_int),                              // 0
+            unit(tys.int),                                   // 1
+            unit(tys.range),                                 // 2
+            unit(tys.str_ty),                                // 3
+            unit(tys.map_str_int),                           // 4
+            unit(tys.param),                                 // 5
+            unit(tys.never),                                 // 6
+            index(IrId::new(0), IrId::new(1), tys.int),      // 7 ListIndex
+            index(IrId::new(0), IrId::new(2), tys.list_int), // 8 ListSlice
+            index(IrId::new(3), IrId::new(2), tys.str_ty),   // 9 StrSlice
+            index(IrId::new(4), IrId::new(3), tys.int),      // 10 MapIndex
+            index(IrId::new(5), IrId::new(1), tys.int),      // 11 General (param base)
+            index(IrId::new(0), IrId::new(5), tys.int),      // 12 General (param index)
+            index(IrId::new(6), IrId::new(1), tys.int),      // 13 General (never base)
+        ];
+        let mut function = finish(function, nodes, Vec::new());
+        function.body = Some(IrId::new(7));
+        let program = IrProgram {
+            fns: vec![function],
+            types,
+            ..IrProgram::default()
+        };
+        let mut runtime = IrRuntime::new(&program, ExecLimits::default());
+        runtime.current = program.function(FnId::new(0));
+        assert_eq!(runtime.index_kind(IrId::new(7)), IndexKind::ListIndex);
+        assert_eq!(runtime.index_kind(IrId::new(8)), IndexKind::ListSlice);
+        assert_eq!(runtime.index_kind(IrId::new(9)), IndexKind::StrSlice);
+        assert_eq!(runtime.index_kind(IrId::new(10)), IndexKind::MapIndex);
+        assert_eq!(runtime.index_kind(IrId::new(11)), IndexKind::General);
+        assert_eq!(runtime.index_kind(IrId::new(12)), IndexKind::General);
+        assert_eq!(runtime.index_kind(IrId::new(13)), IndexKind::General);
+        assert_eq!(runtime.index_kind(IrId::new(0)), IndexKind::General);
+    }
+
+    #[test]
+    fn borrowed_index_chain_clones_only_the_leaf() {
+        let (types, tys) = test_types();
+        let function = empty_function(1);
+        let nodes = vec![
+            expression_with_ty(
+                NodeKind::SlotRead {
+                    slot: Slot::new(0),
+                    mode: AccessMode::Share,
+                },
+                tys.list_int,
+            ),
+            expression_with_ty(NodeKind::Int(ConstId::new(0)), tys.int),
+            expression_with_ty(
+                NodeKind::Index {
+                    base: IrId::new(0),
+                    index: IrId::new(1),
+                },
+                tys.int,
+            ),
+        ];
+        let function = finish(function, nodes, Vec::new());
+        let program = IrProgram {
+            fns: vec![function],
+            consts: vec![ConstValue::Int(1)],
+            types,
+            ..IrProgram::default()
+        };
+        let mut runtime = IrRuntime::new(&program, ExecLimits::default());
+        runtime.current = program.function(FnId::new(0));
+        let value = Value::list(vec![Value::Int(0), Value::Int(1), Value::Int(2)]);
+        runtime.frames.push(Frame {
+            slots: SmallVec::from_elem(Some(value), 1),
+            captures: None,
+            source: martite_base::SourceId(0),
+            name: "test",
+        });
+
+        let read = runtime
+            .eval_place_read(IrId::new(2))
+            .expect("read runs")
+            .expect("the chain is stable");
+        assert_eq!(read, Value::Int(1));
+        assert_eq!(runtime.fuel_used(), 2, "one charge per replaced node");
+        let Value::List(items) = runtime.frames[0].slots[0].as_ref().unwrap() else {
+            panic!("frame holds the list");
+        };
+        assert_eq!(
+            Rc::strong_count(items),
+            1,
+            "the read must not retain or leave a clone of the list"
+        );
+    }
+
+    #[test]
+    fn nested_field_and_index_reads_return_the_leaf() {
+        let constant = ConstValue::List(Rc::from(vec![
+            ConstValue::Struct(
+                TypeId::new(0),
+                Rc::from(vec![ConstValue::Int(10), ConstValue::Int(11)]),
+            ),
+            ConstValue::Struct(
+                TypeId::new(0),
+                Rc::from(vec![ConstValue::Int(20), ConstValue::Int(21)]),
+            ),
+        ]));
+        let typed = chain_read_program(constant.clone(), 1, Some(1), true);
+        let (value, fuel) = run_program(&typed);
+        assert_eq!(value, Value::Int(21));
+
+        let general = chain_read_program(constant, 1, Some(1), false);
+        let (fallback_value, fallback_fuel) = run_program(&general);
+        assert_eq!(fallback_value, value);
+        assert_eq!(
+            fuel, fallback_fuel,
+            "the borrowed chain must charge exactly the nodes it replaces"
+        );
+    }
+
+    #[test]
+    fn a_borrowed_read_traps_with_the_general_fuel_and_message() {
+        let constant = ConstValue::List(Rc::from(vec![ConstValue::Int(1), ConstValue::Int(2)]));
+        let run = |program: &IrProgram| {
+            let mut runtime = IrRuntime::new(program, ExecLimits::default());
+            let error = runtime.run_main().expect_err("index is out of bounds");
+            (error, runtime.fuel_used())
+        };
+        let (typed_error, typed_fuel) = run(&chain_read_program(constant.clone(), 5, None, true));
+        let (general_error, general_fuel) = run(&chain_read_program(constant, 5, None, false));
+        let Trap::Panic { message, .. } = &typed_error else {
+            panic!("expected a panic trap");
+        };
+        assert_eq!(message, "index out of bounds");
+        let Trap::Panic {
+            message: general_message,
+            span: general_span,
+            ..
+        } = general_error
+        else {
+            panic!("expected a panic trap");
+        };
+        assert_eq!(general_message, "index out of bounds");
+        assert_eq!(general_span, Some(test_span()));
+        assert_eq!(typed_fuel, general_fuel);
+    }
+
+    #[test]
+    fn borrowed_tuple_fields_walk_by_reference() {
+        let function = empty_function(1);
+        let nodes = vec![
+            expression_with_ty(
+                NodeKind::SlotRead {
+                    slot: Slot::new(0),
+                    mode: AccessMode::Share,
+                },
+                TyId::new(0),
+            ),
+            expression_with_ty(
+                NodeKind::TupleField {
+                    base: IrId::new(0),
+                    index: 1,
+                },
+                TyId::new(0),
+            ),
+            expression_with_ty(
+                NodeKind::TupleField {
+                    base: IrId::new(1),
+                    index: 0,
+                },
+                TyId::new(0),
+            ),
+        ];
+        let function = finish(function, nodes, Vec::new());
+        let program = IrProgram {
+            fns: vec![function],
+            ..IrProgram::default()
+        };
+        let mut runtime = IrRuntime::new(&program, ExecLimits::default());
+        runtime.current = program.function(FnId::new(0));
+        let pair = Value::tuple(vec![
+            Value::Int(1),
+            Value::tuple(vec![Value::Int(2), Value::Int(3)]),
+        ]);
+        runtime.frames.push(Frame {
+            slots: SmallVec::from_elem(Some(pair), 1),
+            captures: None,
+            source: martite_base::SourceId(0),
+            name: "test",
+        });
+        let read = runtime
+            .eval_place_read(IrId::new(2))
+            .expect("read runs")
+            .expect("the tuple chain is stable");
+        assert_eq!(read, Value::Int(2));
+    }
+
+    #[test]
+    fn calling_or_writing_index_expressions_take_the_general_path() {
+        for effects in [Effects::CALLS, Effects::WRITES_LOCAL, Effects::HOST] {
+            let (types, tys) = test_types();
+            let function = empty_function(1);
+            let nodes = vec![
+                expression_with_ty(
+                    NodeKind::SlotRead {
+                        slot: Slot::new(0),
+                        mode: AccessMode::Share,
+                    },
+                    tys.list_int,
+                ),
+                Node::new(
+                    NodeKind::Int(ConstId::new(0)),
+                    tys.int,
+                    Charge::expression(),
+                    effects,
+                ),
+                expression_with_ty(
+                    NodeKind::Index {
+                        base: IrId::new(0),
+                        index: IrId::new(1),
+                    },
+                    tys.int,
+                ),
+            ];
+            let function = finish(function, nodes, Vec::new());
+            let program = IrProgram {
+                fns: vec![function],
+                consts: vec![ConstValue::Int(0)],
+                types,
+                ..IrProgram::default()
+            };
+            let mut runtime = IrRuntime::new(&program, ExecLimits::default());
+            runtime.current = program.function(FnId::new(0));
+            runtime.frames.push(Frame {
+                slots: SmallVec::from_elem(Some(Value::list(vec![Value::Int(1)])), 1),
+                captures: None,
+                source: martite_base::SourceId(0),
+                name: "test",
+            });
+            assert_eq!(
+                runtime.eval_place_read(IrId::new(2)).expect("read runs"),
+                None,
+                "{effects:?} must disable the borrowed read"
+            );
+            assert_eq!(runtime.fuel_used(), 0, "fallback must not pre-charge");
+        }
+    }
+
+    #[test]
+    fn read_place_borrows_fields_and_lists_but_keeps_map_lookup() {
+        let (types, _) = test_types();
+        let function = finish(empty_function(1), Vec::new(), Vec::new());
+        let program = IrProgram {
+            fns: vec![function],
+            types,
+            ..IrProgram::default()
+        };
+        let mut runtime = IrRuntime::new(&program, ExecLimits::default());
+        runtime.current = program.function(FnId::new(0));
+        let item = Value::Struct(Rc::new(StructValue::new(
+            TypeId::new(0),
+            vec![Value::Int(7)],
+        )));
+        runtime.frames.push(Frame {
+            slots: SmallVec::from_elem(Some(Value::list(vec![item])), 1),
+            captures: None,
+            source: martite_base::SourceId(0),
+            name: "test",
+        });
+        let place = Place {
+            root: Slot::new(0),
+            accessors: SmallVec::from_vec(vec![Accessor::Index(Value::Int(0)), Accessor::Field(0)]),
+        };
+        assert_eq!(
+            runtime.read_place(&place).expect("list place"),
+            Value::Int(7)
+        );
+        assert_eq!(runtime.fuel_used(), 0, "list access needs no charge");
+
+        let key = Value::str("a".repeat(64));
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Str("a".repeat(64)), Value::Int(9));
+        runtime.frames[0].slots[0] = Some(Value::map(map));
+        let place = Place {
+            root: Slot::new(0),
+            accessors: SmallVec::from_vec(vec![Accessor::Index(key.clone())]),
+        };
+        assert_eq!(
+            runtime.read_place(&place).expect("map place"),
+            Value::Int(9)
+        );
+        assert_eq!(runtime.fuel_used(), map_key_cost(&key));
+
+        let missing = Place {
+            root: Slot::new(0),
+            accessors: SmallVec::from_vec(vec![Accessor::Index(Value::str("missing"))]),
+        };
+        let error = runtime.read_place(&missing).expect_err("missing key traps");
+        let super::EvalError::Trap(Trap::Panic { message, .. }) = error else {
+            panic!("expected a panic trap");
+        };
+        assert_eq!(message, "missing map key");
+    }
+
+    #[test]
+    fn specialized_index_kinds_preserve_results_traps_and_fuel() {
+        let program = IrProgram::default();
+        let span = test_span();
+        let list = Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+
+        let mut runtime = IrRuntime::new(&program, ExecLimits::default());
+        assert_eq!(
+            runtime
+                .index_value_kind(IndexKind::ListIndex, list.clone(), Value::Int(1), span)
+                .expect("list index"),
+            Value::Int(2)
+        );
+        assert_eq!(
+            runtime
+                .index_value_kind(
+                    IndexKind::ListSlice,
+                    list.clone(),
+                    Value::Range {
+                        start: 1,
+                        end: 3,
+                        inclusive: false,
+                    },
+                    span,
+                )
+                .expect("list slice"),
+            Value::list(vec![Value::Int(2), Value::Int(3)])
+        );
+        let error = runtime
+            .index_value_kind(IndexKind::ListIndex, list.clone(), Value::Int(3), span)
+            .expect_err("out of bounds");
+        let super::EvalError::Trap(Trap::Panic {
+            message,
+            span: Some(found),
+            ..
+        }) = error
+        else {
+            panic!("expected an index panic");
+        };
+        assert_eq!(message, "index out of bounds");
+        assert_eq!(found, span);
+
+        assert_eq!(
+            runtime
+                .index_value_kind(
+                    IndexKind::StrSlice,
+                    Value::str("héllo"),
+                    Value::Range {
+                        start: 1,
+                        end: 3,
+                        inclusive: false,
+                    },
+                    span,
+                )
+                .expect("string slice"),
+            Value::str("él")
+        );
+
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Str("k".into()), Value::Int(9));
+        let map = Value::map(map);
+        assert_eq!(
+            runtime
+                .index_value_kind(IndexKind::MapIndex, map.clone(), Value::str("k"), span)
+                .expect("map index"),
+            Value::Int(9)
+        );
+        let error = runtime
+            .index_value_kind(IndexKind::MapIndex, map, Value::str("missing"), span)
+            .expect_err("missing key");
+        let super::EvalError::Trap(Trap::Panic { message, .. }) = error else {
+            panic!("expected a map panic");
+        };
+        assert_eq!(message, "missing map key");
+    }
+
+    #[test]
+    fn index_kind_dispatch_does_not_change_fuel() {
+        let program = IrProgram::default();
+        let span = test_span();
+        let list = Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        let range = Value::Range {
+            start: 0,
+            end: 2,
+            inclusive: false,
+        };
+
+        let mut general = IrRuntime::new(&program, ExecLimits::default());
+        general
+            .index_value(list.clone(), range.clone(), span)
+            .expect("general slice");
+        let mut specialized = IrRuntime::new(&program, ExecLimits::default());
+        specialized
+            .index_value_kind(IndexKind::ListSlice, list, range, span)
+            .expect("specialized slice");
+        assert_eq!(general.fuel_used(), specialized.fuel_used());
+
+        let key = Value::str("k".repeat(64));
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Str("k".repeat(64)), Value::Int(1));
+        let map = Value::map(map);
+        let mut general = IrRuntime::new(&program, ExecLimits::default());
+        general
+            .index_value(map.clone(), key.clone(), span)
+            .expect("general map index");
+        let mut specialized = IrRuntime::new(&program, ExecLimits::default());
+        specialized
+            .index_value_kind(IndexKind::MapIndex, map, key, span)
+            .expect("specialized map index");
+        assert_eq!(general.fuel_used(), specialized.fuel_used());
     }
 }
