@@ -16,6 +16,7 @@ pub use exec::{CallResult, ExecLimits, HostCaller, HostContext, HostFault, MainR
 pub use ir_eval::{IrHostDispatcher, IrRuntime};
 pub use ops::{show, value_eq, value_ord};
 pub use value::{
-    Closure, EnumValue, FnValue, HandleValue, KeyValue, MAX_VALUE_DEPTH, MapValue, OrderedMap,
-    SeqValue, StructValue, Value, ValueMeta, key_from_value, key_to_value, value_depth_exceeds,
+    Closure, EnumValue, FnValue, HandleValue, KeyRef, KeyValue, MAX_VALUE_DEPTH, MapValue,
+    OrderedMap, SeqValue, StructValue, Value, ValueMeta, key_from_value, key_to_value,
+    value_depth_exceeds,
 };
