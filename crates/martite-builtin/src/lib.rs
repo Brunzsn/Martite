@@ -161,6 +161,98 @@ mod tests {
     }
 
     #[test]
+    fn named_builtin_method_ids_match_the_canonical_table() {
+        use BuiltinReceiver::*;
+
+        let named = [
+            (BuiltinMethodId::LIST_LEN, List, "len"),
+            (BuiltinMethodId::LIST_GET, List, "get"),
+            (BuiltinMethodId::LIST_FIRST, List, "first"),
+            (BuiltinMethodId::LIST_LAST, List, "last"),
+            (BuiltinMethodId::LIST_CONTAINS, List, "contains"),
+            (BuiltinMethodId::LIST_MAP, List, "map"),
+            (BuiltinMethodId::LIST_FILTER, List, "filter"),
+            (BuiltinMethodId::LIST_FOLD, List, "fold"),
+            (BuiltinMethodId::LIST_ANY, List, "any"),
+            (BuiltinMethodId::LIST_ALL, List, "all"),
+            (BuiltinMethodId::LIST_ENUMERATE, List, "enumerate"),
+            (BuiltinMethodId::LIST_REVERSED, List, "reversed"),
+            (BuiltinMethodId::LIST_SORTED, List, "sorted"),
+            (BuiltinMethodId::LIST_SORTED_BY, List, "sorted_by"),
+            (BuiltinMethodId::LIST_JOIN, List, "join"),
+            (BuiltinMethodId::LIST_PUSH, List, "push"),
+            (BuiltinMethodId::LIST_POP, List, "pop"),
+            (BuiltinMethodId::LIST_SORT, List, "sort"),
+            (BuiltinMethodId::LIST_INSERT, List, "insert"),
+            (BuiltinMethodId::LIST_REMOVE_AT, List, "remove_at"),
+            (BuiltinMethodId::LIST_EXTEND, List, "extend"),
+            (BuiltinMethodId::LIST_CLEAR, List, "clear"),
+            (BuiltinMethodId::MAP_LEN, Map, "len"),
+            (BuiltinMethodId::MAP_GET, Map, "get"),
+            (BuiltinMethodId::MAP_HAS, Map, "has"),
+            (BuiltinMethodId::MAP_KEYS, Map, "keys"),
+            (BuiltinMethodId::MAP_VALUES, Map, "values"),
+            (BuiltinMethodId::MAP_ENTRIES, Map, "entries"),
+            (BuiltinMethodId::MAP_REMOVE, Map, "remove"),
+            (BuiltinMethodId::MAP_CLEAR, Map, "clear"),
+            (BuiltinMethodId::STR_LEN, Str, "len"),
+            (BuiltinMethodId::STR_CHARS, Str, "chars"),
+            (BuiltinMethodId::STR_SPLIT, Str, "split"),
+            (BuiltinMethodId::STR_TRIM, Str, "trim"),
+            (BuiltinMethodId::STR_CONTAINS, Str, "contains"),
+            (BuiltinMethodId::STR_FIND, Str, "find"),
+            (BuiltinMethodId::STR_STARTS_WITH, Str, "starts_with"),
+            (BuiltinMethodId::STR_ENDS_WITH, Str, "ends_with"),
+            (BuiltinMethodId::STR_REPLACE, Str, "replace"),
+            (BuiltinMethodId::STR_TO_UPPER, Str, "to_upper"),
+            (BuiltinMethodId::STR_TO_LOWER, Str, "to_lower"),
+            (BuiltinMethodId::STR_PARSE_INT, Str, "parse_int"),
+            (BuiltinMethodId::STR_PARSE_FLOAT, Str, "parse_float"),
+            (BuiltinMethodId::INT_ABS, Int, "abs"),
+            (BuiltinMethodId::INT_POW, Int, "pow"),
+            (BuiltinMethodId::FLOAT_ABS, Float, "abs"),
+            (BuiltinMethodId::FLOAT_FLOOR, Float, "floor"),
+            (BuiltinMethodId::FLOAT_CEIL, Float, "ceil"),
+            (BuiltinMethodId::FLOAT_TRUNC, Float, "trunc"),
+            (BuiltinMethodId::FLOAT_SQRT, Float, "sqrt"),
+            (BuiltinMethodId::FLOAT_POW, Float, "pow"),
+            (BuiltinMethodId::FLOAT_ROUND, Float, "round"),
+            (BuiltinMethodId::FLOAT_IS_NAN, Float, "is_nan"),
+            (BuiltinMethodId::FLOAT_IS_FINITE, Float, "is_finite"),
+            (BuiltinMethodId::RANGE_LEN, Range, "len"),
+            (BuiltinMethodId::RANGE_CONTAINS, Range, "contains"),
+            (BuiltinMethodId::RANGE_TO_LIST, Range, "to_list"),
+            (BuiltinMethodId::OPTION_IS_SOME, Option, "is_some"),
+            (BuiltinMethodId::OPTION_IS_NONE, Option, "is_none"),
+            (BuiltinMethodId::OPTION_MAP, Option, "map"),
+            (BuiltinMethodId::OPTION_AND_THEN, Option, "and_then"),
+            (BuiltinMethodId::OPTION_UNWRAP_OR, Option, "unwrap_or"),
+            (BuiltinMethodId::OPTION_OK_OR, Option, "ok_or"),
+            (BuiltinMethodId::OPTION_EXPECT, Option, "expect"),
+            (BuiltinMethodId::RESULT_IS_OK, Result, "is_ok"),
+            (BuiltinMethodId::RESULT_IS_ERR, Result, "is_err"),
+            (BuiltinMethodId::RESULT_MAP, Result, "map"),
+            (BuiltinMethodId::RESULT_MAP_ERR, Result, "map_err"),
+            (BuiltinMethodId::RESULT_AND_THEN, Result, "and_then"),
+            (BuiltinMethodId::RESULT_UNWRAP_OR, Result, "unwrap_or"),
+            (BuiltinMethodId::RESULT_OK, Result, "ok"),
+            (BuiltinMethodId::RESULT_EXPECT, Result, "expect"),
+        ];
+
+        assert_eq!(
+            named.len(),
+            BUILTIN_METHODS.len(),
+            "named method ids must cover the canonical table"
+        );
+        for (index, (id, receiver, name)) in named.into_iter().enumerate() {
+            assert_eq!(id, BuiltinMethodId::new(index as u32));
+            let def = id.def().expect("named builtin method id is in range");
+            assert_eq!(def.receiver, receiver, "receiver for {name}");
+            assert_eq!(def.name, name);
+        }
+    }
+
+    #[test]
     fn builtin_arities_cover_the_tables() {
         assert_eq!(BuiltinFnId::PRINT.arity(), Some(1));
         assert_eq!(BuiltinFnId::ASSERT.arity(), Some(2));

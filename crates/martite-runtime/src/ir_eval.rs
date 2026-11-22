@@ -28,9 +28,9 @@ use std::time::Instant;
 use martite_base::{SourceId, Span};
 use martite_fuel as fuel;
 use martite_ir::{
-    AccessMode, BuiltinFnId, BuiltinItemId, CaptureIndex, CaptureSource, ChildRange, ConstId,
-    ConstValue, FnId, FnKind, HostId, IrFn, IrId, IrProgram, MatchSetId, Node, NodeKind, Pattern,
-    PreludeVariant, Slot, StrId, StructLayoutId, Ty, TypeDefKind, TypeId,
+    AccessMode, BuiltinFnId, BuiltinItemId, BuiltinMethodId, CaptureIndex, CaptureSource,
+    ChildRange, ConstId, ConstValue, FnId, FnKind, HostId, IrFn, IrId, IrProgram, MatchSetId, Node,
+    NodeKind, Pattern, PreludeVariant, Slot, StrId, StructLayoutId, Ty, TypeDefKind, TypeId,
 };
 use smallvec::SmallVec;
 
@@ -2551,7 +2551,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 
     fn check_builtin_mutation_depth(
         &self,
-        name: &str,
+        method: BuiltinMethodId,
         args: &[Value],
         path_depth: usize,
     ) -> EvalResult<()> {
@@ -2564,18 +2564,18 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 Ok(())
             }
         };
-        match name {
-            "push" => {
+        match method {
+            BuiltinMethodId::LIST_PUSH => {
                 if let Some(value) = args.first() {
                     check(value, item_limit)?;
                 }
             }
-            "insert" => {
+            BuiltinMethodId::LIST_INSERT => {
                 if let Some(value) = args.get(1) {
                     check(value, item_limit)?;
                 }
             }
-            "extend" => {
+            BuiltinMethodId::LIST_EXTEND => {
                 if let Some(value) = args.first() {
                     check(value, list_limit)?;
                 }
