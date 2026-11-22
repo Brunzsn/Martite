@@ -2850,6 +2850,21 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
     }
 
     fn write_place(&mut self, place: Place, value: Value) -> EvalResult<()> {
+        if place.accessors.is_empty() {
+            let present = self
+                .frames
+                .last()
+                .and_then(|frame| frame.slots.get(place.root.index()))
+                .is_some_and(Option::is_some);
+            if !present {
+                return Err(EvalError::Trap(self.internal_panic("unbound place root")));
+            }
+            if value_depth_exceeds(&value, MAX_VALUE_DEPTH) {
+                return Err(EvalError::Trap(Trap::DepthExceeded));
+            }
+            self.set_slot(place.root, value);
+            return Ok(());
+        }
         let mut root = self.take_place_root(&place)?;
         self.set_path(&mut root, &place.accessors, value, MAX_VALUE_DEPTH)?;
         self.set_slot(place.root, root);
@@ -3417,7 +3432,8 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Accessor, BinaryDispatch, BinaryKind, CallArgs, Frame, IndexKind, IrRuntime, Place,
+        Accessor, BinaryDispatch, BinaryKind, CallArgs, Frame, IndexKind, IrRuntime,
+        MAX_VALUE_DEPTH, Place,
     };
     use crate::exec::{ExecLimits, Trap};
     use crate::value::{Closure, FnValue, KeyValue, OrderedMap, StructValue, Value, map_key_cost};
@@ -4897,6 +4913,55 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Direct slot writes (#87) and unchanged metadata (#80)
+    // ------------------------------------------------------------------
+
+    fn assignment_program(compound: bool, initial: i64, operand: i64) -> IrProgram {
+        let kind = if compound {
+            NodeKind::AddAssign {
+                place: IrId::new(2),
+                value: IrId::new(3),
+            }
+        } else {
+            NodeKind::Assign {
+                place: IrId::new(2),
+                value: IrId::new(3),
+            }
+        };
+        let nodes = vec![
+            expression(NodeKind::Int(ConstId::new(0))),
+            zero(NodeKind::SlotInit {
+                slot: Slot::new(0),
+                value: IrId::new(0),
+            }),
+            zero(NodeKind::SlotPlace(Slot::new(0))),
+            expression(NodeKind::Int(ConstId::new(1))),
+            expression(kind),
+            zero(NodeKind::ExprStmt(IrId::new(4))),
+            expression(NodeKind::SlotRead {
+                slot: Slot::new(0),
+                mode: AccessMode::Share,
+            }),
+            zero(NodeKind::Block(ChildRange::new(0, 3))),
+        ];
+        let mut function = finish(
+            empty_function(1),
+            nodes,
+            vec![IrId::new(1), IrId::new(5), IrId::new(6)],
+        );
+        function.body = Some(IrId::new(7));
+        IrProgram {
+            fns: vec![function],
+            consts: vec![ConstValue::Int(initial), ConstValue::Int(operand)],
+            entries: Entries {
+                main: Some(FnId::new(0)),
+                ..Entries::default()
+            },
+            ..IrProgram::default()
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Binary operation specialization (#71)
     // ------------------------------------------------------------------
 
@@ -4931,6 +4996,70 @@ mod tests {
             },
             ..IrProgram::default()
         }
+    }
+
+    #[test]
+    fn simple_and_compound_slot_assignments_update_the_slot_without_extra_fuel() {
+        let (value, simple_fuel) = run_program(&assignment_program(false, 1, 2));
+        assert_eq!(value, Value::Int(2));
+        assert_eq!(simple_fuel, 4, "only charged expression nodes add fuel");
+
+        let (value, compound_fuel) = run_program(&assignment_program(true, 1, 2));
+        assert_eq!(value, Value::Int(3));
+        assert_eq!(
+            compound_fuel, simple_fuel,
+            "a compound slot write charges no extra fuel"
+        );
+    }
+
+    #[test]
+    fn empty_accessor_writes_trap_without_removing_the_root() {
+        let program = IrProgram::default();
+        let mut runtime = IrRuntime::new(&program, ExecLimits::default());
+        runtime.frames.push(Frame {
+            slots: SmallVec::from_elem(Some(Value::Int(1)), 1),
+            captures: None,
+            source: martite_base::SourceId(0),
+            name: "test",
+        });
+        let place = || Place {
+            root: Slot::new(0),
+            accessors: SmallVec::new(),
+        };
+
+        runtime
+            .write_place(place(), Value::Int(2))
+            .expect("simple write");
+        assert_eq!(
+            runtime.frames.last().expect("frame").slots[0],
+            Some(Value::Int(2))
+        );
+        assert_eq!(runtime.fuel_used(), 0, "the write charges no fuel");
+
+        runtime.frames.last_mut().expect("frame").slots[0] = None;
+        let error = runtime
+            .write_place(place(), Value::Int(3))
+            .expect_err("the missing root traps");
+        let super::EvalError::Trap(Trap::Panic { message, .. }) = error else {
+            panic!("expected a panic trap");
+        };
+        assert_eq!(message, "unbound place root");
+
+        runtime.frames.last_mut().expect("frame").slots[0] = Some(Value::Int(1));
+        let mut deep = Value::Unit;
+        for _ in 0..MAX_VALUE_DEPTH {
+            deep = Value::list(vec![deep]);
+        }
+        let error = runtime
+            .write_place(place(), deep)
+            .expect_err("the depth cap traps");
+        assert!(matches!(error, super::EvalError::Trap(Trap::DepthExceeded)));
+        assert_eq!(
+            runtime.frames.last().expect("frame").slots[0],
+            Some(Value::Int(1)),
+            "the depth check runs before the slot is overwritten"
+        );
+        assert_eq!(runtime.fuel_used(), 0, "a failed write charges no fuel");
     }
 
     #[test]
