@@ -37,8 +37,8 @@ use smallvec::SmallVec;
 use crate::exec::{CallResult, ExecLimits, HostCaller, HostContext, HostFault, MainResult, Trap};
 use crate::ops::{ShowOutput, show, value_eq, value_ord, write_show};
 use crate::value::{
-    Closure, EnumValue, FnValue, MAX_VALUE_DEPTH, MapValue, OrderedMap, SeqValue, StructValue,
-    Value, key_from_value, key_value_size, map_key_cost, value_depth_exceeds,
+    Closure, EnumValue, FnValue, KeyRef, MAX_VALUE_DEPTH, MapValue, OrderedMap, SeqValue,
+    StructValue, Value, key_from_value, key_value_size, map_key_cost, value_depth_exceeds,
 };
 
 /// Host functions resolved by the IR. Dispatch is by [`HostId`]; the embedder
@@ -329,6 +329,16 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 
     fn trap<T>(&self, trap: Trap) -> EvalResult<T> {
         Err(EvalError::Trap(trap))
+    }
+
+    /// Borrow a value for a map lookup without allocating an owned key.
+    fn map_key_ref<'v>(&self, value: &'v Value) -> EvalResult<KeyRef<'v>> {
+        KeyRef::new(value).map_err(|message| EvalError::Trap(self.internal_panic(message)))
+    }
+
+    /// Borrow a value for a map lookup, reporting invalid keys at `span`.
+    fn map_key_ref_at<'v>(&self, value: &'v Value, span: Span) -> EvalResult<KeyRef<'v>> {
+        KeyRef::new(value).map_err(|message| EvalError::Trap(self.panic(message, span)))
     }
 
     fn function_info(&self, function: FnId) -> Result<&'p IrFn, Trap> {
@@ -1608,11 +1618,40 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 }
             }
             Value::Map(map) => {
+                // Destructuring a pair from a map is the common case. Bind the
+                // borrowed entry directly instead of materialising a temporary
+                // `(key, value)` tuple for every iteration.
+                let pair = match pattern {
+                    Pattern::Tuple(items) if items.len() == 2 => Some((&items[0], &items[1])),
+                    _ => None,
+                };
                 for (key, value) in map.iter() {
                     self.charge(per_iter)?;
-                    let pair = Value::tuple(vec![crate::value::key_to_value(key), value.clone()]);
-                    self.note_alloc(16 + 8 * 2);
-                    self.bind_pattern(pattern, &pair)?;
+                    match pair {
+                        Some((key_pattern, value_pattern)) => match key_pattern {
+                            Pattern::Wild => self.bind_pattern(value_pattern, value)?,
+                            Pattern::Bind { .. } => {
+                                let key = crate::value::key_to_value(key);
+                                self.note_value(&key);
+                                self.bind_pattern(key_pattern, &key)?;
+                                self.bind_pattern(value_pattern, value)?;
+                            }
+                            _ => {
+                                let pair = Value::tuple(vec![
+                                    crate::value::key_to_value(key),
+                                    value.clone(),
+                                ]);
+                                self.note_alloc(16 + 8 * 2);
+                                self.bind_pattern(pattern, &pair)?;
+                            }
+                        },
+                        None => {
+                            let pair =
+                                Value::tuple(vec![crate::value::key_to_value(key), value.clone()]);
+                            self.note_alloc(16 + 8 * 2);
+                            self.bind_pattern(pattern, &pair)?;
+                        }
+                    }
                     match self.eval(body) {
                         Ok(_) | Err(EvalError::Continue) => {}
                         Err(EvalError::Break) => break,
@@ -2233,8 +2272,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
                 }
                 (Value::Map(map), Accessor::Index(key)) => {
                     self.charge(map_key_cost(key))?;
-                    let key = key_from_value(key)
-                        .map_err(|message| EvalError::Trap(self.internal_panic(message)))?;
+                    let key = self.map_key_ref(key)?;
                     map.get(&key)
                         .cloned()
                         .ok_or_else(|| EvalError::Trap(self.internal_panic("missing map key")))?
@@ -2613,8 +2651,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
             }
             (Value::Map(map), key) => {
                 self.charge(map_key_cost(&key))?;
-                let key = key_from_value(&key)
-                    .map_err(|message| EvalError::Trap(self.panic(message, span)))?;
+                let key = self.map_key_ref_at(&key, span)?;
                 map.get(&key)
                     .cloned()
                     .ok_or_else(|| EvalError::Trap(self.panic("missing map key", span)))
@@ -2725,7 +2762,7 @@ impl<'p, 'h> IrRuntime<'p, 'h> {
 mod tests {
     use super::{CallArgs, Frame, IrRuntime};
     use crate::exec::{ExecLimits, Trap};
-    use crate::value::{Closure, FnValue, Value};
+    use crate::value::{Closure, FnValue, KeyValue, OrderedMap, Value};
     use martite_ir::{
         AccessMode, CaptureIndex, CaptureInfo, CaptureSource, Charge, ChildRange, ConstId,
         ConstValue, Effects, Entries, FnId, FnKind, IrFn, IrId, IrProgram, Node, NodeKind,
@@ -3329,5 +3366,207 @@ mod tests {
             matches!(error, super::EvalError::Trap(Trap::OutOfMemory)),
             "{error:?}"
         );
+    }
+
+    /// Runs one map `for` loop whose body breaks after binding the first entry.
+    ///
+    /// The map is bound to slot 0; the pattern binds from slot 1 onward. The
+    /// returned slots are the frame state after the single iteration.
+    fn run_map_for_loop(
+        pattern: Pattern,
+        locals: u32,
+        map: OrderedMap,
+    ) -> (Vec<Option<Value>>, u64) {
+        let mut function = empty_function(locals);
+        function.patterns = vec![pattern];
+        let function = finish(
+            function,
+            vec![
+                expression(NodeKind::SlotRead {
+                    slot: Slot::new(0),
+                    mode: AccessMode::Share,
+                }),
+                zero(NodeKind::Break),
+            ],
+            vec![IrId::new(0), IrId::new(1)],
+        );
+        let program = IrProgram {
+            fns: vec![function],
+            ..IrProgram::default()
+        };
+        let mut runtime = IrRuntime::new(&program, ExecLimits::default());
+        runtime.current = Some(&program.fns[0]);
+        runtime.frames.push(Frame {
+            slots: SmallVec::from_elem(None, locals as usize),
+            captures: None,
+            source: program.fns[0].source,
+            name: program.fns[0].name.as_ref(),
+        });
+        runtime.frames.last_mut().expect("frame").slots[0] = Some(Value::map(map));
+        runtime
+            .eval_for(PatternId::new(0), 0, 1)
+            .expect("map loop runs");
+        let slots = runtime.frames.pop().expect("frame").slots;
+        (slots.into_iter().collect(), runtime.fuel_used())
+    }
+
+    fn bound_int(value: Option<&Value>) -> Option<i64> {
+        value.and_then(Value::as_int)
+    }
+
+    #[test]
+    fn map_place_reads_accept_borrowed_keys() {
+        let program = IrProgram::default();
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Str("a".into()), Value::Int(3));
+        map.insert(KeyValue::Int(7), Value::Int(4));
+        map.insert(KeyValue::Tuple(vec![KeyValue::Bool(true)]), Value::Int(5));
+
+        let mut runtime = IrRuntime::new(&program, ExecLimits::default());
+        runtime.frames.push(Frame {
+            slots: SmallVec::from_elem(None, 1),
+            captures: None,
+            source: martite_base::SourceId(0),
+            name: "test",
+        });
+        runtime.frames[0].slots[0] = Some(Value::map(map));
+
+        for (index, expected) in [
+            (Value::str("a"), 3),
+            (Value::Int(7), 4),
+            (Value::tuple(vec![Value::Bool(true)]), 5),
+        ] {
+            let mut accessors: SmallVec<[super::Accessor; 4]> = SmallVec::new();
+            accessors.push(super::Accessor::Index(index));
+            let place = super::Place {
+                root: Slot::new(0),
+                accessors,
+            };
+            let value = runtime.read_place(&place).expect("map place read");
+            assert_eq!(value.as_int(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn map_for_loop_binds_wildcard_key_and_value_directly() {
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Str("first".into()), Value::Int(10));
+        map.insert(KeyValue::Str("second".into()), Value::Int(20));
+        let pattern = Pattern::Tuple(vec![
+            Pattern::Wild,
+            Pattern::Bind {
+                slot: Slot::new(1),
+                ty: TyId::new(0),
+            },
+        ]);
+        let (slots, fuel) = run_map_for_loop(pattern, 2, map);
+        assert_eq!(bound_int(slots[1].as_ref()), Some(10));
+        assert_eq!(
+            fuel, 2,
+            "one expression charge plus one per-iteration charge"
+        );
+    }
+
+    #[test]
+    fn map_for_loop_binds_simple_key_and_value() {
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Str("b".into()), Value::Int(1));
+        map.insert(KeyValue::Str("a".into()), Value::Int(2));
+        let pattern = Pattern::Tuple(vec![
+            Pattern::Bind {
+                slot: Slot::new(1),
+                ty: TyId::new(0),
+            },
+            Pattern::Bind {
+                slot: Slot::new(2),
+                ty: TyId::new(0),
+            },
+        ]);
+        let (slots, fuel) = run_map_for_loop(pattern, 3, map);
+        assert_eq!(slots[1].as_ref().and_then(Value::as_str), Some("b"));
+        assert_eq!(bound_int(slots[2].as_ref()), Some(1));
+        assert_eq!(fuel, 2, "the tuple has no fuel charge of its own");
+    }
+
+    #[test]
+    fn map_for_loop_converts_an_int_key_once() {
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Int(7), Value::Int(1));
+        let pattern = Pattern::Tuple(vec![
+            Pattern::Bind {
+                slot: Slot::new(1),
+                ty: TyId::new(0),
+            },
+            Pattern::Bind {
+                slot: Slot::new(2),
+                ty: TyId::new(0),
+            },
+        ]);
+        let (slots, _) = run_map_for_loop(pattern, 3, map);
+        assert_eq!(bound_int(slots[1].as_ref()), Some(7));
+        assert_eq!(bound_int(slots[2].as_ref()), Some(1));
+    }
+
+    #[test]
+    fn map_for_loop_falls_back_to_an_entry_tuple_for_nested_key_patterns() {
+        let mut map = OrderedMap::new();
+        map.insert(
+            KeyValue::Tuple(vec![KeyValue::Str("nested".into())]),
+            Value::Int(5),
+        );
+        let pattern = Pattern::Tuple(vec![
+            Pattern::Tuple(vec![Pattern::Bind {
+                slot: Slot::new(1),
+                ty: TyId::new(0),
+            }]),
+            Pattern::Bind {
+                slot: Slot::new(2),
+                ty: TyId::new(0),
+            },
+        ]);
+        let (slots, _) = run_map_for_loop(pattern, 3, map);
+        assert_eq!(slots[1].as_ref().and_then(Value::as_str), Some("nested"));
+        assert_eq!(bound_int(slots[2].as_ref()), Some(5));
+    }
+
+    #[test]
+    fn map_for_loop_binds_wildcard_value_without_materialising_it() {
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Str("key".into()), Value::Int(1));
+        let pattern = Pattern::Tuple(vec![
+            Pattern::Bind {
+                slot: Slot::new(1),
+                ty: TyId::new(0),
+            },
+            Pattern::Wild,
+        ]);
+        let (slots, _) = run_map_for_loop(pattern, 2, map);
+        assert_eq!(slots[1].as_ref().and_then(Value::as_str), Some("key"));
+    }
+
+    #[test]
+    fn map_for_loop_wildcard_pair_binds_nothing() {
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Str("key".into()), Value::Int(1));
+        let pattern = Pattern::Tuple(vec![Pattern::Wild, Pattern::Wild]);
+        let (slots, fuel) = run_map_for_loop(pattern, 2, map);
+        assert!(slots.iter().skip(1).all(Option::is_none));
+        assert_eq!(fuel, 2);
+    }
+
+    #[test]
+    fn map_for_loop_keeps_the_whole_entry_pattern_fallback() {
+        let mut map = OrderedMap::new();
+        map.insert(KeyValue::Str("key".into()), Value::Int(9));
+        let pattern = Pattern::Bind {
+            slot: Slot::new(1),
+            ty: TyId::new(0),
+        };
+        let (slots, _) = run_map_for_loop(pattern, 2, map);
+        let Some(Value::Tuple(entry)) = slots[1].as_ref() else {
+            panic!("whole-entry pattern must bind the (key, value) tuple");
+        };
+        assert_eq!(entry[0].as_str(), Some("key"));
+        assert_eq!(entry[1].as_int(), Some(9));
     }
 }

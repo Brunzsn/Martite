@@ -1,7 +1,8 @@
+use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::rc::Rc;
 
-use indexmap::IndexMap;
+use indexmap::{Equivalent, IndexMap};
 use martite_fuel as fuel;
 use martite_ir::{BuiltinFnId, BuiltinItemId, CaptureIndex, FnId, TypeId};
 
@@ -343,9 +344,12 @@ impl MapValue {
         old
     }
 
-    pub(crate) fn remove_with_index(&mut self, key: &Key) -> Option<(usize, Value)> {
-        let stats = KeyStats::new(key);
-        let (index, value) = self.map.remove_with_index(key)?;
+    pub(crate) fn remove_with_index<Q>(&mut self, key: &Q) -> Option<(usize, Value)>
+    where
+        Q: ?Sized + Hash + Equivalent<Key>,
+    {
+        let (index, removed_key, value) = self.map.remove_with_key(key)?;
+        let stats = KeyStats::new(&removed_key);
         let entries = self.map.iter();
         self.meta
             .remove(EntryMeta::map(stats, value.meta()), |meta| {
@@ -536,11 +540,17 @@ impl OrderedMap {
         self.entries.is_empty()
     }
 
-    pub fn get(&self, key: &Key) -> Option<&Value> {
+    pub fn get<Q>(&self, key: &Q) -> Option<&Value>
+    where
+        Q: ?Sized + Hash + Equivalent<Key>,
+    {
         self.entries.get(key)
     }
 
-    pub fn get_mut(&mut self, key: &Key) -> Option<&mut Value> {
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut Value>
+    where
+        Q: ?Sized + Hash + Equivalent<Key>,
+    {
         self.entries.get_mut(key)
     }
 
@@ -554,15 +564,30 @@ impl OrderedMap {
     }
 
     /// Remove a key in O(n), preserving the order of the remaining keys.
-    pub fn remove(&mut self, key: &Key) -> Option<Value> {
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<Value>
+    where
+        Q: ?Sized + Hash + Equivalent<Key>,
+    {
         self.entries.shift_remove(key)
     }
 
     /// Remove a key in O(n), returning its former index for fuel accounting.
-    pub fn remove_with_index(&mut self, key: &Key) -> Option<(usize, Value)> {
+    pub fn remove_with_index<Q>(&mut self, key: &Q) -> Option<(usize, Value)>
+    where
+        Q: ?Sized + Hash + Equivalent<Key>,
+    {
         self.entries
             .shift_remove_full(key)
             .map(|(index, _, value)| (index, value))
+    }
+
+    /// Remove a key in O(n), returning the stored key, its former index and
+    /// its value.
+    pub(crate) fn remove_with_key<Q>(&mut self, key: &Q) -> Option<(usize, Key, Value)>
+    where
+        Q: ?Sized + Hash + Equivalent<Key>,
+    {
+        self.entries.shift_remove_full(key)
     }
 
     pub fn clear(&mut self) {
@@ -615,7 +640,7 @@ pub fn value_depth_exceeds(value: &Value, limit: usize) -> bool {
 
 pub type Key = KeyValue;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyValue {
     Int(i64),
     Bool(bool),
@@ -626,6 +651,370 @@ pub enum KeyValue {
     Option(Option<Box<KeyValue>>),
     Result(Result<Box<KeyValue>, Box<KeyValue>>),
     Handle(TypeId, String),
+}
+
+/// A borrowed view of a [`Value`] that can be used as a map key.
+///
+/// Lookups can compare this view against the stored [`KeyValue`] without
+/// allocating an owned key. Insertion still converts to an owned [`KeyValue`]
+/// through [`key_from_value`].
+#[derive(Debug, Clone, Copy)]
+pub enum KeyRef<'a> {
+    Int(i64),
+    Bool(bool),
+    Str(&'a str),
+    Tuple(&'a [Value]),
+    Struct(TypeId, &'a [Value]),
+    Enum(TypeId, usize, &'a [Value]),
+    Option(Option<&'a Value>),
+    Result(Result<&'a Value, &'a Value>),
+    Handle(TypeId, &'a str),
+}
+
+impl<'a> KeyRef<'a> {
+    /// Build a borrowed key view, rejecting values that cannot be map keys.
+    ///
+    /// Compound keys are validated recursively here so hashing and equality
+    /// can assume every nested value is key-shaped.
+    pub fn new(value: &'a Value) -> Result<Self, String> {
+        Ok(match value {
+            Value::Int(value) => Self::Int(*value),
+            Value::Bool(value) => Self::Bool(*value),
+            Value::Str(value) => Self::Str(value),
+            Value::Tuple(items) => {
+                for item in items.iter() {
+                    Self::new(item)?;
+                }
+                Self::Tuple(items)
+            }
+            Value::Struct(value) => {
+                for field in &value.fields {
+                    Self::new(field)?;
+                }
+                Self::Struct(value.type_id, &value.fields)
+            }
+            Value::Enum(value) => {
+                for item in &value.payload {
+                    Self::new(item)?;
+                }
+                Self::Enum(value.type_id, value.variant, &value.payload)
+            }
+            Value::Option(inner) => {
+                if let Some(inner) = inner.as_deref() {
+                    Self::new(inner)?;
+                }
+                Self::Option(inner.as_deref())
+            }
+            Value::Result(result) => {
+                let result = match result {
+                    Ok(value) => {
+                        Self::new(value)?;
+                        Ok(value.as_ref())
+                    }
+                    Err(value) => {
+                        Self::new(value)?;
+                        Err(value.as_ref())
+                    }
+                };
+                Self::Result(result)
+            }
+            Value::Handle(handle) => Self::Handle(handle.type_id, &handle.token),
+            _ => return Err("value cannot be used as a map key".into()),
+        })
+    }
+}
+
+impl Equivalent<KeyValue> for KeyRef<'_> {
+    fn equivalent(&self, key: &KeyValue) -> bool {
+        match (self, key) {
+            (KeyRef::Int(a), KeyValue::Int(b)) => a == b,
+            (KeyRef::Bool(a), KeyValue::Bool(b)) => a == b,
+            (KeyRef::Str(a), KeyValue::Str(b)) => *a == b.as_str(),
+            (KeyRef::Tuple(items), KeyValue::Tuple(keys)) => keys_match(items, keys),
+            (KeyRef::Struct(id, fields), KeyValue::Struct(key_id, keys)) => {
+                id == key_id && keys_match(fields, keys)
+            }
+            (KeyRef::Enum(id, variant, payload), KeyValue::Enum(key_id, key_variant, keys)) => {
+                id == key_id && variant == key_variant && keys_match(payload, keys)
+            }
+            (KeyRef::Option(inner), KeyValue::Option(key_inner)) => match (inner, key_inner) {
+                (None, None) => true,
+                (Some(value), Some(key)) => key_value_eq(value, key),
+                _ => false,
+            },
+            (KeyRef::Result(result), KeyValue::Result(key_result)) => match (result, key_result) {
+                (Ok(value), Ok(key)) | (Err(value), Err(key)) => key_value_eq(value, key),
+                _ => false,
+            },
+            (KeyRef::Handle(id, token), KeyValue::Handle(key_id, key_token)) => {
+                id == key_id && *token == key_token.as_str()
+            }
+            _ => false,
+        }
+    }
+}
+
+fn keys_match(values: &[Value], keys: &[KeyValue]) -> bool {
+    values.len() == keys.len()
+        && values
+            .iter()
+            .zip(keys.iter())
+            .all(|(value, key)| key_value_eq(value, key))
+}
+
+/// Compare a validated nested value against a stored key component.
+fn key_value_eq(value: &Value, key: &KeyValue) -> bool {
+    match (value, key) {
+        (Value::Int(a), KeyValue::Int(b)) => a == b,
+        (Value::Bool(a), KeyValue::Bool(b)) => a == b,
+        (Value::Str(a), KeyValue::Str(b)) => a.as_ref() == b.as_str(),
+        (Value::Tuple(items), KeyValue::Tuple(keys)) => keys_match(items, keys),
+        (Value::Struct(value), KeyValue::Struct(id, keys)) => {
+            value.type_id == *id && keys_match(&value.fields, keys)
+        }
+        (Value::Enum(value), KeyValue::Enum(id, variant, keys)) => {
+            value.type_id == *id && value.variant == *variant && keys_match(&value.payload, keys)
+        }
+        (Value::Option(inner), KeyValue::Option(key_inner)) => match (inner, key_inner) {
+            (None, None) => true,
+            (Some(value), Some(key)) => key_value_eq(value, key),
+            _ => false,
+        },
+        (Value::Result(result), KeyValue::Result(key_result)) => match (result, key_result) {
+            (Ok(value), Ok(key)) | (Err(value), Err(key)) => key_value_eq(value, key),
+            _ => false,
+        },
+        (Value::Handle(handle), KeyValue::Handle(id, token)) => {
+            handle.type_id == *id && handle.token == *token
+        }
+        _ => false,
+    }
+}
+
+// Tags keep `KeyValue` and `KeyRef` hashes identical. `IndexMap` hashes the
+// lookup key with its own `Hash` implementation, so a borrowed view must feed
+// the hasher the exact same bytes as the stored owned key.
+const KEY_TAG_INT: u8 = 0;
+const KEY_TAG_BOOL: u8 = 1;
+const KEY_TAG_STR: u8 = 2;
+const KEY_TAG_TUPLE: u8 = 3;
+const KEY_TAG_STRUCT: u8 = 4;
+const KEY_TAG_ENUM: u8 = 5;
+const KEY_TAG_OPTION: u8 = 6;
+const KEY_TAG_RESULT: u8 = 7;
+const KEY_TAG_HANDLE: u8 = 8;
+const KEY_TAG_INVALID: u8 = u8::MAX;
+
+impl Hash for KeyValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            KeyValue::Int(value) => {
+                KEY_TAG_INT.hash(state);
+                value.hash(state);
+            }
+            KeyValue::Bool(value) => {
+                KEY_TAG_BOOL.hash(state);
+                value.hash(state);
+            }
+            KeyValue::Str(value) => {
+                KEY_TAG_STR.hash(state);
+                value.as_str().hash(state);
+            }
+            KeyValue::Tuple(items) => {
+                KEY_TAG_TUPLE.hash(state);
+                items.len().hash(state);
+                for item in items {
+                    item.hash(state);
+                }
+            }
+            KeyValue::Struct(id, fields) => {
+                KEY_TAG_STRUCT.hash(state);
+                id.hash(state);
+                fields.len().hash(state);
+                for field in fields {
+                    field.hash(state);
+                }
+            }
+            KeyValue::Enum(id, variant, payload) => {
+                KEY_TAG_ENUM.hash(state);
+                id.hash(state);
+                variant.hash(state);
+                payload.len().hash(state);
+                for item in payload {
+                    item.hash(state);
+                }
+            }
+            KeyValue::Option(inner) => {
+                KEY_TAG_OPTION.hash(state);
+                match inner {
+                    None => 0u8.hash(state),
+                    Some(inner) => {
+                        1u8.hash(state);
+                        inner.hash(state);
+                    }
+                }
+            }
+            KeyValue::Result(result) => {
+                KEY_TAG_RESULT.hash(state);
+                match result {
+                    Ok(inner) => {
+                        0u8.hash(state);
+                        inner.hash(state);
+                    }
+                    Err(inner) => {
+                        1u8.hash(state);
+                        inner.hash(state);
+                    }
+                }
+            }
+            KeyValue::Handle(id, token) => {
+                KEY_TAG_HANDLE.hash(state);
+                id.hash(state);
+                token.as_str().hash(state);
+            }
+        }
+    }
+}
+
+impl Hash for KeyRef<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            KeyRef::Int(value) => {
+                KEY_TAG_INT.hash(state);
+                value.hash(state);
+            }
+            KeyRef::Bool(value) => {
+                KEY_TAG_BOOL.hash(state);
+                value.hash(state);
+            }
+            KeyRef::Str(value) => {
+                KEY_TAG_STR.hash(state);
+                value.hash(state);
+            }
+            KeyRef::Tuple(items) => {
+                KEY_TAG_TUPLE.hash(state);
+                items.len().hash(state);
+                for item in items.iter() {
+                    hash_key_value(item, state);
+                }
+            }
+            KeyRef::Struct(id, fields) => {
+                KEY_TAG_STRUCT.hash(state);
+                id.hash(state);
+                fields.len().hash(state);
+                for field in fields.iter() {
+                    hash_key_value(field, state);
+                }
+            }
+            KeyRef::Enum(id, variant, payload) => {
+                KEY_TAG_ENUM.hash(state);
+                id.hash(state);
+                variant.hash(state);
+                payload.len().hash(state);
+                for item in payload.iter() {
+                    hash_key_value(item, state);
+                }
+            }
+            KeyRef::Option(inner) => {
+                KEY_TAG_OPTION.hash(state);
+                match inner {
+                    None => 0u8.hash(state),
+                    Some(inner) => {
+                        1u8.hash(state);
+                        hash_key_value(inner, state);
+                    }
+                }
+            }
+            KeyRef::Result(result) => {
+                KEY_TAG_RESULT.hash(state);
+                match result {
+                    Ok(inner) => {
+                        0u8.hash(state);
+                        hash_key_value(inner, state);
+                    }
+                    Err(inner) => {
+                        1u8.hash(state);
+                        hash_key_value(inner, state);
+                    }
+                }
+            }
+            KeyRef::Handle(id, token) => {
+                KEY_TAG_HANDLE.hash(state);
+                id.hash(state);
+                token.hash(state);
+            }
+        }
+    }
+}
+
+fn hash_key_value<H: Hasher>(value: &Value, state: &mut H) {
+    match value {
+        Value::Int(value) => {
+            KEY_TAG_INT.hash(state);
+            value.hash(state);
+        }
+        Value::Bool(value) => {
+            KEY_TAG_BOOL.hash(state);
+            value.hash(state);
+        }
+        Value::Str(value) => {
+            KEY_TAG_STR.hash(state);
+            value.hash(state);
+        }
+        Value::Tuple(items) => {
+            KEY_TAG_TUPLE.hash(state);
+            items.len().hash(state);
+            for item in items.iter() {
+                hash_key_value(item, state);
+            }
+        }
+        Value::Struct(value) => {
+            KEY_TAG_STRUCT.hash(state);
+            value.type_id.hash(state);
+            value.fields.len().hash(state);
+            for field in &value.fields {
+                hash_key_value(field, state);
+            }
+        }
+        Value::Enum(value) => {
+            KEY_TAG_ENUM.hash(state);
+            value.type_id.hash(state);
+            value.variant.hash(state);
+            value.payload.len().hash(state);
+            for item in &value.payload {
+                hash_key_value(item, state);
+            }
+        }
+        Value::Option(inner) => {
+            KEY_TAG_OPTION.hash(state);
+            match inner {
+                None => 0u8.hash(state),
+                Some(inner) => {
+                    1u8.hash(state);
+                    hash_key_value(inner, state);
+                }
+            }
+        }
+        Value::Result(result) => {
+            KEY_TAG_RESULT.hash(state);
+            match result {
+                Ok(inner) => {
+                    0u8.hash(state);
+                    hash_key_value(inner, state);
+                }
+                Err(inner) => {
+                    1u8.hash(state);
+                    hash_key_value(inner, state);
+                }
+            }
+        }
+        Value::Handle(handle) => {
+            KEY_TAG_HANDLE.hash(state);
+            handle.type_id.hash(state);
+            handle.token.as_str().hash(state);
+        }
+        _ => KEY_TAG_INVALID.hash(state),
+    }
 }
 
 pub fn key_from_value(value: &Value) -> Result<KeyValue, String> {
@@ -957,6 +1346,196 @@ mod tests {
         b.insert(KeyValue::Str("y".into()), Value::Int(2));
         b.insert(KeyValue::Str("x".into()), Value::Int(1));
         assert!(a.eq_as_set(&b));
+    }
+
+    fn hash_of<T: Hash>(value: &T) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn borrowed_key(value: &Value) -> KeyRef<'_> {
+        KeyRef::new(value).expect("value is a key")
+    }
+
+    fn key_shapes() -> Vec<(KeyValue, Value)> {
+        vec![
+            (KeyValue::Str("text".into()), Value::str("text")),
+            (KeyValue::Int(-7), Value::Int(-7)),
+            (KeyValue::Bool(true), Value::Bool(true)),
+            (
+                KeyValue::Tuple(vec![
+                    KeyValue::Tuple(vec![KeyValue::Str("nested".into())]),
+                    KeyValue::Option(Some(Box::new(KeyValue::Int(4)))),
+                ]),
+                Value::tuple(vec![
+                    Value::tuple(vec![Value::str("nested")]),
+                    Value::Option(Some(Box::new(Value::Int(4)))),
+                ]),
+            ),
+            (
+                KeyValue::Struct(
+                    TypeId(3),
+                    vec![KeyValue::Str("field".into()), KeyValue::Bool(false)],
+                ),
+                Value::Struct(Rc::new(StructValue::new(
+                    TypeId(3),
+                    vec![Value::str("field"), Value::Bool(false)],
+                ))),
+            ),
+            (
+                KeyValue::Enum(
+                    TypeId(4),
+                    2,
+                    vec![
+                        KeyValue::Int(9),
+                        KeyValue::Result(Ok(Box::new(KeyValue::Str("ok".into())))),
+                    ],
+                ),
+                Value::Enum(Rc::new(EnumValue::new(
+                    TypeId(4),
+                    2,
+                    vec![Value::Int(9), Value::Result(Ok(Box::new(Value::str("ok"))))],
+                ))),
+            ),
+            (KeyValue::Option(None), Value::Option(None)),
+            (
+                KeyValue::Result(Err(Box::new(KeyValue::Bool(true)))),
+                Value::Result(Err(Box::new(Value::Bool(true)))),
+            ),
+            (
+                KeyValue::Handle(TypeId(5), "token".into()),
+                Value::Handle(Rc::new(HandleValue {
+                    type_id: TypeId(5),
+                    token: "token".into(),
+                })),
+            ),
+        ]
+    }
+
+    #[test]
+    fn borrowed_keys_hash_like_owned_keys() {
+        for (owned, value) in key_shapes() {
+            assert_eq!(
+                hash_of(&owned),
+                hash_of(&borrowed_key(&value)),
+                "hash mismatch for {owned:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_keys_look_up_every_key_shape() {
+        let shapes = key_shapes();
+        let mut map = OrderedMap::new();
+        for (index, (owned, _)) in shapes.iter().enumerate() {
+            map.insert(owned.clone(), Value::Int(index as i64));
+        }
+        for (index, (owned, value)) in shapes.iter().enumerate() {
+            let borrowed = borrowed_key(value);
+            assert_eq!(map.get(&borrowed), Some(&Value::Int(index as i64)));
+            assert_eq!(map.get(owned), Some(&Value::Int(index as i64)));
+        }
+        let order: Vec<_> = map.entries().iter().map(|(key, _)| key.clone()).collect();
+        assert_eq!(
+            order,
+            shapes
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>(),
+            "lookups must not change insertion order"
+        );
+
+        *map.get_mut(&borrowed_key(&Value::str("text")))
+            .expect("borrowed get_mut") = Value::Int(42);
+        assert_eq!(
+            map.get(&KeyValue::Str("text".into())),
+            Some(&Value::Int(42))
+        );
+
+        let removed = map
+            .remove(&borrowed_key(&Value::Int(-7)))
+            .expect("borrowed remove");
+        assert_eq!(removed.as_int(), Some(1));
+        let order: Vec<_> = map.entries().iter().map(|(key, _)| key.clone()).collect();
+        assert_eq!(
+            order,
+            shapes
+                .iter()
+                .filter(|(key, _)| *key != KeyValue::Int(-7))
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>(),
+            "removal must preserve the order of the remaining keys"
+        );
+    }
+
+    #[test]
+    fn borrowed_keys_reject_non_key_values_at_any_depth() {
+        for value in [
+            Value::Unit,
+            Value::Float(1.0),
+            Value::list(vec![Value::Int(1)]),
+            Value::map(OrderedMap::new()),
+            Value::tuple(vec![Value::Unit]),
+            Value::Struct(Rc::new(StructValue::new(
+                TypeId(1),
+                vec![Value::list(vec![Value::Int(1)])],
+            ))),
+            Value::Enum(Rc::new(EnumValue::new(
+                TypeId(2),
+                0,
+                vec![Value::Float(2.0)],
+            ))),
+            Value::Option(Some(Box::new(Value::Unit))),
+            Value::Result(Err(Box::new(Value::list(Vec::new())))),
+        ] {
+            assert!(KeyRef::new(&value).is_err(), "{value:?} is not a map key");
+        }
+    }
+
+    #[test]
+    fn borrowed_key_equivalence_checks_shape_and_contents() {
+        let key = KeyValue::Tuple(vec![
+            KeyValue::Int(1),
+            KeyValue::Struct(TypeId(3), vec![KeyValue::Bool(true)]),
+        ]);
+        let view_value = Value::tuple(vec![
+            Value::Int(1),
+            Value::Struct(Rc::new(StructValue::new(
+                TypeId(3),
+                vec![Value::Bool(true)],
+            ))),
+        ]);
+        let view = borrowed_key(&view_value);
+        assert!(view.equivalent(&key));
+
+        let wrong_length_value = Value::tuple(vec![Value::Int(1)]);
+        let wrong_length = borrowed_key(&wrong_length_value);
+        assert!(!wrong_length.equivalent(&key));
+
+        let wrong_type_value = Value::tuple(vec![
+            Value::Int(1),
+            Value::Struct(Rc::new(StructValue::new(
+                TypeId(4),
+                vec![Value::Bool(true)],
+            ))),
+        ]);
+        let wrong_type = borrowed_key(&wrong_type_value);
+        assert!(!wrong_type.equivalent(&key));
+
+        let wrong_value_value = Value::tuple(vec![
+            Value::Int(2),
+            Value::Struct(Rc::new(StructValue::new(
+                TypeId(3),
+                vec![Value::Bool(true)],
+            ))),
+        ]);
+        let wrong_value = borrowed_key(&wrong_value_value);
+        assert!(!wrong_value.equivalent(&key));
+
+        let none_value = Value::Option(None);
+        let none = borrowed_key(&none_value);
+        assert!(!none.equivalent(&KeyValue::Option(Some(Box::new(KeyValue::Int(1))))));
     }
 
     #[test]
