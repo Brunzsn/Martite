@@ -14,6 +14,7 @@ fn main() {
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (let_statement
         pattern: (pattern
           (binding_pattern
@@ -28,7 +29,8 @@ fn main() {
               value: (string
                 (string_content)
                 (interpolation
-                  value: (identifier))))))))))
+                  value: (identifier)))))))
+      (rbrace))))
 
 ==================
 interpolation: nested arithmetic
@@ -48,6 +50,7 @@ fn main() {
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (let_statement
         pattern: (pattern
           (binding_pattern
@@ -74,7 +77,8 @@ fn main() {
                     left: (identifier)
                     right: (multiplicative_expression
                       left: (identifier)
-                      right: (identifier))))))))))))
+                      right: (identifier)))))))))
+      (rbrace))))
 
 ==================
 interpolation: map literal and index
@@ -91,6 +95,7 @@ fn main() {
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (expression_statement
         expression: (call_expression
           function: (identifier)
@@ -100,12 +105,15 @@ fn main() {
                 (interpolation
                   value: (index_expression
                     base: (map_literal
+                      (map_lbrace)
                       (map_entry
                         key: (string
                           (string_content))
-                        value: (integer_literal)))
+                        value: (integer_literal))
+                      (rbrace))
                     index: (string
-                      (string_content))))))))))))
+                      (string_content)))))))))
+      (rbrace))))
 
 ==================
 interpolation: nested string
@@ -123,6 +131,7 @@ fn main() {
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (let_statement
         pattern: (pattern
           (binding_pattern
@@ -139,7 +148,8 @@ fn main() {
                     body: (string
                       (string_content)
                       (interpolation
-                        value: (identifier)))))))))))))
+                        value: (identifier))))))))))
+      (rbrace))))
 
 ==================
 interpolation: escaped braces and unicode escape
@@ -156,6 +166,7 @@ fn main() {
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (expression_statement
         expression: (call_expression
           function: (identifier)
@@ -167,7 +178,8 @@ fn main() {
                 (string_content)
                 (escape_sequence)
                 (string_content)
-                (escape_sequence)))))))))
+                (escape_sequence))))))
+      (rbrace))))
 
 ==================
 interpolation: empty interpolation is an error
@@ -179,18 +191,21 @@ fn main() {
 
 ---
 
-(source_file
-  (function_declaration
-    name: (identifier)
-    parameters: (parameter_list)
-    body: (block
-      (expression_statement
-        expression: (call_expression
-          function: (identifier)
-          arguments: (arguments
-            (argument
-              value: (string
-                (ERROR)))))))))
+    (source_file
+      (function_declaration
+        name: (identifier)
+        parameters: (parameter_list)
+        body: (block
+          (block_lbrace)
+          (expression_statement
+            expression: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (string
+                    (ERROR))))))
+          (rbrace))))
+
 
 ==================
 interpolation: malformed interpolation expression
@@ -202,20 +217,23 @@ fn main() {
 
 ---
 
-(source_file
-  (function_declaration
-    name: (identifier)
-    parameters: (parameter_list)
-    body: (block
-      (expression_statement
-        expression: (call_expression
-          function: (identifier)
-          arguments: (arguments
-            (argument
-              value: (string
-                (interpolation
-                  value: (integer_literal)
-                  (ERROR))))))))))
+    (source_file
+      (function_declaration
+        name: (identifier)
+        parameters: (parameter_list)
+        body: (block
+          (block_lbrace)
+          (expression_statement
+            expression: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (string
+                    (interpolation
+                      value: (integer_literal)
+                      (ERROR)))))))
+          (rbrace))))
+
 
 ==================
 interpolation: unterminated string recovers to the next statement
@@ -233,6 +251,7 @@ fn main() {
     (identifier)
     (parameter_list)
     (block
+      (block_lbrace)
       (let_statement
         (pattern
           (binding_pattern
@@ -245,4 +264,5 @@ fn main() {
           (arguments
             (argument
               (string
-                (string_content)))))))))
+                (string_content))))))
+      (rbrace))))

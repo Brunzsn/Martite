@@ -18,6 +18,7 @@ fn main() {
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (let_statement
         pattern: (pattern
           (binding_pattern
@@ -84,7 +85,8 @@ fn main() {
               function: (type_identifier)
               arguments: (arguments
                 (argument
-                  value: (integer_literal))))))))))
+                  value: (integer_literal)))))))
+      (rbrace))))
 
 ==================
 expressions: unary and postfix chains
@@ -108,6 +110,7 @@ fn main() {
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (let_statement
         pattern: (pattern
           (binding_pattern
@@ -190,7 +193,8 @@ fn main() {
                         field: (identifier))
                       arguments: (arguments))))))
             field: (identifier))
-          arguments: (arguments))))))
+          arguments: (arguments)))
+      (rbrace))))
 
 ==================
 expressions: conversions
@@ -209,6 +213,7 @@ fn main() {
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (let_statement
         pattern: (pattern
           (binding_pattern
@@ -226,7 +231,8 @@ fn main() {
           (binding_pattern
             name: (identifier)))
         value: (conversion_expression
-          value: (integer_literal))))))
+          value: (integer_literal)))
+      (rbrace))))
 
 ==================
 expressions: tuple list map and unit literals
@@ -252,6 +258,7 @@ fn main() {
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (let_statement
         pattern: (pattern
           (binding_pattern
@@ -290,6 +297,7 @@ fn main() {
           (binding_pattern
             name: (identifier)))
         value: (map_literal
+          (map_lbrace)
           (map_entry
             key: (string
               (string_content))
@@ -297,12 +305,16 @@ fn main() {
           (map_entry
             key: (string
               (string_content))
-            value: (integer_literal))))
+            value: (integer_literal))
+          (rbrace)))
       (let_statement
         pattern: (pattern
           (binding_pattern
             name: (identifier)))
-        value: (map_literal)))))
+        value: (map_literal
+          (map_lbrace)
+          (rbrace)))
+      (rbrace))))
 
 ==================
 expressions: struct literals shorthand and update
@@ -323,6 +335,7 @@ fn main() {
   (struct_declaration
     name: (type_identifier)
     body: (field_declaration_list
+      (list_lbrace)
       (field_declaration
         name: (identifier)
         type: (type
@@ -330,11 +343,13 @@ fn main() {
       (field_declaration
         name: (identifier)
         type: (type
-          (primitive_type)))))
+          (primitive_type)))
+      (rbrace)))
   (function_declaration
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (let_statement
         pattern: (pattern
           (binding_pattern
@@ -351,20 +366,25 @@ fn main() {
             name: (identifier)))
         value: (struct_literal
           name: (type_identifier)
+          (list_lbrace)
           (field_initializer
             name: (identifier))
           (field_initializer
-            name: (identifier))))
+            name: (identifier))
+          (rbrace)))
       (let_statement
         pattern: (pattern
           (binding_pattern
             name: (identifier)))
         value: (struct_literal
           name: (type_identifier)
+          (list_lbrace)
           base: (identifier)
           (field_initializer
             name: (identifier)
-            value: (integer_literal)))))))
+            value: (integer_literal))
+          (rbrace)))
+      (rbrace))))
 
 ==================
 expressions: if and else if
@@ -393,27 +413,35 @@ fn classify(n: int) -> str {
     return_type: (type
       (primitive_type))
     body: (block
+      (block_lbrace)
       (expression_statement
         expression: (if_expression
           condition: (comparison_expression
             left: (identifier)
             right: (integer_literal))
           consequence: (block
+            (block_lbrace)
             (expression_statement
               expression: (string
-                (string_content))))
+                (string_content)))
+            (rbrace))
           alternative: (if_expression
             condition: (comparison_expression
               left: (identifier)
               right: (integer_literal))
             consequence: (block
+              (block_lbrace)
               (expression_statement
                 expression: (string
-                  (string_content))))
+                  (string_content)))
+              (rbrace))
             alternative: (block
+              (block_lbrace)
               (expression_statement
                 expression: (string
-                  (string_content))))))))))
+                  (string_content)))
+              (rbrace)))))
+      (rbrace))))
 
 ==================
 expressions: match guards and qualified variants
@@ -436,6 +464,7 @@ fn score(token: Token) -> int {
   (enum_declaration
     name: (type_identifier)
     body: (variant_list
+      (list_lbrace)
       (variant
         name: (type_identifier)
         (variant_payload
@@ -447,7 +476,8 @@ fn score(token: Token) -> int {
           (type
             (primitive_type))))
       (variant
-        name: (type_identifier))))
+        name: (type_identifier))
+      (rbrace)))
   (function_declaration
     name: (identifier)
     parameters: (parameter_list
@@ -459,9 +489,11 @@ fn score(token: Token) -> int {
     return_type: (type
       (primitive_type))
     body: (block
+      (block_lbrace)
       (expression_statement
         expression: (match_expression
           value: (identifier)
+          (list_lbrace)
           (match_arm
             pattern: (pattern
               (variant_pattern
@@ -502,7 +534,9 @@ fn score(token: Token) -> int {
             pattern: (pattern
               (variant_pattern
                 name: (type_identifier)))
-            body: (integer_literal)))))))
+            body: (integer_literal))
+          (rbrace)))
+      (rbrace))))
 
 ==================
 expressions: lambda forms
@@ -522,6 +556,7 @@ fn main() {
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (let_statement
         pattern: (pattern
           (binding_pattern
@@ -554,10 +589,12 @@ fn main() {
           return_type: (type
             (primitive_type))
           body: (block
+            (block_lbrace)
             (expression_statement
               expression: (additive_expression
                 left: (identifier)
-                right: (identifier))))))
+                right: (identifier)))
+            (rbrace))))
       (let_statement
         pattern: (pattern
           (binding_pattern
@@ -589,7 +626,8 @@ fn main() {
                       (argument
                         value: (index_expression
                           base: (identifier)
-                          index: (integer_literal))))))))))))))
+                          index: (integer_literal)))))))))))
+      (rbrace))))
 
 ==================
 expressions: parenthesized struct literal in a control-flow head
@@ -607,14 +645,17 @@ fn main() {
   (struct_declaration
     name: (type_identifier)
     body: (field_declaration_list
+      (list_lbrace)
       (field_declaration
         name: (identifier)
         type: (type
-          (primitive_type)))))
+          (primitive_type)))
+      (rbrace)))
   (function_declaration
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (expression_statement
         expression: (if_expression
           condition: (comparison_expression
@@ -622,19 +663,24 @@ fn main() {
               base: (parenthesized_expression
                 value: (struct_literal
                   name: (type_identifier)
+                  (list_lbrace)
                   (field_initializer
                     name: (identifier)
-                    value: (integer_literal))))
+                    value: (integer_literal))
+                  (rbrace)))
               field: (identifier))
             right: (integer_literal))
           consequence: (block
+            (block_lbrace)
             (expression_statement
               expression: (call_expression
                 function: (identifier)
                 arguments: (arguments
                   (argument
                     value: (string
-                      (string_content))))))))))))
+                      (string_content))))))
+            (rbrace))))
+      (rbrace))))
 
 ==================
 expressions: struct literal in a control-flow head is an error
@@ -648,38 +694,47 @@ fn main() {
 
 ---
 
-(source_file
-  (struct_declaration
-    name: (type_identifier)
-    body: (field_declaration_list
-      (field_declaration
+    (source_file
+      (struct_declaration
+        name: (type_identifier)
+        body: (field_declaration_list
+          (list_lbrace)
+          (field_declaration
+            name: (identifier)
+            type: (type
+              (primitive_type)))
+          (rbrace)))
+      (function_declaration
         name: (identifier)
-        type: (type
-          (primitive_type)))))
-  (function_declaration
-    name: (identifier)
-    parameters: (parameter_list)
-    (ERROR
-      (comparison_expression
-        left: (field_expression
-          base: (if_expression
-            condition: (type_identifier)
-            consequence: (block
-              (ERROR
-                (identifier))
-              (expression_statement
-                expression: (integer_literal))))
-          field: (identifier))
-        right: (integer_literal)))
-    body: (block
-      (expression_statement
-        expression: (call_expression
-          function: (identifier)
-          arguments: (arguments
-            (argument
-              value: (string
-                (string_content))))))))
-  (ERROR))
+        parameters: (parameter_list)
+        (ERROR
+          (block_lbrace)
+          (comparison_expression
+            left: (field_expression
+              base: (if_expression
+                condition: (type_identifier)
+                consequence: (block
+                  (block_lbrace)
+                  (ERROR
+                    (identifier))
+                  (expression_statement
+                    expression: (integer_literal))
+                  (rbrace)))
+              field: (identifier))
+            right: (integer_literal)))
+        body: (block
+          (block_lbrace)
+          (expression_statement
+            expression: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (string
+                    (string_content))))))
+          (rbrace)))
+      (ERROR
+        (rbrace)))
+
 
 ==================
 expressions: unparenthesized map arm is a block
@@ -693,22 +748,28 @@ fn choose() -> int {
 
 ---
 
-(source_file
-  (function_declaration
-    name: (identifier)
-    parameters: (parameter_list)
-    return_type: (type
-      (primitive_type))
-    body: (block
-      (expression_statement
-        expression: (match_expression
-          value: (integer_literal)
-          (match_arm
-            pattern: (pattern
-              (wildcard_pattern))
-            body: (block
-              (expression_statement
-                expression: (string
-                  (string_content)))
-              (ERROR
-                (integer_literal)))))))))
+    (source_file
+      (function_declaration
+        name: (identifier)
+        parameters: (parameter_list)
+        return_type: (type
+          (primitive_type))
+        body: (block
+          (block_lbrace)
+          (expression_statement
+            expression: (match_expression
+              value: (integer_literal)
+              (list_lbrace)
+              (match_arm
+                pattern: (pattern
+                  (wildcard_pattern))
+                body: (block
+                  (block_lbrace)
+                  (expression_statement
+                    expression: (string
+                      (string_content)))
+                  (ERROR
+                    (integer_literal))
+                  (rbrace)))
+              (rbrace)))
+          (rbrace))))

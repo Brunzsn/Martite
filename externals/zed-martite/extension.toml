@@ -1,0 +1,12 @@
+id = "martite"
+name = "Martite"
+version = "0.1.0"
+schema_version = 1
+authors = ["Martite contributors"]
+description = "Martite language support: grammar, highlights, brackets, outline, text objects, and CLI tasks."
+repository = "https://github.com/Brunzsn/Martite"
+
+[grammars.martite]
+repository = "https://github.com/Brunzsn/Martite"
+rev = "b51ac50ce254f40bcee48a24be1375863f8984f7"
+path = "externals/tree-sitter-martite"

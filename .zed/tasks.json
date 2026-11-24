@@ -1,0 +1,32 @@
+[
+  {
+    "label": "martite (repo): check",
+    "command": "cargo",
+    "args": ["run", "-q", "-p", "martite-cli", "--", "check", "$ZED_FILE"],
+    "save": "all"
+  },
+  {
+    "label": "martite (repo): lint",
+    "command": "cargo",
+    "args": ["run", "-q", "-p", "martite-cli", "--", "lint", "$ZED_FILE"],
+    "save": "all"
+  },
+  {
+    "label": "martite (repo): run",
+    "command": "cargo",
+    "args": ["run", "-q", "-p", "martite-cli", "--", "run", "$ZED_FILE"],
+    "save": "all"
+  },
+  {
+    "label": "martite (repo): test",
+    "command": "cargo",
+    "args": ["run", "-q", "-p", "martite-cli", "--", "test", "$ZED_FILE"],
+    "save": "all"
+  },
+  {
+    "label": "martite (repo): fmt",
+    "command": "cargo",
+    "args": ["run", "-q", "-p", "martite-cli", "--", "fmt", "$ZED_FILE"],
+    "save": "all"
+  }
+]

@@ -41,13 +41,15 @@ fn main() { print("ok") }
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (expression_statement
         expression: (call_expression
           function: (identifier)
           arguments: (arguments
             (argument
               value: (string
-                (string_content)))))))))
+                (string_content))))))
+      (rbrace))))
 
 ==================
 items: visibility and declarations
@@ -75,6 +77,7 @@ fn private_helper() -> int { LIMIT }
     type_parameters: (plain_type_parameters
       (type_identifier))
     body: (field_declaration_list
+      (list_lbrace)
       (field_declaration
         name: (identifier)
         type: (type
@@ -82,13 +85,15 @@ fn private_helper() -> int { LIMIT }
             type_arguments: (type_arguments
               (type
                 (named_type
-                  name: (type_identifier)))))))))
+                  name: (type_identifier)))))))
+      (rbrace)))
   (enum_declaration
     (visibility)
     name: (type_identifier)
     type_parameters: (plain_type_parameters
       (type_identifier))
     body: (variant_list
+      (list_lbrace)
       (variant
         name: (type_identifier)
         (variant_payload
@@ -96,7 +101,8 @@ fn private_helper() -> int { LIMIT }
             (named_type
               name: (type_identifier)))))
       (variant
-        name: (type_identifier))))
+        name: (type_identifier))
+      (rbrace)))
   (const_declaration
     (visibility)
     name: (constant)
@@ -114,20 +120,26 @@ fn private_helper() -> int { LIMIT }
           (type
             (primitive_type)))))
     body: (block
+      (block_lbrace)
       (expression_statement
         expression: (struct_literal
           name: (type_identifier)
+          (list_lbrace)
           (field_initializer
             name: (identifier)
-            value: (list_literal))))))
+            value: (list_literal))
+          (rbrace)))
+      (rbrace)))
   (function_declaration
     name: (identifier)
     parameters: (parameter_list)
     return_type: (type
       (primitive_type))
     body: (block
+      (block_lbrace)
       (expression_statement
-        expression: (constant)))))
+        expression: (constant))
+      (rbrace))))
 
 ==================
 items: impl blocks with associated functions and methods
@@ -155,6 +167,7 @@ impl[T] Stack[T] {
     type_parameters: (plain_type_parameters
       (type_identifier))
     body: (field_declaration_list
+      (list_lbrace)
       (field_declaration
         name: (identifier)
         type: (type
@@ -162,7 +175,8 @@ impl[T] Stack[T] {
             type_arguments: (type_arguments
               (type
                 (named_type
-                  name: (type_identifier)))))))))
+                  name: (type_identifier)))))))
+      (rbrace)))
   (impl_declaration
     type_parameters: (type_parameters
       (type_parameter
@@ -172,6 +186,7 @@ impl[T] Stack[T] {
       (type
         (named_type
           name: (type_identifier))))
+    (list_lbrace)
     (function_declaration
       (visibility)
       name: (identifier)
@@ -184,12 +199,16 @@ impl[T] Stack[T] {
               (named_type
                 name: (type_identifier))))))
       body: (block
+        (block_lbrace)
         (expression_statement
           expression: (struct_literal
             name: (type_identifier)
+            (list_lbrace)
             (field_initializer
               name: (identifier)
-              value: (list_literal))))))
+              value: (list_literal))
+            (rbrace)))
+        (rbrace)))
     (function_declaration
       (visibility)
       name: (identifier)
@@ -201,6 +220,7 @@ impl[T] Stack[T] {
             (named_type
               name: (type_identifier)))))
       body: (block
+        (block_lbrace)
         (expression_statement
           expression: (call_expression
             function: (field_expression
@@ -210,7 +230,8 @@ impl[T] Stack[T] {
               field: (identifier))
             arguments: (arguments
               (argument
-                value: (identifier)))))))
+                value: (identifier)))))
+        (rbrace)))
     (function_declaration
       name: (identifier)
       parameters: (parameter_list
@@ -220,6 +241,7 @@ impl[T] Stack[T] {
           type: (named_type
             name: (type_identifier))))
       body: (block
+        (block_lbrace)
         (expression_statement
           expression: (call_expression
             function: (field_expression
@@ -227,7 +249,9 @@ impl[T] Stack[T] {
                 base: (self_expression)
                 field: (identifier))
               field: (identifier))
-            arguments: (arguments)))))))
+            arguments: (arguments)))
+        (rbrace)))
+    (rbrace)))
 
 ==================
 items: tests and handlers
@@ -262,14 +286,17 @@ on saved(doc: int) -> int { doc }
     return_type: (type
       (primitive_type))
     body: (block
+      (block_lbrace)
       (expression_statement
         expression: (additive_expression
           left: (identifier)
-          right: (identifier)))))
+          right: (identifier)))
+      (rbrace)))
   (test_declaration
     name: (string
       (string_content))
     body: (block
+      (block_lbrace)
       (expression_statement
         expression: (call_expression
           function: (identifier)
@@ -286,7 +313,8 @@ on saved(doc: int) -> int { doc }
                 right: (integer_literal)))
             (argument
               value: (string
-                (string_content))))))))
+                (string_content))))))
+      (rbrace)))
   (on_declaration
     name: (identifier)
     parameters: (parameter_list
@@ -297,12 +325,16 @@ on saved(doc: int) -> int { doc }
     return_type: (type
       (primitive_type))
     body: (block
+      (block_lbrace)
       (expression_statement
-        expression: (identifier))))
+        expression: (identifier))
+      (rbrace)))
   (on_declaration
     name: (identifier)
     parameters: (parameter_list)
-    body: (block))
+    body: (block
+      (block_lbrace)
+      (rbrace)))
   (on_declaration
     name: (identifier)
     parameters: (parameter_list
@@ -313,5 +345,7 @@ on saved(doc: int) -> int { doc }
     return_type: (type
       (primitive_type))
     body: (block
+      (block_lbrace)
       (expression_statement
-        expression: (identifier)))))
+        expression: (identifier))
+      (rbrace))))

@@ -29,18 +29,27 @@ The workspace is split along the compiler pipeline:
 `externals/tree-sitter-martite/` contains the tree-sitter grammar used by editor
 integrations for `.mt` source and `.mti` interface files. The Rust parser
 remains normative; the grammar is a tooling-only package and no production
-crate depends on it. Future editor integrations, such as the Zed extension,
-can live alongside it under `externals/`.
+crate depends on it.
+
+`grammar.ts` is the typed source of truth and is transpiled to the checked-in
+`grammar.js`. The same `query-spec.ts` metadata generates the canonical
+tree-sitter queries and the Zed extension queries under
+`externals/zed-martite/`.
 
 ```sh
 cd externals/tree-sitter-martite
-pnpm install
-pnpm run check
+bun install
+bun run check
 ```
 
+`bun run generate` regenerates `grammar.js`, `src/`, the canonical queries, and
+the Zed extension files. The Zed extension can be installed from
+`externals/zed-martite` with `zed: install dev extension`; see
+[`externals/zed-martite/README.md`](externals/zed-martite/README.md).
+
 See [`externals/tree-sitter-martite/README.md`](externals/tree-sitter-martite/README.md)
-for the pinned tree-sitter version, corpus layout, node names, and the Zed
-manifest snippet.
+for the pinned tree-sitter version, corpus layout, node names, and grammar
+pinning.
 
 ## Architecture
 

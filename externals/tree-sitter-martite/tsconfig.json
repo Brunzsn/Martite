@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "allowJs": false,
+    "lib": ["ES2023"],
+    "module": "Preserve",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "strict": true,
+    "target": "ES2023",
+    "types": ["bun"],
+    "verbatimModuleSyntax": true
+  },
+  "include": ["grammar.ts", "query-spec.ts", "scripts/**/*.ts"]
+}

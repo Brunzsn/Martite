@@ -22,6 +22,7 @@ struct Point { x: int, y: int }
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (let_statement
         pattern: (pattern
           (binding_pattern
@@ -62,27 +63,33 @@ struct Point { x: int, y: int }
         pattern: (pattern
           (struct_pattern
             type: (type_identifier)
+            (list_lbrace)
             (field_pattern
               name: (identifier))
             (field_pattern
-              name: (identifier))))
+              name: (identifier))
+            (rbrace)))
         value: (struct_literal
           name: (type_identifier)
+          (list_lbrace)
           (field_initializer
             name: (identifier)
             value: (integer_literal))
           (field_initializer
             name: (identifier)
-            value: (integer_literal))))
+            value: (integer_literal))
+          (rbrace)))
       (expression_statement
         expression: (identifier)
         value: (integer_literal))
       (expression_statement
         expression: (identifier)
-        value: (integer_literal))))
+        value: (integer_literal))
+      (rbrace)))
   (struct_declaration
     name: (type_identifier)
     body: (field_declaration_list
+      (list_lbrace)
       (field_declaration
         name: (identifier)
         type: (type
@@ -90,7 +97,8 @@ struct Point { x: int, y: int }
       (field_declaration
         name: (identifier)
         type: (type
-          (primitive_type))))))
+          (primitive_type)))
+      (rbrace))))
 
 ==================
 statements: while for and jumps
@@ -116,6 +124,7 @@ fn main() {
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (var_statement
         pattern: (pattern
           (binding_pattern
@@ -126,6 +135,7 @@ fn main() {
           left: (identifier)
           right: (integer_literal))
         body: (block
+          (block_lbrace)
           (expression_statement
             expression: (identifier)
             value: (integer_literal))
@@ -135,14 +145,19 @@ fn main() {
                 left: (identifier)
                 right: (integer_literal))
               consequence: (block
-                (continue_statement))))
+                (block_lbrace)
+                (continue_statement)
+                (rbrace))))
           (expression_statement
             expression: (if_expression
               condition: (comparison_expression
                 left: (identifier)
                 right: (integer_literal))
               consequence: (block
-                (break_statement))))))
+                (block_lbrace)
+                (break_statement)
+                (rbrace))))
+          (rbrace)))
       (for_statement
         pattern: (pattern
           (binding_pattern
@@ -152,6 +167,7 @@ fn main() {
           (integer_literal)
           (integer_literal))
         body: (block
+          (block_lbrace)
           (expression_statement
             expression: (call_expression
               function: (identifier)
@@ -159,8 +175,10 @@ fn main() {
                 (argument
                   value: (string
                     (interpolation
-                      value: (identifier)))))))))
-      (return_statement))))
+                      value: (identifier)))))))
+          (rbrace)))
+      (return_statement)
+      (rbrace))))
 
 ==================
 statements: assignments
@@ -183,6 +201,7 @@ fn main() {
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (var_statement
         pattern: (pattern
           (binding_pattern
@@ -205,7 +224,8 @@ fn main() {
         value: (integer_literal))
       (expression_statement
         expression: (identifier)
-        value: (integer_literal)))))
+        value: (integer_literal))
+      (rbrace))))
 
 ==================
 statements: final statement needs no newline
@@ -225,13 +245,15 @@ fn value() -> int {
     return_type: (type
       (primitive_type))
     body: (block
+      (block_lbrace)
       (let_statement
         pattern: (pattern
           (binding_pattern
             name: (identifier)))
         value: (integer_literal))
       (expression_statement
-        expression: (identifier)))))
+        expression: (identifier))
+      (rbrace))))
 
 ==================
 statements: return with a newline returns unit
@@ -249,6 +271,8 @@ fn early() {
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (return_statement)
       (expression_statement
-        expression: (integer_literal)))))
+        expression: (integer_literal))
+      (rbrace))))

@@ -15,6 +15,7 @@ fn main() {
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (let_statement
         pattern: (pattern
           (binding_pattern
@@ -34,7 +35,8 @@ fn main() {
                 (interpolation
                   value: (additive_expression
                     left: (identifier)
-                    right: (identifier)))))))))))
+                    right: (identifier))))))))
+      (rbrace))))
 
 ==================
 newlines: same-line statements are an error
@@ -44,20 +46,23 @@ fn main() { let x = 1 let y = 2 }
 
 ---
 
-(source_file
-  (function_declaration
-    name: (identifier)
-    parameters: (parameter_list)
-    body: (block
-      (let_statement
-        pattern: (pattern
-          (binding_pattern
-            name: (identifier)))
-        value: (integer_literal))
-      (ERROR
-        (identifier)
-        (identifier)
-        (integer_literal)))))
+    (source_file
+      (function_declaration
+        name: (identifier)
+        parameters: (parameter_list)
+        body: (block
+          (block_lbrace)
+          (let_statement
+            pattern: (pattern
+              (binding_pattern
+                name: (identifier)))
+            value: (integer_literal))
+          (ERROR
+            (identifier)
+            (identifier)
+            (integer_literal))
+          (rbrace))))
+
 
 ==================
 newlines: continuation after operators and punctuation
@@ -83,6 +88,7 @@ fn foo(a: int, b: int) -> int { a + b }
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (let_statement
         pattern: (pattern
           (binding_pattern
@@ -115,7 +121,8 @@ fn foo(a: int, b: int) -> int { a + b }
             (argument
               value: (integer_literal))
             (argument
-              value: (integer_literal)))))))
+              value: (integer_literal)))))
+      (rbrace)))
   (function_declaration
     name: (identifier)
     parameters: (parameter_list
@@ -130,10 +137,12 @@ fn foo(a: int, b: int) -> int { a + b }
     return_type: (type
       (primitive_type))
     body: (block
+      (block_lbrace)
       (expression_statement
         expression: (additive_expression
           left: (identifier)
-          right: (identifier))))))
+          right: (identifier)))
+      (rbrace))))
 
 ==================
 newlines: continuation before dot else and or coalesce
@@ -157,6 +166,7 @@ fn main() {
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (let_statement
         pattern: (pattern
           (binding_pattern
@@ -181,11 +191,15 @@ fn main() {
             left: (identifier)
             right: (integer_literal))
           consequence: (block
+            (block_lbrace)
             (expression_statement
-              expression: (integer_literal)))
+              expression: (integer_literal))
+            (rbrace))
           alternative: (block
+            (block_lbrace)
             (expression_statement
-              expression: (integer_literal)))))
+              expression: (integer_literal))
+            (rbrace))))
       (let_statement
         pattern: (pattern
           (binding_pattern
@@ -199,7 +213,8 @@ fn main() {
             name: (identifier)))
         value: (coalesce_expression
           left: (type_identifier)
-          right: (integer_literal))))))
+          right: (integer_literal)))
+      (rbrace))))
 
 ==================
 newlines: newlines are ignored in list-style braces
@@ -236,6 +251,7 @@ fn main() {
   (struct_declaration
     name: (type_identifier)
     body: (field_declaration_list
+      (list_lbrace)
       (field_declaration
         name: (identifier)
         type: (type
@@ -243,35 +259,42 @@ fn main() {
       (field_declaration
         name: (identifier)
         type: (type
-          (primitive_type)))))
+          (primitive_type)))
+      (rbrace)))
   (enum_declaration
     name: (type_identifier)
     body: (variant_list
+      (list_lbrace)
       (variant
         name: (type_identifier))
       (variant
-        name: (type_identifier))))
+        name: (type_identifier))
+      (rbrace)))
   (function_declaration
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (let_statement
         pattern: (pattern
           (binding_pattern
             name: (identifier)))
         value: (struct_literal
           name: (type_identifier)
+          (list_lbrace)
           (field_initializer
             name: (identifier)
             value: (integer_literal))
           (field_initializer
             name: (identifier)
-            value: (integer_literal))))
+            value: (integer_literal))
+          (rbrace)))
       (let_statement
         pattern: (pattern
           (binding_pattern
             name: (identifier)))
         value: (map_literal
+          (map_lbrace)
           (map_entry
             key: (string
               (string_content))
@@ -279,12 +302,14 @@ fn main() {
           (map_entry
             key: (string
               (string_content))
-            value: (integer_literal))))
+            value: (integer_literal))
+          (rbrace)))
       (expression_statement
         expression: (match_expression
           value: (field_expression
             base: (identifier)
             field: (identifier))
+          (list_lbrace)
           (match_arm
             pattern: (pattern
               (literal_pattern
@@ -303,7 +328,9 @@ fn main() {
               arguments: (arguments
                 (argument
                   value: (string
-                    (string_content)))))))))))
+                    (string_content))))))
+          (rbrace)))
+      (rbrace))))
 
 ==================
 newlines: blocks inside parentheses
@@ -325,6 +352,7 @@ fn main() {
     name: (identifier)
     parameters: (parameter_list)
     body: (block
+      (block_lbrace)
       (let_statement
         pattern: (pattern
           (binding_pattern
@@ -348,6 +376,7 @@ fn main() {
                     (binding_pattern
                       name: (identifier))))
                 body: (block
+                  (block_lbrace)
                   (let_statement
                     pattern: (pattern
                       (binding_pattern
@@ -356,7 +385,8 @@ fn main() {
                       left: (identifier)
                       right: (integer_literal)))
                   (expression_statement
-                    expression: (identifier))))))))
+                    expression: (identifier))
+                  (rbrace)))))))
       (expression_statement
         expression: (call_expression
           function: (identifier)
@@ -368,7 +398,8 @@ fn main() {
                     function: (field_expression
                       base: (identifier)
                       field: (identifier))
-                    arguments: (arguments)))))))))))
+                    arguments: (arguments))))))))
+      (rbrace))))
 
 ==================
 newlines: comparison and range are non-associative
@@ -378,31 +409,34 @@ fn compare(a: int, b: int, c: int) -> bool { a < b < c }
 
 ---
 
-(source_file
-  (function_declaration
-    name: (identifier)
-    parameters: (parameter_list
-      (parameter
+    (source_file
+      (function_declaration
         name: (identifier)
-        type: (type
-          (primitive_type)))
-      (parameter
-        name: (identifier)
-        type: (type
-          (primitive_type)))
-      (parameter
-        name: (identifier)
-        type: (type
-          (primitive_type))))
-    return_type: (type
-      (primitive_type))
-    body: (block
-      (expression_statement
-        expression: (comparison_expression
-          left: (identifier)
-          right: (identifier)))
-      (ERROR
-        (identifier)))))
+        parameters: (parameter_list
+          (parameter
+            name: (identifier)
+            type: (type
+              (primitive_type)))
+          (parameter
+            name: (identifier)
+            type: (type
+              (primitive_type)))
+          (parameter
+            name: (identifier)
+            type: (type
+              (primitive_type))))
+        return_type: (type
+          (primitive_type))
+        body: (block
+          (block_lbrace)
+          (expression_statement
+            expression: (comparison_expression
+              left: (identifier)
+              right: (identifier)))
+          (ERROR
+            (identifier))
+          (rbrace))))
+
 
 ==================
 newlines: range is non-associative
@@ -412,32 +446,35 @@ fn range(a: int, b: int, c: int) { let x = a..b..c }
 
 ---
 
-(source_file
-  (function_declaration
-    name: (identifier)
-    parameters: (parameter_list
-      (parameter
+    (source_file
+      (function_declaration
         name: (identifier)
-        type: (type
-          (primitive_type)))
-      (parameter
-        name: (identifier)
-        type: (type
-          (primitive_type)))
-      (parameter
-        name: (identifier)
-        type: (type
-          (primitive_type))))
-    body: (block
-      (let_statement
-        pattern: (pattern
-          (binding_pattern
-            name: (identifier)))
-        value: (range_expression
-          start: (identifier)
-          end: (identifier)))
-      (ERROR
-        (identifier)))))
+        parameters: (parameter_list
+          (parameter
+            name: (identifier)
+            type: (type
+              (primitive_type)))
+          (parameter
+            name: (identifier)
+            type: (type
+              (primitive_type)))
+          (parameter
+            name: (identifier)
+            type: (type
+              (primitive_type))))
+        body: (block
+          (block_lbrace)
+          (let_statement
+            pattern: (pattern
+              (binding_pattern
+                name: (identifier)))
+            value: (range_expression
+              start: (identifier)
+              end: (identifier)))
+          (ERROR
+            (identifier))
+          (rbrace))))
+
 
 ==================
 newlines: missing comma between match expression arms
@@ -453,32 +490,36 @@ fn choose(x: int) -> int {
 
 ---
 
-(source_file
-  (function_declaration
-    name: (identifier)
-    parameters: (parameter_list
-      (parameter
+    (source_file
+      (function_declaration
         name: (identifier)
-        type: (type
-          (primitive_type))))
-    return_type: (type
-      (primitive_type))
-    body: (block
-      (expression_statement
-        expression: (match_expression
-          value: (identifier)
-          (match_arm
-            pattern: (pattern
-              (literal_pattern
-                (integer_literal)))
-            body: (integer_literal))
-          (MISSING ",")
-          (match_arm
-            pattern: (pattern
-              (literal_pattern
-                (integer_literal)))
-            body: (integer_literal))
-          (match_arm
-            pattern: (pattern
-              (wildcard_pattern))
-            body: (integer_literal)))))))
+        parameters: (parameter_list
+          (parameter
+            name: (identifier)
+            type: (type
+              (primitive_type))))
+        return_type: (type
+          (primitive_type))
+        body: (block
+          (block_lbrace)
+          (expression_statement
+            expression: (match_expression
+              value: (identifier)
+              (list_lbrace)
+              (match_arm
+                pattern: (pattern
+                  (literal_pattern
+                    (integer_literal)))
+                body: (integer_literal))
+              (MISSING ",")
+              (match_arm
+                pattern: (pattern
+                  (literal_pattern
+                    (integer_literal)))
+                body: (integer_literal))
+              (match_arm
+                pattern: (pattern
+                  (wildcard_pattern))
+                body: (integer_literal))
+              (rbrace)))
+          (rbrace))))

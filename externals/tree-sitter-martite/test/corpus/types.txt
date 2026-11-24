@@ -129,12 +129,14 @@ fn sample(
           (type
             (primitive_type)))))
     body: (block
+      (block_lbrace)
       (expression_statement
         expression: (call_expression
           function: (type_identifier)
           arguments: (arguments
             (argument
-              value: (type_identifier))))))))
+              value: (type_identifier)))))
+      (rbrace))))
 
 ==================
 types: generics and bounds
@@ -175,17 +177,23 @@ impl[T: Show] Stack[T] {
       (named_type
         name: (type_identifier)))
     body: (block
+      (block_lbrace)
       (expression_statement
         expression: (if_expression
           condition: (comparison_expression
             left: (identifier)
             right: (identifier))
           consequence: (block
+            (block_lbrace)
             (expression_statement
-              expression: (identifier)))
+              expression: (identifier))
+            (rbrace))
           alternative: (block
+            (block_lbrace)
             (expression_statement
-              expression: (identifier)))))))
+              expression: (identifier))
+            (rbrace))))
+      (rbrace)))
   (impl_declaration
     type_parameters: (type_parameters
       (type_parameter
@@ -197,6 +205,7 @@ impl[T: Show] Stack[T] {
       (type
         (named_type
           name: (type_identifier))))
+    (list_lbrace)
     (function_declaration
       name: (identifier)
       parameters: (parameter_list
@@ -204,12 +213,15 @@ impl[T: Show] Stack[T] {
       return_type: (type
         (primitive_type))
       body: (block
+        (block_lbrace)
         (expression_statement
           expression: (string
             (interpolation
               value: (field_expression
                 base: (self_expression)
-                field: (identifier)))))))))
+                field: (identifier)))))
+        (rbrace)))
+    (rbrace)))
 
 ==================
 types: nested generic arguments
@@ -245,8 +257,10 @@ fn nested(value: list[map[str, Option[list[int]]]]) -> int { 0 }
     return_type: (type
       (primitive_type))
     body: (block
+      (block_lbrace)
       (expression_statement
-        expression: (integer_literal)))))
+        expression: (integer_literal))
+      (rbrace))))
 
 ==================
 types: optional binds to the base type
@@ -278,13 +292,15 @@ fn reads(value: fn() -> int?) -> Option[fn() -> int] {
               return_type: (type
                 (primitive_type)))))))
     body: (block
+      (block_lbrace)
       (expression_statement
         expression: (call_expression
           function: (type_identifier)
           arguments: (arguments
             (argument
               value: (lambda_expression
-                body: (integer_literal)))))))))
+                body: (integer_literal))))))
+      (rbrace))))
 
 ==================
 types: double optional is not syntax
@@ -294,18 +310,20 @@ fn bad(value: int??) -> int { 0 }
 
 ---
 
-(source_file
-  (function_declaration
-    name: (identifier)
-    parameters: (parameter_list
-      (parameter
+    (source_file
+      (function_declaration
         name: (identifier)
-        type: (type
-          (optional_type
-            type: (primitive_type))))
-      (ERROR))
-    return_type: (type
-      (primitive_type))
-    body: (block
-      (expression_statement
-        expression: (integer_literal)))))
+        parameters: (parameter_list
+          (parameter
+            name: (identifier)
+            type: (type
+              (optional_type
+                type: (primitive_type))))
+          (ERROR))
+        return_type: (type
+          (primitive_type))
+        body: (block
+          (block_lbrace)
+          (expression_statement
+            expression: (integer_literal))
+          (rbrace))))

@@ -15,33 +15,40 @@ compiler.
 
 | Tool | Version |
 | --- | --- |
+| Bun | `1.4.5` |
 | tree-sitter CLI | `0.27.2` |
 | Parser ABI | `15` |
-| pnpm | `12.3.1` |
 
-The CLI is pinned in `package.json` and `pnpm-lock.yaml`. Generated parser
-files are checked in:
+The CLI is pinned in `package.json` and `bun.lock`, and is downloaded by
+`scripts/install-tree-sitter.ts` with Bun, so no Node installation is needed.
+Generated files are checked in:
 
+- `grammar.js` (generated from `grammar.ts`)
 - `src/parser.c`
 - `src/grammar.json`
 - `src/node-types.json`
 - `src/tree_sitter/*.h`
+- `queries/*.scm`
 
 `src/scanner.c` is handwritten and is not generated.
 
 ## Commands
 
 ```sh
-pnpm install
-pnpm run generate       # regenerate src/ after editing grammar.js
-pnpm test               # run the corpus tests
-pnpm run check-fixtures # parse the repository's .mt/.mti fixtures
-pnpm run check          # verify generated files + corpus + fixtures
+bun install
+bun run generate       # grammar.ts -> grammar.js -> src/ -> queries
+bun test               # run the corpus tests
+bun run check-fixtures # parse the repository's .mt/.mti fixtures
+bun run check-queries  # validate every query against the fixtures
+bun run check          # typecheck + generated-file drift + corpus + fixtures + queries
 ```
 
-`pnpm run check` uses `check-generated.mjs`, which runs a fresh generate in a
-temporary directory and compares the result with `src/`. It does not require a
+`bun run check` runs `scripts/generate.ts --check`, which verifies
+`grammar.ts` -> `grammar.js`, compares a fresh parser generate with `src/`, and
+regenerates the canonical and Zed query files in memory. It does not require a
 clean git worktree.
+
+The Zed extension lives in [`../zed-martite`](../zed-martite).
 
 Zed has supported tree-sitter ABI 15 since tree-sitter 0.25, and has shipped
 tree-sitter 0.26.9 since May 2026, so the pinned ABI is safe for the extension.
@@ -70,11 +77,17 @@ deterministic fuzz corpus. The expected syntax-error fixtures are
 
 ## Stable node names
 
+The grammar is written in `grammar.ts` and transpiled to `grammar.js`. The
+`queries/*.scm` files are generated from `query-spec.ts` and the generated
+`grammar.json`/`node-types.json`; edit those sources, not the query files.
+
 The grammar exposes these node names for highlighting and navigation:
 
 - Declarations: `function_declaration`, `on_declaration`, `struct_declaration`,
   `opaque_struct_declaration`, `enum_declaration`, `variant`, `impl_declaration`,
   `const_declaration`, `test_declaration`, `use_declaration`, `field_declaration`
+- Braces: `block_lbrace`, `list_lbrace`, `map_lbrace`, `rbrace` are visible
+  scanner tokens so editors can match and colorize `{}`
 - Names and bindings: `identifier`, `type_identifier`, `constant`, `parameter`,
   `self_parameter`, `binding_pattern`, `field_pattern`, `type_parameter`, `bound`
 - Types: `primitive_type`, `named_type`, `optional_type`, `tuple_type`,
@@ -95,8 +108,8 @@ The grammar exposes these node names for highlighting and navigation:
   `rest_pattern`
 - Trivia: `comment`, `doc_comment`
 
-Starter queries live in `queries/highlights.scm`, `queries/locals.scm`, and
-`queries/tags.scm`.
+Canonical queries are generated into `queries/highlights.scm`,
+`queries/locals.scm`, and `queries/tags.scm` by `scripts/generate-queries.ts`.
 
 ## Interface mode
 
@@ -113,22 +126,18 @@ limit.
 ## Zed manifest
 
 If you use this repository directly, point the grammars section at the
-subdirectory:
+subdirectory and a pushed commit or tag that contains `src/parser.c`:
 
 ```toml
 [grammars.martite]
 repository = "https://github.com/Brunzsn/Martite"
-rev = "tree-sitter-martite-v0.1.0"
+rev = "b51ac50ce254f40bcee48a24be1375863f8984f7"
 path = "externals/tree-sitter-martite"
 ```
 
-The `rev` must be a tag or commit SHA that contains the generated `src/parser.c`.
-Create the tag after the grammar commit is on the main branch:
-
-```sh
-git tag -a tree-sitter-martite-v0.1.0 -m "tree-sitter-martite 0.1.0"
-git push origin tree-sitter-martite-v0.1.0
-```
+The tag `tree-sitter-martite-v0.1.0` is reserved for the first standalone
+grammar release; create and push it after the release commit is on the main
+branch, then update the extension pin.
 
 ### Publishing as a standalone repository
 
@@ -140,5 +149,6 @@ git subtree split --prefix=externals/tree-sitter-martite -b tree-sitter-martite
 ```
 
 then push that branch to a standalone `tree-sitter-martite` repository. The
-generated `src/` files and `package.json`/`tree-sitter.json` are already
-self-contained; no Cargo dependency is required.
+generated `src/` files, `grammar.js`, `queries/`, `package.json`,
+`tree-sitter.json`, and `bun.lock` are self-contained; no Cargo dependency is
+required.

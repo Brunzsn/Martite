@@ -3,14 +3,22 @@
   "version": "0.1.0",
   "description": "Martite grammar for tree-sitter",
   "license": "MIT OR Apache-2.0",
+  "packageManager": "bun@1.4.5",
   "scripts": {
-    "generate": "tree-sitter generate --abi 15",
-    "test": "tree-sitter test",
-    "check-generated": "node scripts/check-generated.mjs",
-    "check-fixtures": "node scripts/check-fixtures.mjs",
-    "check": "pnpm run check-generated && pnpm test && pnpm run check-fixtures"
+    "postinstall": "bun scripts/install-tree-sitter.ts",
+    "setup:cli": "bun scripts/install-tree-sitter.ts",
+    "generate": "bun scripts/generate.ts",
+    "generate:check": "bun scripts/generate.ts --check",
+    "typecheck": "bun check --no-script",
+    "test": "bun scripts/run-tree-sitter.ts test --stat total-only",
+    "check:fixtures": "bun scripts/check-fixtures.ts",
+    "check:queries": "bun scripts/check-queries.ts",
+    "check": "bun run typecheck && bun run generate:check && bun run test && bun run check:fixtures && bun run check:queries"
   },
   "devDependencies": {
+    "@types/bun": "^1.4.5",
+    "sucrase": "^3.35.1",
     "tree-sitter-cli": "0.27.2"
-  }
+  },
+  "trustedDependencies": []
 }

@@ -1,0 +1,53 @@
+[
+  {
+    "label": "martite: check",
+    "command": "martite",
+    "args": [
+      "check",
+      "$ZED_FILE"
+    ],
+    "save": "all"
+  },
+  {
+    "label": "martite: lint",
+    "command": "martite",
+    "args": [
+      "lint",
+      "$ZED_FILE"
+    ],
+    "save": "all"
+  },
+  {
+    "label": "martite: run",
+    "command": "martite",
+    "args": [
+      "run",
+      "$ZED_FILE"
+    ],
+    "save": "all",
+    "tags": [
+      "martite-main"
+    ]
+  },
+  {
+    "label": "martite: test",
+    "command": "martite",
+    "args": [
+      "test",
+      "$ZED_FILE"
+    ],
+    "save": "all",
+    "tags": [
+      "martite-test"
+    ]
+  },
+  {
+    "label": "martite: fmt",
+    "command": "martite",
+    "args": [
+      "fmt",
+      "$ZED_FILE"
+    ],
+    "save": "all"
+  }
+]
