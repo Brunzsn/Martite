@@ -310,20 +310,20 @@ fn bad(value: int??) -> int { 0 }
 
 ---
 
-    (source_file
-      (function_declaration
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
         name: (identifier)
-        parameters: (parameter_list
-          (parameter
-            name: (identifier)
-            type: (type
-              (optional_type
-                type: (primitive_type))))
-          (ERROR))
-        return_type: (type
-          (primitive_type))
-        body: (block
-          (block_lbrace)
-          (expression_statement
-            expression: (integer_literal))
-          (rbrace))))
+        type: (type
+          (optional_type
+            type: (primitive_type))))
+      (ERROR))
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (block_lbrace)
+      (expression_statement
+        expression: (integer_literal))
+      (rbrace))))

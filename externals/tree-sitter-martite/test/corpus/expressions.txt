@@ -694,47 +694,46 @@ fn main() {
 
 ---
 
-    (source_file
-      (struct_declaration
-        name: (type_identifier)
-        body: (field_declaration_list
-          (list_lbrace)
-          (field_declaration
-            name: (identifier)
-            type: (type
-              (primitive_type)))
-          (rbrace)))
-      (function_declaration
+(source_file
+  (struct_declaration
+    name: (type_identifier)
+    body: (field_declaration_list
+      (list_lbrace)
+      (field_declaration
         name: (identifier)
-        parameters: (parameter_list)
-        (ERROR
-          (block_lbrace)
-          (comparison_expression
-            left: (field_expression
-              base: (if_expression
-                condition: (type_identifier)
-                consequence: (block
-                  (block_lbrace)
-                  (ERROR
-                    (identifier))
-                  (expression_statement
-                    expression: (integer_literal))
-                  (rbrace)))
-              field: (identifier))
-            right: (integer_literal)))
-        body: (block
-          (block_lbrace)
-          (expression_statement
-            expression: (call_expression
-              function: (identifier)
-              arguments: (arguments
-                (argument
-                  value: (string
-                    (string_content))))))
-          (rbrace)))
-      (ERROR
-        (rbrace)))
-
+        type: (type
+          (primitive_type)))
+      (rbrace)))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    (ERROR
+      (block_lbrace)
+      (comparison_expression
+        left: (field_expression
+          base: (if_expression
+            condition: (type_identifier)
+            consequence: (block
+              (block_lbrace)
+              (ERROR
+                (identifier))
+              (expression_statement
+                expression: (integer_literal))
+              (rbrace)))
+          field: (identifier))
+        right: (integer_literal)))
+    body: (block
+      (block_lbrace)
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (string_content))))))
+      (rbrace)))
+  (ERROR
+    (rbrace)))
 
 ==================
 expressions: unparenthesized map arm is a block
@@ -748,28 +747,28 @@ fn choose() -> int {
 
 ---
 
-    (source_file
-      (function_declaration
-        name: (identifier)
-        parameters: (parameter_list)
-        return_type: (type
-          (primitive_type))
-        body: (block
-          (block_lbrace)
-          (expression_statement
-            expression: (match_expression
-              value: (integer_literal)
-              (list_lbrace)
-              (match_arm
-                pattern: (pattern
-                  (wildcard_pattern))
-                body: (block
-                  (block_lbrace)
-                  (expression_statement
-                    expression: (string
-                      (string_content)))
-                  (ERROR
-                    (integer_literal))
-                  (rbrace)))
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (block_lbrace)
+      (expression_statement
+        expression: (match_expression
+          value: (integer_literal)
+          (list_lbrace)
+          (match_arm
+            pattern: (pattern
+              (wildcard_pattern))
+            body: (block
+              (block_lbrace)
+              (expression_statement
+                expression: (string
+                  (string_content)))
+              (ERROR
+                (integer_literal))
               (rbrace)))
-          (rbrace))))
+          (rbrace)))
+      (rbrace))))

@@ -191,21 +191,20 @@ fn main() {
 
 ---
 
-    (source_file
-      (function_declaration
-        name: (identifier)
-        parameters: (parameter_list)
-        body: (block
-          (block_lbrace)
-          (expression_statement
-            expression: (call_expression
-              function: (identifier)
-              arguments: (arguments
-                (argument
-                  value: (string
-                    (ERROR))))))
-          (rbrace))))
-
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (block_lbrace)
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (ERROR))))))
+      (rbrace))))
 
 ==================
 interpolation: malformed interpolation expression
@@ -217,23 +216,22 @@ fn main() {
 
 ---
 
-    (source_file
-      (function_declaration
-        name: (identifier)
-        parameters: (parameter_list)
-        body: (block
-          (block_lbrace)
-          (expression_statement
-            expression: (call_expression
-              function: (identifier)
-              arguments: (arguments
-                (argument
-                  value: (string
-                    (interpolation
-                      value: (integer_literal)
-                      (ERROR)))))))
-          (rbrace))))
-
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (block_lbrace)
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (interpolation
+                  value: (integer_literal)
+                  (ERROR)))))))
+      (rbrace))))
 
 ==================
 interpolation: unterminated string recovers to the next statement

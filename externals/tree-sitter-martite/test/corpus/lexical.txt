@@ -173,16 +173,20 @@ fn main() {
 ---
 
 (source_file
+  (doc_comment)
   (function_declaration
     name: (identifier)
     parameters: (parameter_list)
     body: (block
       (block_lbrace)
+      (comment)
       (let_statement
         pattern: (pattern
           (binding_pattern
             name: (identifier)))
         value: (integer_literal))
+      (comment)
+      (doc_comment)
       (let_statement
         pattern: (pattern
           (binding_pattern

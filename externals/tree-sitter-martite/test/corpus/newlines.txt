@@ -46,23 +46,22 @@ fn main() { let x = 1 let y = 2 }
 
 ---
 
-    (source_file
-      (function_declaration
-        name: (identifier)
-        parameters: (parameter_list)
-        body: (block
-          (block_lbrace)
-          (let_statement
-            pattern: (pattern
-              (binding_pattern
-                name: (identifier)))
-            value: (integer_literal))
-          (ERROR
-            (identifier)
-            (identifier)
-            (integer_literal))
-          (rbrace))))
-
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (block_lbrace)
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (ERROR
+        (identifier)
+        (identifier)
+        (integer_literal))
+      (rbrace))))
 
 ==================
 newlines: continuation after operators and punctuation
@@ -409,34 +408,33 @@ fn compare(a: int, b: int, c: int) -> bool { a < b < c }
 
 ---
 
-    (source_file
-      (function_declaration
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
         name: (identifier)
-        parameters: (parameter_list
-          (parameter
-            name: (identifier)
-            type: (type
-              (primitive_type)))
-          (parameter
-            name: (identifier)
-            type: (type
-              (primitive_type)))
-          (parameter
-            name: (identifier)
-            type: (type
-              (primitive_type))))
-        return_type: (type
-          (primitive_type))
-        body: (block
-          (block_lbrace)
-          (expression_statement
-            expression: (comparison_expression
-              left: (identifier)
-              right: (identifier)))
-          (ERROR
-            (identifier))
-          (rbrace))))
-
+        type: (type
+          (primitive_type)))
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type))))
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (block_lbrace)
+      (expression_statement
+        expression: (comparison_expression
+          left: (identifier)
+          right: (identifier)))
+      (ERROR
+        (identifier))
+      (rbrace))))
 
 ==================
 newlines: range is non-associative
@@ -446,35 +444,34 @@ fn range(a: int, b: int, c: int) { let x = a..b..c }
 
 ---
 
-    (source_file
-      (function_declaration
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
         name: (identifier)
-        parameters: (parameter_list
-          (parameter
-            name: (identifier)
-            type: (type
-              (primitive_type)))
-          (parameter
-            name: (identifier)
-            type: (type
-              (primitive_type)))
-          (parameter
-            name: (identifier)
-            type: (type
-              (primitive_type))))
-        body: (block
-          (block_lbrace)
-          (let_statement
-            pattern: (pattern
-              (binding_pattern
-                name: (identifier)))
-            value: (range_expression
-              start: (identifier)
-              end: (identifier)))
-          (ERROR
-            (identifier))
-          (rbrace))))
-
+        type: (type
+          (primitive_type)))
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type))))
+    body: (block
+      (block_lbrace)
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (range_expression
+          start: (identifier)
+          end: (identifier)))
+      (ERROR
+        (identifier))
+      (rbrace))))
 
 ==================
 newlines: missing comma between match expression arms
@@ -490,36 +487,36 @@ fn choose(x: int) -> int {
 
 ---
 
-    (source_file
-      (function_declaration
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
         name: (identifier)
-        parameters: (parameter_list
-          (parameter
-            name: (identifier)
-            type: (type
-              (primitive_type))))
-        return_type: (type
-          (primitive_type))
-        body: (block
-          (block_lbrace)
-          (expression_statement
-            expression: (match_expression
-              value: (identifier)
-              (list_lbrace)
-              (match_arm
-                pattern: (pattern
-                  (literal_pattern
-                    (integer_literal)))
-                body: (integer_literal))
-              (MISSING ",")
-              (match_arm
-                pattern: (pattern
-                  (literal_pattern
-                    (integer_literal)))
-                body: (integer_literal))
-              (match_arm
-                pattern: (pattern
-                  (wildcard_pattern))
-                body: (integer_literal))
-              (rbrace)))
-          (rbrace))))
+        type: (type
+          (primitive_type))))
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (block_lbrace)
+      (expression_statement
+        expression: (match_expression
+          value: (identifier)
+          (list_lbrace)
+          (match_arm
+            pattern: (pattern
+              (literal_pattern
+                (integer_literal)))
+            body: (integer_literal))
+          (MISSING ",")
+          (match_arm
+            pattern: (pattern
+              (literal_pattern
+                (integer_literal)))
+            body: (integer_literal))
+          (match_arm
+            pattern: (pattern
+              (wildcard_pattern))
+            body: (integer_literal))
+          (rbrace)))
+      (rbrace))))

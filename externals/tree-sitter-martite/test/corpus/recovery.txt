@@ -6,15 +6,13 @@ fn main() {
 
 ---
 
-    (source_file
-      (function_declaration
-        name: (identifier)
-        parameters: (parameter_list)
-        body: (block
-          (block_lbrace)
-          (MISSING rbrace))))
-
-
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (block_lbrace)
+      (MISSING rbrace))))
 
 ==================
 recovery: incomplete list literal
@@ -25,18 +23,17 @@ fn main() {
 
 ---
 
-    (source_file
-      (function_declaration
-        name: (identifier)
-        parameters: (parameter_list))
-      (ERROR
-        (block_lbrace)
-        (pattern
-          (binding_pattern
-            name: (identifier)))
-        (integer_literal)
-        (integer_literal)))
-
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list))
+  (ERROR
+    (block_lbrace)
+    (pattern
+      (binding_pattern
+        name: (identifier)))
+    (integer_literal)
+    (integer_literal)))
 
 ==================
 recovery: incomplete call
@@ -47,16 +44,15 @@ fn main() {
 
 ---
 
-    (source_file
-      (function_declaration
-        name: (identifier)
-        parameters: (parameter_list))
-      (ERROR
-        (block_lbrace)
-        (identifier)
-        (string
-          (string_content))))
-
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list))
+  (ERROR
+    (block_lbrace)
+    (identifier)
+    (string
+      (string_content))))
 
 ==================
 recovery: incomplete string
@@ -67,21 +63,19 @@ fn main() {
 
 ---
 
-    (source_file
-      (function_declaration
-        name: (identifier)
-        parameters: (parameter_list)
-        body: (block
-          (block_lbrace)
-          (let_statement
-            pattern: (pattern
-              (binding_pattern
-                name: (identifier)))
-            value: (string
-              (string_content)))
-          (MISSING rbrace))))
-
-
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (block_lbrace)
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (string
+          (string_content)))
+      (MISSING rbrace))))
 
 ==================
 recovery: incomplete interpolation
@@ -92,22 +86,21 @@ fn main() {
 
 ---
 
-    (source_file
-      (function_declaration
-        name: (identifier)
-        parameters: (parameter_list))
-      (ERROR
-        (block_lbrace)
-        (identifier)
-        (string
-          (interpolation
-            value: (additive_expression
-              left: (integer_literal)
-              (ERROR
-                (integer_literal))
-              right: (string
-                (string_content)))))))
-
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list))
+  (ERROR
+    (block_lbrace)
+    (identifier)
+    (string
+      (interpolation
+        value: (additive_expression
+          left: (integer_literal)
+          (ERROR
+            (integer_literal))
+          right: (string
+            (string_content)))))))
 
 ==================
 recovery: malformed statement recovers to the next statement
@@ -121,28 +114,28 @@ fn main() {
 
 ---
 
-    (source_file
-      (function_declaration
-        name: (identifier)
-        parameters: (parameter_list)
-        body: (block
-          (block_lbrace)
-          (let_statement
-            pattern: (pattern
-              (binding_pattern
-                name: (MISSING identifier)))
-            value: (integer_literal))
-          (let_statement
-            pattern: (pattern
-              (binding_pattern
-                name: (identifier)))
-            value: (integer_literal))
-          (expression_statement
-            expression: (call_expression
-              function: (identifier)
-              arguments: (arguments
-                (argument
-                  value: (string
-                    (interpolation
-                      value: (identifier)))))))
-          (rbrace))))
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (block_lbrace)
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (MISSING identifier)))
+        value: (integer_literal))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (interpolation
+                  value: (identifier)))))))
+      (rbrace))))

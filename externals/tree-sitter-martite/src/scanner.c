@@ -306,15 +306,11 @@ bool tree_sitter_martite_external_scanner_scan(
       }
 
       if (lexer->lookahead == '/') {
-        lexer->advance(lexer, true);
-        if (lexer->lookahead != '/') {
-          // Division, not a comment. Let the internal lexer handle it.
-          return false;
-        }
-        while (!scanner_eof(lexer) && lexer->lookahead != '\n') {
-          lexer->advance(lexer, true);
-        }
-        continue;
+        // Comments are extras. Do not consume them here: the internal lexer
+        // must emit them as `comment`/`doc_comment` nodes so editors can
+        // highlight them. Returning false also lets the internal lexer handle
+        // division.
+        return false;
       }
 
       break;
