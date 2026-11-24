@@ -1,0 +1,31 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/config.schema.json",
+  "grammars": [
+    {
+      "name": "martite",
+      "camelcase": "Martite",
+      "title": "Martite",
+      "scope": "source.martite",
+      "file-types": [
+        "mt",
+        "mti"
+      ],
+      "highlights": "queries/highlights.scm",
+      "locals": "queries/locals.scm",
+      "tags": "queries/tags.scm"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT OR Apache-2.0",
+    "description": "Tree-sitter grammar for the Martite language",
+    "links": {
+      "repository": "https://github.com/Brunzsn/Martite"
+    },
+    "authors": [
+      {
+        "name": "Martite contributors"
+      }
+    ]
+  }
+}

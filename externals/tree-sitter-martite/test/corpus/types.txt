@@ -1,0 +1,311 @@
+==================
+types: primitives and compound types
+==================
+
+fn sample(
+    a: int,
+    b: float,
+    c: bool,
+    d: str,
+    e: range,
+    f: (),
+    g: (int,),
+    h: (int, str),
+    i: list[int],
+    j: map[str, int],
+    k: int?,
+    l: Option[int],
+    m: Result[int, str],
+    n: fn(int, str) -> bool,
+) -> Result[Option[(int, str)], str] { Ok(None) }
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (parameter
+        name: (identifier)
+        type: (type
+          (unit_type)))
+      (parameter
+        name: (identifier)
+        type: (type
+          (tuple_type
+            element: (type
+              (primitive_type)))))
+      (parameter
+        name: (identifier)
+        type: (type
+          (tuple_type
+            element: (type
+              (primitive_type))
+            (type
+              (primitive_type)))))
+      (parameter
+        name: (identifier)
+        type: (type
+          (list_type
+            type_arguments: (type_arguments
+              (type
+                (primitive_type))))))
+      (parameter
+        name: (identifier)
+        type: (type
+          (map_type
+            type_arguments: (type_arguments
+              (type
+                (primitive_type))
+              (type
+                (primitive_type))))))
+      (parameter
+        name: (identifier)
+        type: (type
+          (optional_type
+            type: (primitive_type))))
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier)
+            type_arguments: (type_arguments
+              (type
+                (primitive_type))))))
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier)
+            type_arguments: (type_arguments
+              (type
+                (primitive_type))
+              (type
+                (primitive_type))))))
+      (parameter
+        name: (identifier)
+        type: (type
+          (function_type
+            (type
+              (primitive_type))
+            (type
+              (primitive_type))
+            return_type: (type
+              (primitive_type))))))
+    return_type: (type
+      (named_type
+        name: (type_identifier)
+        type_arguments: (type_arguments
+          (type
+            (named_type
+              name: (type_identifier)
+              type_arguments: (type_arguments
+                (type
+                  (tuple_type
+                    element: (type
+                      (primitive_type))
+                    (type
+                      (primitive_type)))))))
+          (type
+            (primitive_type)))))
+    body: (block
+      (expression_statement
+        expression: (call_expression
+          function: (type_identifier)
+          arguments: (arguments
+            (argument
+              value: (type_identifier))))))))
+
+==================
+types: generics and bounds
+==================
+
+fn pick[T: Eq + Ord + Show](a: T, b: T) -> T {
+    if a == b { a } else { b }
+}
+
+impl[T: Show] Stack[T] {
+    fn show(self) -> str { "{self.items}" }
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    type_parameters: (type_parameters
+      (type_parameter
+        name: (type_identifier)
+        bounds: (bounds
+          (bound)
+          (bound)
+          (bound))))
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier))))
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier)))))
+    return_type: (type
+      (named_type
+        name: (type_identifier)))
+    body: (block
+      (expression_statement
+        expression: (if_expression
+          condition: (comparison_expression
+            left: (identifier)
+            right: (identifier))
+          consequence: (block
+            (expression_statement
+              expression: (identifier)))
+          alternative: (block
+            (expression_statement
+              expression: (identifier)))))))
+  (impl_declaration
+    type_parameters: (type_parameters
+      (type_parameter
+        name: (type_identifier)
+        bounds: (bounds
+          (bound))))
+    type: (type_identifier)
+    type_arguments: (type_arguments
+      (type
+        (named_type
+          name: (type_identifier))))
+    (function_declaration
+      name: (identifier)
+      parameters: (parameter_list
+        (self_parameter))
+      return_type: (type
+        (primitive_type))
+      body: (block
+        (expression_statement
+          expression: (string
+            (interpolation
+              value: (field_expression
+                base: (self_expression)
+                field: (identifier)))))))))
+
+==================
+types: nested generic arguments
+==================
+
+fn nested(value: list[map[str, Option[list[int]]]]) -> int { 0 }
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (list_type
+            type_arguments: (type_arguments
+              (type
+                (map_type
+                  type_arguments: (type_arguments
+                    (type
+                      (primitive_type))
+                    (type
+                      (named_type
+                        name: (type_identifier)
+                        type_arguments: (type_arguments
+                          (type
+                            (list_type
+                              type_arguments: (type_arguments
+                                (type
+                                  (primitive_type))))))))))))))))
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (expression_statement
+        expression: (integer_literal)))))
+
+==================
+types: optional binds to the base type
+==================
+
+fn reads(value: fn() -> int?) -> Option[fn() -> int] {
+    Some(fn() => 1)
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (function_type
+            return_type: (type
+              (optional_type
+                type: (primitive_type)))))))
+    return_type: (type
+      (named_type
+        name: (type_identifier)
+        type_arguments: (type_arguments
+          (type
+            (function_type
+              return_type: (type
+                (primitive_type)))))))
+    body: (block
+      (expression_statement
+        expression: (call_expression
+          function: (type_identifier)
+          arguments: (arguments
+            (argument
+              value: (lambda_expression
+                body: (integer_literal)))))))))
+
+==================
+types: double optional is not syntax
+==================
+
+fn bad(value: int??) -> int { 0 }
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (optional_type
+            type: (primitive_type))))
+      (ERROR))
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (expression_statement
+        expression: (integer_literal)))))

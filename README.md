@@ -24,6 +24,24 @@ The workspace is split along the compiler pipeline:
 - `martite-conformance` — cross-cutting conformance fixtures
 - `martite-bench` — Criterion benchmarks for the compiler, runtime, tools, and CLI
 
+## Editor grammar
+
+`externals/tree-sitter-martite/` contains the tree-sitter grammar used by editor
+integrations for `.mt` source and `.mti` interface files. The Rust parser
+remains normative; the grammar is a tooling-only package and no production
+crate depends on it. Future editor integrations, such as the Zed extension,
+can live alongside it under `externals/`.
+
+```sh
+cd externals/tree-sitter-martite
+pnpm install
+pnpm run check
+```
+
+See [`externals/tree-sitter-martite/README.md`](externals/tree-sitter-martite/README.md)
+for the pinned tree-sitter version, corpus layout, node names, and the Zed
+manifest snippet.
+
 ## Architecture
 
 The compiler pipeline is `syntax → resolve → check → lower → IR execution`;

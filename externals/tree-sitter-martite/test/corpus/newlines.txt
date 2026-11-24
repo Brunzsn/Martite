@@ -1,0 +1,484 @@
+==================
+newlines: statements end at newlines
+==================
+
+fn main() {
+    let x = 1
+    let y = 2
+    print("{x + y}")
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (interpolation
+                  value: (additive_expression
+                    left: (identifier)
+                    right: (identifier)))))))))))
+
+==================
+newlines: same-line statements are an error
+==================
+
+fn main() { let x = 1 let y = 2 }
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (ERROR
+        (identifier)
+        (identifier)
+        (integer_literal)))))
+
+==================
+newlines: continuation after operators and punctuation
+==================
+
+fn main() {
+    let a = 1 +
+        2
+    let b = [1,
+        2]
+    let c = (1
+        + 2)
+    let d = foo(1,
+        2)
+}
+
+fn foo(a: int, b: int) -> int { a + b }
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (additive_expression
+          left: (integer_literal)
+          right: (integer_literal)))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (list_literal
+          (integer_literal)
+          (integer_literal)))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (parenthesized_expression
+          value: (additive_expression
+            left: (integer_literal)
+            right: (integer_literal))))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (integer_literal))
+            (argument
+              value: (integer_literal)))))))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type))))
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (expression_statement
+        expression: (additive_expression
+          left: (identifier)
+          right: (identifier))))))
+
+==================
+newlines: continuation before dot else and or coalesce
+==================
+
+fn main() {
+    let value = Some(1)
+        .unwrap_or(0)
+    let other = if value > 0 { 1 }
+        else { 2 }
+    let flag = true
+        and false
+    let fallback = None
+        ?? 7
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (call_expression
+          function: (field_expression
+            base: (call_expression
+              function: (type_identifier)
+              arguments: (arguments
+                (argument
+                  value: (integer_literal))))
+            field: (identifier))
+          arguments: (arguments
+            (argument
+              value: (integer_literal)))))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (if_expression
+          condition: (comparison_expression
+            left: (identifier)
+            right: (integer_literal))
+          consequence: (block
+            (expression_statement
+              expression: (integer_literal)))
+          alternative: (block
+            (expression_statement
+              expression: (integer_literal)))))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (and_expression
+          left: (boolean_literal)
+          right: (boolean_literal)))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (coalesce_expression
+          left: (type_identifier)
+          right: (integer_literal))))))
+
+==================
+newlines: newlines are ignored in list-style braces
+==================
+
+struct Point {
+    x: int,
+    y: int,
+}
+
+enum Shade {
+    Light,
+    Dark,
+}
+
+fn main() {
+    let p = Point {
+        x: 1,
+        y: 2,
+    }
+    let table = {
+        "a": 1,
+        "b": 2,
+    }
+    match p.x {
+        1 => print("one"),
+        _ => print("other"),
+    }
+}
+
+---
+
+(source_file
+  (struct_declaration
+    name: (type_identifier)
+    body: (field_declaration_list
+      (field_declaration
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (field_declaration
+        name: (identifier)
+        type: (type
+          (primitive_type)))))
+  (enum_declaration
+    name: (type_identifier)
+    body: (variant_list
+      (variant
+        name: (type_identifier))
+      (variant
+        name: (type_identifier))))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (struct_literal
+          name: (type_identifier)
+          (field_initializer
+            name: (identifier)
+            value: (integer_literal))
+          (field_initializer
+            name: (identifier)
+            value: (integer_literal))))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (map_literal
+          (map_entry
+            key: (string
+              (string_content))
+            value: (integer_literal))
+          (map_entry
+            key: (string
+              (string_content))
+            value: (integer_literal))))
+      (expression_statement
+        expression: (match_expression
+          value: (field_expression
+            base: (identifier)
+            field: (identifier))
+          (match_arm
+            pattern: (pattern
+              (literal_pattern
+                (integer_literal)))
+            body: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (string
+                    (string_content))))))
+          (match_arm
+            pattern: (pattern
+              (wildcard_pattern))
+            body: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (string
+                    (string_content)))))))))))
+
+==================
+newlines: blocks inside parentheses
+==================
+
+fn main() {
+    let values = [1, 2]
+    let mapped = values.map(fn(x) {
+        let y = x + 1
+        y
+    })
+    print("{mapped.len()}")
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (list_literal
+          (integer_literal)
+          (integer_literal)))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (call_expression
+          function: (field_expression
+            base: (identifier)
+            field: (identifier))
+          arguments: (arguments
+            (argument
+              value: (lambda_expression
+                (lambda_parameter
+                  pattern: (pattern
+                    (binding_pattern
+                      name: (identifier))))
+                body: (block
+                  (let_statement
+                    pattern: (pattern
+                      (binding_pattern
+                        name: (identifier)))
+                    value: (additive_expression
+                      left: (identifier)
+                      right: (integer_literal)))
+                  (expression_statement
+                    expression: (identifier))))))))
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (interpolation
+                  value: (call_expression
+                    function: (field_expression
+                      base: (identifier)
+                      field: (identifier))
+                    arguments: (arguments)))))))))))
+
+==================
+newlines: comparison and range are non-associative
+==================
+
+fn compare(a: int, b: int, c: int) -> bool { a < b < c }
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type))))
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (expression_statement
+        expression: (comparison_expression
+          left: (identifier)
+          right: (identifier)))
+      (ERROR
+        (identifier)))))
+
+==================
+newlines: range is non-associative
+==================
+
+fn range(a: int, b: int, c: int) { let x = a..b..c }
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type))))
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (range_expression
+          start: (identifier)
+          end: (identifier)))
+      (ERROR
+        (identifier)))))
+
+==================
+newlines: missing comma between match expression arms
+==================
+
+fn choose(x: int) -> int {
+    match x {
+        1 => 10
+        2 => 20,
+        _ => 0,
+    }
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type))))
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (expression_statement
+        expression: (match_expression
+          value: (identifier)
+          (match_arm
+            pattern: (pattern
+              (literal_pattern
+                (integer_literal)))
+            body: (integer_literal))
+          (MISSING ",")
+          (match_arm
+            pattern: (pattern
+              (literal_pattern
+                (integer_literal)))
+            body: (integer_literal))
+          (match_arm
+            pattern: (pattern
+              (wildcard_pattern))
+            body: (integer_literal)))))))

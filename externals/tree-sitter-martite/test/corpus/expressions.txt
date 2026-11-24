@@ -1,0 +1,714 @@
+==================
+expressions: precedence and associativity
+==================
+
+fn main() {
+    let a = 1 + 2 * 3 - 4 / 2 % 2
+    let b = not true or false and true
+    let c = 1 == 2 or 3 != 4
+    let d = 0..10
+    let e = 0..=10
+    let f = None ?? Some(1) ?? Some(2)
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (additive_expression
+          left: (additive_expression
+            left: (integer_literal)
+            right: (multiplicative_expression
+              left: (integer_literal)
+              right: (integer_literal)))
+          right: (multiplicative_expression
+            left: (multiplicative_expression
+              left: (integer_literal)
+              right: (integer_literal))
+            right: (integer_literal))))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (or_expression
+          left: (not_expression
+            operand: (boolean_literal))
+          right: (and_expression
+            left: (boolean_literal)
+            right: (boolean_literal))))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (or_expression
+          left: (comparison_expression
+            left: (integer_literal)
+            right: (integer_literal))
+          right: (comparison_expression
+            left: (integer_literal)
+            right: (integer_literal))))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (range_expression
+          start: (integer_literal)
+          end: (integer_literal)))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (range_expression
+          start: (integer_literal)
+          end: (integer_literal)))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (coalesce_expression
+          left: (type_identifier)
+          right: (coalesce_expression
+            left: (call_expression
+              function: (type_identifier)
+              arguments: (arguments
+                (argument
+                  value: (integer_literal))))
+            right: (call_expression
+              function: (type_identifier)
+              arguments: (arguments
+                (argument
+                  value: (integer_literal))))))))))
+
+==================
+expressions: unary and postfix chains
+==================
+
+fn main() {
+    let values = [[1, 2], [3, 4]]
+    let first = values[0][1]
+    let maybe = Some(1)
+    let value = maybe?
+    let text = "abc".len()
+    let pair = (1, 2)
+    let one = pair.0
+    let chained = values.map(fn(xs) => xs.len()).last()
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (list_literal
+          (list_literal
+            (integer_literal)
+            (integer_literal))
+          (list_literal
+            (integer_literal)
+            (integer_literal))))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (index_expression
+          base: (index_expression
+            base: (identifier)
+            index: (integer_literal))
+          index: (integer_literal)))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (call_expression
+          function: (type_identifier)
+          arguments: (arguments
+            (argument
+              value: (integer_literal)))))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (try_expression
+          operand: (identifier)))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (call_expression
+          function: (field_expression
+            base: (string
+              (string_content))
+            field: (identifier))
+          arguments: (arguments)))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (tuple_expression
+          element: (integer_literal)
+          (integer_literal)))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (field_expression
+          base: (identifier)
+          field: (integer_literal)))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (call_expression
+          function: (field_expression
+            base: (call_expression
+              function: (field_expression
+                base: (identifier)
+                field: (identifier))
+              arguments: (arguments
+                (argument
+                  value: (lambda_expression
+                    (lambda_parameter
+                      pattern: (pattern
+                        (binding_pattern
+                          name: (identifier))))
+                    body: (call_expression
+                      function: (field_expression
+                        base: (identifier)
+                        field: (identifier))
+                      arguments: (arguments))))))
+            field: (identifier))
+          arguments: (arguments))))))
+
+==================
+expressions: conversions
+==================
+
+fn main() {
+    let a = int(1.9)
+    let b = float(1)
+    let c = str(42)
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (conversion_expression
+          value: (float_literal)))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (conversion_expression
+          value: (integer_literal)))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (conversion_expression
+          value: (integer_literal))))))
+
+==================
+expressions: tuple list map and unit literals
+==================
+
+fn main() {
+    let unit = ()
+    let one = (1,)
+    let tuple = (1, "two", true)
+    let list = [1, 2, 3]
+    let empty = []
+    let table = {
+        "a": 1,
+        "b": 2,
+    }
+    let empty_table = {}
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (unit_expression))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (tuple_expression
+          element: (integer_literal)))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (tuple_expression
+          element: (integer_literal)
+          (string
+            (string_content))
+          (boolean_literal)))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (list_literal
+          (integer_literal)
+          (integer_literal)
+          (integer_literal)))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (list_literal))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (map_literal
+          (map_entry
+            key: (string
+              (string_content))
+            value: (integer_literal))
+          (map_entry
+            key: (string
+              (string_content))
+            value: (integer_literal))))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (map_literal)))))
+
+==================
+expressions: struct literals shorthand and update
+==================
+
+struct Point { x: int, y: int }
+
+fn main() {
+    let x = 1
+    let y = 2
+    let p = Point { x, y }
+    let moved = Point { ..p, x: 3 }
+}
+
+---
+
+(source_file
+  (struct_declaration
+    name: (type_identifier)
+    body: (field_declaration_list
+      (field_declaration
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (field_declaration
+        name: (identifier)
+        type: (type
+          (primitive_type)))))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (struct_literal
+          name: (type_identifier)
+          (field_initializer
+            name: (identifier))
+          (field_initializer
+            name: (identifier))))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (struct_literal
+          name: (type_identifier)
+          base: (identifier)
+          (field_initializer
+            name: (identifier)
+            value: (integer_literal)))))))
+
+==================
+expressions: if and else if
+==================
+
+fn classify(n: int) -> str {
+    if n < 0 {
+        "negative"
+    } else if n == 0 {
+        "zero"
+    } else {
+        "positive"
+    }
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type))))
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (expression_statement
+        expression: (if_expression
+          condition: (comparison_expression
+            left: (identifier)
+            right: (integer_literal))
+          consequence: (block
+            (expression_statement
+              expression: (string
+                (string_content))))
+          alternative: (if_expression
+            condition: (comparison_expression
+              left: (identifier)
+              right: (integer_literal))
+            consequence: (block
+              (expression_statement
+                expression: (string
+                  (string_content))))
+            alternative: (block
+              (expression_statement
+                expression: (string
+                  (string_content))))))))))
+
+==================
+expressions: match guards and qualified variants
+==================
+
+enum Token { Number(int), Word(str), Empty }
+
+fn score(token: Token) -> int {
+    match token {
+        Token.Number(value) if value > 0 => value,
+        Number(value) => -value,
+        Word(text) => text.len(),
+        Empty => 0,
+    }
+}
+
+---
+
+(source_file
+  (enum_declaration
+    name: (type_identifier)
+    body: (variant_list
+      (variant
+        name: (type_identifier)
+        (variant_payload
+          (type
+            (primitive_type))))
+      (variant
+        name: (type_identifier)
+        (variant_payload
+          (type
+            (primitive_type))))
+      (variant
+        name: (type_identifier))))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier)))))
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (expression_statement
+        expression: (match_expression
+          value: (identifier)
+          (match_arm
+            pattern: (pattern
+              (variant_pattern
+                qualifier: (type_identifier)
+                name: (type_identifier)
+                arguments: (pattern_arguments
+                  (pattern
+                    (binding_pattern
+                      name: (identifier))))))
+            guard: (comparison_expression
+              left: (identifier)
+              right: (integer_literal))
+            body: (identifier))
+          (match_arm
+            pattern: (pattern
+              (variant_pattern
+                name: (type_identifier)
+                arguments: (pattern_arguments
+                  (pattern
+                    (binding_pattern
+                      name: (identifier))))))
+            body: (unary_expression
+              operand: (identifier)))
+          (match_arm
+            pattern: (pattern
+              (variant_pattern
+                name: (type_identifier)
+                arguments: (pattern_arguments
+                  (pattern
+                    (binding_pattern
+                      name: (identifier))))))
+            body: (call_expression
+              function: (field_expression
+                base: (identifier)
+                field: (identifier))
+              arguments: (arguments)))
+          (match_arm
+            pattern: (pattern
+              (variant_pattern
+                name: (type_identifier)))
+            body: (integer_literal)))))))
+
+==================
+expressions: lambda forms
+==================
+
+fn main() {
+    let double = fn(x) => x * 2
+    let add = fn(a: int, b: int) -> int { a + b }
+    let values = [1, 2, 3].map(double)
+    print("{add(values[0], values[1])}")
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (lambda_expression
+          (lambda_parameter
+            pattern: (pattern
+              (binding_pattern
+                name: (identifier))))
+          body: (multiplicative_expression
+            left: (identifier)
+            right: (integer_literal))))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (lambda_expression
+          (lambda_parameter
+            pattern: (pattern
+              (binding_pattern
+                name: (identifier)))
+            type: (type
+              (primitive_type)))
+          (lambda_parameter
+            pattern: (pattern
+              (binding_pattern
+                name: (identifier)))
+            type: (type
+              (primitive_type)))
+          return_type: (type
+            (primitive_type))
+          body: (block
+            (expression_statement
+              expression: (additive_expression
+                left: (identifier)
+                right: (identifier))))))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (call_expression
+          function: (field_expression
+            base: (list_literal
+              (integer_literal)
+              (integer_literal)
+              (integer_literal))
+            field: (identifier))
+          arguments: (arguments
+            (argument
+              value: (identifier)))))
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (interpolation
+                  value: (call_expression
+                    function: (identifier)
+                    arguments: (arguments
+                      (argument
+                        value: (index_expression
+                          base: (identifier)
+                          index: (integer_literal)))
+                      (argument
+                        value: (index_expression
+                          base: (identifier)
+                          index: (integer_literal))))))))))))))
+
+==================
+expressions: parenthesized struct literal in a control-flow head
+==================
+
+struct Point { x: int }
+
+fn main() {
+    if (Point { x: 1 }).x == 1 { print("x") }
+}
+
+---
+
+(source_file
+  (struct_declaration
+    name: (type_identifier)
+    body: (field_declaration_list
+      (field_declaration
+        name: (identifier)
+        type: (type
+          (primitive_type)))))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (expression_statement
+        expression: (if_expression
+          condition: (comparison_expression
+            left: (field_expression
+              base: (parenthesized_expression
+                value: (struct_literal
+                  name: (type_identifier)
+                  (field_initializer
+                    name: (identifier)
+                    value: (integer_literal))))
+              field: (identifier))
+            right: (integer_literal))
+          consequence: (block
+            (expression_statement
+              expression: (call_expression
+                function: (identifier)
+                arguments: (arguments
+                  (argument
+                    value: (string
+                      (string_content))))))))))))
+
+==================
+expressions: struct literal in a control-flow head is an error
+==================
+
+struct Point { x: int }
+
+fn main() {
+    if Point { x: 1 }.x == 1 { print("x") }
+}
+
+---
+
+(source_file
+  (struct_declaration
+    name: (type_identifier)
+    body: (field_declaration_list
+      (field_declaration
+        name: (identifier)
+        type: (type
+          (primitive_type)))))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    (ERROR
+      (comparison_expression
+        left: (field_expression
+          base: (if_expression
+            condition: (type_identifier)
+            consequence: (block
+              (ERROR
+                (identifier))
+              (expression_statement
+                expression: (integer_literal))))
+          field: (identifier))
+        right: (integer_literal)))
+    body: (block
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (string_content))))))))
+  (ERROR))
+
+==================
+expressions: unparenthesized map arm is a block
+==================
+
+fn choose() -> int {
+    match 1 {
+        _ => {"a": 1},
+    }
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (expression_statement
+        expression: (match_expression
+          value: (integer_literal)
+          (match_arm
+            pattern: (pattern
+              (wildcard_pattern))
+            body: (block
+              (expression_statement
+                expression: (string
+                  (string_content)))
+              (ERROR
+                (integer_literal)))))))))

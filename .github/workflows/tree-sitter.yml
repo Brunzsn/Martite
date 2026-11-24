@@ -1,0 +1,42 @@
+name: Tree-sitter grammar
+
+on:
+  push:
+    paths:
+      - "externals/tree-sitter-martite/**"
+      - "examples/**"
+      - "crates/martite-conformance/fixtures/**"
+      - "crates/martite-fmt/tests/fixtures/**"
+      - "crates/martite-cli/tests/fixtures/**"
+      - ".github/workflows/tree-sitter.yml"
+  pull_request:
+    paths:
+      - "externals/tree-sitter-martite/**"
+      - "examples/**"
+      - "crates/martite-conformance/fixtures/**"
+      - "crates/martite-fmt/tests/fixtures/**"
+      - "crates/martite-cli/tests/fixtures/**"
+      - ".github/workflows/tree-sitter.yml"
+  workflow_dispatch:
+
+jobs:
+  grammar:
+    name: tree-sitter
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: externals/tree-sitter-martite
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.3.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: externals/tree-sitter-martite/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run check
+      - name: Verify generated files are committed
+        run: git diff --exit-code -- src

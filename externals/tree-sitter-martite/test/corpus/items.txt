@@ -1,0 +1,317 @@
+==================
+items: use declarations and aliases
+==================
+
+use geometry.shapes
+use geometry.shapes.Circle
+use config.MAX_SIZE
+use app.util as app_util
+use app.editor.Doc as EditorDoc
+
+fn main() { print("ok") }
+
+---
+
+(source_file
+  (use_declaration
+    path: (module_path
+      (identifier)
+      (identifier)))
+  (use_declaration
+    path: (module_path
+      (identifier)
+      (identifier)
+      (type_identifier)))
+  (use_declaration
+    path: (module_path
+      (identifier)
+      (constant)))
+  (use_declaration
+    path: (module_path
+      (identifier)
+      (identifier))
+    alias: (identifier))
+  (use_declaration
+    path: (module_path
+      (identifier)
+      (identifier)
+      (type_identifier))
+    alias: (type_identifier))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (string_content)))))))))
+
+==================
+items: visibility and declarations
+==================
+
+pub struct Stack[T] { items: list[T] }
+
+pub enum Choice[T] {
+    One(T),
+    Two,
+}
+
+pub const LIMIT: int = 10
+
+pub fn make() -> Stack[int] { Stack { items: [] } }
+
+fn private_helper() -> int { LIMIT }
+
+---
+
+(source_file
+  (struct_declaration
+    (visibility)
+    name: (type_identifier)
+    type_parameters: (plain_type_parameters
+      (type_identifier))
+    body: (field_declaration_list
+      (field_declaration
+        name: (identifier)
+        type: (type
+          (list_type
+            type_arguments: (type_arguments
+              (type
+                (named_type
+                  name: (type_identifier)))))))))
+  (enum_declaration
+    (visibility)
+    name: (type_identifier)
+    type_parameters: (plain_type_parameters
+      (type_identifier))
+    body: (variant_list
+      (variant
+        name: (type_identifier)
+        (variant_payload
+          (type
+            (named_type
+              name: (type_identifier)))))
+      (variant
+        name: (type_identifier))))
+  (const_declaration
+    (visibility)
+    name: (constant)
+    type: (type
+      (primitive_type))
+    value: (integer_literal))
+  (function_declaration
+    (visibility)
+    name: (identifier)
+    parameters: (parameter_list)
+    return_type: (type
+      (named_type
+        name: (type_identifier)
+        type_arguments: (type_arguments
+          (type
+            (primitive_type)))))
+    body: (block
+      (expression_statement
+        expression: (struct_literal
+          name: (type_identifier)
+          (field_initializer
+            name: (identifier)
+            value: (list_literal))))))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (expression_statement
+        expression: (constant)))))
+
+==================
+items: impl blocks with associated functions and methods
+==================
+
+struct Stack[T] { items: list[T] }
+
+impl[T] Stack[T] {
+    pub fn new() -> Stack[T] { Stack { items: [] } }
+
+    pub fn push(mut self, x: T) {
+        self.items.push(x)
+    }
+
+    fn peek(self) -> T? {
+        self.items.last()
+    }
+}
+
+---
+
+(source_file
+  (struct_declaration
+    name: (type_identifier)
+    type_parameters: (plain_type_parameters
+      (type_identifier))
+    body: (field_declaration_list
+      (field_declaration
+        name: (identifier)
+        type: (type
+          (list_type
+            type_arguments: (type_arguments
+              (type
+                (named_type
+                  name: (type_identifier)))))))))
+  (impl_declaration
+    type_parameters: (type_parameters
+      (type_parameter
+        name: (type_identifier)))
+    type: (type_identifier)
+    type_arguments: (type_arguments
+      (type
+        (named_type
+          name: (type_identifier))))
+    (function_declaration
+      (visibility)
+      name: (identifier)
+      parameters: (parameter_list)
+      return_type: (type
+        (named_type
+          name: (type_identifier)
+          type_arguments: (type_arguments
+            (type
+              (named_type
+                name: (type_identifier))))))
+      body: (block
+        (expression_statement
+          expression: (struct_literal
+            name: (type_identifier)
+            (field_initializer
+              name: (identifier)
+              value: (list_literal))))))
+    (function_declaration
+      (visibility)
+      name: (identifier)
+      parameters: (parameter_list
+        (self_parameter)
+        (parameter
+          name: (identifier)
+          type: (type
+            (named_type
+              name: (type_identifier)))))
+      body: (block
+        (expression_statement
+          expression: (call_expression
+            function: (field_expression
+              base: (field_expression
+                base: (self_expression)
+                field: (identifier))
+              field: (identifier))
+            arguments: (arguments
+              (argument
+                value: (identifier)))))))
+    (function_declaration
+      name: (identifier)
+      parameters: (parameter_list
+        (self_parameter))
+      return_type: (type
+        (optional_type
+          type: (named_type
+            name: (type_identifier))))
+      body: (block
+        (expression_statement
+          expression: (call_expression
+            function: (field_expression
+              base: (field_expression
+                base: (self_expression)
+                field: (identifier))
+              field: (identifier))
+            arguments: (arguments)))))))
+
+==================
+items: tests and handlers
+==================
+
+fn add(a: int, b: int) -> int { a + b }
+
+test "adds numbers" {
+    assert(add(2, 3) == 5, "2 + 3 should be 5")
+}
+
+on init(settings: int) -> int { settings }
+
+on shutdown() {}
+
+on saved(doc: int) -> int { doc }
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type))))
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (expression_statement
+        expression: (additive_expression
+          left: (identifier)
+          right: (identifier)))))
+  (test_declaration
+    name: (string
+      (string_content))
+    body: (block
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (comparison_expression
+                left: (call_expression
+                  function: (identifier)
+                  arguments: (arguments
+                    (argument
+                      value: (integer_literal))
+                    (argument
+                      value: (integer_literal))))
+                right: (integer_literal)))
+            (argument
+              value: (string
+                (string_content))))))))
+  (on_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type))))
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (expression_statement
+        expression: (identifier))))
+  (on_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block))
+  (on_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type))))
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (expression_statement
+        expression: (identifier)))))

@@ -1,0 +1,373 @@
+==================
+patterns: wildcard literals and bindings
+==================
+
+fn main(n: int, text: str) {
+    match n {
+        _ => print("wild"),
+        0 => print("zero"),
+        -1 => print("minus one"),
+        value => print("{value}"),
+    }
+    match text {
+        "" => print("empty"),
+        "x" => print("x"),
+        other => print(other),
+    }
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type))))
+    body: (block
+      (expression_statement
+        expression: (match_expression
+          value: (identifier)
+          (match_arm
+            pattern: (pattern
+              (wildcard_pattern))
+            body: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (string
+                    (string_content))))))
+          (match_arm
+            pattern: (pattern
+              (literal_pattern
+                (integer_literal)))
+            body: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (string
+                    (string_content))))))
+          (match_arm
+            pattern: (pattern
+              (literal_pattern
+                value: (integer_literal)))
+            body: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (string
+                    (string_content))))))
+          (match_arm
+            pattern: (pattern
+              (binding_pattern
+                name: (identifier)))
+            body: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (string
+                    (interpolation
+                      value: (identifier)))))))))
+      (expression_statement
+        expression: (match_expression
+          value: (identifier)
+          (match_arm
+            pattern: (pattern
+              (literal_pattern
+                (string)))
+            body: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (string
+                    (string_content))))))
+          (match_arm
+            pattern: (pattern
+              (literal_pattern
+                (string
+                  (string_content))))
+            body: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (string
+                    (string_content))))))
+          (match_arm
+            pattern: (pattern
+              (binding_pattern
+                name: (identifier)))
+            body: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (identifier))))))))))
+
+==================
+patterns: variant payloads and struct patterns
+==================
+
+struct Point { x: int, y: int }
+enum Shape { Circle(float), Rect(Point), Empty }
+
+fn area(shape: Shape) -> float {
+    match shape {
+        Shape.Circle(radius) => 3.14 * radius * radius,
+        Rect(Point { x, y, .. }) => float(x * y),
+        Empty => 0.0,
+    }
+}
+
+---
+
+(source_file
+  (struct_declaration
+    name: (type_identifier)
+    body: (field_declaration_list
+      (field_declaration
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (field_declaration
+        name: (identifier)
+        type: (type
+          (primitive_type)))))
+  (enum_declaration
+    name: (type_identifier)
+    body: (variant_list
+      (variant
+        name: (type_identifier)
+        (variant_payload
+          (type
+            (primitive_type))))
+      (variant
+        name: (type_identifier)
+        (variant_payload
+          (type
+            (named_type
+              name: (type_identifier)))))
+      (variant
+        name: (type_identifier))))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier)))))
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (expression_statement
+        expression: (match_expression
+          value: (identifier)
+          (match_arm
+            pattern: (pattern
+              (variant_pattern
+                qualifier: (type_identifier)
+                name: (type_identifier)
+                arguments: (pattern_arguments
+                  (pattern
+                    (binding_pattern
+                      name: (identifier))))))
+            body: (multiplicative_expression
+              left: (multiplicative_expression
+                left: (float_literal)
+                right: (identifier))
+              right: (identifier)))
+          (match_arm
+            pattern: (pattern
+              (variant_pattern
+                name: (type_identifier)
+                arguments: (pattern_arguments
+                  (pattern
+                    (struct_pattern
+                      type: (type_identifier)
+                      (field_pattern
+                        name: (identifier))
+                      (field_pattern
+                        name: (identifier))
+                      (rest_pattern))))))
+            body: (conversion_expression
+              value: (multiplicative_expression
+                left: (identifier)
+                right: (identifier))))
+          (match_arm
+            pattern: (pattern
+              (variant_pattern
+                name: (type_identifier)))
+            body: (float_literal)))))))
+
+==================
+patterns: tuples and or-patterns
+==================
+
+fn main(pair: (int, int), n: int) {
+    match pair {
+        (0, 0) => print("origin"),
+        (x, 0) | (0, x) => print("{x}"),
+        (x, y) => print("{x + y}"),
+    }
+    let first | second = n
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (tuple_type
+            element: (type
+              (primitive_type))
+            (type
+              (primitive_type)))))
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type))))
+    body: (block
+      (expression_statement
+        expression: (match_expression
+          value: (identifier)
+          (match_arm
+            pattern: (pattern
+              (tuple_pattern
+                element: (pattern
+                  (literal_pattern
+                    (integer_literal)))
+                (pattern
+                  (literal_pattern
+                    (integer_literal)))))
+            body: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (string
+                    (string_content))))))
+          (match_arm
+            pattern: (pattern
+              (or_pattern
+                (tuple_pattern
+                  element: (pattern
+                    (binding_pattern
+                      name: (identifier)))
+                  (pattern
+                    (literal_pattern
+                      (integer_literal))))
+                pattern: (pattern
+                  (tuple_pattern
+                    element: (pattern
+                      (literal_pattern
+                        (integer_literal)))
+                    (pattern
+                      (binding_pattern
+                        name: (identifier)))))))
+            body: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (string
+                    (interpolation
+                      value: (identifier)))))))
+          (match_arm
+            pattern: (pattern
+              (tuple_pattern
+                element: (pattern
+                  (binding_pattern
+                    name: (identifier)))
+                (pattern
+                  (binding_pattern
+                    name: (identifier)))))
+            body: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (string
+                    (interpolation
+                      value: (additive_expression
+                        left: (identifier)
+                        right: (identifier))))))))))
+      (let_statement
+        pattern: (pattern
+          (or_pattern
+            (binding_pattern
+              name: (identifier))
+            pattern: (pattern
+              (binding_pattern
+                name: (identifier)))))
+        value: (identifier)))))
+
+==================
+patterns: struct pattern rest last
+==================
+
+struct P { x: int, y: int }
+
+fn main(p: P) {
+    match p {
+        P { x, .. } => print("{x}"),
+        P { .. } => print("p"),
+    }
+}
+
+---
+
+(source_file
+  (struct_declaration
+    name: (type_identifier)
+    body: (field_declaration_list
+      (field_declaration
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (field_declaration
+        name: (identifier)
+        type: (type
+          (primitive_type)))))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier)))))
+    body: (block
+      (expression_statement
+        expression: (match_expression
+          value: (identifier)
+          (match_arm
+            pattern: (pattern
+              (struct_pattern
+                type: (type_identifier)
+                (field_pattern
+                  name: (identifier))
+                (rest_pattern)))
+            body: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (string
+                    (interpolation
+                      value: (identifier)))))))
+          (match_arm
+            pattern: (pattern
+              (struct_pattern
+                type: (type_identifier)
+                (rest_pattern)))
+            body: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (string
+                    (string_content)))))))))))

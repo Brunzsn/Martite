@@ -1,0 +1,16 @@
+{
+  "name": "tree-sitter-martite",
+  "version": "0.1.0",
+  "description": "Martite grammar for tree-sitter",
+  "license": "MIT OR Apache-2.0",
+  "scripts": {
+    "generate": "tree-sitter generate --abi 15",
+    "test": "tree-sitter test",
+    "check-generated": "node scripts/check-generated.mjs",
+    "check-fixtures": "node scripts/check-fixtures.mjs",
+    "check": "pnpm run check-generated && pnpm test && pnpm run check-fixtures"
+  },
+  "devDependencies": {
+    "tree-sitter-cli": "0.27.2"
+  }
+}

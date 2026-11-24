@@ -1,0 +1,191 @@
+==================
+lexical: keywords and identifier classes
+==================
+
+struct HTTPServer { id: int }
+
+const MAX_SIZE: int = 1_000
+const HEX: int = 0xFF
+const BITS: int = 0b1010_1010
+
+fn make_thing() -> int { MAX_SIZE }
+
+---
+
+(source_file
+  (struct_declaration
+    name: (type_identifier)
+    body: (field_declaration_list
+      (field_declaration
+        name: (identifier)
+        type: (type
+          (primitive_type)))))
+  (const_declaration
+    name: (constant)
+    type: (type
+      (primitive_type))
+    value: (integer_literal))
+  (const_declaration
+    name: (constant)
+    type: (type
+      (primitive_type))
+    value: (integer_literal))
+  (const_declaration
+    name: (constant)
+    type: (type
+      (primitive_type))
+    value: (integer_literal))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (expression_statement
+        expression: (constant)))))
+
+==================
+lexical: numeric literals
+==================
+
+fn main() {
+    let a = 42
+    let b = 1_000_000
+    let c = 0xDEAD_BEEF
+    let d = 0b1010_1010
+    let e = 1.5
+    let f = 2.0e-3
+    let g = 1e9
+    let h = -9223372036854775807
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (float_literal))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (float_literal))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (float_literal))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (unary_expression
+          operand: (integer_literal))))))
+
+==================
+lexical: strings and escapes
+==================
+
+fn main() {
+    let text = "line\n tab\t quote\" slash\\ brace\{ brace\} unicode\u{1F600}"
+    let empty = ""
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (string
+          (string_content)
+          (escape_sequence)
+          (string_content)
+          (escape_sequence)
+          (string_content)
+          (escape_sequence)
+          (string_content)
+          (escape_sequence)
+          (string_content)
+          (escape_sequence)
+          (string_content)
+          (escape_sequence)
+          (string_content)
+          (escape_sequence)))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (string)))))
+
+==================
+lexical: comments and doc comments
+==================
+
+/// Main entry point.
+fn main() {
+    // a line comment
+    let value = 1 // trailing comment
+    /// This is an ordinary comment here.
+    let other = value + 1
+    print("{other}")
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (additive_expression
+          left: (identifier)
+          right: (integer_literal)))
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (interpolation
+                  value: (identifier))))))))))

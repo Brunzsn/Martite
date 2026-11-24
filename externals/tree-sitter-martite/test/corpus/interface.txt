@@ -1,0 +1,256 @@
+==================
+interface: opaque structs and host functions
+==================
+
+struct Doc
+struct Selection { start: int, end: int }
+enum SaveKind { Manual, Auto }
+
+const MAX_DOC_BYTES: int = 1_000_000
+
+fn text(doc: Doc) -> str
+fn selection(doc: Doc) -> Selection
+fn replace(doc: Doc, sel: Selection, new_text: str) -> Result[(), str]
+fn generic[T](value: T) -> T
+
+on saved(doc: Doc, kind: SaveKind) -> Result[(), str]
+on init(settings: int) -> int
+on shutdown()
+
+---
+
+(source_file
+  (opaque_struct_declaration
+    name: (type_identifier))
+  (struct_declaration
+    name: (type_identifier)
+    body: (field_declaration_list
+      (field_declaration
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (field_declaration
+        name: (identifier)
+        type: (type
+          (primitive_type)))))
+  (enum_declaration
+    name: (type_identifier)
+    body: (variant_list
+      (variant
+        name: (type_identifier))
+      (variant
+        name: (type_identifier))))
+  (const_declaration
+    name: (constant)
+    type: (type
+      (primitive_type))
+    value: (integer_literal))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier)))))
+    return_type: (type
+      (primitive_type)))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier)))))
+    return_type: (type
+      (named_type
+        name: (type_identifier))))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier))))
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier))))
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type))))
+    return_type: (type
+      (named_type
+        name: (type_identifier)
+        type_arguments: (type_arguments
+          (type
+            (unit_type))
+          (type
+            (primitive_type))))))
+  (function_declaration
+    name: (identifier)
+    type_parameters: (type_parameters
+      (type_parameter
+        name: (type_identifier)))
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier)))))
+    return_type: (type
+      (named_type
+        name: (type_identifier))))
+  (on_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier))))
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier)))))
+    return_type: (type
+      (named_type
+        name: (type_identifier)
+        type_arguments: (type_arguments
+          (type
+            (unit_type))
+          (type
+            (primitive_type))))))
+  (on_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type))))
+    return_type: (type
+      (primitive_type)))
+  (on_declaration
+    name: (identifier)
+    parameters: (parameter_list)))
+
+==================
+interface: use declarations and aliases
+==================
+
+use app.editor.Doc as EditorDoc
+use app.util as app_util
+
+fn open(doc: EditorDoc) -> int
+fn helper(value: int) -> int
+
+---
+
+(source_file
+  (use_declaration
+    path: (module_path
+      (identifier)
+      (identifier)
+      (type_identifier))
+    alias: (type_identifier))
+  (use_declaration
+    path: (module_path
+      (identifier)
+      (identifier))
+    alias: (identifier))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier)))))
+    return_type: (type
+      (primitive_type)))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (primitive_type))))
+    return_type: (type
+      (primitive_type))))
+
+==================
+interface: signatures end at a newline
+==================
+
+struct Doc
+fn text(doc: Doc) -> str
+fn size(doc: Doc) -> int
+
+---
+
+(source_file
+  (opaque_struct_declaration
+    name: (type_identifier))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier)))))
+    return_type: (type
+      (primitive_type)))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier)))))
+    return_type: (type
+      (primitive_type))))
+
+==================
+interface: malformed line keeps later signatures
+==================
+
+struct Doc
+fn broken(
+fn text(doc: Doc) -> str
+fn size(doc: Doc) -> int
+
+---
+
+(source_file
+  (opaque_struct_declaration
+    name: (type_identifier))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (ERROR
+        (identifier)
+        (identifier))
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier)))))
+    return_type: (type
+      (primitive_type)))
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list
+      (parameter
+        name: (identifier)
+        type: (type
+          (named_type
+            name: (type_identifier)))))
+    return_type: (type
+      (primitive_type))))

@@ -1,0 +1,133 @@
+==================
+recovery: incomplete function body
+==================
+
+fn main() {
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list))
+  (ERROR))
+
+==================
+recovery: incomplete list literal
+==================
+
+fn main() {
+    let values = [1, 2
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list))
+  (ERROR
+    (pattern
+      (binding_pattern
+        name: (identifier)))
+    (integer_literal)
+    (integer_literal)))
+
+==================
+recovery: incomplete call
+==================
+
+fn main() {
+    print("value"
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list))
+  (ERROR
+    (identifier)
+    (string
+      (string_content))))
+
+==================
+recovery: incomplete string
+==================
+
+fn main() {
+    let text = "abc
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (string
+          (string_content)))
+      (MISSING _rbrace))))
+
+==================
+recovery: incomplete interpolation
+==================
+
+fn main() {
+    print("{1 + 2")
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list))
+  (ERROR
+    (identifier)
+    (string
+      (interpolation
+        value: (additive_expression
+          left: (integer_literal)
+          (ERROR
+            (integer_literal))
+          right: (string
+            (string_content)))))))
+
+==================
+recovery: malformed statement recovers to the next statement
+==================
+
+fn main() {
+    let = 1
+    let ok = 2
+    print("{ok}")
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (MISSING identifier)))
+        value: (integer_literal))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (interpolation
+                  value: (identifier))))))))))

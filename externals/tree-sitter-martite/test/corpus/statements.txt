@@ -1,0 +1,254 @@
+==================
+statements: let and var declarations
+==================
+
+fn main() {
+    let a = 1
+    let b: int = 2
+    var c = 3
+    var d: int = 4
+    let (e, f) = (5, 6)
+    let Point { x, y } = Point { x: 7, y: 8 }
+    c += 1
+    d -= 1
+}
+
+struct Point { x: int, y: int }
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        type: (type
+          (primitive_type))
+        value: (integer_literal))
+      (var_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (var_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        type: (type
+          (primitive_type))
+        value: (integer_literal))
+      (let_statement
+        pattern: (pattern
+          (tuple_pattern
+            element: (pattern
+              (binding_pattern
+                name: (identifier)))
+            (pattern
+              (binding_pattern
+                name: (identifier)))))
+        value: (tuple_expression
+          element: (integer_literal)
+          (integer_literal)))
+      (let_statement
+        pattern: (pattern
+          (struct_pattern
+            type: (type_identifier)
+            (field_pattern
+              name: (identifier))
+            (field_pattern
+              name: (identifier))))
+        value: (struct_literal
+          name: (type_identifier)
+          (field_initializer
+            name: (identifier)
+            value: (integer_literal))
+          (field_initializer
+            name: (identifier)
+            value: (integer_literal))))
+      (expression_statement
+        expression: (identifier)
+        value: (integer_literal))
+      (expression_statement
+        expression: (identifier)
+        value: (integer_literal))))
+  (struct_declaration
+    name: (type_identifier)
+    body: (field_declaration_list
+      (field_declaration
+        name: (identifier)
+        type: (type
+          (primitive_type)))
+      (field_declaration
+        name: (identifier)
+        type: (type
+          (primitive_type))))))
+
+==================
+statements: while for and jumps
+==================
+
+fn main() {
+    var i = 0
+    while i < 3 {
+        i += 1
+        if i == 2 { continue }
+        if i == 3 { break }
+    }
+    for value in [1, 2, 3] {
+        print("{value}")
+    }
+    return
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (var_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (while_statement
+        condition: (comparison_expression
+          left: (identifier)
+          right: (integer_literal))
+        body: (block
+          (expression_statement
+            expression: (identifier)
+            value: (integer_literal))
+          (expression_statement
+            expression: (if_expression
+              condition: (comparison_expression
+                left: (identifier)
+                right: (integer_literal))
+              consequence: (block
+                (continue_statement))))
+          (expression_statement
+            expression: (if_expression
+              condition: (comparison_expression
+                left: (identifier)
+                right: (integer_literal))
+              consequence: (block
+                (break_statement))))))
+      (for_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (list_literal
+          (integer_literal)
+          (integer_literal)
+          (integer_literal))
+        body: (block
+          (expression_statement
+            expression: (call_expression
+              function: (identifier)
+              arguments: (arguments
+                (argument
+                  value: (string
+                    (interpolation
+                      value: (identifier)))))))))
+      (return_statement))))
+
+==================
+statements: assignments
+==================
+
+fn main() {
+    var x = 10
+    x = 11
+    x += 1
+    x -= 1
+    x *= 2
+    x /= 2
+    x %= 3
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (var_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (expression_statement
+        expression: (identifier)
+        value: (integer_literal))
+      (expression_statement
+        expression: (identifier)
+        value: (integer_literal))
+      (expression_statement
+        expression: (identifier)
+        value: (integer_literal))
+      (expression_statement
+        expression: (identifier)
+        value: (integer_literal))
+      (expression_statement
+        expression: (identifier)
+        value: (integer_literal))
+      (expression_statement
+        expression: (identifier)
+        value: (integer_literal)))))
+
+==================
+statements: final statement needs no newline
+==================
+
+fn value() -> int {
+    let x = 1
+    x
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    return_type: (type
+      (primitive_type))
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (expression_statement
+        expression: (identifier)))))
+
+==================
+statements: return with a newline returns unit
+==================
+
+fn early() {
+    return
+    1
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (return_statement)
+      (expression_statement
+        expression: (integer_literal)))))

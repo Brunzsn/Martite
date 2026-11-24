@@ -1,0 +1,248 @@
+==================
+interpolation: simple expression
+==================
+
+fn main() {
+    let name = "world"
+    print("hello {name}")
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (string
+          (string_content)))
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (string_content)
+                (interpolation
+                  value: (identifier))))))))))
+
+==================
+interpolation: nested arithmetic
+==================
+
+fn main() {
+    let a = 1
+    let b = 2
+    let c = 3
+    print("{a + b * c}")
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (interpolation
+                  value: (additive_expression
+                    left: (identifier)
+                    right: (multiplicative_expression
+                      left: (identifier)
+                      right: (identifier))))))))))))
+
+==================
+interpolation: map literal and index
+==================
+
+fn main() {
+    print("{{"a": 1}["a"]}")
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (interpolation
+                  value: (index_expression
+                    base: (map_literal
+                      (map_entry
+                        key: (string
+                          (string_content))
+                        value: (integer_literal)))
+                    index: (string
+                      (string_content))))))))))))
+
+==================
+interpolation: nested string
+==================
+
+fn main() {
+    let x = 1
+    print("{fn() => "inner {x}"}")
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (let_statement
+        pattern: (pattern
+          (binding_pattern
+            name: (identifier)))
+        value: (integer_literal))
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (interpolation
+                  value: (lambda_expression
+                    body: (string
+                      (string_content)
+                      (interpolation
+                        value: (identifier)))))))))))))
+
+==================
+interpolation: escaped braces and unicode escape
+==================
+
+fn main() {
+    print("literal \{ brace \} and \u{1F600}")
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (string_content)
+                (escape_sequence)
+                (string_content)
+                (escape_sequence)
+                (string_content)
+                (escape_sequence)))))))))
+
+==================
+interpolation: empty interpolation is an error
+==================
+
+fn main() {
+    print("{}")
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (ERROR)))))))))
+
+==================
+interpolation: malformed interpolation expression
+==================
+
+fn main() {
+    print("{1 + }")
+}
+
+---
+
+(source_file
+  (function_declaration
+    name: (identifier)
+    parameters: (parameter_list)
+    body: (block
+      (expression_statement
+        expression: (call_expression
+          function: (identifier)
+          arguments: (arguments
+            (argument
+              value: (string
+                (interpolation
+                  value: (integer_literal)
+                  (ERROR))))))))))
+
+==================
+interpolation: unterminated string recovers to the next statement
+==================
+
+fn main() {
+    let text = "abc
+    print("done")
+}
+
+---
+
+(source_file
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (block
+      (let_statement
+        (pattern
+          (binding_pattern
+            (identifier)))
+        (string
+          (string_content)))
+      (expression_statement
+        (call_expression
+          (identifier)
+          (arguments
+            (argument
+              (string
+                (string_content)))))))))

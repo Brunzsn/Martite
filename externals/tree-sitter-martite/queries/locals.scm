@@ -1,0 +1,17 @@
+; Scopes
+(function_declaration) @local.scope
+(on_declaration) @local.scope
+(lambda_expression) @local.scope
+(block) @local.scope
+(test_declaration) @local.scope
+(for_statement) @local.scope
+(match_arm) @local.scope
+
+; Definitions
+(parameter name: (identifier) @local.definition)
+(self_parameter) @local.definition
+(binding_pattern name: (identifier) @local.definition)
+(field_pattern name: (identifier) @local.definition)
+
+; References
+(identifier) @local.reference
