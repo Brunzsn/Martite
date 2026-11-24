@@ -95,7 +95,7 @@ the corpus, fixture, and query validation.
 ```toml
 [grammars.martite]
 repository = "https://github.com/Brunzsn/Martite"
-rev = "b51ac50ce254f40bcee48a24be1375863f8984f7"
+rev = "e0ae30f7398dee8c75381217687c9caefd447836"
 path = "externals/tree-sitter-martite"
 ```
 
